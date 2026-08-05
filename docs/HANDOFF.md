@@ -4,7 +4,7 @@ Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
 Repository: https://github.com/Lulzx/soma. The default semantic core is
-dependency-free. There are 201 integration tests (two of which need the `metal`
+dependency-free. There are 208 integration tests (two of which need the `metal`
 feature), two compile-fail doc tests, and no Clippy warnings. The optional `metal` feature adds the `metal-rs` implementation
 dependency on macOS.
 
@@ -43,7 +43,7 @@ Two documents, and they are not equals:
 | Doc | Status |
 | --- | --- |
 | `docs/SOMA-v0.2.md` | **Current.** The semantic specification. Start here. |
-| `docs/SOMA-v0.3.md` | **Current for anything added since v0.2.** §1–§3 are implemented and checked: the equivalence relation, evaluator bodies, and the carried debts. So is §4.1, the first of the device scheduler's four obligations. The rest of §4 and all of §5–§6 scope the device scheduler, the distributed implementation, and performance work. |
+| `docs/SOMA-v0.3.md` | **Current for anything added since v0.2.** §1–§3 are implemented and checked: the equivalence relation, evaluator bodies, and the carried debts. So are §4.1 and §4.2, two of the device scheduler's four obligations. §4.3 and all of §5–§6 scope the rest of the device scheduler, the distributed implementation, and performance work. |
 | `docs/SOMA-P1.md` | Historical. The original broad Phase-1 contract, still referenced by `§n` markers in code comments. Useful context, but it describes a wider system than the one being built, and its framing is what the refocus moved away from. |
 
 The directory is still named `gpu-os` and the crate `soma`. Harmless, but expect
@@ -145,8 +145,10 @@ Added in v0.3:
 - Per-process live-continuation counts in place of a table scan per commit,
   and generation-exhausted slots retired rather than wrapped.
 - Admission as a pure function of the epoch's candidate set (I22), replacing
-  the first-come `HashSet` claim. The first of the device scheduler's four
-  obligations; the other three are open.
+  the first-come `HashSet` claim.
+- Lane-relative trace positions (I23), so the run's order is recoverable
+  without a shared clock. Two of the device scheduler's four obligations;
+  canonical commit is the one that gates a concurrent executive.
 
 ### Semantic boundary
 
@@ -154,9 +156,10 @@ No entity or invariant named by `SOMA-v0.2.md` remains absent, and v0.3 §1–§
 are implemented and checked, as is §4.1. A device-resident scheduler, a
 distributed implementation, and hardware performance results remain beyond
 conformance — scoped in v0.3 §4–§6, and not guarantees silently claimed by the
-current machine. In particular, admission is now order-independent but
-*execution* is not: lane order within a bin is arrival order, and nothing yet
-makes that order reproducible when bins are appended concurrently.
+current machine. In particular, admission is order-independent and the trace's
+order is reconstructible from position, but *execution* is neither: effects are
+still applied as they are produced, so what a lane observes depends on when it
+ran. Canonical commit is what would change that, and it is not done.
 
 ---
 
@@ -375,6 +378,12 @@ decision that would otherwise depend on `HashMap` iteration order.
   behavioural test would notice. `Admission` is sealed for that reason: an
   epoch that builds its own does not compile. If you find yourself wanting to
   widen that, the thing you are about to break is checkable only on hardware.
+- **Trace emission must stay lane-attributed.** `enter_lane`/`leave_lane` in
+  `epochs.rs` are what put an executing continuation's events in a sequence
+  space of its own. Delete the call and I23's reconstruction test still passes —
+  a single host counter satisfies "sorted by position equals emitted order"
+  perfectly — while the trace goes back to needing a shared clock. Clause 3 of
+  I23 is the only thing that reports it.
 - **Trace `causal` is load-bearing for I18.** Adding an event that participates
   in a cross-entity happens-before edge without setting `causal` silently drops
   that edge, and a dropped edge makes the conformance checker weaker without

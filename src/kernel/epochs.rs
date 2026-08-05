@@ -112,8 +112,11 @@ impl Kernel {
             self.accounting.stalled_epochs += 1;
         }
 
-        // Phase F: Execute (CPU scalar — a cohort's lanes run in lane order).
-        let mut steps = 0;
+        // Phase E, recorded: the whole epoch's dispatch shape, before any of it
+        // runs. These used to be emitted one cohort at a time as execution
+        // reached it, which made a placement record depend on when a lane ran.
+        // The plan is complete before Phase F starts, so the records belong to
+        // the host's part of the epoch and are emitted there (I23).
         for plan in &plans {
             for cohort in &plan.cohorts {
                 self.accounting.cohorts += 1;
@@ -130,13 +133,29 @@ impl Kernel {
                     cohort.run_class,
                     cohort.active_lanes as u32,
                 );
+            }
+        }
 
+        // Phase F: Execute (CPU scalar — a cohort's lanes run in lane order).
+        //
+        // A lane's number comes from its position in the plan, not from when it
+        // ran, and every event it emits is stamped with that number and a
+        // counter local to it. Nothing here consults a shared clock, so a
+        // concurrent executive can run these lanes in any order and the trace
+        // still sorts back into this one.
+        let mut steps = 0;
+        let mut lane_number = 0u32;
+        for plan in &plans {
+            for cohort in &plan.cohorts {
                 for cont in cohort.lanes() {
+                    lane_number += 1;
                     let process = match self.continuations.get(*cont) {
                         Ok(c) => c.process,
                         Err(_) => continue,
                     };
+                    self.enter_lane(lane_number);
                     steps += self.execute_cont(*cont, process);
+                    self.leave_lane();
                 }
             }
             // Deferred lanes return to their bins for a later epoch.
@@ -158,6 +177,7 @@ impl Kernel {
         self.accounting.steps += steps as u64;
 
         self.epoch = self.epoch.wrapping_add(1);
+        self.open_epoch_positions();
 
         steps
     }

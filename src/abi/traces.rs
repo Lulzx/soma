@@ -42,14 +42,43 @@ pub enum EventKind {
     ModuleLoaded = 32,
 }
 
+/// The lane an event was emitted from when it was not emitted from one: epoch
+/// bookkeeping, cohort records, and anything a caller does between epochs.
+///
+/// Zero rather than a sentinel at the top of the range, so that ordering by
+/// `(epoch, lane, lane_sequence)` puts an epoch's host events before the lanes
+/// they set up. That is also the order they happen in.
+pub const HOST_LANE: u32 = 0;
+
 /// Compact trace record (§21).
 #[derive(Clone, Copy, Debug)]
 pub struct TraceEvent {
+    /// A total order over the whole run, assigned by whoever appended the
+    /// event. It is what I11 checks, and it is exactly what a device cannot
+    /// produce: concurrent lanes have no shared clock to draw it from.
+    ///
+    /// It is kept because the sequential interpreter is the reference and
+    /// because replay reads it, but it carries no information beyond
+    /// `(epoch, lane, lane_sequence)` — which is what I23 checks, and what
+    /// makes it reconstructible rather than required.
     pub logical_time: u64,
 
     pub epoch: u32,
     pub event_kind: EventKind,
     pub engine: u16,
+
+    /// Which lane of its epoch emitted this event, or `HOST_LANE`.
+    ///
+    /// Lanes are numbered from 1 in the epoch's admitted order, so the number
+    /// is a position in the epoch's plan rather than a fact about hardware. It
+    /// is placement information and the semantic projection does not carry it.
+    pub lane: u32,
+    /// The event's position within its lane's own emissions this epoch.
+    ///
+    /// A lane is sequential, so this needs nothing shared to assign: a
+    /// concurrent implementation counts locally and the total order falls out
+    /// of the three fields together.
+    pub lane_sequence: u32,
 
     pub process: Ref64,
     pub continuation: Ref64,
@@ -88,11 +117,19 @@ impl TraceEvent {
             epoch,
             event_kind,
             engine: 0,
+            lane: HOST_LANE,
+            lane_sequence: 0,
             process,
             continuation,
             run_class,
             auxiliary: 0,
             causal: Ref64::NULL,
         }
+    }
+
+    /// The event's position, independent of any clock: the key a concurrent
+    /// implementation sorts on to recover the order this run emitted.
+    pub fn position(&self) -> (u32, u32, u32) {
+        (self.epoch, self.lane, self.lane_sequence)
     }
 }

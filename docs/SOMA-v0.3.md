@@ -1,7 +1,7 @@
 # SOMA v0.3
 
 **Status:** partially implemented. §1–§3 are specification and are
-machine-checked, as is §4.1. The rest of §4 and all of §5–§6 are scope.
+machine-checked, as are §4.1 and §4.2. §4.3 and all of §5–§6 are scope.
 
 v0.2 closed the semantic core: every entity and invariant it named was
 implemented and checked. v0.3 is the first version whose work is not "finish the
@@ -20,8 +20,8 @@ did not depend on it are done; the rest is scoped below.
 | **C** | Distributed / multi-node implementation | scope (§5) |
 | **D** | Performance work on real hardware | scope (§6) |
 
-Five new clauses are now checked — I18, I19, I20, I21, I22 — and v0.2's only
-`[modelled]` clause is gone. The test suite went from 151 to 201.
+Six new clauses are now checked — I18 through I23 — and v0.2's only
+`[modelled]` clause is gone. The test suite went from 151 to 208.
 
 ---
 
@@ -251,8 +251,10 @@ bytes and semantic trace against the CPU interpreter.
 
 ## 4. B — persistent device-resident scheduler
 
-**Started.** S was its blocker and S is done. The first of its four obligations
-— admission — is discharged and checked (§4.1); the other three are not.
+**Started.** S was its blocker and S is done. Two of its four obligations are
+discharged and checked: admission (§4.1) and trace emission (§4.2). The two that
+remain are commit and the step-budget check's position, and the first of those
+is the one that gates a concurrent executive.
 
 `kernel/epochs.rs` still cohorts, executes, and commits on the host, one
 continuation at a time. The Metal path dispatches a single collective and blocks
@@ -271,7 +273,7 @@ What must hold, and why each is hard:
   `HANDOFF.md` §7 records the bug from getting this wrong). Concurrency does not
   relax this.
 - **Trace emission** becomes a concurrent append. Logical time must still
-  satisfy I11 and now also I18.
+  satisfy I11 and now also I18. **Done — §4.2.**
 
 ### 4.1 Admission decides from state, not from position
 
@@ -334,13 +336,73 @@ and is not done. Folding lane order into I22 now would state a property the host
 satisfies and no device could, which is exactly the defect §2 removed from the
 equivalence relation.
 
-The obstacle to that second obligation is structural rather than subtle: the
+### 4.2 The trace no longer needs a clock
+
+`logical_time` is one counter, incremented per event. Concurrent lanes have no
+counter to share, so the fourth obligation is not "make the append thread-safe"
+— a mutex around the clock would do that and would serialise every lane at the
+point the design is trying to parallelise.
+
+Every event now carries the position it was emitted at: its epoch, the lane that
+emitted it, and that lane's own count. Lanes are numbered from 1 in the epoch's
+admitted order — a position in the plan, decided before anything runs — and
+`HOST_LANE` is zero, so an epoch's own bookkeeping sorts ahead of the lanes it
+set up. A lane counts locally and consults nothing shared.
+
+**I23. Position-derived emission [checked].** Three clauses:
+
+1. positions are unique, so the ordering they induce is total;
+2. sorting the trace by position reproduces the trace as emitted; and
+3. work that ran in a lane is attributed to one, and no two continuations share
+   a lane within an epoch.
+
+Clause 3 is not bookkeeping. Without it an implementation that emitted every
+event from `HOST_LANE` off a single counter satisfies clauses 1 and 2 *exactly*
+— positions unique, sorted order equal to emitted order — while being the
+shared-clock design the clause replaces. That is not hypothetical: deleting the
+`enter_lane` call leaves `sorting_by_position_reconstructs_the_run` green and
+fails five other tests, which is how the hole was found.
+
+Clause 2 is a statement about the reference, and the specification should not be
+read as demanding it of an implementation. It holds for a run whose append order
+*is* its emission order, which is what a sequential interpreter produces. A
+concurrent implementation appends interleaved and will not satisfy it on its raw
+trace; what it owes is clauses 1 and 3, and I18 after sorting by position.
+Demanding clause 2 of it would re-import the assumption §2 removed from the
+equivalence relation.
+
+Two consequences worth recording. The epoch's `CohortCreated` records are now
+emitted together, before Phase F, rather than one at a time as execution reached
+each cohort: the plan is complete before anything runs, so a placement record
+that depended on when a lane ran was recording the wrong thing. And lane and
+sequence are placement information, so `semantic_projection` does not carry them
+— a device that groups work differently must still be I18-equivalent.
+
+What §4.2 does not do is make lanes reorderable. It makes the *record* of a run
+reconstructible without a clock. What a lane observes still depends on when it
+ran relative to other lanes, because effects are still applied as they are
+produced. That is the next section's problem.
+
+### 4.3 What is left: canonical commit
+
+The obstacle to the second obligation is structural rather than subtle: the
 executive's handlers take `&mut Kernel` and allocate their effects as they run
 (`create_process`, `resolve_future`, `enqueue_message`), so execute and commit
 are fused. Canonical commit requires a step to produce an effect list that the
 kernel applies afterwards, in lane order. That refactor is the next piece of B,
 and it is the one that makes a concurrent executive — host threads first, device
 after — possible at all.
+
+§4.2 supplies the ordering key it will apply them in: a lane number is a
+position in the plan, so "in lane order" is already well-defined and already
+independent of when a lane ran. What is missing is a step that produces effects
+instead of performing them, which needs symbolic references for the entities a
+step allocates and then uses — a step that creates a future and stores it in its
+frame cannot be handed a real `Ref64` before commit.
+
+The third obligation — the step-budget check preceding dispatch — holds today
+and is not weakened by anything above; it needs no work, only a guard against
+being moved. `HANDOFF.md` §7 records why.
 
 Not in B: preemption. The model does not assume it (v0.2 §1.1), and adding it to
 the scheduler before adding it to the model would be backwards.
@@ -427,6 +489,7 @@ cannot reach means the model is charging for the wrong thing.
 | I20 backend agreement | checked | CPU interpreter is the definition |
 | I21 bounded progress | checked | no withholding, plus a starvation bound |
 | I22 admission determinism | checked | the decision is a function of the candidate set (§4.1) |
+| I23 position-derived emission | checked | the trace's order needs no shared clock (§4.2) |
 
 **I21** has two halves. The first — an epoch that admitted work dispatched some
 of it — is a statement about a transition rather than a state, so it is counted

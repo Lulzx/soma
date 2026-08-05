@@ -176,6 +176,11 @@ impl ContinuationSpec {
 pub struct TraceSnapshotRow {
     pub logical_time: u64,
     pub epoch: u32,
+    /// Emitting lane and its local sequence. Placement information: two runs
+    /// that differ only in how work was grouped differ here, so the semantic
+    /// projection I18 compares does not read these fields.
+    pub lane: u32,
+    pub lane_sequence: u32,
     pub event_kind: EventKind,
     pub engine: u16,
     pub process: u64,
@@ -200,6 +205,13 @@ pub struct Kernel {
     epoch: u32,
     logical_time: u64,
     trace: Vec<TraceEvent>,
+    /// The lane currently executing, or `HOST_LANE` between lanes.
+    current_lane: u32,
+    /// Emissions so far from `current_lane` this epoch. Reset when a lane is
+    /// entered, which is safe because a lane is sequential; the host counter is
+    /// separate so host events keep their order across an epoch's lanes.
+    lane_sequence: u32,
+    host_sequence: u32,
     /// Total runnable continuations at the end of each epoch, for accounting.
     epoch_runnable: Vec<usize>,
     /// Each epoch's admission candidates and the decision taken over them, kept
@@ -266,6 +278,9 @@ impl Kernel {
             epoch: 0,
             logical_time: 0,
             trace: Vec::new(),
+            current_lane: crate::abi::traces::HOST_LANE,
+            lane_sequence: 0,
+            host_sequence: 0,
             epoch_runnable: Vec::new(),
             admission_log: Vec::new(),
             processes: GenTable::new(Kind::Process),
@@ -513,6 +528,7 @@ impl Kernel {
         causal: Ref64,
     ) {
         self.logical_time = self.logical_time.wrapping_add(1);
+        let (lane, lane_sequence) = self.next_position();
         self.trace.push(TraceEvent::new(
             self.logical_time,
             self.epoch,
@@ -524,7 +540,58 @@ impl Kernel {
         if let Some(last) = self.trace.last_mut() {
             last.auxiliary = auxiliary;
             last.causal = causal;
+            last.lane = lane;
+            last.lane_sequence = lane_sequence;
         }
+    }
+
+    /// Take the next `(lane, lane_sequence)` for an event.
+    ///
+    /// Nothing shared is consulted beyond the counter belonging to whoever is
+    /// emitting, which is the point: a concurrent implementation runs this per
+    /// lane with no coordination, and the epoch's total order is recovered by
+    /// sorting on `TraceEvent::position` afterwards (I23).
+    fn next_position(&mut self) -> (u32, u32) {
+        if self.current_lane == crate::abi::traces::HOST_LANE {
+            let sequence = self.host_sequence;
+            self.host_sequence = self.host_sequence.saturating_add(1);
+            (crate::abi::traces::HOST_LANE, sequence)
+        } else {
+            let sequence = self.lane_sequence;
+            self.lane_sequence = self.lane_sequence.saturating_add(1);
+            (self.current_lane, sequence)
+        }
+    }
+
+    /// Bind subsequent trace emissions to `lane` of the current epoch.
+    ///
+    /// Lanes are numbered from 1 in the epoch's admitted order. The number is a
+    /// position in the plan, decided before anything runs, so a concurrent
+    /// executive assigns it the same way a sequential one does.
+    pub(crate) fn enter_lane(&mut self, lane: u32) {
+        debug_assert_ne!(lane, crate::abi::traces::HOST_LANE);
+        self.current_lane = lane;
+        self.lane_sequence = 0;
+    }
+
+    /// Return emission to the host: epoch bookkeeping and anything a caller
+    /// does between epochs.
+    pub(crate) fn leave_lane(&mut self) {
+        self.current_lane = crate::abi::traces::HOST_LANE;
+    }
+
+    /// Open a new epoch's position space, at the moment the epoch number
+    /// advances rather than when the next epoch starts running.
+    ///
+    /// Positions are meaningful only within an epoch, and a caller that creates
+    /// work *between* epochs already stamps its events with the new epoch
+    /// number. Resetting later would restart the host counter underneath those
+    /// events and sort the epoch's own bookkeeping ahead of work that preceded
+    /// it.
+    pub(crate) fn open_epoch_positions(&mut self) {
+        self.current_lane = crate::abi::traces::HOST_LANE;
+        self.lane_sequence = 0;
+        self.host_sequence = 0;
     }
 
     /// Compact, comparable snapshot of the trace for determinism tests.
@@ -539,6 +606,8 @@ impl Kernel {
             .map(|t| TraceSnapshotRow {
                 logical_time: t.logical_time,
                 epoch: t.epoch,
+                lane: t.lane,
+                lane_sequence: t.lane_sequence,
                 event_kind: t.event_kind,
                 engine: t.engine,
                 process: t.process.to_u64(),

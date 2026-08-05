@@ -59,7 +59,7 @@ continuation boundary.
 
 ## Specification
 
-The specification defines twenty-two numbered invariants. Each clause has one of
+The specification defines twenty-three numbered invariants. Each clause has one of
 three states:
 
 - `checked`: evaluated against interpreter state after each transition
@@ -207,8 +207,9 @@ Not implemented:
 
 - A general-purpose language or compiler for arbitrary evaluator bodies
 - A complete device-resident scheduler/executive or distributed backend.
-  Admission is order-independent (I22); canonical commit, concurrent trace
-  append, and a concurrent executive are not started
+  Admission is order-independent (I22) and the trace's order is recoverable
+  from event position rather than a shared clock (I23); canonical commit and a
+  concurrent executive are not started
 - Hardware throughput, scheduler-overhead, and end-to-end migration benchmarks
 
 Every entity and invariant named by the v0.2 machine is now implemented. The

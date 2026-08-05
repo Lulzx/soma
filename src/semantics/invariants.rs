@@ -63,6 +63,9 @@ pub enum Invariant {
     /// I22. Admission decides from the epoch's candidate set, not from the
     /// order that set is discovered in.
     AdmissionDeterminism,
+    /// I23. The trace's order is recoverable from event positions alone, with
+    /// no shared clock.
+    PositionDerivedEmission,
 }
 
 /// A specific way in which a state was illegal.
@@ -110,8 +113,126 @@ pub fn check(kernel: &Kernel) -> Vec<Violation> {
     module_integrity(kernel, &mut v);
     bounded_progress(kernel, &mut v);
     admission_determinism(kernel, &mut v);
+    position_derived_emission(kernel, &mut v);
     v.sort();
     v
+}
+
+// ---- I23 -----------------------------------------------------------------
+
+/// **I23. Position-derived emission.**
+///
+/// `docs/SOMA-v0.3.md` §4 lists trace emission as the fourth thing a
+/// device-resident scheduler has to preserve: it becomes a concurrent append,
+/// and logical time must still satisfy I11 and I18. The difficulty is that
+/// `logical_time` is drawn from a single counter, and concurrent lanes have no
+/// counter to share.
+///
+/// The clause is that they do not need one. Every event carries the position it
+/// was emitted at — its epoch, the lane that emitted it, and that lane's own
+/// count — and the run's order is exactly the order of those positions:
+///
+/// 1. positions are unique, so the ordering is total;
+/// 2. sorting the trace by position reproduces the trace as emitted; and
+/// 3. work that ran in a lane is attributed to one, and no two continuations
+///    share a lane within an epoch.
+///
+/// Together the first two say `logical_time` is derived rather than
+/// load-bearing. A concurrent implementation counts locally, appends in
+/// whatever order it finishes, and the reference order is recovered by a sort —
+/// which is what makes I11 and I18 checkable against it at all.
+///
+/// Clause 3 is what stops that from being free. Without it, an implementation
+/// that emitted every event from `HOST_LANE` off a single counter would satisfy
+/// clauses 1 and 2 exactly — positions unique, sorted order equal to emitted
+/// order — while being the shared-clock design the clause exists to replace.
+/// Requiring each executing continuation to hold a lane of its own means the
+/// sequence space really is partitioned, which is the thing a device needs.
+///
+/// **Clause 2 is a statement about the reference.** It holds for a run whose
+/// append order *is* its emission order, which is what a sequential interpreter
+/// produces. A concurrent implementation appends interleaved and will not
+/// satisfy it on its raw trace; what it owes is clauses 1 and 3, and I18 after
+/// sorting by position. Requiring clause 2 of such an implementation would
+/// re-import the assumption §2 removed from the equivalence relation.
+///
+/// The clause deliberately does *not* say that lanes may run in any order. It
+/// says the record of a run is reconstructible without a clock. What a lane
+/// observes still depends on when it ran relative to other lanes, because
+/// effects are still applied as they are produced; that is canonical commit,
+/// which is a different obligation and is not met.
+fn position_derived_emission(kernel: &Kernel, out: &mut Vec<Violation>) {
+    let events = kernel.trace_events();
+
+    let mut seen: std::collections::BTreeSet<(u32, u32, u32)> = std::collections::BTreeSet::new();
+    for event in events {
+        if !seen.insert(event.position()) {
+            let (epoch, lane, sequence) = event.position();
+            out.push(Violation::new(
+                Invariant::PositionDerivedEmission,
+                format!(
+                    "two events share position (epoch {epoch}, lane {lane}, sequence {sequence}), \
+                     so their order is not recoverable"
+                ),
+            ));
+        }
+    }
+
+    // Clause 2. Comparing positions pairwise rather than sorting a copy keeps
+    // the report specific: the first inversion names the two events, where a
+    // sort would only report that the orders differ.
+    for (index, window) in events.windows(2).enumerate() {
+        if window[0].position() >= window[1].position() {
+            let (epoch, lane, sequence) = window[0].position();
+            let (next_epoch, next_lane, next_sequence) = window[1].position();
+            out.push(Violation::new(
+                Invariant::PositionDerivedEmission,
+                format!(
+                    "event {index} at (epoch {epoch}, lane {lane}, sequence {sequence}) was \
+                     emitted before event {} at (epoch {next_epoch}, lane {next_lane}, sequence \
+                     {next_sequence}), which sorts earlier",
+                    index + 1
+                ),
+            ));
+            break;
+        }
+    }
+
+    // Clause 3. `ContinuationStarted` is the one event that marks a lane
+    // actually running something, so it is where attribution is checkable.
+    let mut occupant: std::collections::BTreeMap<(u32, u32), Ref64> =
+        std::collections::BTreeMap::new();
+    for event in events {
+        if event.event_kind != crate::abi::EventKind::ContinuationStarted {
+            continue;
+        }
+        if event.lane == crate::abi::traces::HOST_LANE {
+            out.push(Violation::new(
+                Invariant::PositionDerivedEmission,
+                format!(
+                    "continuation {} ran without a lane of its own, so emission is still \
+                     serialised through the host",
+                    event.continuation.slot
+                ),
+            ));
+            continue;
+        }
+        if let Some(previous) = occupant.insert((event.epoch, event.lane), event.continuation) {
+            if previous != event.continuation {
+                out.push(Violation::new(
+                    Invariant::PositionDerivedEmission,
+                    format!(
+                        "epoch {} lane {} carried continuations {} and {}, so their events share \
+                         one sequence space",
+                        event.epoch,
+                        event.lane,
+                        previous.slot,
+                        event.continuation.slot
+                    ),
+                ));
+            }
+        }
+    }
 }
 
 // ---- I22 -----------------------------------------------------------------
