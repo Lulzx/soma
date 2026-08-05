@@ -52,6 +52,10 @@ pub struct Arrival {
     pub run_class: u32,
     /// Stable identity, used to keep ordering deterministic.
     pub id: u64,
+    /// The node that spawned this one, if any. A distributed scheduler needs
+    /// this to model work staying where it was created — which is what happens
+    /// on a GPU when nothing makes a placement decision.
+    pub parent: Option<u64>,
 }
 
 /// A fixed readiness stream that every policy is scored against.
@@ -129,7 +133,7 @@ impl Default for IrregularKnobs {
 /// a heuristic future that resolves after a variable delay.
 pub fn trace(knobs: &IrregularKnobs) -> ArrivalTrace {
     let mut events = Vec::new();
-    let mut queue: VecDeque<(u64, u32, u32)> = VecDeque::new();
+    let mut queue: VecDeque<(u64, u32, u32, Option<u64>)> = VecDeque::new();
     let mut next_id = 0u64;
 
     for root in 0..knobs.roots {
@@ -138,15 +142,17 @@ pub fn trace(knobs: &IrregularKnobs) -> ArrivalTrace {
         } else {
             root * knobs.arrival_span / knobs.roots
         };
-        queue.push_back((root as u64 + 1, knobs.depth, tick));
+        queue.push_back((root as u64 + 1, knobs.depth, tick, None));
     }
 
-    while let Some((value, depth, ready)) = queue.pop_front() {
+    while let Some((value, depth, ready, parent)) = queue.pop_front() {
         let run_class = search_class(value, knobs.class_count);
+        let id = next_id;
         events.push(Arrival {
             tick: ready,
             run_class,
-            id: next_id,
+            id,
+            parent,
         });
         next_id += 1;
 
@@ -159,7 +165,7 @@ pub fn trace(knobs: &IrregularKnobs) -> ArrivalTrace {
                 } else {
                     (child % (knobs.jitter as u64 + 1)) as u32
                 };
-                queue.push_back((child, depth - 1, ready + 1 + jitter));
+                queue.push_back((child, depth - 1, ready + 1 + jitter, Some(id)));
             }
         }
     }
