@@ -262,7 +262,10 @@ fn slot(encoded: u64) -> u32 {
 /// from every conforming implementation's trace loses no information about
 /// process, continuation, message, future, capability, or collective state.
 pub fn is_placement_event(kind: EventKind) -> bool {
-    matches!(kind, EventKind::CohortCreated | EventKind::ContinuationPlaced)
+    matches!(
+        kind,
+        EventKind::CohortCreated | EventKind::ContinuationPlaced
+    )
 }
 
 /// The observable part of a trace: everything except placement reporting.
@@ -326,7 +329,12 @@ fn derive_edges(events: &[TraceSnapshotRow]) -> Vec<Edge> {
             // wake is the "producer" side here).
             EventKind::ContinuationReady if row.causal != 0 => {
                 produced.insert(
-                    (EdgeReason::FutureResolution, row.causal, row.continuation, 0),
+                    (
+                        EdgeReason::FutureResolution,
+                        row.causal,
+                        row.continuation,
+                        0,
+                    ),
                     index,
                 );
             }

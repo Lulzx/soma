@@ -154,10 +154,10 @@ pub struct AdmissionRecord {
 pub fn admit(candidates: &[Candidate]) -> Admission {
     // Pass 1: the mutable claim, per process. `claim_key` is a total order over
     // distinct continuations, so the winner is a function of the set.
-    let mut claim: BTreeMap<u32, Candidate> = BTreeMap::new();
+    let mut claim: BTreeMap<u64, Candidate> = BTreeMap::new();
     for candidate in candidates.iter().filter(|c| c.is_mutable()) {
         claim
-            .entry(candidate.process.slot)
+            .entry(candidate.process.key())
             .and_modify(|best| {
                 if candidate.claim_key() < best.claim_key() {
                     *best = *candidate;
@@ -173,7 +173,7 @@ pub fn admit(candidates: &[Candidate]) -> Admission {
     for candidate in candidates {
         let won = !candidate.is_mutable()
             || claim
-                .get(&candidate.process.slot)
+                .get(&candidate.process.key())
                 .is_some_and(|winner| winner.continuation == candidate.continuation);
         if won {
             bins.entry(candidate.bin)

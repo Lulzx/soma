@@ -21,7 +21,7 @@ did not depend on it are done; the rest is scoped below.
 | **D** | Performance work on real hardware | scope (§6) |
 
 Six new clauses are now checked — I18 through I23 — and v0.2's only
-`[modelled]` clause is gone. The test suite went from 151 to 215.
+`[modelled]` clause is gone. The test suite went from 151 to 221.
 
 ---
 
@@ -467,9 +467,32 @@ slot wherever the kernel keys a map by entity identity.
 
 Partitioned allocation was untestable until §2.6, because a run allocating from
 a different partition fails raw-reference comparison for reasons unrelated to
-its behaviour. §2.6 is done; the allocator itself is not — the tables still
-allocate from partition 0, and `tests/identity_equivalence.rs` exercises the
-shape a partitioned one produces rather than a real one.
+its behaviour. Both are now done.
+
+`GenTable` allocates from a partition rather than from one slot space. A lane's
+partition is `(lane - 1) mod n` — a function of its position in the epoch's
+plan, so it is decided before anything runs and does not depend on which worker
+picks the lane up. Within a partition, allocations still happen in lane order.
+That is the whole determinism argument, and it is why the partition comes from
+the plan rather than from a worker id: worker assignment is dynamic, plan
+position is not.
+
+**I19 now varies allocation partitioning** alongside cohort width, at 1, 2, 4
+and 8 partitions and in combination with widths 1 through 16. The nulls: a
+one-partition run really does use only partition 0, an eight-partition run
+really does spread, slot numbers really do repeat across partitions, and a
+partitioned run really does name its entities differently in more than a quarter
+of its events — which is the measurement of how badly raw-reference comparison
+would have failed.
+
+Wiring this up **found a live defect** rather than confirming a design. I8
+(frame exclusivity) keyed its owner map by the frame's bare slot, so two frames
+allocated as slot 7 in different partitions read as one frame shared by two
+continuations. Four more checks had the same shape: I3's live-continuation
+recount, I6's per-sender sequence map, and the kernel's mailbox, payload,
+capability-space, supervision-queue and send-sequence maps. All of them are
+keyed by `Ref64::key` now. A bare slot stopped being an identity the moment
+partitions existed, and the invariant checker is what said so.
 
 The obstacle to the first is structural rather than subtle: the
 executive's handlers take `&mut Kernel` and allocate their effects as they run

@@ -401,7 +401,7 @@ fn blocked_reply_does_not_respawn_children_on_re_entry() {
     // Free one slot and wake the blocked sender, as receive_message would.
     unsafe { raw::state(&mut kernel) }
         .mailboxes
-        .get_mut(&requester.slot)
+        .get_mut(&requester.key())
         .unwrap()
         .entries
         .pop_front();

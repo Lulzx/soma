@@ -162,7 +162,7 @@ fn i4_catches_a_waiter_on_a_settled_future() {
 
     unsafe { raw::state(&mut kernel) }
         .future_waiters
-        .entry(future.slot)
+        .entry(future.key())
         .or_default()
         .push(cont);
     assert!(violated(&kernel, Invariant::FutureSingleAssignment));
@@ -176,13 +176,13 @@ fn i5_catches_an_overfull_mailbox() {
 
     let mailbox = unsafe { raw::state(&mut kernel) }
         .mailboxes
-        .get_mut(&p.slot)
+        .get_mut(&p.key())
         .unwrap();
     mailbox.capacity = 0;
     let filler = kernel.create_object(p, ObjectKind::MessagePayload, vec![0; 8]);
     let mailbox = unsafe { raw::state(&mut kernel) }
         .mailboxes
-        .get_mut(&p.slot)
+        .get_mut(&p.key())
         .unwrap();
     mailbox
         .entries
@@ -207,7 +207,7 @@ fn i6_catches_messages_delivered_out_of_send_order() {
     // Swap two messages from the same sender.
     let mailbox = unsafe { raw::state(&mut kernel) }
         .mailboxes
-        .get_mut(&receiver.slot)
+        .get_mut(&receiver.key())
         .unwrap();
     mailbox.entries.make_contiguous().swap(0, 1);
     assert!(violated(&kernel, Invariant::MessageOrdering));
@@ -274,7 +274,7 @@ fn i10b_catches_multiple_mutable_authority_holders() {
 
     unsafe { raw::state(&mut kernel) }
         .capability_spaces
-        .get_mut(&other.slot)
+        .get_mut(&other.key())
         .unwrap()
         .alloc(duplicate);
 
@@ -443,7 +443,7 @@ fn i15_catches_a_restart_notice_without_its_replacement() {
 
     unsafe { raw::state(&mut kernel) }
         .supervision_queues
-        .get_mut(&supervisor.slot)
+        .get_mut(&supervisor.key())
         .unwrap()
         .notices
         .front_mut()

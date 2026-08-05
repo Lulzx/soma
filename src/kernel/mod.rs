@@ -228,7 +228,7 @@ pub struct Kernel {
     objects: GenTable<ObjectDescriptor>,
     /// Capability references are relative to the acting process. Slot zero is
     /// the explicit system principal.
-    capability_spaces: HashMap<u32, GenTable<CapabilityEntry>>,
+    capability_spaces: HashMap<u64, GenTable<CapabilityEntry>>,
     continuations: crate::table::GenTable<crate::abi::continuations::ContinuationDescriptor>,
     futures: GenTable<FutureDescriptor>,
     channels: GenTable<ChannelDescriptor>,
@@ -236,20 +236,30 @@ pub struct Kernel {
 
     /// Object payload bytes, keyed by object slot. Kernel-private (§6: user
     /// programs cannot inspect or construct the physical mapping).
-    object_payloads: HashMap<u32, Vec<u8>>,
+    object_payloads: HashMap<u64, Vec<u8>>,
     /// Mailboxes keyed by process slot.
-    mailboxes: HashMap<u32, Mailbox>,
+    mailboxes: HashMap<u64, Mailbox>,
     /// Future waiters keyed by future slot.
-    future_waiters: HashMap<u32, Vec<Ref64>>,
-    channel_queues: HashMap<u32, ChannelQueue>,
+    future_waiters: HashMap<u64, Vec<Ref64>>,
+    channel_queues: HashMap<u64, ChannelQueue>,
     /// Per (sender, receiver) pair, the next `sender_sequence` value (§11).
-    send_sequences: HashMap<(u32, u32), u64>,
-    supervision_queues: HashMap<u32, SupervisionQueue>,
-    restart_blueprints: HashMap<u32, RestartBlueprint>,
-    module_evaluators: HashMap<u32, Vec<(u32, u32)>>,
+    send_sequences: HashMap<(u64, u64), u64>,
+    supervision_queues: HashMap<u64, SupervisionQueue>,
+    restart_blueprints: HashMap<u64, RestartBlueprint>,
+    module_evaluators: HashMap<u64, Vec<(u32, u32)>>,
 
     scheduler: Scheduler,
 
+    /// How many allocator partitions an epoch's lanes are spread across
+    /// (v0.3 §4.3). One means every allocation comes from partition 0, which is
+    /// exactly what the table did before partitions existed.
+    ///
+    /// This is a placement knob, not a semantic one: changing it renames
+    /// entities and changes nothing else, which is what I19 checks now that I18
+    /// compares up to a correspondence between names (§2.6).
+    allocation_partitions: u8,
+    /// The partition every table is currently allocating from.
+    active_partition: u8,
     /// SIMD lanes per dispatch (§14). The default of 1 makes every cohort a
     /// single lane, which is exactly scalar execution.
     cohort_width: u16,
@@ -304,6 +314,8 @@ impl Kernel {
             restart_blueprints: HashMap::new(),
             module_evaluators: HashMap::new(),
             scheduler,
+            allocation_partitions: 1,
+            active_partition: 0,
             cohort_width: 1,
             partial_policy: PartialCohortPolicy::default(),
             deferral_bound: 64,
@@ -322,6 +334,48 @@ impl Kernel {
     pub fn configure_cohorts(&mut self, width: u16, policy: PartialCohortPolicy) {
         self.cohort_width = width;
         self.partial_policy = policy;
+    }
+
+    /// Spread the epoch's lanes across `partitions` allocators.
+    ///
+    /// A lane's partition comes from its position in the plan, so it is decided
+    /// before anything runs and does not depend on which worker picks the lane
+    /// up. That is what makes partitioned allocation deterministic: within one
+    /// partition, allocations still happen in lane order.
+    pub fn set_allocation_partitions(&mut self, partitions: u8) {
+        self.allocation_partitions = partitions.max(1);
+    }
+
+    pub fn allocation_partitions(&self) -> u8 {
+        self.allocation_partitions
+    }
+
+    /// Point every table's allocator at `partition`.
+    ///
+    /// Capability spaces are included: they are actor-relative, and two
+    /// read-only continuations of one process may run in the same epoch and
+    /// both mint authority, so their space is as contended as any other table.
+    fn set_active_partition(&mut self, partition: u8) {
+        if self.allocation_partitions == 1 && self.active_partition == 0 {
+            // Nothing to switch: one partition means everything already
+            // allocates from partition 0. Worth the branch because the loop
+            // over capability spaces below is proportional to the process
+            // count and would otherwise run on every lane entry.
+            return;
+        }
+        self.processes.set_active_partition(partition);
+        self.domains.set_active_partition(partition);
+        self.contracts.set_active_partition(partition);
+        self.modules.set_active_partition(partition);
+        self.objects.set_active_partition(partition);
+        self.continuations.set_active_partition(partition);
+        self.futures.set_active_partition(partition);
+        self.channels.set_active_partition(partition);
+        self.collectives.set_active_partition(partition);
+        for space in self.capability_spaces.values_mut() {
+            space.set_active_partition(partition);
+        }
+        self.active_partition = partition;
     }
 
     /// How many consecutive epochs a runnable continuation may sit in a bin
@@ -371,20 +425,20 @@ impl Kernel {
 
     pub fn mailbox_entries(&self, process: Ref64) -> Option<&VecDeque<MessageDescriptor>> {
         self.mailboxes
-            .get(&process.slot)
+            .get(&process.key())
             .map(|mailbox| &mailbox.entries)
     }
 
     pub fn mailbox_full_waiter_count(&self, process: Ref64) -> usize {
         self.mailboxes
-            .get(&process.slot)
+            .get(&process.key())
             .map(|mailbox| mailbox.full_waiters.len())
             .unwrap_or(0)
     }
 
     pub fn mailbox_first_full_waiter(&self, process: Ref64) -> Option<Ref64> {
         self.mailboxes
-            .get(&process.slot)
+            .get(&process.key())
             .and_then(|mailbox| mailbox.full_waiters.front().copied())
     }
 
@@ -427,7 +481,7 @@ impl Kernel {
         &self.objects
     }
 
-    pub(crate) fn capability_spaces(&self) -> &HashMap<u32, GenTable<CapabilityEntry>> {
+    pub(crate) fn capability_spaces(&self) -> &HashMap<u64, GenTable<CapabilityEntry>> {
         &self.capability_spaces
     }
 
@@ -454,7 +508,7 @@ impl Kernel {
             .iter()
             .filter_map(|(channel, _)| {
                 self.channel_queues
-                    .get(&channel.slot)
+                    .get(&channel.key())
                     .map(|queue| ChannelQueueSnapshot {
                         channel,
                         entries: queue
@@ -475,15 +529,15 @@ impl Kernel {
             .collect()
     }
 
-    pub(crate) fn mailboxes(&self) -> &HashMap<u32, Mailbox> {
+    pub(crate) fn mailboxes(&self) -> &HashMap<u64, Mailbox> {
         &self.mailboxes
     }
 
-    pub(crate) fn future_waiters(&self) -> &HashMap<u32, Vec<Ref64>> {
+    pub(crate) fn future_waiters(&self) -> &HashMap<u64, Vec<Ref64>> {
         &self.future_waiters
     }
 
-    pub(crate) fn supervision_queues(&self) -> &HashMap<u32, SupervisionQueue> {
+    pub(crate) fn supervision_queues(&self) -> &HashMap<u64, SupervisionQueue> {
         &self.supervision_queues
     }
 
@@ -622,12 +676,15 @@ impl Kernel {
         debug_assert_ne!(lane, crate::abi::traces::HOST_LANE);
         self.current_lane = lane;
         self.lane_sequence = 0;
+        let partition = ((lane - 1) % self.allocation_partitions as u32) as u8;
+        self.set_active_partition(partition);
     }
 
     /// Return emission to the host: epoch bookkeeping and anything a caller
     /// does between epochs.
     pub(crate) fn leave_lane(&mut self) {
         self.current_lane = crate::abi::traces::HOST_LANE;
+        self.set_active_partition(0);
     }
 
     /// Open a new epoch's position space, at the moment the epoch number
@@ -689,7 +746,7 @@ impl Kernel {
             .objects
             .alloc(ObjectDescriptor::new(kind, bytes.len() as u64));
         let byte_length = bytes.len() as u64;
-        self.object_payloads.insert(r.slot, bytes);
+        self.object_payloads.insert(r.key(), bytes);
         {
             let o = self.objects.get_mut(r).expect("fresh object");
             o.id = r;
@@ -711,10 +768,13 @@ impl Kernel {
         let mut entry = CapabilityEntry::new(target, crate::abi::Rights::for_target(target.kind));
         entry.length = length;
         entry.object_version = object_version;
-        self.capability_spaces
-            .entry(actor.slot)
-            .or_insert_with(|| GenTable::new(Kind::Capability))
-            .alloc(entry)
+        let active = self.active_partition;
+        let space = self
+            .capability_spaces
+            .entry(actor.key())
+            .or_insert_with(|| GenTable::new(Kind::Capability));
+        space.set_active_partition(active);
+        space.alloc(entry)
     }
 
     /// Derive weaker authority in `actor`'s capability space.
@@ -728,7 +788,7 @@ impl Kernel {
     ) -> Result<Ref64, RuntimeError> {
         let space = self
             .capability_spaces
-            .get_mut(&actor.slot)
+            .get_mut(&actor.key())
             .ok_or(RuntimeError::MissingCapabilitySpace)?;
         let parent_entry = space.get(parent)?.clone();
         let child_end = offset
@@ -756,7 +816,7 @@ impl Kernel {
     /// Find a capability in an actor-relative space by target and required rights.
     pub fn find_capability(&self, actor: Ref64, target: Ref64, rights: u32) -> Option<Ref64> {
         self.capability_spaces
-            .get(&actor.slot)?
+            .get(&actor.key())?
             .iter()
             .find_map(|(r, cap)| {
                 (cap.target == target && cap.rights & rights == rights).then_some(r)
@@ -769,7 +829,7 @@ impl Kernel {
         capability: Ref64,
     ) -> Result<&CapabilityEntry, RuntimeError> {
         self.capability_spaces
-            .get(&actor.slot)
+            .get(&actor.key())
             .ok_or(RuntimeError::MissingCapabilitySpace)?
             .get(capability)
             .map_err(RuntimeError::from)
@@ -799,7 +859,7 @@ impl Kernel {
             .ok_or(RuntimeError::AuthorityDenied)?;
         let source = self
             .capability_spaces
-            .get(&actor.slot)
+            .get(&actor.key())
             .ok_or(RuntimeError::MissingCapabilitySpace)?
             .get(source_ref)?
             .clone();
@@ -822,7 +882,7 @@ impl Kernel {
         self.authority_effect(actor, crate::abi::Rights::TRANSFER, target);
         Ok(self
             .capability_spaces
-            .get_mut(&receiver.slot)
+            .get_mut(&receiver.key())
             .ok_or(RuntimeError::MissingCapabilitySpace)?
             .alloc(exported))
     }
@@ -856,7 +916,7 @@ impl Kernel {
     }
 
     fn find_authorized_capability(&self, actor: Ref64, right: u32, target: Ref64) -> Option<Ref64> {
-        let space = self.capability_spaces.get(&actor.slot)?;
+        let space = self.capability_spaces.get(&actor.key())?;
         let object_metadata = if target.kind == Kind::Object {
             self.objects
                 .get(target)
@@ -905,12 +965,7 @@ impl Kernel {
             .keys()
             .filter(|holder| {
                 self.find_authorized_capability(
-                    Ref64 {
-                        slot: **holder,
-                        generation: 0,
-                        kind: Kind::Process,
-                        partition: 0,
-                    },
+                    Ref64::process_at(**holder),
                     right,
                     target,
                 )
@@ -946,7 +1001,7 @@ impl Kernel {
         capability.length = byte_length;
         capability.object_version = version;
         self.capability_spaces
-            .entry(actor.slot)
+            .entry(actor.key())
             .or_insert_with(|| GenTable::new(Kind::Capability))
             .alloc(capability)
     }
@@ -974,7 +1029,7 @@ impl Kernel {
             .ok_or(RuntimeError::AuthorityDenied)?;
         let mut exported = self
             .capability_spaces
-            .get(&actor.slot)
+            .get(&actor.key())
             .ok_or(RuntimeError::MissingCapabilitySpace)?
             .get(source_ref)?
             .clone();
@@ -983,12 +1038,12 @@ impl Kernel {
         if actor != receiver {
             self.authority_effect(actor, crate::abi::Rights::TRANSFER, target);
             self.capability_spaces
-                .get_mut(&receiver.slot)
+                .get_mut(&receiver.key())
                 .ok_or(RuntimeError::MissingCapabilitySpace)?
                 .alloc(exported);
             let space = self
                 .capability_spaces
-                .get_mut(&actor.slot)
+                .get_mut(&actor.key())
                 .ok_or(RuntimeError::MissingCapabilitySpace)?;
             Self::revoke_capability_tree(space, source_ref);
         }
@@ -1018,7 +1073,7 @@ impl Kernel {
         self.authorize(actor, crate::abi::Rights::READ, obj)?;
         let _ = self.objects.get(obj)?;
         self.object_payloads
-            .get(&obj.slot)
+            .get(&obj.key())
             .map(|v| v.as_slice())
             .ok_or(RuntimeError::MissingPayload)
     }
@@ -1035,7 +1090,7 @@ impl Kernel {
         let _ = self.objects.get(obj)?;
         self.authority_effect(actor, crate::abi::Rights::WRITE, obj);
         self.object_payloads
-            .get_mut(&obj.slot)
+            .get_mut(&obj.key())
             .ok_or(RuntimeError::MissingPayload)
     }
 
@@ -1074,7 +1129,7 @@ impl Kernel {
         self.authorize(actor, crate::abi::Rights::WRITE, state)?;
         self.authority_effect(actor, crate::abi::Rights::WRITE, state);
         self.object_payloads
-            .get_mut(&state.slot)
+            .get_mut(&state.key())
             .ok_or(RuntimeError::MissingPayload)
     }
 
@@ -1131,16 +1186,16 @@ impl Kernel {
             process.status = ProcessState::Created as u32;
         }
         self.capability_spaces
-            .insert(r.slot, GenTable::new(Kind::Capability));
+            .insert(r.key(), GenTable::new(Kind::Capability));
         self.mint_genesis(r, r, 0, 0);
         self.mint_genesis(r, domain, 0, 0);
         let state_obj = self.create_object_for(r, ObjectKind::ProcessState, Vec::new());
         if actor != r {
             self.mint_genesis(actor, r, 0, 0);
         }
-        self.mailboxes.insert(r.slot, Mailbox::new(8));
+        self.mailboxes.insert(r.key(), Mailbox::new(8));
         self.supervision_queues
-            .insert(r.slot, SupervisionQueue::default());
+            .insert(r.key(), SupervisionQueue::default());
         {
             let p = self.processes.get_mut(r).expect("fresh process");
             p.state = state_obj;
@@ -1246,7 +1301,7 @@ impl Kernel {
             descriptor.restart_limit = restart_limit;
         }
         self.restart_blueprints.insert(
-            child.slot,
+            child.key(),
             RestartBlueprint {
                 entry: entry.clone(),
             },
@@ -1268,7 +1323,7 @@ impl Kernel {
     }
 
     pub(crate) fn has_restart_blueprint(&self, process: Ref64) -> bool {
-        self.restart_blueprints.contains_key(&process.slot)
+        self.restart_blueprints.contains_key(&process.key())
     }
 
     pub fn process_supervisor(&self, process: Ref64) -> Result<Ref64, RuntimeError> {
@@ -1290,7 +1345,7 @@ impl Kernel {
         self.authority_effect(actor, crate::abi::Rights::RECEIVE, actor);
         let queue = self
             .supervision_queues
-            .get_mut(&actor.slot)
+            .get_mut(&actor.key())
             .ok_or(RuntimeError::MissingMailbox)?;
         if let Some(notice) = queue.notices.pop_front() {
             return Ok(Some(notice));
@@ -1303,7 +1358,7 @@ impl Kernel {
 
     pub fn pending_supervision_notices(&self, supervisor: Ref64) -> usize {
         self.supervision_queues
-            .get(&supervisor.slot)
+            .get(&supervisor.key())
             .map(|queue| queue.notices.len())
             .unwrap_or(0)
     }
@@ -1330,7 +1385,7 @@ impl Kernel {
         };
         let waiter = self
             .supervision_queues
-            .get_mut(&supervisor.slot)
+            .get_mut(&supervisor.key())
             .and_then(|queue| {
                 queue.notices.push_back(SupervisionNotice {
                     child,
@@ -1366,7 +1421,7 @@ impl Kernel {
         if failed_descriptor.restart_attempt >= failed_descriptor.restart_limit {
             return None;
         }
-        let blueprint = self.restart_blueprints.get(&failed.slot)?.clone();
+        let blueprint = self.restart_blueprints.get(&failed.key())?.clone();
         let replacement = self
             .allocate_process(
                 failed_descriptor.supervisor,
@@ -1387,7 +1442,7 @@ impl Kernel {
             descriptor.deadline_ns = failed_descriptor.deadline_ns;
         }
         self.restart_blueprints
-            .insert(replacement.slot, blueprint.clone());
+            .insert(replacement.key(), blueprint.clone());
         if self
             .create_continuation(replacement, replacement, blueprint.entry)
             .is_err()
@@ -1464,7 +1519,7 @@ impl Kernel {
         self.settle_owned_futures(process, FutureState::Failed);
         self.settle_owned_collectives(process, CollectiveState::Failed);
         self.drain_terminal_mailbox(process);
-        self.capability_spaces.remove(&process.slot);
+        self.capability_spaces.remove(&process.key());
     }
 
     pub(super) fn finalize_process_cancellation(&mut self, process: Ref64) {
@@ -1472,7 +1527,7 @@ impl Kernel {
         self.settle_owned_futures(process, FutureState::Cancelled);
         self.settle_owned_collectives(process, CollectiveState::Cancelled);
         self.drain_terminal_mailbox(process);
-        self.capability_spaces.remove(&process.slot);
+        self.capability_spaces.remove(&process.key());
         if let Ok(descriptor) = self.processes.get_mut(process) {
             descriptor.status = ProcessState::Cancelled as u32;
             descriptor.active_continuation = Ref64::NULL;
@@ -1556,7 +1611,7 @@ impl Kernel {
                     descriptor.failure = process;
                 }
             }
-            let waiters = self.future_waiters.remove(&future.slot).unwrap_or_default();
+            let waiters = self.future_waiters.remove(&future.key()).unwrap_or_default();
             for waiter in waiters {
                 let Some((waiter_process, run_class, status)) =
                     self.continuations.get(waiter).ok().map(|descriptor| {
@@ -1615,7 +1670,7 @@ impl Kernel {
     }
 
     fn drain_terminal_mailbox(&mut self, process: Ref64) {
-        let full_waiters = if let Some(mailbox) = self.mailboxes.get_mut(&process.slot) {
+        let full_waiters = if let Some(mailbox) = self.mailboxes.get_mut(&process.key()) {
             mailbox.entries.clear();
             mailbox.recv_waiters.clear();
             std::mem::take(&mut mailbox.full_waiters)
@@ -1848,7 +1903,7 @@ impl Kernel {
             manifest.len() as u32,
         ));
         self.modules.get_mut(module)?.id = module;
-        self.module_evaluators.insert(module.slot, manifest);
+        self.module_evaluators.insert(module.key(), manifest);
         self.mint_genesis(actor, module, 0, 0);
         self.trace(
             EventKind::ModuleLoaded,
@@ -1861,7 +1916,7 @@ impl Kernel {
     }
 
     pub(crate) fn module_manifest(&self, module: Ref64) -> Option<&[(u32, u32)]> {
-        self.module_evaluators.get(&module.slot).map(Vec::as_slice)
+        self.module_evaluators.get(&module.key()).map(Vec::as_slice)
     }
 
     pub(crate) fn module_matches(
@@ -1923,7 +1978,7 @@ impl Kernel {
             return Ok(AwaitOutcome::AlreadySettled(future_state));
         }
         self.future_waiters
-            .entry(future.slot)
+            .entry(future.key())
             .or_default()
             .push(cont);
         // The `ContinuationWaiting` trace is emitted once, by the commit phase
@@ -1950,7 +2005,7 @@ impl Kernel {
             f.value = value;
             f.resolved_epoch = self.epoch;
         }
-        let waiters = self.future_waiters.remove(&future.slot).unwrap_or_default();
+        let waiters = self.future_waiters.remove(&future.key()).unwrap_or_default();
         let owner = self.futures.get(future)?.owner_process;
         for w in waiters {
             let (process, rc) = {
@@ -2001,7 +2056,7 @@ impl Kernel {
         let channel = self.channels.alloc(ChannelDescriptor::new(capacity.max(1)));
         self.channels.get_mut(channel).expect("fresh channel").id = channel;
         self.channel_queues
-            .insert(channel.slot, ChannelQueue::new());
+            .insert(channel.key(), ChannelQueue::new());
         self.mint_genesis(actor, channel, 0, 0);
         channel
     }
@@ -2020,7 +2075,7 @@ impl Kernel {
         }
         let full = self
             .channel_queues
-            .get(&channel.slot)
+            .get(&channel.key())
             .ok_or(RuntimeError::MissingMailbox)?
             .entries
             .len()
@@ -2029,7 +2084,7 @@ impl Kernel {
             self.authority_effect(actor, crate::abi::Rights::SEND, channel);
             let queue = self
                 .channel_queues
-                .get_mut(&channel.slot)
+                .get_mut(&channel.key())
                 .ok_or(RuntimeError::MissingMailbox)?;
             if !sender_continuation.is_null() && !queue.send_waiters.contains(&sender_continuation)
             {
@@ -2044,7 +2099,7 @@ impl Kernel {
         let (sequence, receiver_waiter) = {
             let queue = self
                 .channel_queues
-                .get_mut(&channel.slot)
+                .get_mut(&channel.key())
                 .ok_or(RuntimeError::MissingMailbox)?;
             let sequence = queue.next_sequence;
             queue.next_sequence = queue.next_sequence.wrapping_add(1);
@@ -2080,7 +2135,7 @@ impl Kernel {
         let closed = self.channels.get(channel)?.closed != 0;
         let empty = self
             .channel_queues
-            .get(&channel.slot)
+            .get(&channel.key())
             .ok_or(RuntimeError::MissingMailbox)?
             .entries
             .is_empty();
@@ -2091,7 +2146,7 @@ impl Kernel {
         let (entry, sender_waiter) = {
             let queue = self
                 .channel_queues
-                .get_mut(&channel.slot)
+                .get_mut(&channel.key())
                 .ok_or(RuntimeError::MissingMailbox)?;
             match queue.entries.pop_front() {
                 Some(entry) => (Some(entry), queue.send_waiters.pop_front()),
@@ -2111,7 +2166,7 @@ impl Kernel {
         };
         let transferred = self
             .capability_spaces
-            .get_mut(&actor.slot)
+            .get_mut(&actor.key())
             .ok_or(RuntimeError::MissingCapabilitySpace)?
             .alloc(entry.payload_authority);
         entry.descriptor.transferred_capability = transferred;
@@ -2155,7 +2210,7 @@ impl Kernel {
             let _ = self.channels.get(*channel)?;
             let _ = self
                 .channel_queues
-                .get(&channel.slot)
+                .get(&channel.key())
                 .ok_or(RuntimeError::MissingMailbox)?;
             self.authorize(actor, crate::abi::Rights::RECEIVE, *channel)?;
         }
@@ -2176,7 +2231,7 @@ impl Kernel {
             let descriptor = self.channels.get(*channel)?;
             let queue = self
                 .channel_queues
-                .get(&channel.slot)
+                .get(&channel.key())
                 .ok_or(RuntimeError::MissingMailbox)?;
             if queue.entries.is_empty() {
                 if descriptor.closed != 0 {
@@ -2190,7 +2245,7 @@ impl Kernel {
                 for channel in missing {
                     let queue = self
                         .channel_queues
-                        .get_mut(&channel.slot)
+                        .get_mut(&channel.key())
                         .ok_or(RuntimeError::MissingMailbox)?;
                     queue.receive_waiters.push_back(continuation);
                 }
@@ -2203,7 +2258,7 @@ impl Kernel {
             let (mut entry, sender_waiter) = {
                 let queue = self
                     .channel_queues
-                    .get_mut(&channel.slot)
+                    .get_mut(&channel.key())
                     .ok_or(RuntimeError::MissingMailbox)?;
                 (
                     queue.entries.pop_front().expect("all inputs prechecked"),
@@ -2215,7 +2270,7 @@ impl Kernel {
             }
             let transferred = self
                 .capability_spaces
-                .get_mut(&actor.slot)
+                .get_mut(&actor.key())
                 .ok_or(RuntimeError::MissingCapabilitySpace)?
                 .alloc(entry.payload_authority);
             entry.descriptor.transferred_capability = transferred;
@@ -2241,7 +2296,7 @@ impl Kernel {
         let waiters = {
             let queue = self
                 .channel_queues
-                .get_mut(&channel.slot)
+                .get_mut(&channel.key())
                 .ok_or(RuntimeError::MissingMailbox)?;
             queue
                 .send_waiters
@@ -2260,7 +2315,7 @@ impl Kernel {
         let _ = self.channels.get(channel)?;
         Ok(self
             .channel_queues
-            .get(&channel.slot)
+            .get(&channel.key())
             .ok_or(RuntimeError::MissingMailbox)?
             .entries
             .len())
@@ -2281,7 +2336,7 @@ impl Kernel {
             .ok_or(RuntimeError::AuthorityDenied)?;
         let mut escrowed = self
             .capability_spaces
-            .get(&actor.slot)
+            .get(&actor.key())
             .ok_or(RuntimeError::MissingCapabilitySpace)?
             .get(capability)?
             .clone();
@@ -2540,7 +2595,7 @@ impl Kernel {
     fn mailbox_is_full(&self, receiver: Ref64) -> Result<bool, RuntimeError> {
         let mailbox = self
             .mailboxes
-            .get(&receiver.slot)
+            .get(&receiver.key())
             .ok_or(RuntimeError::MissingMailbox)?;
         Ok(mailbox.entries.len() >= mailbox.capacity)
     }
@@ -2555,7 +2610,7 @@ impl Kernel {
         trace_send: bool,
     ) -> Result<(), RuntimeError> {
         let seq = {
-            let key = (sender.slot, receiver.slot);
+            let key = (sender.key(), receiver.key());
             let s = self.send_sequences.entry(key).or_insert(0);
             let v = *s;
             *s = s.wrapping_add(1);
@@ -2571,7 +2626,7 @@ impl Kernel {
         let waiter = {
             let mailbox = self
                 .mailboxes
-                .get_mut(&receiver.slot)
+                .get_mut(&receiver.key())
                 .ok_or(RuntimeError::MissingMailbox)?;
             if mailbox.entries.len() >= mailbox.capacity {
                 // Every blocked sender is registered, not just the first, so no
@@ -2634,12 +2689,12 @@ impl Kernel {
         }
         let _ = self
             .mailboxes
-            .get(&process.slot)
+            .get(&process.key())
             .ok_or(RuntimeError::MissingMailbox)?;
         self.authority_effect(actor, crate::abi::Rights::RECEIVE, process);
         let mailbox = self
             .mailboxes
-            .get_mut(&process.slot)
+            .get_mut(&process.key())
             .ok_or(RuntimeError::MissingMailbox)?;
         if let Some(msg) = mailbox.entries.pop_front() {
             // One receive frees exactly one slot, so wake exactly one sender.
@@ -2669,7 +2724,7 @@ impl Kernel {
     /// Number of undelivered messages in a process's mailbox.
     pub fn mailbox_len(&self, p: Ref64) -> usize {
         self.mailboxes
-            .get(&p.slot)
+            .get(&p.key())
             .map(|m| m.entries.len())
             .unwrap_or(0)
     }

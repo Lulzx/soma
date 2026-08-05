@@ -109,7 +109,7 @@ fn write_requires_live_unexpired_authority_at_use() {
     let capability = kernel.find_capability(actor, object, Rights::WRITE).unwrap();
     unsafe { raw::state(&mut kernel) }
         .capability_spaces
-        .get_mut(&actor.slot)
+        .get_mut(&actor.key())
         .unwrap()
         .get_mut(capability)
         .unwrap()
@@ -137,7 +137,7 @@ fn revoking_a_parent_is_observed_when_a_parked_capability_is_reused() {
 
     unsafe { raw::state(&mut kernel) }
         .capability_spaces
-        .get_mut(&actor.slot)
+        .get_mut(&actor.key())
         .unwrap()
         .delete(parent)
         .unwrap();
@@ -159,7 +159,7 @@ fn a_subrange_capability_cannot_open_whole_object_mutation() {
         .unwrap();
 
     let state = unsafe { raw::state(&mut kernel) };
-    let space = state.capability_spaces.get_mut(&actor.slot).unwrap();
+    let space = state.capability_spaces.get_mut(&actor.key()).unwrap();
     space.delete(parent).unwrap();
     space.get_mut(child).unwrap().parent_capability = Ref64::NULL;
 
@@ -257,7 +257,7 @@ fn await_authority_is_rechecked_when_a_continuation_resumes() {
         .unwrap();
     unsafe { raw::state(&mut kernel) }
         .capability_spaces
-        .get_mut(&process.slot)
+        .get_mut(&process.key())
         .unwrap()
         .get_mut(capability)
         .unwrap()
@@ -336,7 +336,7 @@ fn freezing_replaces_mutable_authority_with_read_authority_for_the_new_version()
     );
     let has_current_read = unsafe { raw::state(&mut kernel) }
         .capability_spaces
-        .get(&owner.slot)
+        .get(&owner.key())
         .unwrap()
         .iter()
         .any(|(_, entry)| {

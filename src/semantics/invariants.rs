@@ -682,14 +682,14 @@ fn supervision_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
         }
     }
 
-    for (supervisor_slot, queue) in kernel.supervision_queues() {
+    for (supervisor_key, queue) in kernel.supervision_queues() {
         for notice in &queue.notices {
             let Ok(child) = kernel.processes().get(notice.child) else {
                 // The dangling child is also reported by the more general
                 // reference checker when held from a descriptor.
                 out.push(Violation::new(
                     Invariant::SupervisionIntegrity,
-                    format!("supervisor {supervisor_slot} has notice for a dead child"),
+                    format!("supervisor {supervisor_key} has notice for a dead child"),
                 ));
                 continue;
             };
@@ -698,14 +698,14 @@ fn supervision_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
                 crate::abi::ExitReason::Failed => ProcessState::Failed,
                 crate::abi::ExitReason::Cancelled => ProcessState::Cancelled,
             };
-            if child.supervisor.slot != *supervisor_slot
+            if child.supervisor.key() != *supervisor_key
                 || child.status != expected_status as u32
                 || notice.failure_count != child.failure_count
             {
                 out.push(Violation::new(
                     Invariant::SupervisionIntegrity,
                     format!(
-                        "supervisor {supervisor_slot} has an inconsistent notice for child {}",
+                        "supervisor {supervisor_key} has an inconsistent notice for child {}",
                         notice.child.slot
                     ),
                 ));
@@ -723,7 +723,7 @@ fn supervision_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
                         Invariant::SupervisionIntegrity,
                         format!(
                             "failed child {} required escalation but supervisor {} did not fail",
-                            notice.child.slot, supervisor_slot
+                            notice.child.slot, supervisor_key
                         ),
                     ));
                 }
@@ -781,12 +781,12 @@ fn supervision_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
             let valid = kernel
                 .continuations()
                 .get(*waiter)
-                .map(|continuation| continuation.process.slot == *supervisor_slot)
+                .map(|continuation| continuation.process.key() == *supervisor_key)
                 .unwrap_or(false);
             if !valid {
                 out.push(Violation::new(
                     Invariant::SupervisionIntegrity,
-                    format!("supervisor {supervisor_slot} has a foreign or dead waiter"),
+                    format!("supervisor {supervisor_key} has a foreign or dead waiter"),
                 ));
             }
         }
@@ -837,14 +837,14 @@ fn process_continuation_consistency(kernel: &Kernel, out: &mut Vec<Violation>) {
     // derived state that can silently drift. Recompute it the slow way and
     // compare: a status write that bypasses `set_continuation_status` is a
     // bug that would otherwise surface much later as a stranded process.
-    let mut actual: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
+    let mut actual: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
     for (_, c) in kernel.continuations().iter() {
         if c.status.is_live() {
-            *actual.entry(c.process.slot).or_insert(0) += 1;
+            *actual.entry(c.process.key()).or_insert(0) += 1;
         }
     }
     for (r, p) in kernel.processes().iter() {
-        let counted = actual.get(&r.slot).copied().unwrap_or(0);
+        let counted = actual.get(&r.key()).copied().unwrap_or(0);
         if p.live_continuations != counted {
             out.push(Violation::new(
                 Invariant::ProcessContinuationConsistency,
@@ -879,7 +879,7 @@ fn future_single_assignment(kernel: &Kernel, out: &mut Vec<Violation>) {
                 }
                 // A settled future's waiter list has already been drained, so a
                 // continuation registered on it would never wake.
-                if let Some(waiters) = kernel.future_waiters().get(&r.slot) {
+                if let Some(waiters) = kernel.future_waiters().get(&r.key()) {
                     if !waiters.is_empty() {
                         out.push(Violation::new(
                             Invariant::FutureSingleAssignment,
@@ -957,9 +957,9 @@ fn mailbox_bound(kernel: &Kernel, out: &mut Vec<Violation>) {
 
 fn message_ordering(kernel: &Kernel, out: &mut Vec<Violation>) {
     for (slot, mailbox) in kernel.mailboxes() {
-        let mut last: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        let mut last: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
         for m in &mailbox.entries {
-            if let Some(previous) = last.get(&m.sender.slot) {
+            if let Some(previous) = last.get(&m.sender.key()) {
                 if m.sender_sequence <= *previous {
                     out.push(Violation::new(
                         Invariant::MessageOrdering,
@@ -970,7 +970,7 @@ fn message_ordering(kernel: &Kernel, out: &mut Vec<Violation>) {
                     ));
                 }
             }
-            last.insert(m.sender.slot, m.sender_sequence);
+            last.insert(m.sender.key(), m.sender_sequence);
         }
     }
     for queue in kernel.channel_queue_snapshots() {
@@ -1027,12 +1027,14 @@ fn scheduler_well_formed(kernel: &Kernel, out: &mut Vec<Violation>) {
 // ---- I8 ------------------------------------------------------------------
 
 fn frame_exclusivity(kernel: &Kernel, out: &mut Vec<Violation>) {
-    let mut owner: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    // Keyed by full identity, not slot: two partitions each mint a slot 7, and
+    // comparing bare slots would report those two frames as one shared frame.
+    let mut owner: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
     for (r, c) in kernel.continuations().iter() {
         if c.frame.is_null() {
             continue;
         }
-        if let Some(previous) = owner.insert(c.frame.slot, r.slot) {
+        if let Some(previous) = owner.insert(c.frame.key(), r.slot) {
             out.push(Violation::new(
                 Invariant::FrameExclusivity,
                 format!(

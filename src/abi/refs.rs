@@ -115,6 +115,21 @@ impl Ref64 {
         }
     }
 
+    /// Rebuild a process reference from a `key`, with a generation of zero.
+    ///
+    /// Used only where the kernel walks a map keyed by process identity and
+    /// needs a reference back. The generation is not recoverable from a key and
+    /// is not wanted here: these lookups ask "which process", not "is this
+    /// reference still valid".
+    pub fn process_at(key: u64) -> Ref64 {
+        Ref64 {
+            slot: (key & 0xFFFF_FFFF) as u32,
+            generation: 0,
+            kind: Kind::Process,
+            partition: ((key >> 32) & 0xFF) as u8,
+        }
+    }
+
     /// The identity of the entity a reference names, ignoring generation: the
     /// key under which kernel-side maps that outlive a single reference — a
     /// process's mailbox, an object's payload — are stored.

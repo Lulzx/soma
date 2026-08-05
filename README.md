@@ -154,7 +154,7 @@ overhead remain unmeasured.
 ```text
 src/
   abi/          references and fixed-width descriptors
-  table.rs      generational slot table
+  table.rs      partitioned generational slot table
   kernel/       machine state, epochs, commit, ownership, accounting
   executives/   scalar interpreter and physical batch backends
   scheduler/    run-class bins and cohort construction
@@ -207,8 +207,9 @@ Not implemented:
 
 - A general-purpose language or compiler for arbitrary evaluator bodies
 - A complete device-resident scheduler/executive or distributed backend.
-  Admission is order-independent (I22) and the trace's order is recoverable
-  from event position rather than a shared clock (I23); canonical commit and a
+  Admission is order-independent (I22), the trace's order is recoverable from
+  event position rather than a shared clock (I23), and allocation is
+  partitioned so lanes need no shared allocator; canonical commit and a
   concurrent executive are not started
 - Hardware throughput, scheduler-overhead, and end-to-end migration benchmarks
 

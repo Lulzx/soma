@@ -4,7 +4,7 @@ Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
 Repository: https://github.com/Lulzx/soma. The default semantic core is
-dependency-free. There are 215 integration tests (two of which need the `metal`
+dependency-free. There are 221 integration tests (two of which need the `metal`
 feature), two compile-fail doc tests, and no Clippy warnings. The optional `metal` feature adds the `metal-rs` implementation
 dependency on macOS.
 
@@ -59,8 +59,8 @@ src/
                Descriptors for objects, processes, continuations, cohorts,
                futures, messages, channels, collectives, capabilities,
                domains, contracts, traces.
-  table.rs     Generational slot table. Slot 0 is NULL. Delete bumps generation.
-               Stale references fail.
+  table.rs     Generational slot table, partitioned. Slot 0 is NULL in every
+               partition. Delete bumps generation. Stale references fail.
   kernel/      The machine. mod.rs holds all state. epochs.rs runs epochs.
                commit.rs publishes effects. ownership.rs derives object state
                from live capabilities.
@@ -155,6 +155,10 @@ Added in v0.3:
   construction. `Ref64` gains a `partition` byte in place of the unused
   `flags`, and `TraceEvent` a `subject` field so no entity is recorded as a
   bare slot number.
+- Partitioned allocation: `GenTable` allocates from a partition chosen by the
+  lane's position in the epoch's plan, so lanes need no shared allocator. I19
+  varies it at 1/2/4/8 partitions. The third of the device scheduler's four
+  obligations still open is canonical commit.
 
 ### Semantic boundary
 
@@ -390,6 +394,11 @@ decision that would otherwise depend on `HashMap` iteration order.
   a single host counter satisfies "sorted by position equals emitted order"
   perfectly — while the trace goes back to needing a shared clock. Clause 3 of
   I23 is the only thing that reports it.
+- **A bare slot is not an identity.** Two partitions each mint slot 7. Anything
+  keyed or compared by `.slot` is wrong; use `Ref64::key()` for map keys and the
+  whole reference for comparison. `.slot` belongs in error messages and nowhere
+  else. I8 shipped with this bug for exactly as long as it took to turn
+  partitioning on — the invariant checker caught it on the first run.
 - **An entity never goes in `auxiliary`.** That field is numeric — sequence
   numbers, counts, right masks. A slot number put there carries no kind and no
   generation, so the identity correspondence cannot translate it and cannot
