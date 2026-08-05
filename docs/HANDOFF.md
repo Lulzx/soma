@@ -4,8 +4,8 @@ Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
 Repository: https://github.com/Lulzx/soma. The default semantic core is
-dependency-free. There are 192 integration tests, one doc test, and no Clippy
-warnings. The optional `metal` feature adds the `metal-rs` implementation
+dependency-free. There are 201 integration tests (two of which need the `metal`
+feature), two compile-fail doc tests, and no Clippy warnings. The optional `metal` feature adds the `metal-rs` implementation
 dependency on macOS.
 
 ```sh
@@ -43,7 +43,7 @@ Two documents, and they are not equals:
 | Doc | Status |
 | --- | --- |
 | `docs/SOMA-v0.2.md` | **Current.** The semantic specification. Start here. |
-| `docs/SOMA-v0.3.md` | **Current for anything added since v0.2.** §1–§3 are implemented and checked: the equivalence relation, evaluator bodies, and the carried debts. §4–§6 scope the device scheduler, the distributed implementation, and performance work, none of which has started. |
+| `docs/SOMA-v0.3.md` | **Current for anything added since v0.2.** §1–§3 are implemented and checked: the equivalence relation, evaluator bodies, and the carried debts. So is §4.1, the first of the device scheduler's four obligations. The rest of §4 and all of §5–§6 scope the device scheduler, the distributed implementation, and performance work. |
 | `docs/SOMA-P1.md` | Historical. The original broad Phase-1 contract, still referenced by `§n` markers in code comments. Useful context, but it describes a wider system than the one being built, and its framing is what the refocus moved away from. |
 
 The directory is still named `gpu-os` and the crate `soma`. Harmless, but expect
@@ -69,12 +69,15 @@ src/
                physical backend/publication boundary; metal.rs is optional.
   scheduler/   runnable_bins.rs contains double-buffered run-class bins.
                cohorts.rs builds cohorts and computes dispatch cost.
+               admission.rs decides which continuations run this epoch, as a
+               pure function of the candidate set.
   compiler/    frame.rs encodes frames. state_machine_lowering.rs contains the
                hand-lowered Expand example. body.rs is the evaluator body
                language and its MSL codegen; examples.rs holds the example
                module both backends are checked against.
   semantics/   invariants.rs checks the executable part of the specification.
                order.rs derives the semantic order and checks I18/I19.
+               schedule.rs checks I22, admission determinism.
   replay/      trace comparison for determinism checks.
   experiments/ measurement only. None of it is part of the machine.
 ```
@@ -141,14 +144,19 @@ Added in v0.3:
   adds a starvation bound.
 - Per-process live-continuation counts in place of a table scan per commit,
   and generation-exhausted slots retired rather than wrapped.
+- Admission as a pure function of the epoch's candidate set (I22), replacing
+  the first-come `HashSet` claim. The first of the device scheduler's four
+  obligations; the other three are open.
 
 ### Semantic boundary
 
 No entity or invariant named by `SOMA-v0.2.md` remains absent, and v0.3 §1–§3
-are implemented and checked. A device-resident scheduler, a distributed
-implementation, and hardware performance results remain beyond conformance —
-scoped in v0.3 §4–§6, and not guarantees silently claimed by the current
-machine.
+are implemented and checked, as is §4.1. A device-resident scheduler, a
+distributed implementation, and hardware performance results remain beyond
+conformance — scoped in v0.3 §4–§6, and not guarantees silently claimed by the
+current machine. In particular, admission is now order-independent but
+*execution* is not: lane order within a bin is arrival order, and nothing yet
+makes that order reproducible when bins are appended concurrently.
 
 ---
 
@@ -359,6 +367,14 @@ decision that would otherwise depend on `HashMap` iteration order.
   of one withdrawn slot per 65,535 recycles. What is *still* missing for a
   distributed implementation is a node identity in `Ref64`, so two nodes cannot
   allocate colliding references. See v0.3 §1.2.
+- **Admission must not decide from position.** `scheduler::admission::admit`
+  sees the whole candidate set before placing any of it, and every field it
+  reads is state rather than a position in that set. Deciding as the list is
+  walked — the natural way to write it — reintroduces the race I22 exists to
+  rule out, and it changes no trace the reference interpreter produces, so no
+  behavioural test would notice. `Admission` is sealed for that reason: an
+  epoch that builds its own does not compile. If you find yourself wanting to
+  widen that, the thing you are about to break is checkable only on hardware.
 - **Trace `causal` is load-bearing for I18.** Adding an event that participates
   in a cross-entity happens-before edge without setting `causal` silently drops
   that edge, and a dropped edge makes the conformance checker weaker without
@@ -389,4 +405,5 @@ decision that would otherwise depend on `HashMap` iteration order.
 4. Read `docs/SOMA-v0.3.md`. §2 and §3 explain the two pieces of machinery
    most likely to surprise you — why trace equality had to go, and why both
    backends used to agree about nothing. Then pick up §4 (the persistent device
-   scheduler), which is unblocked and is the next piece.
+   scheduler). Its first obligation is discharged in §4.1; the next piece is
+   canonical commit, which §4.1 ends by describing.

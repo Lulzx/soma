@@ -202,6 +202,10 @@ pub struct Kernel {
     trace: Vec<TraceEvent>,
     /// Total runnable continuations at the end of each epoch, for accounting.
     epoch_runnable: Vec<usize>,
+    /// Each epoch's admission candidates and the decision taken over them, kept
+    /// so I22 can be checked over a whole run rather than over whichever epoch
+    /// happened to be last.
+    pub(crate) admission_log: Vec<crate::scheduler::admission::AdmissionRecord>,
 
     processes: GenTable<ProcessDescriptor>,
     domains: GenTable<DomainDescriptor>,
@@ -263,6 +267,7 @@ impl Kernel {
             logical_time: 0,
             trace: Vec::new(),
             epoch_runnable: Vec::new(),
+            admission_log: Vec::new(),
             processes: GenTable::new(Kind::Process),
             domains: GenTable::new(Kind::Domain),
             contracts: GenTable::new(Kind::Contract),
@@ -369,6 +374,17 @@ impl Kernel {
 
     pub fn trace_events(&self) -> &[TraceEvent] {
         &self.trace
+    }
+
+    /// Every epoch's admission, in epoch order: the candidates offered and the
+    /// decision taken over them.
+    ///
+    /// The decision is meant to be a function of the candidate set and nothing
+    /// else (v0.3 §4). Keeping both is what lets `semantics::schedule` check
+    /// that over a whole run, and check that the run made the decision the rule
+    /// specifies rather than one of its own.
+    pub fn admission_log(&self) -> &[crate::scheduler::admission::AdmissionRecord] {
+        &self.admission_log
     }
 
     pub(crate) fn epoch_number(&self) -> u32 {

@@ -9,15 +9,13 @@
 //! With the default `cohort_width` of 1 every dispatch is a single lane, which
 //! reduces exactly to the pre-cohorting behaviour.
 
-use std::collections::HashSet;
-
 use crate::abi::cohorts::PartialCohortPolicy;
 use crate::abi::continuations::ContinuationState;
 use crate::abi::Ref64;
-use crate::abi::StateAccess;
 use crate::executives::cpu_scalar;
 use crate::kernel::commit;
 use crate::kernel::Kernel;
+use crate::scheduler::admission::{admit, AdmissionRecord, Candidate};
 use crate::scheduler::cohorts::{build_cohorts, CohortPlan};
 
 impl Kernel {
@@ -30,54 +28,63 @@ impl Kernel {
         // Epoch boundary: promote `next` → `current` (§18 Phase H → next epoch).
         self.scheduler.swap_all();
 
-        // Phases B/C: Validate and Admit. Everything admitted this epoch is
-        // collected per bin before any of it runs, so cohort construction sees
-        // the whole epoch's eligible work rather than a prefix of it.
-        //
-        // Process-state invariant (I13): at most one continuation declaring
-        // mutable state access runs per process per epoch. Sequential execution
-        // cannot overlap two continuations *within* a step, but a parallel
-        // executive would run a whole epoch's cohorts concurrently — so the
-        // invariant must hold at epoch granularity. A slot claimed here is held
-        // for the rest of the epoch; later mutable continuations of that process
-        // defer to the next epoch.
-        let mut claimed_procs: HashSet<u32> = HashSet::new();
-        let mut admitted: Vec<(u32, Vec<(Ref64, u32)>)> = Vec::new();
-
+        // Phase B: Validate. Drain every bin into one candidate set before
+        // anything is decided, so cohort construction sees the whole epoch's
+        // eligible work rather than a prefix of it.
         let bins: Vec<u32> = self
             .scheduler
             .runnable_counts()
             .iter()
             .map(|(b, _)| *b)
             .collect();
+        let mut candidates: Vec<Candidate> = Vec::new();
         for bin in bins {
-            let mut lanes: Vec<(Ref64, u32)> = Vec::new();
             for cont in self.scheduler.drain(bin) {
-                let (process, run_class, state_access, status) = match self.continuations.get(cont)
-                {
-                    Ok(c) => (c.process, c.run_class, c.state_access, c.status),
-                    Err(_) => continue,
+                let Ok(descriptor) = self.continuations.get(cont) else {
+                    continue;
                 };
                 // Only runnable continuations execute. Nothing in the current
                 // single-threaded path enqueues a non-runnable continuation —
                 // the budget check faults before any commit can requeue — so
                 // this is a guard for the executives to come, where a cohort can
                 // be cancelled or faulted after its bin was filled.
-                if status != ContinuationState::Runnable {
+                if descriptor.status != ContinuationState::Runnable {
                     continue;
                 }
-                let mutating = state_access == StateAccess::Mutable;
-                if mutating && !claimed_procs.insert(process.slot) {
-                    self.scheduler.enqueue(run_class, cont);
-                    self.accounting.serial_deferrals += 1;
-                    continue;
-                }
-                lanes.push((cont, run_class));
-            }
-            if !lanes.is_empty() {
-                admitted.push((bin, lanes));
+                candidates.push(Candidate {
+                    bin,
+                    continuation: cont,
+                    process: descriptor.process,
+                    run_class: descriptor.run_class,
+                    state_access: descriptor.state_access,
+                    waiting_since: descriptor.last_run_epoch.max(descriptor.created_epoch),
+                });
             }
         }
+
+        // Phase C: Admit. I13 permits at most one continuation declaring
+        // mutable state access to run per process per epoch. Sequential
+        // execution cannot overlap two continuations *within* a step, but a
+        // parallel executive runs a whole epoch's cohorts concurrently, so the
+        // invariant holds at epoch granularity: a claim taken here stands for
+        // the rest of the epoch and the losers defer to the next one.
+        //
+        // The decision is `scheduler::admission`'s, computed from the candidate
+        // set rather than taken as the scan walks it. On a device that scan is
+        // a concurrent claim, and a rule that resolves it by arrival resolves it
+        // by race (v0.3 §4). I22 checks that the decision survives permutation
+        // of the candidates.
+        let decision = admit(&candidates);
+        self.admission_log.push(AdmissionRecord {
+            candidates,
+            decision: decision.clone(),
+        });
+
+        for (run_class, cont) in decision.deferred() {
+            self.scheduler.enqueue(*run_class, *cont);
+            self.accounting.serial_deferrals += 1;
+        }
+        let admitted = decision.into_bins();
 
         // Phase E: Cohort (§14).
         let mut plans: Vec<CohortPlan> = admitted

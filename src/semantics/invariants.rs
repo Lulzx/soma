@@ -60,6 +60,9 @@ pub enum Invariant {
     /// I21. Admitted work is dispatched, and no runnable continuation waits
     /// longer than the declared deferral bound.
     BoundedProgress,
+    /// I22. Admission decides from the epoch's candidate set, not from the
+    /// order that set is discovered in.
+    AdmissionDeterminism,
 }
 
 /// A specific way in which a state was illegal.
@@ -106,8 +109,25 @@ pub fn check(kernel: &Kernel) -> Vec<Violation> {
     domain_contract_integrity(kernel, &mut v);
     module_integrity(kernel, &mut v);
     bounded_progress(kernel, &mut v);
+    admission_determinism(kernel, &mut v);
     v.sort();
     v
+}
+
+// ---- I22 -----------------------------------------------------------------
+
+/// **I22. Admission determinism.**
+///
+/// Stated and checked in `semantics::schedule`, which owns the permutation
+/// machinery; this is the seam that makes it part of `check`, so a run that is
+/// checked at all is checked for it.
+fn admission_determinism(kernel: &Kernel, out: &mut Vec<Violation>) {
+    for violation in crate::semantics::schedule::admission_determinism(kernel) {
+        out.push(Violation::new(
+            Invariant::AdmissionDeterminism,
+            violation.detail,
+        ));
+    }
 }
 
 // ---- I21 -----------------------------------------------------------------

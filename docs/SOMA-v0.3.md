@@ -1,7 +1,7 @@
 # SOMA v0.3
 
-**Status:** partially implemented. §1–§3 are specification and are machine-checked.
-§4–§6 are scope for work that has not started.
+**Status:** partially implemented. §1–§3 are specification and are
+machine-checked, as is §4.1. The rest of §4 and all of §5–§6 are scope.
 
 v0.2 closed the semantic core: every entity and invariant it named was
 implemented and checked. v0.3 is the first version whose work is not "finish the
@@ -16,12 +16,12 @@ did not depend on it are done; the rest is scoped below.
 | **0** | Carried debts on the critical path | **done** (§1) |
 | **S** | An equivalence a concurrent implementation can satisfy | **done** (§2) |
 | **A** | General evaluator bodies and a compiler | **done** (§3) |
-| **B** | Persistent device-resident scheduler | scope (§4) |
+| **B** | Persistent device-resident scheduler | **started** (§4) |
 | **C** | Distributed / multi-node implementation | scope (§5) |
 | **D** | Performance work on real hardware | scope (§6) |
 
-Four new clauses are now checked — I18, I19, I20, I21 — and v0.2's only
-`[modelled]` clause is gone. The test suite went from 151 to 192.
+Five new clauses are now checked — I18, I19, I20, I21, I22 — and v0.2's only
+`[modelled]` clause is gone. The test suite went from 151 to 201.
 
 ---
 
@@ -251,18 +251,19 @@ bytes and semantic trace against the CPU interpreter.
 
 ## 4. B — persistent device-resident scheduler
 
-**Not started.** S was its blocker and S is done, so this is the next piece.
+**Started.** S was its blocker and S is done. The first of its four obligations
+— admission — is discharged and checked (§4.1); the other three are not.
 
-`kernel/epochs.rs` still admits, cohorts, executes, and commits on the host, one
+`kernel/epochs.rs` still cohorts, executes, and commits on the host, one
 continuation at a time. The Metal path dispatches a single collective and blocks
 on `wait_until_completed` — a host-driven kernel launch, which is the thing the
 project's original premise wanted to remove.
 
 What must hold, and why each is hard:
 
-- **Admission (I13)** claims a per-process mutable slot with a host `HashSet`.
+- **Admission (I13)** claimed a per-process mutable slot with a host `HashSet`.
   On device this is a concurrent claim and must be deterministic, so it cannot
-  be "whoever gets there first".
+  be "whoever gets there first". **Done — §4.1.**
 - **Commit** is the sole path to `Runnable` (v0.2 §3.4), which is what makes I7
   checkable. A device commit must preserve that exclusivity across concurrent
   writers.
@@ -271,6 +272,75 @@ What must hold, and why each is hard:
   relax this.
 - **Trace emission** becomes a concurrent append. Logical time must still
   satisfy I11 and now also I18.
+
+### 4.1 Admission decides from state, not from position
+
+`scheduler::admission::admit` is a pure function of the epoch's candidate set.
+It resolves I13's per-process claim by taking the longest-waiting mutable
+continuation, ties broken by continuation identity, having first collected every
+candidate — so no candidate's fate depends on how far a scan had got when it was
+reached.
+
+The waiting term is not decoration. Identity alone would be deterministic and
+unfair: a process whose lower-slot mutable continuation stays runnable would win
+every epoch and the other would never run, which I21's starvation bound would
+eventually report as a violation nobody chose. The scan rule got that right by
+accident — a deferred continuation was re-enqueued during admission, ahead of
+the appends that epoch's commits made, so it led the next epoch's bin. Once bin
+order stops being trustworthy the accident is gone, so the property moves into
+the key.
+
+**I22. Admission determinism [checked].** Two halves:
+
+1. Each epoch's decision is the one `admit` specifies for that epoch's
+   candidates.
+2. `admit`'s decision is invariant under permutation of those candidates.
+
+Half 2 alone would be a statement about a function nobody is obliged to call: a
+scheduler that took its own first-come claim inline — which is what the host did
+and what a device is tempted to do — would leave it green. So the epoch records
+the decision it took (`Kernel::admission_log`) and half 1 compares the two. This
+is the same failure mode §2.5 found in the first pairing scan, caught earlier
+this time because §2.5 had already named it.
+
+Half 1 is nonetheless weak on its own, and the way that was established is worth
+recording: reintroducing the first-come claim inline in `epochs.rs` broke *no
+test*. The two rules agree on the reference interpreter's discovery order, so a
+checker comparing one run's decision against the rule sees nothing. Only a
+concurrent implementation would diverge, which is to say the clause would first
+fail on the hardware it was written to protect.
+
+So `Admission` is sealed: its fields are private and `admit` is its only
+constructor, which makes an epoch that takes its own claim a compile error
+rather than a test that might catch it. This is the technique
+`docs/SOMA-CAPABILITIES.md` used to close the operation set, applied to the
+scheduler. Half 1 stays, because the record is what lets the clause be asked of
+an implementation this crate did not run — the case it is ultimately for.
+
+The fault injection is the rule this replaced: `first_come_decision` in
+`tests/admission.rs` is the pre-v0.3 claim, and half 2 rejects it. Half 1's
+negative case corrupts a recorded epoch's candidates so its decision no longer
+follows from them. The null is that the workload really does put two mutable
+continuations of one process in one epoch — without that, the clause would be
+checking a decision with nothing to decide.
+
+**What §4.1 does not settle.** I22 constrains *which* continuations run, not the
+order they run in. Lane order within a bin is still arrival order, which is
+observable — two lanes receiving from one mailbox get different messages
+depending on which goes first — and a device whose bins are appended
+concurrently does not get that order for free. It gets it only by committing an
+epoch's effects in canonical lane order, which is the second obligation above
+and is not done. Folding lane order into I22 now would state a property the host
+satisfies and no device could, which is exactly the defect §2 removed from the
+equivalence relation.
+
+The obstacle to that second obligation is structural rather than subtle: the
+executive's handlers take `&mut Kernel` and allocate their effects as they run
+(`create_process`, `resolve_future`, `enqueue_message`), so execute and commit
+are fused. Canonical commit requires a step to produce an effect list that the
+kernel applies afterwards, in lane order. That refactor is the next piece of B,
+and it is the one that makes a concurrent executive — host threads first, device
+after — possible at all.
 
 Not in B: preemption. The model does not assume it (v0.2 §1.1), and adding it to
 the scheduler before adding it to the model would be backwards.
@@ -356,6 +426,7 @@ cannot reach means the model is charging for the wrong thing.
 | I19 placement neutrality | checked | cohort width, with a non-vacuity null |
 | I20 backend agreement | checked | CPU interpreter is the definition |
 | I21 bounded progress | checked | no withholding, plus a starvation bound |
+| I22 admission determinism | checked | the decision is a function of the candidate set (§4.1) |
 
 **I21** has two halves. The first — an epoch that admitted work dispatched some
 of it — is a statement about a transition rather than a state, so it is counted

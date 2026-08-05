@@ -13,6 +13,7 @@ use crate::abi::{
 };
 use crate::kernel::accounting::Accounting;
 use crate::kernel::{Kernel, Mailbox, SupervisionQueue};
+use crate::scheduler::admission::AdmissionRecord;
 use crate::scheduler::runnable_bins::Scheduler;
 use crate::table::GenTable;
 
@@ -35,6 +36,7 @@ pub struct State<'a> {
     pub supervision_queues: &'a mut HashMap<u32, SupervisionQueue>,
     pub scheduler: &'a mut Scheduler,
     pub accounting: &'a mut Accounting,
+    pub admission_log: &'a mut Vec<AdmissionRecord>,
 }
 
 /// Borrow all raw kernel storage.
@@ -63,5 +65,6 @@ pub unsafe fn state(kernel: &mut Kernel) -> State<'_> {
         supervision_queues: &mut kernel.supervision_queues,
         scheduler: &mut kernel.scheduler,
         accounting: &mut kernel.accounting,
+        admission_log: &mut kernel.admission_log,
     }
 }
