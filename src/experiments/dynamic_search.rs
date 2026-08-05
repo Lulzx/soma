@@ -71,7 +71,7 @@ pub fn build(knobs: &ControlKnobs) -> Kernel {
 /// mode, cohort width, or partial policy without duplicating workload setup.
 pub fn build_in(mut kernel: Kernel, knobs: &ControlKnobs) -> Kernel {
     for root in 0..knobs.process_count {
-        let p = kernel.create_process(ProcessMode::Serial);
+        let p = kernel.create_process(crate::kernel::SYSTEM_PRINCIPAL, ProcessMode::Serial);
         let frame = SearchFrame {
             value: root as u64 + 1,
             depth: knobs.depth,
@@ -82,7 +82,14 @@ pub fn build_in(mut kernel: Kernel, knobs: &ControlKnobs) -> Kernel {
         let run_class = frame.run_class();
         let mut bytes = Vec::new();
         frame.encode(&mut bytes);
-        kernel.create_continuation(p, run_class, 0, bytes, DEFAULT_MAX_STEPS);
+        kernel.create_continuation(
+            crate::kernel::SYSTEM_PRINCIPAL,
+            p,
+            run_class,
+            0,
+            bytes,
+            DEFAULT_MAX_STEPS,
+        );
     }
     kernel
 }

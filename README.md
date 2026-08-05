@@ -66,10 +66,9 @@ test constructs an illegal state and proves that the checker rejects it. A
 checker that cannot reject anything proves nothing.
 
 Capability spaces, creator genesis, derivation, attenuation, and the structural
-I10a/I10b checks exist. Operation enforcement does not. A process can still
-mutate any object it can name, even if its capability space grants no access.
-That missing rule is I10c. Channels, collectives, domains, cancellation, and
-supervision are also absent.
+I10a/I10b checks exist. `WRITE` is the first enforced right; the remaining
+operation rights and trace-level I10c proof are incomplete. Channels,
+collectives, domains, cancellation, and supervision are also absent.
 
 The specification has already caught a lifetime bug. `Complete` once retired a
 process when one continuation finished. A second live continuation could then
@@ -156,12 +155,12 @@ Implemented now:
 
 Not implemented:
 
-- Capability checks on operations
+- Capability checks on operations other than `WRITE`
 - Writes guarded by ownership state
 - Channels and collectives
 - Cancellation and supervision
 - GPU execution, CPU/GPU migration, and spill
-- The Sokoban workload
+- A generic dynamic constraint-search validation workload
 
 The current job is to finish the machine semantics before adding a surface
 language or GPU backend. Open questions include process ownership, the fate of a

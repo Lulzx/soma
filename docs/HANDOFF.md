@@ -4,7 +4,7 @@ Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
 Repository: https://github.com/Lulzx/soma. About 7,200 lines of Rust, no
-dependencies, 89 tests, and no Clippy warnings.
+dependencies, 91 tests, and no Clippy warnings.
 
 ```sh
 cargo test
@@ -95,10 +95,10 @@ register state, so another executor can resume the continuation.
 Treat these as absent, not nearly-done:
 
 - **Capability enforcement.** Actor-relative spaces, genesis, derivation, I10a,
-  and I10b exist. Operations do not yet consult them, so **any process can still
-  mutate any object it can name.**
-  `tests/semantics.rs::capability_effect_authority_remains_unenforced`
-  demonstrates the remaining I10c gap.
+  and I10b exist. `WRITE` checks live, unexpired authority at use. Other rights
+  remain permissive, so I10c is still partial.
+  `tests/semantics.rs::write_authority_is_enforced_while_other_rights_remain_permissive`
+  demonstrates the boundary.
 - **Ownership enforcement.** `freeze` / `transfer_unique` record intent. Nothing
   stops a write to a frozen object.
 - **Channels.** Messaging is per-process mailboxes. `Kind::Channel` is a
@@ -157,8 +157,8 @@ before coding: ownership should be redefined in terms of capabilities (deleting
 `unique_owner` and collapsing I9), and failure needs a position on whether
 authority survives a faulted holder.
 
-Steps 1 through 4 are complete. Continue with step 5, which enforces rights one
-operation at a time, starting with `WRITE`.
+Steps 1 through 4 are complete. Step 5 is in progress: `WRITE` is enforced;
+continue with the remaining rights one operation at a time.
 
 ### 5.2 What does a process own? (spec §6.2)
 
@@ -183,9 +183,12 @@ cooperative execution shapes and there is no implementation at all.
 
 ### 5.5 Validation workloads
 
-Beyond dynamic search: streaming pipelines, actor systems, irregular dataflow.
-Choose them to stress **ordering, back-pressure, and failure**, not throughput.
-The existing workloads exercise none of those hard.
+Beyond dynamic search: a theoretical dynamic constraint search, streaming
+pipelines, actor systems, and irregular dataflow. The constraint search is
+defined by a state, transition relation, goal predicate, and optional
+asynchronous score rather than a named application. Choose workloads to stress
+**ordering, back-pressure, and failure**, not throughput. The existing
+workloads exercise none of those hard.
 
 ### 5.6 Minimal IR, deliberately deferred
 
@@ -265,5 +268,5 @@ decision that would otherwise depend on `HashMap` iteration order.
 3. Break something on purpose. Flip a condition in `commit.rs` and confirm the
    invariant checker catches it. That tells you the safety net is real before
    you rely on it.
-4. Continue the capability implementation at step 5 of
-   `docs/SOMA-CAPABILITIES.md`: enforce `WRITE`, then add the remaining rights.
+4. Continue the remaining rights in step 5 of
+   `docs/SOMA-CAPABILITIES.md`, one operation at a time.

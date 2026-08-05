@@ -60,15 +60,14 @@ pub fn run(
     partial_policy: PartialCohortPolicy,
 ) -> StudyRun {
     let mut kernel = Kernel::with_mode(mode);
-    kernel.cohort_width = cohort_width;
-    kernel.partial_policy = partial_policy;
+    kernel.configure_cohorts(cohort_width, partial_policy);
     let mut kernel = build_in(kernel, knobs);
     let epochs = kernel.run_to_quiescence(100_000);
     StudyRun {
         mode,
         cohort_width,
         epochs,
-        accounting: kernel.accounting,
+        accounting: *kernel.accounting(),
     }
 }
 

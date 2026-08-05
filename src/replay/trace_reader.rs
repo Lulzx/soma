@@ -11,7 +11,7 @@ use crate::kernel::Kernel;
 /// Summary counts per event kind (process/continuation-level view).
 pub fn summarize(kernel: &Kernel) -> std::collections::BTreeMap<EventKind, usize> {
     let mut m = std::collections::BTreeMap::new();
-    for t in &kernel.trace {
+    for t in kernel.trace_events() {
         *m.entry(t.event_kind).or_insert(0) += 1;
     }
     m
@@ -19,7 +19,7 @@ pub fn summarize(kernel: &Kernel) -> std::collections::BTreeMap<EventKind, usize
 
 /// Total number of trace events recorded.
 pub fn event_count(kernel: &Kernel) -> usize {
-    kernel.trace.len()
+    kernel.trace_events().len()
 }
 
 /// All events of a given kind, in order.
@@ -27,7 +27,7 @@ pub fn events_of<'a>(
     kernel: &'a Kernel,
     kind: EventKind,
 ) -> impl Iterator<Item = &'a TraceEvent> + 'a {
-    kernel.trace.iter().filter(move |t| t.event_kind == kind)
+    kernel.trace_events().iter().filter(move |t| t.event_kind == kind)
 }
 
 /// Whether two runs produced identical traces (used to assert determinism).

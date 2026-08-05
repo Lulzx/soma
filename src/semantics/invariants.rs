@@ -46,6 +46,10 @@ pub enum Invariant {
     FrameExclusivity,
     /// I9. A frozen object never returns to mutable state.
     OwnershipMonotonicity,
+    /// I10a. Derived capabilities never amplify rights or byte range.
+    CapabilityAttenuation,
+    /// I10b. Capability targets and parent links resolve with valid rights.
+    CapabilityIntegrity,
     /// I11. The trace is a strictly increasing logical clock.
     TraceMonotonicity,
     /// I12. Accounting counters are mutually consistent.
@@ -87,6 +91,8 @@ pub fn check(kernel: &Kernel) -> Vec<Violation> {
     scheduler_well_formed(kernel, &mut v);
     frame_exclusivity(kernel, &mut v);
     ownership_monotonicity(kernel, &mut v);
+    capability_attenuation(kernel, &mut v);
+    capability_integrity(kernel, &mut v);
     trace_monotonicity(kernel, &mut v);
     accounting_consistency(kernel, &mut v);
     v.sort();
@@ -99,7 +105,7 @@ pub fn assert_legal(kernel: &Kernel) {
     assert!(
         violations.is_empty(),
         "illegal machine state at epoch {}:\n{}",
-        kernel.epoch,
+        kernel.epoch_number(),
         violations
             .iter()
             .map(|v| format!("  {v}"))
@@ -112,11 +118,13 @@ pub fn assert_legal(kernel: &Kernel) {
 
 fn live(kernel: &Kernel, r: Ref64) -> bool {
     match r.kind {
-        Kind::Process => kernel.processes.get(r).is_ok(),
-        Kind::Object => kernel.objects.get(r).is_ok(),
-        Kind::Continuation => kernel.continuations.get(r).is_ok(),
-        Kind::Future => kernel.futures.get(r).is_ok(),
-        Kind::Capability => kernel.capabilities.get(r).is_ok(),
+        Kind::Process => kernel.processes().get(r).is_ok(),
+        Kind::Object => kernel.objects().get(r).is_ok(),
+        Kind::Continuation => kernel.continuations().get(r).is_ok(),
+        Kind::Future => kernel.futures().get(r).is_ok(),
+        // Capability references are actor-relative and are checked by I10b in
+        // the space that owns them; there is no meaningful global lookup.
+        Kind::Capability => true,
         // Domains, channels, contracts, collectives and modules have no table
         // in the reference model; a reference to one cannot be validated.
         _ => true,
@@ -124,7 +132,7 @@ fn live(kernel: &Kernel, r: Ref64) -> bool {
 }
 
 fn reference_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
-    for (r, p) in kernel.processes.iter() {
+    for (r, p) in kernel.processes().iter() {
         if !p.id.is_null() && p.id != r {
             out.push(Violation::new(
                 Invariant::ReferenceIntegrity,
@@ -139,7 +147,7 @@ fn reference_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
         }
     }
 
-    for (r, c) in kernel.continuations.iter() {
+    for (r, c) in kernel.continuations().iter() {
         if !live(kernel, c.process) {
             out.push(Violation::new(
                 Invariant::ReferenceIntegrity,
@@ -160,7 +168,7 @@ fn reference_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
         }
     }
 
-    for (r, f) in kernel.futures.iter() {
+    for (r, f) in kernel.futures().iter() {
         if f.state == FutureState::Resolved && !f.value.is_null() && !live(kernel, f.value) {
             out.push(Violation::new(
                 Invariant::ReferenceIntegrity,
@@ -169,7 +177,7 @@ fn reference_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
         }
     }
 
-    for (slot, mailbox) in &kernel.mailboxes {
+    for (slot, mailbox) in kernel.mailboxes() {
         for m in &mailbox.entries {
             if !m.payload.is_null() && !live(kernel, m.payload) {
                 out.push(Violation::new(
@@ -184,7 +192,7 @@ fn reference_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
 // ---- I2 ------------------------------------------------------------------
 
 fn no_continuation_left_running(kernel: &Kernel, out: &mut Vec<Violation>) {
-    for (r, c) in kernel.continuations.iter() {
+    for (r, c) in kernel.continuations().iter() {
         if c.status == ContinuationState::Running {
             out.push(Violation::new(
                 Invariant::NoContinuationLeftRunning,
@@ -197,8 +205,8 @@ fn no_continuation_left_running(kernel: &Kernel, out: &mut Vec<Violation>) {
 // ---- I3 ------------------------------------------------------------------
 
 fn process_continuation_consistency(kernel: &Kernel, out: &mut Vec<Violation>) {
-    for (r, c) in kernel.continuations.iter() {
-        let process = match kernel.processes.get(c.process) {
+    for (r, c) in kernel.continuations().iter() {
+        let process = match kernel.processes().get(c.process) {
             Ok(p) => p,
             // Already reported by I1.
             Err(_) => continue,
@@ -222,7 +230,7 @@ fn process_continuation_consistency(kernel: &Kernel, out: &mut Vec<Violation>) {
 // ---- I4 ------------------------------------------------------------------
 
 fn future_single_assignment(kernel: &Kernel, out: &mut Vec<Violation>) {
-    for (r, f) in kernel.futures.iter() {
+    for (r, f) in kernel.futures().iter() {
         match f.state {
             FutureState::Pending => {
                 if !f.value.is_null() {
@@ -233,7 +241,7 @@ fn future_single_assignment(kernel: &Kernel, out: &mut Vec<Violation>) {
                 }
             }
             FutureState::Resolved | FutureState::Failed | FutureState::Cancelled => {
-                if f.resolved_epoch > kernel.epoch {
+                if f.resolved_epoch > kernel.epoch_number() {
                     out.push(Violation::new(
                         Invariant::FutureSingleAssignment,
                         format!("future {} resolved in a future epoch", r.slot),
@@ -241,7 +249,7 @@ fn future_single_assignment(kernel: &Kernel, out: &mut Vec<Violation>) {
                 }
                 // A settled future's waiter list has already been drained, so a
                 // continuation registered on it would never wake.
-                if let Some(waiters) = kernel.future_waiters.get(&r.slot) {
+                if let Some(waiters) = kernel.future_waiters().get(&r.slot) {
                     if !waiters.is_empty() {
                         out.push(Violation::new(
                             Invariant::FutureSingleAssignment,
@@ -261,7 +269,7 @@ fn future_single_assignment(kernel: &Kernel, out: &mut Vec<Violation>) {
 // ---- I5 ------------------------------------------------------------------
 
 fn mailbox_bound(kernel: &Kernel, out: &mut Vec<Violation>) {
-    for (slot, mailbox) in &kernel.mailboxes {
+    for (slot, mailbox) in kernel.mailboxes() {
         if mailbox.entries.len() > mailbox.capacity {
             out.push(Violation::new(
                 Invariant::MailboxBound,
@@ -278,7 +286,7 @@ fn mailbox_bound(kernel: &Kernel, out: &mut Vec<Violation>) {
 // ---- I6 ------------------------------------------------------------------
 
 fn message_ordering(kernel: &Kernel, out: &mut Vec<Violation>) {
-    for (slot, mailbox) in &kernel.mailboxes {
+    for (slot, mailbox) in kernel.mailboxes() {
         let mut last: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
         for m in &mailbox.entries {
             if let Some(previous) = last.get(&m.sender.slot) {
@@ -300,8 +308,8 @@ fn message_ordering(kernel: &Kernel, out: &mut Vec<Violation>) {
 // ---- I7 ------------------------------------------------------------------
 
 fn scheduler_well_formed(kernel: &Kernel, out: &mut Vec<Violation>) {
-    for (bin, cont) in kernel.scheduler.pending_entries() {
-        let c = match kernel.continuations.get(cont) {
+    for (bin, cont) in kernel.scheduler().pending_entries() {
+        let c = match kernel.continuations().get(cont) {
             Ok(c) => c,
             Err(_) => {
                 out.push(Violation::new(
@@ -320,7 +328,7 @@ fn scheduler_well_formed(kernel: &Kernel, out: &mut Vec<Violation>) {
                 ),
             ));
         }
-        let expected = kernel.scheduler.bin_of(c.run_class);
+        let expected = kernel.scheduler().bin_of(c.run_class);
         if expected != bin {
             out.push(Violation::new(
                 Invariant::SchedulerWellFormed,
@@ -337,7 +345,7 @@ fn scheduler_well_formed(kernel: &Kernel, out: &mut Vec<Violation>) {
 
 fn frame_exclusivity(kernel: &Kernel, out: &mut Vec<Violation>) {
     let mut owner: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-    for (r, c) in kernel.continuations.iter() {
+    for (r, c) in kernel.continuations().iter() {
         if c.frame.is_null() {
             continue;
         }
@@ -357,7 +365,7 @@ fn frame_exclusivity(kernel: &Kernel, out: &mut Vec<Violation>) {
 
 fn ownership_monotonicity(kernel: &Kernel, out: &mut Vec<Violation>) {
     use crate::abi::objects::OwnershipState;
-    for (r, o) in kernel.objects.iter() {
+    for (r, o) in kernel.objects().iter() {
         // A frozen object is readable by many, so it must have been published.
         if o.ownership_state == OwnershipState::FrozenShared && o.reader_count == 0 {
             out.push(Violation::new(
@@ -380,10 +388,88 @@ fn ownership_monotonicity(kernel: &Kernel, out: &mut Vec<Violation>) {
 
 // ---- I11 -----------------------------------------------------------------
 
+// ---- I10 -----------------------------------------------------------------
+
+fn capability_attenuation(kernel: &Kernel, out: &mut Vec<Violation>) {
+    for (holder, space) in kernel.capability_spaces() {
+        for (r, cap) in space.iter() {
+            if cap.parent_capability.is_null() {
+                continue;
+            }
+            let Ok(parent) = space.get(cap.parent_capability) else {
+                // I10b reports the broken link.
+                continue;
+            };
+            let cap_end = cap.offset.checked_add(cap.length);
+            let parent_end = parent.offset.checked_add(parent.length);
+            if cap.rights & !parent.rights != 0
+                || cap.offset < parent.offset
+                || cap_end.is_none()
+                || parent_end.is_none()
+                || cap_end > parent_end
+            {
+                out.push(Violation::new(
+                    Invariant::CapabilityAttenuation,
+                    format!(
+                        "capability {} in space {holder} amplifies its parent",
+                        r.slot
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+fn capability_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
+    use crate::abi::Rights;
+
+    for (holder, space) in kernel.capability_spaces() {
+        for (r, cap) in space.iter() {
+            let target_live = match cap.target.kind {
+                Kind::Process => kernel.processes().get(cap.target).is_ok(),
+                Kind::Object => kernel.objects().get(cap.target).is_ok(),
+                Kind::Continuation => kernel.continuations().get(cap.target).is_ok(),
+                Kind::Future => kernel.futures().get(cap.target).is_ok(),
+                Kind::Capability => space.get(cap.target).is_ok(),
+                _ => false,
+            };
+            if !target_live {
+                out.push(Violation::new(
+                    Invariant::CapabilityIntegrity,
+                    format!(
+                        "capability {} in space {holder} has a dead or unsupported target",
+                        r.slot
+                    ),
+                ));
+            }
+            if cap.rights & !Rights::for_target(cap.target.kind) != 0 {
+                out.push(Violation::new(
+                    Invariant::CapabilityIntegrity,
+                    format!(
+                        "capability {} in space {holder} has rights invalid for {:?}",
+                        r.slot, cap.target.kind
+                    ),
+                ));
+            }
+            if !cap.parent_capability.is_null() && space.get(cap.parent_capability).is_err() {
+                out.push(Violation::new(
+                    Invariant::CapabilityIntegrity,
+                    format!(
+                        "capability {} in space {holder} has a dead parent",
+                        r.slot
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+// ---- I11 -----------------------------------------------------------------
+
 fn trace_monotonicity(kernel: &Kernel, out: &mut Vec<Violation>) {
     let mut previous_time = 0u64;
     let mut previous_epoch = 0u32;
-    for (i, e) in kernel.trace.iter().enumerate() {
+    for (i, e) in kernel.trace_events().iter().enumerate() {
         if e.logical_time <= previous_time && i > 0 {
             out.push(Violation::new(
                 Invariant::TraceMonotonicity,
@@ -407,7 +493,7 @@ fn trace_monotonicity(kernel: &Kernel, out: &mut Vec<Violation>) {
 // ---- I12 -----------------------------------------------------------------
 
 fn accounting_consistency(kernel: &Kernel, out: &mut Vec<Violation>) {
-    let a = &kernel.accounting;
+    let a = kernel.accounting();
     if a.useful_lane_slots > a.lane_slots {
         out.push(Violation::new(
             Invariant::AccountingConsistency,
@@ -440,7 +526,7 @@ fn accounting_consistency(kernel: &Kernel, out: &mut Vec<Violation>) {
 /// Whether a process is serial, i.e. bound by the one-mutator rule.
 pub fn is_serial(kernel: &Kernel, process: Ref64) -> bool {
     kernel
-        .processes
+        .processes()
         .get(process)
         .map(|p| matches!(p.process_mode, ProcessMode::Serial | ProcessMode::System))
         .unwrap_or(false)

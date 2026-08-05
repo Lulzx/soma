@@ -1129,9 +1129,12 @@ process count
 
 This maps the regime in which cohorting helps or fails.
 
-## 25.2 Sokoban-style search
+## 25.2 Dynamic constraint search
 
-Each search state becomes a process or process-owned work item.
+This theoretical workload explores a finite state space defined only by an
+initial state, a data-dependent transition relation, a goal predicate, and an
+optional asynchronous scoring function. Each state becomes a process or a
+process-owned work item. No application domain is assumed.
 
 The workload includes:
 
@@ -1146,7 +1149,8 @@ solution propagation
 multiple simultaneous searches
 ```
 
-This determines whether the mechanism remains useful outside a synthetic benchmark.
+This determines whether the mechanism remains useful outside the regular
+synthetic branching benchmark without tying the result to one puzzle or domain.
 
 ---
 
@@ -1325,7 +1329,7 @@ The shortest evidence-producing sequence is:
 7. Add the bulk frontier baseline.
 8. Measure cohorting before adding CPU/GPU migration.
 9. Add CPU spill for partial cohorts.
-10. Run the Sokoban-style workload.
+10. Run the generic dynamic constraint-search workload.
 ```
 
 The CPU interpreter comes first because it provides:

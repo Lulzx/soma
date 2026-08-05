@@ -89,8 +89,8 @@ A run class is simultaneously the interpreter's dispatch key and the scheduler's
 bin key. That they are the same value is a design commitment, not a coincidence.
 
 **Capability**, actor-relative permission to act on an entity. Capability
-spaces, genesis, and attenuation are implemented. Operation enforcement is
-still **[absent]**, see I10.
+spaces, genesis, attenuation, and `WRITE` enforcement are implemented. Full
+operation enforcement is still **[absent]**, see I10.
 
 **Channel**, **Collective**, **Domain**, named by the model, not implemented.
 **[absent]**
@@ -160,11 +160,11 @@ subset of its parent's rights and its byte range lies within its parent's.
 rights apply to the target kind, and its parent is live in the same actor's
 capability space.
 
-**I10c. No unauthorised effect [absent].** *Intended:* no process may act on an
-entity without holding a capability conferring that right. Operations name an
-actor and pass through one authorization gate, but the gate is still permissive.
-A process can therefore mutate an object it cannot access through its own space.
-The structural checks above do not enforce operation authority.
+**I10c. No unauthorised effect [absent, partial implementation].** *Intended:*
+no process may act on an entity without holding a capability conferring that
+right. `WRITE` is enforced at use, including expiry, version, and live-parent
+checks. Other rights remain permissive and authority decisions are not yet in
+the trace, so the full clause is not checked.
 
 **I11. Trace monotonicity [checked].** Logical time strictly increases across
 the trace. Epochs never move backwards.
@@ -325,7 +325,7 @@ continuations within an epoch provided it preserves I1–I12 and determinism.
 | I9 ownership monotonicity | checked, partial | structural half only |
 | I10a attenuation | checked | rights and ranges only shrink |
 | I10b capability integrity | checked | actor-relative spaces and live links |
-| I10c no unauthorised effect | **absent** | operations do not consult authority |
+| I10c no unauthorised effect | **absent, partial** | `WRITE` enforced; other rights and trace proof missing |
 | I11 trace monotonicity | checked | |
 | I12 accounting consistency | checked | |
 | I13 serial execution | modelled | per-epoch, by test |
@@ -337,10 +337,9 @@ mailboxes rather than first-class channels. There is no collective construct at
 all, so the model's claim to cover cooperative execution shapes is currently
 unsupported by any implementation.
 
-`tests/semantics.rs::capability_effect_authority_remains_unenforced`
-demonstrates the remaining I10c gap concretely: a process with no capability
-mutates an object it does not own, ownership transfer changes nothing, and the
-machine still reports itself legal. Separate negative tests prove that the
+`tests/semantics.rs::write_authority_is_enforced_while_other_rights_remain_permissive`
+demonstrates the current I10c boundary: an unauthorised write is denied while an
+unauthorised freeze still succeeds. Separate negative tests prove that the
 I10a/I10b checkers catch amplification and a dead parent.
 
 ---
@@ -395,9 +394,10 @@ them.
 2. **Failure and cancellation (§6.3, §6.4).** Both need the answer to §6.2
    first.
 3. **Channels and collectives.** Currently vocabulary, not machinery.
-4. **Validation workloads** beyond dynamic search: streaming pipelines, actor
-   systems, irregular dataflow, chosen to stress ordering, back-pressure, and
-   failure rather than throughput.
+4. **Validation workloads** beyond dynamic search: a domain-neutral dynamic
+   constraint search, streaming pipelines, actor systems, and irregular
+   dataflow, chosen to stress ordering, back-pressure, and failure rather than
+   throughput.
 5. **A minimal IR**, after §6.2 and §6.3 are settled. A surface syntax for a
    model with unresolved ownership and failure semantics would preserve the
    ambiguity.

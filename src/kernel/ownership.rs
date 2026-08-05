@@ -15,7 +15,8 @@ use crate::kernel::RuntimeError;
 /// 2. increment the version,
 /// 3. transition to immutable state,
 /// 4. publish to readers (increment reader count).
-pub fn freeze(kernel: &mut Kernel, object: Ref64) -> Result<u32, RuntimeError> {
+pub fn freeze(kernel: &mut Kernel, actor: Ref64, object: Ref64) -> Result<u32, RuntimeError> {
+    kernel.authorize(actor, crate::abi::Rights::FREEZE, object)?;
     let _ = kernel.objects.get(object)?;
     let (version, ownership) = {
         let o = kernel.objects.get(object)?;
@@ -38,9 +39,11 @@ pub fn freeze(kernel: &mut Kernel, object: Ref64) -> Result<u32, RuntimeError> {
 /// Returns `Err` if the object is frozen (not transferable) or a stale ref.
 pub fn transfer_unique(
     kernel: &mut Kernel,
+    actor: Ref64,
     object: Ref64,
     new_owner: Ref64,
 ) -> Result<(), RuntimeError> {
+    kernel.authorize(actor, crate::abi::Rights::TRANSFER, object)?;
     let _ = kernel.objects.get(object)?;
     {
         let o = kernel.objects.get_mut(object)?;

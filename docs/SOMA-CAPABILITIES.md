@@ -1,7 +1,7 @@
 # Design note: capability enforcement (I10)
 
 **Status:** partially implemented. Actor-relative spaces, genesis, derivation,
-I10a, and I10b exist. Operations do not enforce authority yet.
+I10a, and I10b exist. `WRITE` authority is enforced; other rights are not.
 
 **Decision: check at operation, with the operation set closed by construction.**
 
@@ -18,10 +18,9 @@ semantics. See §7.
 a version pin, and a `transferred_capability` slot on every message.
 
 Actor-relative capability spaces, genesis, derivation, and the I10a/I10b state
-checks are implemented. Operations pass through a permissive authorization gate
-that does not consult capability spaces yet.
-`tests/semantics.rs` demonstrates a process mutating an object it has no
-relationship to while the machine reports itself legal.
+checks are implemented. Operations pass through one authorization gate. `WRITE`
+consults the actor's space, epoch bound, version pin, and live parent at use;
+other rights remain permissive.
 
 Three prerequisites for enforcement are complete:
 
@@ -230,9 +229,9 @@ observable.
 
 Then flip the marker in `docs/SOMA-v0.2.md` §5 from **absent** to **checked**,
 and rewrite
-`tests/semantics.rs::capability_effect_authority_remains_unenforced`
-into its opposite. That test is designed to fail when this work is complete.
-Update it rather than deleting it.
+`tests/semantics.rs::write_authority_is_enforced_while_other_rights_remain_permissive`
+into a full-denial test. The current test deliberately records the boundary
+between enforced `WRITE` and the remaining permissive rights.
 
 ---
 
@@ -304,13 +303,14 @@ Each step should land green.
 2. **Rename `CapabilityEntry.object` to `target`.** Complete.
 3. **Capability spaces, genesis, derivation, I10a, and I10b. Complete.**
    Capability references are actor-relative and structural authority is now
-   executable, but operations remain unenforced until step 5.
+   executable.
 4. **Thread `actor` through the operation surface. Complete.** All governed
-   operations name their principal and pass through one gate, which still
-   returns `Ok` unconditionally. This isolates API churn from semantic change.
-5. **Enforce rights**, one at a time, starting with `WRITE`. Expect the
-   `Expand` and search workloads to need capabilities plumbed through their
-   frames. That will exercise §5.1 immediately.
+   operations name their principal and pass through one gate. This checkpoint
+   originally landed permissive to isolate API churn from semantic change;
+   step 5 now enables rights incrementally.
+5. **Enforce rights, in progress.** `WRITE` is complete, including expiry and
+   parent-revocation checks at use. Continue one right at a time across the
+   remaining operation surface.
 6. **Trace events and I10c.**
 7. **Unify ownership (§7.1)**, delete `unique_owner`, collapse I9.
 8. **Settle failure (§7.2)** and update the spec.

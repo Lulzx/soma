@@ -29,12 +29,11 @@ fn expand_process_terminates_and_replies() {
     assert_eq!(kernel.mailbox_len(requester), 1);
 
     // The reply payload is the heuristic result: input*2+1.
-    let mb = kernel.mailboxes.get(&requester.slot).unwrap();
-    let msg = mb.entries.front().unwrap();
-    assert_eq!(kernel.read_u64_object(msg.payload), Some(15));
+    let msg = kernel.mailbox_entries(requester).unwrap().front().unwrap();
+    assert_eq!(kernel.read_u64_object(requester, msg.payload), Some(15));
 
     // Three children (moves 7,14,21) plus requester, expand, all terminated.
-    assert_eq!(kernel.processes.len(), 5);
+    assert_eq!(kernel.process_count(), 5);
 }
 
 #[test]
@@ -42,7 +41,7 @@ fn expand_visits_expected_events_in_order() {
     let (kernel, _expand, _requester) = run_expand(3);
 
     // Reconstruct the phase sequence from the trace.
-    let kinds: Vec<EventKind> = kernel.trace.iter().map(|t| t.event_kind).collect();
+    let kinds: Vec<EventKind> = kernel.trace_events().iter().map(|t| t.event_kind).collect();
     assert!(kinds.contains(&EventKind::ProcessCreated));
     assert!(kinds.contains(&EventKind::MessageReceived), "resume_0 receives the request");
     assert!(kinds.contains(&EventKind::ContinuationWaiting), "resume_0 awaits the heuristic future");
@@ -53,12 +52,12 @@ fn expand_visits_expected_events_in_order() {
 
     // The reply must be sent after the future is resolved.
     let pos_future = kernel
-        .trace
+        .trace_events()
         .iter()
         .position(|t| t.event_kind == EventKind::FutureResolved)
         .unwrap();
     let pos_send = kernel
-        .trace
+        .trace_events()
         .iter()
         .position(|t| t.event_kind == EventKind::MessageSent)
         .unwrap();
@@ -76,9 +75,8 @@ fn expand_is_deterministic() {
 fn expand_reply_value_tracks_input() {
     let (kernel, _expand, requester) = run_expand(100);
     assert_eq!(kernel.mailbox_len(requester), 1);
-    let mb = kernel.mailboxes.get(&requester.slot).unwrap();
-    let msg = mb.entries.front().unwrap();
-    assert_eq!(kernel.read_u64_object(msg.payload), Some(201));
+    let msg = kernel.mailbox_entries(requester).unwrap().front().unwrap();
+    assert_eq!(kernel.read_u64_object(requester, msg.payload), Some(201));
     assert!(event_count(&kernel) > 0);
     assert!(!summarize(&kernel).is_empty());
     assert!(events_of(&kernel, EventKind::FutureResolved).count() >= 1);

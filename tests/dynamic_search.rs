@@ -22,8 +22,8 @@ fn search_visits_expected_number_of_processes() {
     assert_eq!(kernel.total_pending(), knobs.process_count as usize);
     kernel.run_to_quiescence(100_000);
 
-    assert_eq!(kernel.processes.len() as u64, expected);
-    assert_eq!(kernel.continuations.len() as u64, expected);
+    assert_eq!(kernel.process_count() as u64, expected);
+    assert_eq!(kernel.continuation_count() as u64, expected);
     // Every node terminated; the search reached quiescence.
     assert_eq!(kernel.total_pending(), 0);
 }

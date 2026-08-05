@@ -210,10 +210,10 @@ fn both_modes_execute_exactly_the_same_work() {
     let expected = knobs.node_count();
     for mode in [SchedulingMode::PersistentFifo, SchedulingMode::RunClassBins] {
         let mut kernel = Kernel::with_mode(mode);
-        kernel.cohort_width = 16;
+        kernel.configure_cohorts(16, Default::default());
         let mut kernel = build_in(kernel, &knobs);
         kernel.run_to_quiescence(100_000);
-        assert_eq!(kernel.processes.len() as u64, expected, "{mode:?}");
+        assert_eq!(kernel.process_count() as u64, expected, "{mode:?}");
         assert_eq!(kernel.total_pending(), 0, "{mode:?}");
     }
 }
@@ -233,7 +233,7 @@ fn cohorted_execution_is_deterministic_and_traced() {
     let mut kernels = Vec::new();
     for _ in 0..2 {
         let mut kernel = Kernel::with_mode(SchedulingMode::RunClassBins);
-        kernel.cohort_width = 8;
+        kernel.configure_cohorts(8, Default::default());
         let mut kernel = build_in(kernel, &knobs);
         kernel.run_to_quiescence(100_000);
         kernels.push(kernel);
@@ -247,7 +247,7 @@ fn cohorted_execution_is_deterministic_and_traced() {
     let cohort_events: Vec<_> = events_of(kernel, EventKind::CohortCreated).collect();
     assert_eq!(
         cohort_events.len() as u64,
-        kernel.accounting.cohorts,
+        kernel.accounting().cohorts,
         "every dispatch emits exactly one CohortCreated event (§21)"
     );
     assert!(
@@ -266,12 +266,12 @@ fn width_one_cohorting_reduces_to_scalar_execution() {
     let mut kernel = build_in(Kernel::new(), &knobs);
     kernel.run_to_quiescence(100_000);
 
-    assert_eq!(kernel.cohort_width, 1);
-    assert_eq!(kernel.accounting.idle_lane_slots, 0);
+    assert_eq!(kernel.cohort_width(), 1);
+    assert_eq!(kernel.accounting().idle_lane_slots, 0);
     assert_eq!(
-        kernel.accounting.lane_slots,
-        kernel.accounting.useful_lane_slots
+        kernel.accounting().lane_slots,
+        kernel.accounting().useful_lane_slots
     );
-    assert!((kernel.accounting.lane_occupancy() - 1.0).abs() < 1e-9);
-    assert!((kernel.accounting.cohort_fill_ratio() - 1.0).abs() < 1e-9);
+    assert!((kernel.accounting().lane_occupancy() - 1.0).abs() < 1e-9);
+    assert!((kernel.accounting().cohort_fill_ratio() - 1.0).abs() < 1e-9);
 }

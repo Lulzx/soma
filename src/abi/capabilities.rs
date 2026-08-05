@@ -6,6 +6,8 @@ use super::AbiHeader;
 /// Phase-1 rights (§5).
 #[allow(non_snake_case)]
 pub mod Rights {
+    use crate::abi::Kind;
+
     pub const READ: u32 = 1 << 0;
     pub const WRITE: u32 = 1 << 1;
     pub const FREEZE: u32 = 1 << 2;
@@ -18,6 +20,19 @@ pub mod Rights {
 
     /// All Phase-1 rights.
     pub const ALL: u32 = READ | WRITE | FREEZE | TRANSFER | SEND | RECEIVE | RESOLVE | AWAIT | DESTROY;
+
+    /// Rights meaningful for each implemented target kind.
+    pub const fn for_target(kind: Kind) -> u32 {
+        match kind {
+            Kind::Object => READ | WRITE | FREEZE | TRANSFER | DESTROY,
+            Kind::Process => READ | WRITE | SEND | RECEIVE | TRANSFER | DESTROY,
+            Kind::Continuation => TRANSFER | DESTROY,
+            Kind::Future => RESOLVE | AWAIT | TRANSFER | DESTROY,
+            Kind::Capability => TRANSFER | DESTROY,
+            Kind::Channel => SEND | RECEIVE | TRANSFER | DESTROY,
+            _ => DESTROY,
+        }
+    }
 }
 
 /// Phase-1 ownership modes (§5).
@@ -36,7 +51,7 @@ pub enum OwnershipMode {
 pub struct CapabilityEntry {
     pub header: AbiHeader,
 
-    pub object: Ref64,
+    pub target: Ref64,
 
     pub offset: u64,
     pub length: u64,
@@ -52,10 +67,10 @@ pub struct CapabilityEntry {
 }
 
 impl CapabilityEntry {
-    pub fn new(object: Ref64, rights: u32) -> CapabilityEntry {
+    pub fn new(target: Ref64, rights: u32) -> CapabilityEntry {
         CapabilityEntry {
             header: AbiHeader::new(4, std::mem::size_of::<CapabilityEntry>() as u32),
-            object,
+            target,
             offset: 0,
             length: 0,
             rights,

@@ -6,6 +6,8 @@ pub mod accounting;
 pub mod commit;
 pub mod epochs;
 pub mod ownership;
+#[doc(hidden)]
+pub mod raw;
 
 use std::collections::{HashMap, VecDeque};
 
@@ -28,7 +30,13 @@ pub enum RuntimeError {
     MailboxFull,
     AlreadyResolved,
     NotResolved,
+    MissingCapabilitySpace,
+    InvalidCapabilityDerivation,
+    AuthorityDenied,
 }
+
+/// Explicit principal used when the abstract machine itself performs an action.
+pub const SYSTEM_PRINCIPAL: Ref64 = Ref64::NULL;
 
 impl From<AbiError> for RuntimeError {
     fn from(e: AbiError) -> Self {
@@ -92,39 +100,49 @@ pub struct TraceSnapshotRow {
 
 /// The whole kernel state: every table, the object payloads, mailboxes, the
 /// scheduler, and the deterministic event trace (§21).
+///
+/// Kernel storage is intentionally private; safe callers can only change it
+/// through the operations below.
+///
+/// ```compile_fail
+/// let kernel = soma::kernel::Kernel::new();
+/// let _ = kernel.objects;
+/// ```
 #[derive(Debug)]
 pub struct Kernel {
-    pub epoch: u32,
-    pub logical_time: u64,
-    pub trace: Vec<TraceEvent>,
+    epoch: u32,
+    logical_time: u64,
+    trace: Vec<TraceEvent>,
     /// Total runnable continuations at the end of each epoch, for accounting.
-    pub epoch_runnable: Vec<usize>,
+    epoch_runnable: Vec<usize>,
 
-    pub processes: GenTable<ProcessDescriptor>,
-    pub objects: GenTable<ObjectDescriptor>,
-    pub capabilities: GenTable<CapabilityEntry>,
-    pub continuations: crate::table::GenTable<crate::abi::continuations::ContinuationDescriptor>,
-    pub futures: GenTable<FutureDescriptor>,
+    processes: GenTable<ProcessDescriptor>,
+    objects: GenTable<ObjectDescriptor>,
+    /// Capability references are relative to the acting process. Slot zero is
+    /// the explicit system principal.
+    capability_spaces: HashMap<u32, GenTable<CapabilityEntry>>,
+    continuations: crate::table::GenTable<crate::abi::continuations::ContinuationDescriptor>,
+    futures: GenTable<FutureDescriptor>,
 
     /// Object payload bytes, keyed by object slot. Kernel-private (§6: user
     /// programs cannot inspect or construct the physical mapping).
-    pub object_payloads: HashMap<u32, Vec<u8>>,
+    object_payloads: HashMap<u32, Vec<u8>>,
     /// Mailboxes keyed by process slot.
-    pub mailboxes: HashMap<u32, Mailbox>,
+    mailboxes: HashMap<u32, Mailbox>,
     /// Future waiters keyed by future slot.
-    pub future_waiters: HashMap<u32, Vec<Ref64>>,
+    future_waiters: HashMap<u32, Vec<Ref64>>,
     /// Per (sender, receiver) pair, the next `sender_sequence` value (§11).
-    pub send_sequences: HashMap<(u32, u32), u64>,
+    send_sequences: HashMap<(u32, u32), u64>,
 
-    pub scheduler: Scheduler,
+    scheduler: Scheduler,
 
     /// SIMD lanes per dispatch (§14). The default of 1 makes every cohort a
     /// single lane, which is exactly scalar execution.
-    pub cohort_width: u16,
+    cohort_width: u16,
     /// What to do with a run class's final, incompletely filled cohort (§14).
-    pub partial_policy: PartialCohortPolicy,
+    partial_policy: PartialCohortPolicy,
     /// Cumulative counters for the §27 measurements.
-    pub accounting: Accounting,
+    accounting: Accounting,
 }
 
 impl Kernel {
@@ -146,7 +164,7 @@ impl Kernel {
             epoch_runnable: Vec::new(),
             processes: GenTable::new(Kind::Process),
             objects: GenTable::new(Kind::Object),
-            capabilities: GenTable::new(Kind::Capability),
+            capability_spaces: HashMap::from([(0, GenTable::new(Kind::Capability))]),
             continuations: GenTable::new(Kind::Continuation),
             futures: GenTable::new(Kind::Future),
             object_payloads: HashMap::new(),
@@ -160,10 +178,101 @@ impl Kernel {
         }
     }
 
+    // ---- configuration and observation ---------------------------------
+
+    /// Configure the lane width and partial-cohort policy used by dispatch.
+    pub fn configure_cohorts(&mut self, width: u16, policy: PartialCohortPolicy) {
+        self.cohort_width = width;
+        self.partial_policy = policy;
+    }
+
+    pub fn cohort_width(&self) -> u16 {
+        self.cohort_width
+    }
+
+    pub fn accounting(&self) -> &Accounting {
+        &self.accounting
+    }
+
+    pub fn process_count(&self) -> usize {
+        self.processes.len()
+    }
+
+    pub fn continuation_count(&self) -> usize {
+        self.continuations.len()
+    }
+
+    pub fn capability_count(&self) -> usize {
+        self.capability_spaces.values().map(GenTable::len).sum()
+    }
+
+    pub fn capability_table_kind(&self) -> Kind {
+        Kind::Capability
+    }
+
+    pub fn mailbox_entries(&self, process: Ref64) -> Option<&VecDeque<MessageDescriptor>> {
+        self.mailboxes.get(&process.slot).map(|mailbox| &mailbox.entries)
+    }
+
+    pub fn mailbox_full_waiter_count(&self, process: Ref64) -> usize {
+        self.mailboxes
+            .get(&process.slot)
+            .map(|mailbox| mailbox.full_waiters.len())
+            .unwrap_or(0)
+    }
+
+    pub fn mailbox_first_full_waiter(&self, process: Ref64) -> Option<Ref64> {
+        self.mailboxes
+            .get(&process.slot)
+            .and_then(|mailbox| mailbox.full_waiters.front().copied())
+    }
+
+    pub fn trace_events(&self) -> &[TraceEvent] {
+        &self.trace
+    }
+
+    pub(crate) fn epoch_number(&self) -> u32 {
+        self.epoch
+    }
+
+    pub(crate) fn processes(&self) -> &GenTable<ProcessDescriptor> {
+        &self.processes
+    }
+
+    pub(crate) fn objects(&self) -> &GenTable<ObjectDescriptor> {
+        &self.objects
+    }
+
+    pub(crate) fn capability_spaces(&self) -> &HashMap<u32, GenTable<CapabilityEntry>> {
+        &self.capability_spaces
+    }
+
+    pub(crate) fn continuations(
+        &self,
+    ) -> &GenTable<crate::abi::continuations::ContinuationDescriptor> {
+        &self.continuations
+    }
+
+    pub(crate) fn futures(&self) -> &GenTable<FutureDescriptor> {
+        &self.futures
+    }
+
+    pub(crate) fn mailboxes(&self) -> &HashMap<u32, Mailbox> {
+        &self.mailboxes
+    }
+
+    pub(crate) fn future_waiters(&self) -> &HashMap<u32, Vec<Ref64>> {
+        &self.future_waiters
+    }
+
+    pub(crate) fn scheduler(&self) -> &Scheduler {
+        &self.scheduler
+    }
+
     // ---- trace -----------------------------------------------------------
 
     /// Append a trace event, advancing the logical clock deterministically.
-    pub fn trace(
+    fn trace(
         &mut self,
         event_kind: EventKind,
         process: Ref64,
@@ -209,17 +318,153 @@ impl Kernel {
 
     // ---- objects ---------------------------------------------------------
 
-    pub fn create_object(&mut self, kind: ObjectKind, bytes: Vec<u8>) -> Ref64 {
+    pub fn create_object(&mut self, actor: Ref64, kind: ObjectKind, bytes: Vec<u8>) -> Ref64 {
+        self.create_object_for(actor, kind, bytes)
+    }
+
+    fn create_object_for(&mut self, actor: Ref64, kind: ObjectKind, bytes: Vec<u8>) -> Ref64 {
         let r = self.objects.alloc(ObjectDescriptor::new(kind, bytes.len() as u64));
+        let byte_length = bytes.len() as u64;
         self.object_payloads.insert(r.slot, bytes);
         {
             let o = self.objects.get_mut(r).expect("fresh object");
             o.id = r;
         }
+        self.mint_genesis(actor, r, byte_length, 0);
         r
     }
 
-    pub fn object_bytes(&self, obj: Ref64) -> Result<&[u8], RuntimeError> {
+    // ---- capabilities ----------------------------------------------------
+
+    fn mint_genesis(
+        &mut self,
+        actor: Ref64,
+        target: Ref64,
+        length: u64,
+        object_version: u32,
+    ) -> Ref64 {
+        let mut entry = CapabilityEntry::new(target, crate::abi::Rights::for_target(target.kind));
+        entry.length = length;
+        entry.object_version = object_version;
+        self.capability_spaces
+            .entry(actor.slot)
+            .or_insert_with(|| GenTable::new(Kind::Capability))
+            .alloc(entry)
+    }
+
+    /// Derive weaker authority in `actor`'s capability space.
+    pub fn derive_capability(
+        &mut self,
+        actor: Ref64,
+        parent: Ref64,
+        rights: u32,
+        offset: u64,
+        length: u64,
+    ) -> Result<Ref64, RuntimeError> {
+        let space = self
+            .capability_spaces
+            .get_mut(&actor.slot)
+            .ok_or(RuntimeError::MissingCapabilitySpace)?;
+        let parent_entry = space.get(parent)?.clone();
+        let child_end = offset
+            .checked_add(length)
+            .ok_or(RuntimeError::InvalidCapabilityDerivation)?;
+        let parent_end = parent_entry
+            .offset
+            .checked_add(parent_entry.length)
+            .ok_or(RuntimeError::InvalidCapabilityDerivation)?;
+        if rights & !parent_entry.rights != 0
+            || offset < parent_entry.offset
+            || child_end > parent_end
+        {
+            return Err(RuntimeError::InvalidCapabilityDerivation);
+        }
+
+        let mut child = parent_entry;
+        child.rights = rights;
+        child.offset = offset;
+        child.length = length;
+        child.parent_capability = parent;
+        Ok(space.alloc(child))
+    }
+
+    /// Find a capability in an actor-relative space by target and required rights.
+    pub fn find_capability(&self, actor: Ref64, target: Ref64, rights: u32) -> Option<Ref64> {
+        self.capability_spaces.get(&actor.slot)?.iter().find_map(|(r, cap)| {
+            (cap.target == target && cap.rights & rights == rights).then_some(r)
+        })
+    }
+
+    pub fn capability_entry(
+        &self,
+        actor: Ref64,
+        capability: Ref64,
+    ) -> Result<&CapabilityEntry, RuntimeError> {
+        self.capability_spaces
+            .get(&actor.slot)
+            .ok_or(RuntimeError::MissingCapabilitySpace)?
+            .get(capability)
+            .map_err(RuntimeError::from)
+    }
+
+    /// Central authority gate. Enforcement is landing one right at a time;
+    /// WRITE is the first enabled right and all others remain permissive.
+    fn authorize(&self, actor: Ref64, right: u32, target: Ref64) -> Result<(), RuntimeError> {
+        if actor == SYSTEM_PRINCIPAL || right != crate::abi::Rights::WRITE {
+            return Ok(());
+        }
+        let Some(space) = self.capability_spaces.get(&actor.slot) else {
+            return Err(RuntimeError::AuthorityDenied);
+        };
+        let object_metadata = if target.kind == Kind::Object {
+            self.objects
+                .get(target)
+                .map(|object| (object.version, object.byte_length))
+                .ok()
+        } else {
+            None
+        };
+        let granted = space.iter().any(|(capability_ref, capability)| {
+            capability.target == target
+                && capability.rights & right == right
+                && capability.valid_until_epoch >= self.epoch
+                && Self::capability_chain_is_live(space, capability_ref)
+                && object_metadata
+                    .map(|(version, byte_length)| {
+                        capability.object_version == version
+                            && capability.offset == 0
+                            && capability.length >= byte_length
+                    })
+                    .unwrap_or(true)
+        });
+        if granted {
+            Ok(())
+        } else {
+            Err(RuntimeError::AuthorityDenied)
+        }
+    }
+
+    fn capability_chain_is_live(
+        space: &GenTable<CapabilityEntry>,
+        capability: Ref64,
+    ) -> bool {
+        let mut current = capability;
+        // More parent edges than live entries implies a cycle. The bound also
+        // makes corrupted raw-test states terminate deterministically.
+        for _ in 0..=space.len() {
+            let Ok(entry) = space.get(current) else {
+                return false;
+            };
+            if entry.parent_capability.is_null() {
+                return true;
+            }
+            current = entry.parent_capability;
+        }
+        false
+    }
+
+    pub fn object_bytes(&self, actor: Ref64, obj: Ref64) -> Result<&[u8], RuntimeError> {
+        self.authorize(actor, crate::abi::Rights::READ, obj)?;
         let _ = self.objects.get(obj)?;
         self.object_payloads
             .get(&obj.slot)
@@ -227,7 +472,12 @@ impl Kernel {
             .ok_or(RuntimeError::MissingPayload)
     }
 
-    pub fn object_bytes_mut(&mut self, obj: Ref64) -> Result<&mut Vec<u8>, RuntimeError> {
+    pub fn object_bytes_mut(
+        &mut self,
+        actor: Ref64,
+        obj: Ref64,
+    ) -> Result<&mut Vec<u8>, RuntimeError> {
+        self.authorize(actor, crate::abi::Rights::WRITE, obj)?;
         let _ = self.objects.get(obj)?;
         self.object_payloads
             .get_mut(&obj.slot)
@@ -235,8 +485,8 @@ impl Kernel {
     }
 
     /// Read the first 8 bytes of an object's payload as a little-endian u64.
-    pub fn read_u64_object(&self, obj: Ref64) -> Option<u64> {
-        let b = self.object_bytes(obj).ok()?;
+    pub fn read_u64_object(&self, actor: Ref64, obj: Ref64) -> Option<u64> {
+        let b = self.object_bytes(actor, obj).ok()?;
         if b.len() < 8 {
             return None;
         }
@@ -246,9 +496,14 @@ impl Kernel {
 
     // ---- processes -------------------------------------------------------
 
-    pub fn create_process(&mut self, mode: ProcessMode) -> Ref64 {
+    pub fn create_process(&mut self, actor: Ref64, mode: ProcessMode) -> Ref64 {
         let r = self.processes.alloc(ProcessDescriptor::new(mode));
-        let state_obj = self.create_object(ObjectKind::ProcessState, Vec::new());
+        self.capability_spaces.insert(r.slot, GenTable::new(Kind::Capability));
+        self.mint_genesis(r, r, 0, 0);
+        let state_obj = self.create_object_for(r, ObjectKind::ProcessState, Vec::new());
+        if actor != r {
+            self.mint_genesis(actor, r, 0, 0);
+        }
         self.mailboxes.insert(r.slot, Mailbox::new(8));
         {
             let p = self.processes.get_mut(r).expect("fresh process");
@@ -282,13 +537,16 @@ impl Kernel {
     /// its run-class bin. The child is scheduled for the next epoch.
     pub fn create_continuation(
         &mut self,
+        actor: Ref64,
         process: Ref64,
         run_class: u32,
         resume_point: u32,
         frame_bytes: Vec<u8>,
         max_steps: u32,
     ) -> Ref64 {
-        let frame_obj = self.create_object(ObjectKind::ContinuationFrame, frame_bytes);
+        self.authorize(actor, crate::abi::Rights::WRITE, process)
+            .expect("permissive authorization gate");
+        let frame_obj = self.create_object_for(process, ObjectKind::ContinuationFrame, frame_bytes);
         let r = self.continuations.alloc(
             crate::abi::continuations::ContinuationDescriptor::new(process, run_class, resume_point),
         );
@@ -301,6 +559,7 @@ impl Kernel {
             c.created_epoch = self.epoch;
         }
         self.scheduler.enqueue(run_class, r);
+        self.mint_genesis(process, r, 0, 0);
         self.trace(EventKind::ContinuationReady, process, r, run_class, 0);
         r
     }
@@ -315,13 +574,14 @@ impl Kernel {
 
     // ---- futures ---------------------------------------------------------
 
-    pub fn create_future(&mut self) -> Ref64 {
+    pub fn create_future(&mut self, actor: Ref64) -> Ref64 {
         let r = self.futures.alloc(FutureDescriptor::new());
         {
             let f = self.futures.get_mut(r).expect("fresh future");
             f.id = r;
             f.owner_domain = r;
         }
+        self.mint_genesis(actor, r, 0, 0);
         r
     }
 
@@ -334,10 +594,12 @@ impl Kernel {
     /// never revisit it.
     pub fn await_future(
         &mut self,
+        actor: Ref64,
         cont: Ref64,
         future: Ref64,
         next_run_class: u32,
     ) -> Result<AwaitOutcome, RuntimeError> {
+        self.authorize(actor, crate::abi::Rights::AWAIT, future)?;
         let resolved = self.futures.get(future)?.state != FutureState::Pending;
         {
             let c = self.continuations.get_mut(cont)?;
@@ -358,7 +620,13 @@ impl Kernel {
 
     /// Single-assignment resolution of a future: publish the value, then wake
     /// every waiter into its (next) run-class bin (§12, §19).
-    pub fn resolve_future(&mut self, future: Ref64, value: Ref64) -> Result<(), RuntimeError> {
+    pub fn resolve_future(
+        &mut self,
+        actor: Ref64,
+        future: Ref64,
+        value: Ref64,
+    ) -> Result<(), RuntimeError> {
+        self.authorize(actor, crate::abi::Rights::RESOLVE, future)?;
         {
             let f = self.futures.get_mut(future)?;
             if f.state != FutureState::Pending {
@@ -405,23 +673,26 @@ impl Kernel {
     /// `full_waiter` and returns `MailboxFull` (the sender does not spin, §11).
     pub fn enqueue_message(
         &mut self,
-        sender: Ref64,
+        actor: Ref64,
         receiver: Ref64,
         payload: Ref64,
         sender_cont: Ref64,
     ) -> Result<(), RuntimeError> {
-        self.push_message(sender, receiver, payload, sender_cont, true)
+        self.authorize(actor, crate::abi::Rights::SEND, receiver)?;
+        self.push_message(actor, receiver, payload, sender_cont, true)
     }
 
     /// Deliver an externally-ingested message (§18 Phase A: external messages)
     /// without a `MessageSent` trace — it is an input, not a send.
     pub fn ingest_message(
         &mut self,
+        actor: Ref64,
         sender: Ref64,
         receiver: Ref64,
         payload: Ref64,
         sender_cont: Ref64,
     ) -> Result<(), RuntimeError> {
+        debug_assert_eq!(actor, SYSTEM_PRINCIPAL);
         self.push_message(sender, receiver, payload, sender_cont, false)
     }
 
@@ -483,8 +754,13 @@ impl Kernel {
     /// Pop the next message for `cont`'s process, waking a `full_waiter` if
     /// capacity frees. Returns `Ok(None)` after registering `cont` as a receiver
     /// waiter (the caller should await).
-    pub fn receive_message(&mut self, cont: Ref64) -> Result<Option<MessageDescriptor>, RuntimeError> {
+    pub fn receive_message(
+        &mut self,
+        actor: Ref64,
+        cont: Ref64,
+    ) -> Result<Option<MessageDescriptor>, RuntimeError> {
         let process = self.continuations.get(cont)?.process;
+        self.authorize(actor, crate::abi::Rights::RECEIVE, process)?;
         let mailbox = self
             .mailboxes
             .get_mut(&process.slot)

@@ -182,19 +182,24 @@ impl Frame for HeuristicFrame {
 /// Returns `(expand_process, requester_process)`.
 pub fn create_expand(kernel: &mut Kernel, request_value: u64) -> (Ref64, Ref64) {
     // Requester: an empty process that will receive the reply message.
-    let requester = kernel.create_process(ProcessMode::Serial);
+    let requester = kernel.create_process(crate::kernel::SYSTEM_PRINCIPAL, ProcessMode::Serial);
 
     // Search process.
-    let expand = kernel.create_process(ProcessMode::Serial);
+    let expand = kernel.create_process(crate::kernel::SYSTEM_PRINCIPAL, ProcessMode::Serial);
 
     // Payload object for the ExpandRequest message.
-    let payload = kernel.create_object(ObjectKind::MessagePayload, request_value.to_le_bytes().to_vec());
+    let payload = kernel.create_object(
+        crate::kernel::SYSTEM_PRINCIPAL,
+        ObjectKind::MessagePayload,
+        request_value.to_le_bytes().to_vec(),
+    );
 
     // Initial continuation (resume_0) with its frame.
     let frame = ExpandFrame::initial(request_value, requester);
     let mut bytes = Vec::new();
     frame.encode(&mut bytes);
     let cont = kernel.create_continuation(
+        crate::kernel::SYSTEM_PRINCIPAL,
         expand,
         EXPAND_RESUME_0,
         EXPAND_RESUME_0,
@@ -205,7 +210,13 @@ pub fn create_expand(kernel: &mut Kernel, request_value: u64) -> (Ref64, Ref64) 
     // Ingest the request message into the search process's mailbox (§18 Phase A).
     // This wakes resume_0 if it is already waiting; otherwise it is consumed on
     // the next receive.
-    let _ = kernel.ingest_message(requester, expand, payload, cont);
+    let _ = kernel.ingest_message(
+        crate::kernel::SYSTEM_PRINCIPAL,
+        requester,
+        expand,
+        payload,
+        cont,
+    );
 
     (expand, requester)
 }
