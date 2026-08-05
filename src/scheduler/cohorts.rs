@@ -40,6 +40,63 @@ impl CohortPlan {
     }
 }
 
+/// The dispatch cost of a sequence of run classes, independent of what is being
+/// dispatched.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DispatchCost {
+    pub dispatches: u64,
+    pub lane_slots: u64,
+    pub useful_lane_slots: u64,
+    pub full_dispatches: u64,
+}
+
+impl DispatchCost {
+    pub fn occupancy(&self) -> f64 {
+        if self.lane_slots == 0 {
+            return 0.0;
+        }
+        self.useful_lane_slots as f64 / self.lane_slots as f64
+    }
+
+    pub fn fill_ratio(&self) -> f64 {
+        if self.dispatches == 0 {
+            return 0.0;
+        }
+        self.full_dispatches as f64 / self.dispatches as f64
+    }
+}
+
+/// Cost of dispatching work whose run classes are `run_classes`, in that order,
+/// cut into width-`W` lane groups under the `RunPartial` policy.
+///
+/// This exists so the SOMA scheduler and the hand-written bulk-frontier baseline
+/// are scored by exactly the same divergence model — a baseline scored more
+/// harshly than the system under test is not a baseline. `dispatch_cost_matches_
+/// build_cohorts` in the cohorting suite pins the two to each other.
+pub fn dispatch_cost(run_classes: &[u32], width: u16) -> DispatchCost {
+    let group = (width.max(1) as usize).min(crate::abi::cohorts::MAX_COHORT_WIDTH);
+    let mut cost = DispatchCost::default();
+
+    for lane_group in run_classes.chunks(group) {
+        let mut classes: Vec<u32> = Vec::new();
+        for rc in lane_group {
+            if !classes.contains(rc) {
+                classes.push(*rc);
+            }
+        }
+        for rc in classes {
+            let active = lane_group.iter().filter(|c| **c == rc).count() as u64;
+            cost.dispatches += 1;
+            cost.lane_slots += group as u64;
+            cost.useful_lane_slots += active;
+            if active == group as u64 {
+                cost.full_dispatches += 1;
+            }
+        }
+    }
+    cost
+}
+
 /// Partition one bin's `lanes` — `(continuation, run_class)` pairs in bin order
 /// — into cohorts of `width`.
 ///

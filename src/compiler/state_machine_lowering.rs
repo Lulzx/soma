@@ -105,6 +105,24 @@ pub struct SearchFrame {
     pub class_count: u32,
 }
 
+/// The arithmetic one search node performs (§25.1's "state duration" knob).
+///
+/// Shared verbatim by the continuation interpreter and the bulk-frontier
+/// baseline. Any comparison between them is only meaningful if both compute the
+/// same thing, so both call this rather than reimplementing it.
+///
+/// `class_index` selects the constants, which is what makes the search run
+/// classes genuinely distinct code paths rather than labels on one handler.
+pub fn search_step(value: u64, work_iters: u32, class_index: u32) -> u64 {
+    let multiplier = 31u64.wrapping_add(class_index as u64 * 2);
+    let addend = 7u64.wrapping_add(class_index as u64);
+    let mut acc = value;
+    for _ in 0..work_iters {
+        acc = acc.wrapping_mul(multiplier).wrapping_add(addend);
+    }
+    acc
+}
+
 impl SearchFrame {
     /// A single node with no children, confined to one run class.
     pub fn leaf(value: u64, work_iters: u32) -> SearchFrame {

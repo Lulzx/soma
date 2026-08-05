@@ -18,7 +18,7 @@ use crate::compiler::run_classes::{
     SEARCH_BRANCH, SEARCH_HEURISTIC,
 };
 use crate::compiler::state_machine_lowering::{
-    ExpandFrame, HeuristicFrame, SearchFrame,
+    search_step, ExpandFrame, HeuristicFrame, SearchFrame,
 };
 use crate::kernel::{AwaitOutcome, Kernel, RuntimeError};
 
@@ -208,13 +208,7 @@ fn search_branch(kernel: &mut Kernel, cont: Ref64, process: Ref64, index: u32) -
         },
     );
 
-    let multiplier = 31u64.wrapping_add(index as u64 * 2);
-    let addend = 7u64.wrapping_add(index as u64);
-    let mut acc = sf.value;
-    for _ in 0..sf.work_iters {
-        acc = acc.wrapping_mul(multiplier).wrapping_add(addend);
-    }
-    sf.value = acc;
+    sf.value = search_step(sf.value, sf.work_iters, index);
 
     if sf.depth > 0 {
         for i in 0..sf.branching {

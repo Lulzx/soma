@@ -22,6 +22,7 @@
 //! the hypothesis, not evidence that it holds.
 
 use crate::abi::cohorts::PartialCohortPolicy;
+use crate::experiments::bulk_frontier::{self, BulkFrontierRun};
 use crate::experiments::dynamic_search::{build_in, ControlKnobs};
 use crate::kernel::accounting::Accounting;
 use crate::kernel::Kernel;
@@ -121,6 +122,59 @@ pub fn compare(knobs: &ControlKnobs, cohort_width: u16) -> Comparison {
     }
 }
 
+/// SOMA against both required baselines (§26).
+#[derive(Clone, Copy, Debug)]
+pub struct Baselines {
+    pub fifo: StudyRun,
+    pub cohorted: StudyRun,
+    /// The naive manual batch: one kernel over the frontier, mixed classes.
+    pub bulk_unsorted: BulkFrontierRun,
+    /// The strong manual batch: the host partitions each frontier by run class
+    /// before dispatching it.
+    pub bulk_sorted: BulkFrontierRun,
+}
+
+impl Baselines {
+    /// §28.3: on work already well suited to bulk execution, SOMA must stay
+    /// within 15% of the manually batched implementation. Measured in
+    /// dispatches, the only currency Phase 1 can compare without a real clock.
+    pub fn within_bulk_tolerance(&self) -> bool {
+        let bulk = self.bulk_sorted.dispatches();
+        if bulk == 0 {
+            return false;
+        }
+        self.cohorted.dispatches() as f64 <= bulk as f64 * 1.15
+    }
+
+    /// How SOMA's dispatch count compares to the strong manual batch. Above 1.0
+    /// means SOMA issues more dispatches than a hand-written frontier kernel.
+    pub fn dispatch_ratio_vs_bulk(&self) -> f64 {
+        let bulk = self.bulk_sorted.dispatches();
+        if bulk == 0 {
+            return 0.0;
+        }
+        self.cohorted.dispatches() as f64 / bulk as f64
+    }
+
+    /// §28.4: host round-trips the baseline needs and SOMA does not. SOMA's
+    /// epoch loop is device-resident by design, so the host submits nothing per
+    /// operation; the bulk frontier needs one launch per level.
+    pub fn host_launches_avoided(&self) -> u64 {
+        self.bulk_sorted.host_launches
+    }
+}
+
+/// Run SOMA both ways and both baselines on one workload.
+pub fn baselines(knobs: &ControlKnobs, cohort_width: u16) -> Baselines {
+    let c = compare(knobs, cohort_width);
+    Baselines {
+        fifo: c.fifo,
+        cohorted: c.cohorted,
+        bulk_unsorted: bulk_frontier::run(knobs, cohort_width, false),
+        bulk_sorted: bulk_frontier::run(knobs, cohort_width, true),
+    }
+}
+
 /// A human-readable report of the comparison, for `cargo run --example` style
 /// inspection and for pasting into the measurement log.
 pub fn report(knobs: &ControlKnobs, cohort_width: u16) -> String {
@@ -151,6 +205,58 @@ pub fn report(knobs: &ControlKnobs, cohort_width: u16) -> String {
             "meets 28.1 occupancy limb"
         } else {
             "below 28.1 occupancy limb"
+        }
+    ));
+    s
+}
+
+/// The full §26 baseline table for one workload.
+pub fn baseline_report(knobs: &ControlKnobs, cohort_width: u16) -> String {
+    let b = baselines(knobs, cohort_width);
+    let mut s = String::new();
+    s.push_str(&format!(
+        "branching={} depth={} roots={} classes={} width={}\n",
+        knobs.branching_factor,
+        knobs.depth,
+        knobs.process_count,
+        knobs.class_count,
+        cohort_width
+    ));
+    s.push_str(&format!(
+        "  {:<22} dispatches={:<7} occupancy={:.3}  host_launches={}\n",
+        "soma/persistent-fifo",
+        b.fifo.dispatches(),
+        b.fifo.lane_occupancy(),
+        0
+    ));
+    s.push_str(&format!(
+        "  {:<22} dispatches={:<7} occupancy={:.3}  host_launches={}\n",
+        "soma/run-class",
+        b.cohorted.dispatches(),
+        b.cohorted.lane_occupancy(),
+        0
+    ));
+    s.push_str(&format!(
+        "  {:<22} dispatches={:<7} occupancy={:.3}  host_launches={}\n",
+        "bulk-frontier/naive",
+        b.bulk_unsorted.dispatches(),
+        b.bulk_unsorted.lane_occupancy(),
+        b.bulk_unsorted.host_launches
+    ));
+    s.push_str(&format!(
+        "  {:<22} dispatches={:<7} occupancy={:.3}  host_launches={}\n",
+        "bulk-frontier/sorted",
+        b.bulk_sorted.dispatches(),
+        b.bulk_sorted.lane_occupancy(),
+        b.bulk_sorted.host_launches
+    ));
+    s.push_str(&format!(
+        "  soma/bulk-sorted dispatch ratio {:.2}x  [{}]\n",
+        b.dispatch_ratio_vs_bulk(),
+        if b.within_bulk_tolerance() {
+            "within 28.3 15% tolerance"
+        } else {
+            "OUTSIDE 28.3 15% tolerance"
         }
     ));
     s
