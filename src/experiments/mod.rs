@@ -3,6 +3,7 @@
 pub mod ant_colony;
 pub mod ant_scoring;
 pub mod ant_trace;
+pub mod backend_bench;
 pub mod bulk_frontier;
 pub mod cohort_study;
 pub mod dynamic_search;
