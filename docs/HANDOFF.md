@@ -4,7 +4,7 @@ Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
 Repository: https://github.com/Lulzx/soma. About 7,200 lines of Rust, no
-dependencies, 98 tests, and no Clippy warnings.
+dependencies, 99 tests, and no Clippy warnings.
 
 ```sh
 cargo test
@@ -149,15 +149,16 @@ Authority is checked at operation, not at reference resolution, and the
 operation set is closed by making kernel state private so a bypass is a compile
 error. That note carries the full check surface, a staged implementation order
 where every step passes tests, and the two consequences it forced: object
-ownership is now defined entirely by capabilities, while failure still needs a
-recorded position on whether exported authority survives a faulted holder.
+ownership is defined entirely by capabilities, and exported authority survives
+the exporting holder's failure.
 
-Steps 1 through 7 are complete. Every right used by a reachable operation is
+All eight steps are complete. Every right used by a reachable operation is
 enforced, message sends delegate payload `READ` authority, parked `AWAIT`
 authority is rechecked on resume, and authority decisions/effects make I10c
 trace-checkable. Object ownership is derived from live capability holders; the
-advisory owner/mode/count fields are gone and I9 is subsumed by I10b. Step 8 is
-next: settle authority lifetime across process failure and update the spec.
+advisory owner/mode/count fields are gone and I9 is subsumed by I10b. A fault
+reclaims the failed process's local capability space, while exported roots in
+other spaces remain valid.
 
 ### 5.2 What does a process own? (spec §6.2)
 

@@ -266,7 +266,8 @@ COMMIT(c, p, result)
   Yield(n)      c.run_class := n; c.status := Runnable; c enqueued
   Await(t, n)   c.run_class := n; c.status := Waiting; NOT enqueued
   Send | Spawn  if next ≠ 0: continue as Yield; else as Complete
-  Fault         c.status := Faulted; p.status := Failed; failure count += 1
+  Fault         c.status := Faulted; p.status := Failed; failure count += 1;
+                reclaim p's local capability space
 ```
 
 A continuation becomes runnable or terminal *only* through this rule. That is
@@ -372,11 +373,15 @@ the answer, which is too coarse.
 
 ### 6.3 Unresolved: failure containment
 
-`Fault` marks a process failed and increments a counter. Nothing says what
-happens to its other continuations, its queued messages, its unresolved futures,
-or anyone awaiting them. A future whose resolver faults is never resolved, so
-its waiters wait forever. I14 does not catch this because those continuations
-are not runnable.
+One authority-lifetime rule is settled: `Fault` reclaims the failed process's
+local capability space, while capabilities already exported as roots into other
+spaces survive. Failure does not cause transitive revocation outside the failed
+holder.
+
+The rest remains unresolved. Nothing says what happens to the failed process's
+other continuations, queued messages, unresolved futures, or anyone awaiting
+them. A future whose resolver faults is never resolved, so its waiters wait
+forever. I14 does not catch this because those continuations are not runnable.
 
 ### 6.4 Unresolved: cancellation
 
@@ -387,20 +392,16 @@ them.
 
 ## 7. Remaining work
 
-1. **Capability failure lifetime.** I10 and capability-derived object ownership
-   are implemented. The remaining capability decision is whether exported
-   authority survives when the exporting process faults; see
-   [docs/SOMA-CAPABILITIES.md](SOMA-CAPABILITIES.md) §7.2.
-2. **Failure and cancellation (§6.3, §6.4).** Both need the answer to §6.2
+1. **Failure and cancellation (§6.3, §6.4).** Both need the answer to §6.2
    first.
-3. **Channels and collectives.** Currently vocabulary, not machinery.
-4. **Validation workloads** beyond the existing domain-neutral dynamic
+2. **Channels and collectives.** Currently vocabulary, not machinery.
+3. **Validation workloads** beyond the existing domain-neutral dynamic
    constraint search: streaming pipelines, actor systems, and irregular
    dataflow, chosen to stress ordering, back-pressure, and failure rather than
    throughput.
-5. **A minimal IR**, after §6.2 and §6.3 are settled. A surface syntax for a
-   model with unresolved ownership and failure semantics would preserve the
-   ambiguity.
+4. **A minimal IR**, after §6.2 and §6.3 are settled. A surface syntax for a
+   model with unresolved process ownership and failure semantics would preserve
+   the ambiguity.
 
 Performance work belongs after all of this, and the performance results already
 in this repository (`docs/SOMA-P1.md`, and the cohorting studies) should be read

@@ -116,6 +116,10 @@ pub fn apply_step_result(kernel: &mut Kernel, cont: Ref64, process: Ref64, resul
                 p.status = ProcessState::Failed as u32;
                 p.failure_count = p.failure_count.wrapping_add(1);
             }
+            // Failure reclaims the holder's local authority. Capabilities
+            // previously exported into other spaces are independent roots and
+            // deliberately survive (§7.2 of the capability design note).
+            kernel.capability_spaces.remove(&process.slot);
             kernel.trace(EventKind::ProcessFailed, process, cont, result.next_run_class, 0);
         }
     }

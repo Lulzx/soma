@@ -1,8 +1,8 @@
 # Design note: capability enforcement (I10)
 
-**Status:** capability enforcement implemented through I10c. Actor-relative
-spaces, genesis, derivation, operation checks, authority trace events, and the
-I10a/I10b/I10c checkers exist. Ownership unification is the next step.
+**Status:** implementation sequence complete. Actor-relative spaces, genesis,
+derivation, operation checks, authority trace events, I10a/I10b/I10c, derived
+object ownership, and failure-lifetime policy are implemented and tested.
 
 **Decision: check at operation, with the operation set closed by construction.**
 
@@ -259,23 +259,20 @@ write-bearing capability tree before publishing a version-pinned `READ` root.
 I10b rejects more than one mutable holder. This subsumes I9 and makes "mutation
 of a frozen object requires allocating a new object" true by construction.
 
-### 7.2 Failure containment needs an answer for authority
+### 7.2 Exported authority survives holder failure
 
-Spec §6.3 is open: when a process faults, nothing says what happens to its
-futures or their waiters. Capabilities widen the question, a faulted process
-holds a capability space, and capabilities it derived and transferred are live
-elsewhere. Two coherent positions:
+The broader failure semantics in spec §6.3 remain open for continuations,
+messages, futures, and waiters. Authority lifetime is settled separately.
 
-- Transferred capabilities may remain valid after the holder faults. The
-  space is reclaimed but its exports survive, so a faulted process's
-  grants outlive it.
-- **Authority is revoked transitively.** Faulting revokes the process's
-  capabilities and everything derived from them, which can cascade through
-  unrelated processes and needs a story for what a holder observes.
+**Decision:** faulting reclaims the failed process's local capability space.
+Capabilities previously exported to another process are independent roots, so
+they survive. Failure does not transitively revoke authority in unrelated
+spaces. This avoids a fault causing a capability-revocation cascade through
+otherwise healthy processes.
 
-The first is the smaller change and the easier one to reason about. Pick it
-unless there is a concrete requirement for the second, and record the choice in
-the spec rather than leaving it to the implementation.
+`tests/capabilities.rs::exported_authority_survives_when_the_exporting_process_faults`
+proves both halves: the failed holder loses its local space and the receiver can
+still read through the exported root.
 
 ---
 
@@ -321,7 +318,9 @@ Each step should land green.
 7. **Unify ownership (§7.1). Complete.** Ownership is derived from live holder
    spaces; advisory owner/mode/count fields are deleted, `WRITE` is linear
    across processes, freeze revokes it, and I9 is subsumed by I10b.
-8. **Settle failure (§7.2)** and update the spec.
+8. **Settle failure (§7.2). Complete.** A fault reclaims the failed holder's
+   local space; exported roots survive. The broader failure/cancellation work
+   remains explicitly outside this capability decision.
 
 ---
 

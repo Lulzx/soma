@@ -340,3 +340,23 @@ fn freezing_replaces_mutable_authority_with_read_authority_for_the_new_version()
         });
     assert!(has_current_read);
 }
+
+#[test]
+fn exported_authority_survives_when_the_exporting_process_faults() {
+    let mut kernel = Kernel::new();
+    let exporter = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let receiver = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let object = kernel.create_object(exporter, ObjectKind::RawBytes, vec![4, 2]);
+    kernel
+        .grant_capability(exporter, receiver, object, Rights::READ, 0, 2)
+        .unwrap();
+
+    kernel
+        .create_continuation(exporter, exporter, u32::MAX, 0, Vec::new(), 1)
+        .unwrap();
+    kernel.run_epoch();
+
+    assert_eq!(kernel.process_state(exporter).unwrap(), ProcessState::Failed);
+    assert_eq!(kernel.find_capability(exporter, object, Rights::READ), None);
+    assert_eq!(kernel.object_bytes(receiver, object).unwrap(), &[4, 2]);
+}
