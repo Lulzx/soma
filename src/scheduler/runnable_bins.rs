@@ -11,6 +11,7 @@
 //! `next_run_class`.
 
 use crate::abi::Ref64;
+use crate::kernel::effects::Committing;
 
 /// One double-buffered bin for a single run class.
 #[derive(Clone, Debug, Default)]
@@ -85,6 +86,10 @@ pub const FIFO_BIN: u32 = 0;
 pub struct Scheduler {
     bins: std::collections::HashMap<u32, DoubleBin>,
     mode: SchedulingMode,
+    /// Every bin entry ever made, mediated or not. I24 compares it against the
+    /// effect log, so a write that reached a bin without producing an effect
+    /// shows up as a count the log cannot account for.
+    admissions: u64,
 }
 
 impl Scheduler {
@@ -93,6 +98,7 @@ impl Scheduler {
         Scheduler {
             bins: std::collections::HashMap::new(),
             mode,
+            admissions: 0,
         }
     }
 
@@ -118,12 +124,33 @@ impl Scheduler {
     /// Append a runnable continuation to the next-epoch bin its run class maps
     /// to. Under `PersistentFifo` every run class maps to the same bin, which is
     /// what makes lane groups divergent downstream.
-    pub fn enqueue(&mut self, run_class: u32, cont: Ref64) {
+    ///
+    /// The [`Committing`] token is the point: a bin entry is the one piece of
+    /// state every lane of an epoch writes, so a step that writes it as it runs
+    /// cannot be run concurrently with another. Only `kernel::effects` can build
+    /// the token, so producing an effect is the only way to reach here
+    /// (v0.3 §4.4). `admissions` counts what actually landed, so an
+    /// implementation that got in another way is visible in the count without
+    /// being visible in the effect log — which is I24 clause 3.
+    pub fn enqueue(&mut self, run_class: u32, cont: Ref64, _applying: &Committing) {
+        self.enqueue_unmediated(run_class, cont);
+    }
+
+    /// The bin write itself, with no proof required. `kernel::raw` is the only
+    /// caller that is not the effect applier, and it exists so I24 clause 3 has
+    /// a failing case.
+    pub(crate) fn enqueue_unmediated(&mut self, run_class: u32, cont: Ref64) {
         let bin = self.bin_of(run_class);
         self.bins
             .entry(bin)
             .or_insert_with(|| DoubleBin::new(u32::MAX))
             .enqueue(cont);
+        self.admissions = self.admissions.saturating_add(1);
+    }
+
+    /// How many continuations have entered a bin over the scheduler's life.
+    pub fn admissions(&self) -> u64 {
+        self.admissions
     }
 
     /// Remove a continuation from both epoch buffers of every bin.

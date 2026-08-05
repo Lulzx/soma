@@ -5,6 +5,7 @@
 
 pub mod accounting;
 pub mod commit;
+pub mod effects;
 pub mod epochs;
 pub mod ownership;
 #[doc(hidden)]
@@ -219,6 +220,22 @@ pub struct Kernel {
     /// so I22 can be checked over a whole run rather than over whichever epoch
     /// happened to be last.
     pub(crate) admission_log: Vec<crate::scheduler::admission::AdmissionRecord>,
+    /// Scheduling effects the current lane has produced and the kernel has not
+    /// applied yet, in production order (v0.3 §4.4). Empty outside a lane.
+    pub(crate) lane_effects: Vec<((u32, u32, u32), crate::kernel::effects::Effect)>,
+    /// Every effect applied over the run, with the position it was produced at
+    /// and the index it was applied at. I24 asks whether the second is the
+    /// first sorted.
+    pub(crate) effect_log: Vec<crate::kernel::effects::EffectRecord>,
+    /// Effects produced so far by `current_lane`, and by the host, this epoch.
+    /// Separate from the trace counters: an effect's position says where in the
+    /// plan it was produced, not how many events preceded it.
+    lane_effect_sequence: u32,
+    host_effect_sequence: u32,
+    /// True while `apply_lane_effects` is running, so an effect produced by an
+    /// application lands immediately instead of re-entering the journal it is
+    /// draining.
+    applying_effects: bool,
 
     processes: GenTable<ProcessDescriptor>,
     domains: GenTable<DomainDescriptor>,
@@ -294,6 +311,11 @@ impl Kernel {
             host_sequence: 0,
             epoch_runnable: Vec::new(),
             admission_log: Vec::new(),
+            lane_effects: Vec::new(),
+            effect_log: Vec::new(),
+            lane_effect_sequence: 0,
+            host_effect_sequence: 0,
+            applying_effects: false,
             processes: GenTable::new(Kind::Process),
             domains: GenTable::new(Kind::Domain),
             contracts: GenTable::new(Kind::Contract),
@@ -453,6 +475,10 @@ impl Kernel {
     /// else (v0.3 §4). Keeping both is what lets `semantics::schedule` check
     /// that over a whole run, and check that the run made the decision the rule
     /// specifies rather than one of its own.
+    pub fn effect_log(&self) -> &[crate::kernel::effects::EffectRecord] {
+        &self.effect_log
+    }
+
     pub fn admission_log(&self) -> &[crate::scheduler::admission::AdmissionRecord] {
         &self.admission_log
     }
@@ -676,6 +702,7 @@ impl Kernel {
         debug_assert_ne!(lane, crate::abi::traces::HOST_LANE);
         self.current_lane = lane;
         self.lane_sequence = 0;
+        self.lane_effect_sequence = 0;
         let partition = ((lane - 1) % self.allocation_partitions as u32) as u8;
         self.set_active_partition(partition);
     }
@@ -699,6 +726,8 @@ impl Kernel {
         self.current_lane = crate::abi::traces::HOST_LANE;
         self.lane_sequence = 0;
         self.host_sequence = 0;
+        self.lane_effect_sequence = 0;
+        self.host_effect_sequence = 0;
     }
 
     /// Compact, comparable snapshot of the trace for determinism tests.
@@ -1554,6 +1583,15 @@ impl Kernel {
             })
             .collect();
 
+        // Cancellation empties the bins of everything it cancels, so it has to
+        // see the whole lane, not the part of it that has landed. Applying the
+        // journal first is what makes that true, and it leaves the state
+        // exactly where performing the effects inline used to: the entry is
+        // made, then removed. The alternative — withdrawing pending effects
+        // instead — would leave the same state by a path no handler in this
+        // executive can currently reach, and so by a path nothing tests.
+        self.apply_lane_effects();
+
         for continuation in &cancelled {
             self.scheduler.remove(*continuation);
             self.set_continuation_status(
@@ -1625,10 +1663,10 @@ impl Kernel {
                 {
                     continue;
                 }
-                if let Ok(descriptor) = self.continuations.get_mut(waiter) {
-                    descriptor.status = crate::abi::continuations::ContinuationState::Runnable;
-                }
-                self.scheduler.enqueue(run_class, waiter);
+                self.emit(crate::kernel::effects::Effect::Wake {
+                    continuation: waiter,
+                    run_class,
+                });
                 self.trace(
                     EventKind::ContinuationReady,
                     waiter_process,
@@ -1691,10 +1729,10 @@ impl Kernel {
             {
                 continue;
             }
-            if let Ok(descriptor) = self.continuations.get_mut(waiter) {
-                descriptor.status = crate::abi::continuations::ContinuationState::Runnable;
-            }
-            self.scheduler.enqueue(run_class, waiter);
+            self.emit(crate::kernel::effects::Effect::Wake {
+                continuation: waiter,
+                run_class,
+            });
             self.trace(
                 EventKind::ContinuationReady,
                 waiter_process,
@@ -1751,7 +1789,10 @@ impl Kernel {
         if let Ok(descriptor) = self.processes.get_mut(process) {
             descriptor.live_continuations = descriptor.live_continuations.saturating_add(1);
         }
-        self.scheduler.enqueue(spec.run_class, r);
+        self.emit(crate::kernel::effects::Effect::Bin {
+            continuation: r,
+            run_class: spec.run_class,
+        });
         self.mint_genesis(process, r, 0, 0);
         self.trace(EventKind::ContinuationReady, process, r, spec.run_class, 0);
         Ok(r)
@@ -2005,7 +2046,10 @@ impl Kernel {
             f.value = value;
             f.resolved_epoch = self.epoch;
         }
-        let waiters = self.future_waiters.remove(&future.key()).unwrap_or_default();
+        let waiters = self
+            .future_waiters
+            .remove(&future.key())
+            .unwrap_or_default();
         let owner = self.futures.get(future)?.owner_process;
         for w in waiters {
             let (process, rc) = {
@@ -2015,11 +2059,10 @@ impl Kernel {
                     None => continue,
                 }
             };
-            {
-                let c = self.continuations.get_mut(w).unwrap();
-                c.status = crate::abi::continuations::ContinuationState::Runnable;
-            }
-            self.scheduler.enqueue(rc, w);
+            self.emit(crate::kernel::effects::Effect::Wake {
+                continuation: w,
+                run_class: rc,
+            });
             self.trace_caused(EventKind::ContinuationReady, process, w, rc, 0, future);
         }
         // §3.3 emits the wakes first and the resolution last, so the semantic
@@ -2358,10 +2401,10 @@ impl Kernel {
         if status != crate::abi::continuations::ContinuationState::Waiting {
             return;
         }
-        if let Ok(entry) = self.continuations.get_mut(continuation) {
-            entry.status = crate::abi::continuations::ContinuationState::Runnable;
-        }
-        self.scheduler.enqueue(run_class, continuation);
+        self.emit(crate::kernel::effects::Effect::Wake {
+            continuation,
+            run_class,
+        });
         self.trace(
             EventKind::ContinuationReady,
             process,
@@ -2654,11 +2697,10 @@ impl Kernel {
 
         if let Some(waiter) = waiter {
             let rc = self.continuations.get(waiter)?.run_class;
-            self.scheduler.enqueue(rc, waiter);
-            {
-                let c = self.continuations.get_mut(waiter).unwrap();
-                c.status = crate::abi::continuations::ContinuationState::Runnable;
-            }
+            self.emit(crate::kernel::effects::Effect::Wake {
+                continuation: waiter,
+                run_class: rc,
+            });
             self.trace_caused(
                 EventKind::MessageReceived,
                 receiver,
@@ -2700,11 +2742,10 @@ impl Kernel {
             // One receive frees exactly one slot, so wake exactly one sender.
             if let Some(w) = mailbox.full_waiters.pop_front() {
                 let rc = self.continuations.get(w)?.run_class;
-                self.scheduler.enqueue(rc, w);
-                {
-                    let c = self.continuations.get_mut(w).unwrap();
-                    c.status = crate::abi::continuations::ContinuationState::Runnable;
-                }
+                self.emit(crate::kernel::effects::Effect::Wake {
+                    continuation: w,
+                    run_class: rc,
+                });
                 self.trace(EventKind::ContinuationReady, process, w, rc, 0);
             }
             self.trace_caused(

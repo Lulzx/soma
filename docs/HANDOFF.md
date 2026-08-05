@@ -4,8 +4,8 @@ Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
 Repository: https://github.com/Lulzx/soma. The default semantic core is
-dependency-free. There are 221 integration tests (two of which need the `metal`
-feature), two compile-fail doc tests, and no Clippy warnings. The optional `metal` feature adds the `metal-rs` implementation
+dependency-free. There are 231 integration tests (two of which need the `metal`
+feature), three compile-fail doc tests, and no Clippy warnings. The optional `metal` feature adds the `metal-rs` implementation
 dependency on macOS.
 
 ```sh
@@ -43,7 +43,7 @@ Two documents, and they are not equals:
 | Doc | Status |
 | --- | --- |
 | `docs/SOMA-v0.2.md` | **Current.** The semantic specification. Start here. |
-| `docs/SOMA-v0.3.md` | **Current for anything added since v0.2.** §1–§3 are implemented and checked: the equivalence relation, evaluator bodies, and the carried debts. So are §4.1 and §4.2, two of the device scheduler's four obligations. §4.3 and all of §5–§6 scope the rest of the device scheduler, the distributed implementation, and performance work. |
+| `docs/SOMA-v0.3.md` | **Current for anything added since v0.2.** §1–§3 are implemented and checked: the equivalence relation, evaluator bodies, and the carried debts. So are §4.1, §4.2 and §4.4, three of the device scheduler's four obligations. What is left of §4.3 and all of §5–§6 scope the rest of the device scheduler, the distributed implementation, and performance work. |
 | `docs/SOMA-P1.md` | Historical. The original broad Phase-1 contract, still referenced by `§n` markers in code comments. Useful context, but it describes a wider system than the one being built, and its framing is what the refocus moved away from. |
 
 The directory is still named `gpu-os` and the crate `soma`. Harmless, but expect
@@ -62,8 +62,9 @@ src/
   table.rs     Generational slot table, partitioned. Slot 0 is NULL in every
                partition. Delete bumps generation. Stale references fail.
   kernel/      The machine. mod.rs holds all state. epochs.rs runs epochs.
-               commit.rs publishes effects. ownership.rs derives object state
-               from live capabilities.
+               commit.rs publishes effects. effects.rs is the effect log: a
+               step produces its bin entries and the applier writes them.
+               ownership.rs derives object state from live capabilities.
                accounting.rs records counters.
   executives/  cpu_scalar.rs is the continuation interpreter. batch.rs is the
                physical backend/publication boundary; metal.rs is optional.
@@ -157,19 +158,28 @@ Added in v0.3:
   bare slot number.
 - Partitioned allocation: `GenTable` allocates from a partition chosen by the
   lane's position in the epoch's plan, so lanes need no shared allocator. I19
-  varies it at 1/2/4/8 partitions. The third of the device scheduler's four
-  obligations still open is canonical commit.
+  varies it at 1/2/4/8 partitions.
+- An effect log (I24). A step no longer writes a runnable bin; it produces the
+  entries it wants and the kernel applies them, in the order the plan puts the
+  producing lanes in. `Scheduler::enqueue` demands a token only the applier can
+  build, so writing a bin inline is a compile error. The applier still runs at
+  the end of each lane — which is where a sequential interpreter already wrote,
+  so no run changed. Moving it to the end of the epoch is canonical commit, and
+  that is blocked on read visibility (v0.3 §4.3 (3)), not on this.
 
 ### Semantic boundary
 
 No entity or invariant named by `SOMA-v0.2.md` remains absent, and v0.3 §1–§3
-are implemented and checked, as is §4.1. A device-resident scheduler, a
-distributed implementation, and hardware performance results remain beyond
-conformance — scoped in v0.3 §4–§6, and not guarantees silently claimed by the
-current machine. In particular, admission is order-independent and the trace's
-order is reconstructible from position, but *execution* is neither: effects are
-still applied as they are produced, so what a lane observes depends on when it
-ran. Canonical commit is what would change that, and it is not done.
+are implemented and checked, as are §4.1, §4.2 and §4.4. A device-resident
+scheduler, a distributed implementation, and hardware performance results remain
+beyond conformance — scoped in v0.3 §4–§6, and not guarantees silently claimed
+by the current machine. In particular, admission is order-independent, the
+trace's order is reconstructible from position, and bin entries are applied
+rather than performed — but *execution* is still not reorderable. The applier
+runs at the end of each lane, and everything other than bin entry (mailboxes,
+futures, capability spaces, the object tables) is still written as the step
+runs, so what a lane observes depends on when it ran. Canonical commit is what
+would change that, and it is not done.
 
 ---
 
@@ -333,6 +343,25 @@ This is not yet a persistent device scheduler, arbitrary evaluator compiler, or
 hardware performance result. `src/experiments/territories.rs` remains the
 placement-policy model.
 
+### 5.10 The effect log
+
+Implemented in `kernel/effects.rs`, and the third of B's four obligations
+(v0.3 §4.4). A step produces the runnable-bin entries it wants rather than
+writing them, and the kernel applies the lane's journal in production order.
+`Scheduler::enqueue` demands a token only the applier can construct, so an
+inline bin write is a compile error; I24 checks that the applied indices are
+complete, that sorting the log by production position recovers the application
+order, and that the scheduler's own entry count is fully accounted for by the
+log.
+
+Read the scope claim exactly. Only bin entry is mediated, and the applier runs
+at the end of each lane — which is where a sequential interpreter already wrote,
+so no run changed and no test needed modifying. Mailboxes, futures, capability
+spaces and the object tables are still written as the step runs, and allocation
+is still eager because v0.3 §4.3 (2) shows it has to be. What this buys is that
+canonical commit is now the move of a single call out of the lane loop, gated on
+read visibility (§4.3 (3)) rather than on a refactor.
+
 ---
 
 ## 6. Test discipline
@@ -394,6 +423,18 @@ decision that would otherwise depend on `HashMap` iteration order.
   a single host counter satisfies "sorted by position equals emitted order"
   perfectly — while the trace goes back to needing a shared clock. Clause 3 of
   I23 is the only thing that reports it.
+- **A bin entry is written by the applier, not by the step.** `kernel/effects.rs`
+  is the only place that can build the `Committing` token `Scheduler::enqueue`
+  demands, so a handler that enqueues inline does not compile. If you find
+  yourself reaching for `raw::enqueue_unmediated` outside a fault injection, the
+  thing you are about to undo is I24 clause 3 — and with it the only reason
+  canonical commit is one line away rather than a rewrite.
+- **Cancellation applies the journal before it runs.** `cancel_process_continuations`
+  starts with `apply_lane_effects()` because it empties the bins of everything it
+  cancels, and a bin entry the same lane produced but has not applied yet would
+  land afterwards. No current handler creates work and then fails in the same
+  step, so no test covers it; it is one line whose correctness is visible by
+  inspection for exactly that reason.
 - **A bare slot is not an identity.** Two partitions each mint slot 7. Anything
   keyed or compared by `.slot` is wrong; use `Ref64::key()` for map keys and the
   whole reference for comparison. `.slot` belongs in error messages and nowhere
@@ -434,5 +475,6 @@ decision that would otherwise depend on `HashMap` iteration order.
 4. Read `docs/SOMA-v0.3.md`. §2 and §3 explain the two pieces of machinery
    most likely to surprise you — why trace equality had to go, and why both
    backends used to agree about nothing. Then pick up §4 (the persistent device
-   scheduler). Its first obligation is discharged in §4.1; the next piece is
-   canonical commit, which §4.1 ends by describing.
+   scheduler). Three of its four obligations are discharged in §4.1, §4.2 and
+   §4.4; the next piece is the rest of canonical commit, which §4.4 ends by
+   describing.

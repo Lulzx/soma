@@ -1,7 +1,8 @@
 # SOMA v0.3
 
 **Status:** partially implemented. §1–§3 are specification and are
-machine-checked, as are §4.1 and §4.2. §4.3 and all of §5–§6 are scope.
+machine-checked, as are §4.1, §4.2 and §4.4. §4.3's remaining two problems and
+all of §5–§6 are scope.
 
 v0.2 closed the semantic core: every entity and invariant it named was
 implemented and checked. v0.3 is the first version whose work is not "finish the
@@ -20,8 +21,8 @@ did not depend on it are done; the rest is scoped below.
 | **C** | Distributed / multi-node implementation | scope (§5) |
 | **D** | Performance work on real hardware | scope (§6) |
 
-Six new clauses are now checked — I18 through I23 — and v0.2's only
-`[modelled]` clause is gone. The test suite went from 151 to 221.
+Seven new clauses are now checked — I18 through I24 — and v0.2's only
+`[modelled]` clause is gone. The test suite went from 151 to 231.
 
 ---
 
@@ -293,10 +294,13 @@ bytes and semantic trace against the CPU interpreter.
 
 ## 4. B — persistent device-resident scheduler
 
-**Started.** S was its blocker and S is done. Two of its four obligations are
-discharged and checked: admission (§4.1) and trace emission (§4.2). The two that
-remain are commit and the step-budget check's position, and the first of those
-is the one that gates a concurrent executive.
+**Started.** S was its blocker and S is done. Three of its four obligations are
+discharged and checked: admission (§4.1), trace emission (§4.2), and commit's
+first half — the scheduler's bins are now written by an applier over an effect
+list rather than by the steps that produced it (§4.4). The step-budget check's
+position holds already. What remains of commit is the two problems §4.3 names
+alongside mutation ordering: read visibility, and moving the applier from the
+end of a lane to the end of an epoch.
 
 `kernel/epochs.rs` still cohorts, executes, and commits on the host, one
 continuation at a time. The Metal path dispatches a single collective and blocks
@@ -310,7 +314,8 @@ What must hold, and why each is hard:
   be "whoever gets there first". **Done — §4.1.**
 - **Commit** is the sole path to `Runnable` (v0.2 §3.4), which is what makes I7
   checkable. A device commit must preserve that exclusivity across concurrent
-  writers.
+  writers. **Half done — §4.4.** Bin entry is produced and applied rather than
+  performed; when the applier runs is still per lane.
 - **The step-budget check must precede dispatch** (`epochs.rs`, and
   `HANDOFF.md` §7 records the bug from getting this wrong). Concurrency does not
   relax this.
@@ -422,8 +427,8 @@ sequence are placement information, so `semantic_projection` does not carry them
 
 What §4.2 does not do is make lanes reorderable. It makes the *record* of a run
 reconstructible without a clock. What a lane observes still depends on when it
-ran relative to other lanes, because effects are still applied as they are
-produced. That is the next section's problem.
+ran relative to other lanes. §4.4 takes the produce-then-apply half of that;
+what stays is read visibility, §4.3's third problem.
 
 ### 4.3 Canonical commit is three problems, not one
 
@@ -498,9 +503,9 @@ The obstacle to the first is structural rather than subtle: the
 executive's handlers take `&mut Kernel` and allocate their effects as they run
 (`create_process`, `resolve_future`, `enqueue_message`), so execute and commit
 are fused. Canonical commit requires a step to produce an effect list that the
-kernel applies afterwards, in lane order. That refactor is the next piece of B,
-and it is the one that makes a concurrent executive — host threads first, device
-after — possible at all.
+kernel applies afterwards, in lane order. That refactor is §4.4, and it is the
+one that makes a concurrent executive — host threads first, device after —
+possible at all.
 
 §4.2 supplies the ordering key it will apply them in: a lane number is a
 position in the plan, so "in lane order" is already well-defined and already
@@ -526,6 +531,85 @@ machine cannot enforce them — hardware placement and lane shape — should be
 admitted once B can enforce them, per v0.2 §7 item 2. Relaxed determinism and
 wall-clock deadlines stay rejected: the first contradicts I18 and the second
 contradicts §4's "there is no wall clock".
+
+### 4.4 The effect log
+
+§4.3's first problem was mutation ordering: handlers mutate as they run, so
+execute and commit are fused. This section unfuses the part of it that every
+lane of an epoch writes.
+
+A step no longer writes a runnable bin. It **produces** the entries it wants
+written, into a per-lane journal, and the kernel applies them afterwards. Four
+shapes exist, and they are the four the kernel already had rather than a
+generalisation: a commit resume, a waiter wake, a fresh continuation's first
+bin, and a lane a partial-cohort policy held back. They differ in how the
+continuation's status is written, and collapsing them would change which
+continuations look long-waiting to §4.1's claim.
+
+**Scope, stated plainly.** Bin entry, and the status transition that goes with
+it. Nothing else. Mailboxes, futures, capability spaces and the object tables
+are still written as the step runs, and allocation is still eager. The choice is
+not arbitrary: v0.2 §3.4 already makes commit the sole path to `Runnable` — that
+is what makes I7 checkable — and the bins are the one structure an epoch's lanes
+all write. §4.3 (2) establishes that allocation *has* to stay eager, because a
+step stores references it allocated into opaque frame bytes; partitioned
+allocation is what makes that safe for concurrent lanes.
+
+**The applier runs at the end of each lane**, which is exactly where a
+sequential interpreter already wrote. So no run changed: the whole suite passes
+with one call site edited, and that one only because the seal below moved a
+deliberate fault injection into `kernel::raw`. This is the point at which it
+would be easy to overclaim. Producing effects is not canonical commit; it is
+what makes canonical commit a *change of one line*. Move the
+`apply_lane_effects()` call out of the lane loop and after it, and an epoch
+applies its lanes in plan order rather than in the order they ran. That move is
+blocked on §4.3 (3), read visibility, which is a semantic change and not a
+refactor.
+
+**I24. Effect-mediated commit [checked].** Three clauses:
+
+1. nothing is applied twice and nothing is lost — the applied indices are
+   exactly `0..n`, each once;
+2. sorting the log by the position an effect was produced at puts the applied
+   indices in increasing order; and
+3. no bin entry arrived any other way — the scheduler counts every entry it has
+   ever made, and the log accounts for all of them.
+
+Clause 2 is what "in lane order" means as a property of a record. A lane number
+is a position in the plan (§4.2), so the clause is independent of when a lane
+ran, which is the whole reason the plan supplies the ordering key rather than
+the clock.
+
+Clauses 1 and 2 are, on this interpreter, satisfied by construction — a
+sequential applier draining one journal at a time cannot produce an out-of-order
+log. That is the same standing as I23's clause 2 and I22's first half, and for
+the same reason: the record is not there to catch this crate. It is there so the
+clause can be asked of an implementation whose lanes append concurrently, where
+the log's row order is not its application order and the question has content.
+`kernel::raw` supplies the failing cases in the meantime, one per clause.
+
+Clause 3 is the one with teeth here, and it is the runtime half of a
+compile-time guarantee. `Scheduler::enqueue` demands a `Committing` token whose
+only constructor is inside `kernel::effects`, so a step that writes a bin as it
+runs does not compile. That is §4.1's technique for sealing `Admission`, applied
+to the other end of the epoch; the count carries it to an implementation this
+crate did not compile.
+
+**One ordering rule came out of it.** Cancellation empties the bins of
+everything it cancels, so it has to see the whole lane and not the part that has
+landed: `cancel_process_continuations` applies the journal before it runs. No
+handler in the current executive creates work and then fails in the same step,
+so no run exercises it — which is why it is a one-line ordering statement whose
+correctness is visible by inspection, rather than a withdrawal list with
+retention logic nothing tests. It becomes load-bearing the moment such a handler
+exists.
+
+**What §4.4 does not do.** It does not make lanes reorderable, for the same
+reason §4.2 did not: what a lane *reads* still depends on when it ran. §4.3 (3)
+measured that no ≺ edge joins two lanes of one epoch across the workloads
+checked, and was careful to call that a precondition to check per run rather
+than an invariant. Applying an epoch's effects at the epoch boundary is what
+turns that precondition into a requirement, and it is the next piece.
 
 ---
 
@@ -599,6 +683,7 @@ cannot reach means the model is charging for the wrong thing.
 | I21 bounded progress | checked | no withholding, plus a starvation bound |
 | I22 admission determinism | checked | the decision is a function of the candidate set (§4.1) |
 | I23 position-derived emission | checked | the trace's order needs no shared clock (§4.2) |
+| I24 effect-mediated commit | checked | bins are written by an applier, in plan order (§4.4) |
 
 **I21** has two halves. The first — an epoch that admitted work dispatched some
 of it — is a statement about a transition rather than a state, so it is counted

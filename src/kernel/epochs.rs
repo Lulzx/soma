@@ -81,7 +81,10 @@ impl Kernel {
         });
 
         for (run_class, cont) in decision.deferred() {
-            self.scheduler.enqueue(*run_class, *cont);
+            self.emit(crate::kernel::effects::Effect::Requeue {
+                continuation: *cont,
+                run_class: *run_class,
+            });
             self.accounting.serial_deferrals += 1;
         }
         let admitted = decision.into_bins();
@@ -134,6 +137,24 @@ impl Kernel {
                     cohort.active_lanes as u32,
                 );
             }
+            // Lanes the partial-cohort policy held back return to their bins.
+            // Which they are is a property of the plan, so this belongs here
+            // rather than after execution, for the reason the cohort records
+            // moved here in §4.2: a host effect produced after the lanes ran
+            // would carry a position that sorts ahead of theirs and be applied
+            // behind them, which is I24's clause 2 exactly.
+            for cont in &plan.deferred {
+                let run_class = self
+                    .continuations
+                    .get(*cont)
+                    .map(|c| c.run_class)
+                    .unwrap_or(0);
+                self.emit(crate::kernel::effects::Effect::Requeue {
+                    continuation: *cont,
+                    run_class,
+                });
+                self.accounting.deferred_lanes += 1;
+            }
         }
 
         // Phase F: Execute (CPU scalar — a cohort's lanes run in lane order).
@@ -155,18 +176,16 @@ impl Kernel {
                     };
                     self.enter_lane(lane_number);
                     steps += self.execute_cont(*cont, process);
+                    // Phase G: apply what the lane produced, in the order it
+                    // produced it. This call is the whole of canonical commit's
+                    // remaining distance: moving it out of the lane loop and
+                    // after it applies an epoch's lanes in plan order instead of
+                    // in the order they happened to run (v0.3 §4.4). It stays
+                    // inside the lane so that anything the application traces is
+                    // still attributed to the lane that caused it (I23).
+                    self.apply_lane_effects();
                     self.leave_lane();
                 }
-            }
-            // Deferred lanes return to their bins for a later epoch.
-            for cont in &plan.deferred {
-                let run_class = self
-                    .continuations
-                    .get(*cont)
-                    .map(|c| c.run_class)
-                    .unwrap_or(0);
-                self.scheduler.enqueue(run_class, *cont);
-                self.accounting.deferred_lanes += 1;
             }
         }
 

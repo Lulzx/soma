@@ -12,6 +12,7 @@ use crate::abi::{
     ModuleDescriptor, ObjectDescriptor, ProcessDescriptor, Ref64, TraceEvent,
 };
 use crate::kernel::accounting::Accounting;
+use crate::kernel::effects::EffectRecord;
 use crate::kernel::{Kernel, Mailbox, SupervisionQueue};
 use crate::scheduler::admission::AdmissionRecord;
 use crate::scheduler::runnable_bins::Scheduler;
@@ -37,6 +38,7 @@ pub struct State<'a> {
     pub scheduler: &'a mut Scheduler,
     pub accounting: &'a mut Accounting,
     pub admission_log: &'a mut Vec<AdmissionRecord>,
+    pub effect_log: &'a mut Vec<EffectRecord>,
 }
 
 /// Borrow all raw kernel storage.
@@ -66,5 +68,21 @@ pub unsafe fn state(kernel: &mut Kernel) -> State<'_> {
         scheduler: &mut kernel.scheduler,
         accounting: &mut kernel.accounting,
         admission_log: &mut kernel.admission_log,
+        effect_log: &mut kernel.effect_log,
     }
+}
+
+/// Put a continuation in a runnable bin without producing an effect for it.
+///
+/// This is the shape I24 clause 3 forbids: a bin entry the effect log cannot
+/// account for. `Scheduler::enqueue` demands a `Committing` token that only the
+/// effect applier can build, so this module is the only way to write a bin
+/// unmediated — which is what gives the clause a failing case.
+///
+/// # Safety
+///
+/// The continuation is binned with no status change and no record. The caller
+/// must be constructing an illegal state deliberately.
+pub unsafe fn enqueue_unmediated(kernel: &mut Kernel, run_class: u32, cont: Ref64) {
+    kernel.scheduler.enqueue_unmediated(run_class, cont);
 }

@@ -66,6 +66,9 @@ pub enum Invariant {
     /// I23. The trace's order is recoverable from event positions alone, with
     /// no shared clock.
     PositionDerivedEmission,
+    /// I24. Every runnable-bin entry is an effect a step produced and the
+    /// kernel applied, in the order the plan puts the producing lanes in.
+    EffectMediatedCommit,
 }
 
 /// A specific way in which a state was illegal.
@@ -114,8 +117,122 @@ pub fn check(kernel: &Kernel) -> Vec<Violation> {
     bounded_progress(kernel, &mut v);
     admission_determinism(kernel, &mut v);
     position_derived_emission(kernel, &mut v);
+    effect_mediated_commit(kernel, &mut v);
     v.sort();
     v
+}
+
+// ---- I24 -----------------------------------------------------------------
+
+/// **I24. Effect-mediated commit.**
+///
+/// `docs/SOMA-v0.3.md` §4.3 names the obstacle to canonical commit: handlers
+/// take `&mut Kernel` and allocate their effects as they run, so execute and
+/// commit are fused, and an epoch's lanes therefore touch shared state in
+/// whatever order they were scheduled in. §4.4 unfuses the part every lane
+/// writes — entry into a runnable bin, which v0.2 §3.4 already makes commit's
+/// exclusive right. A step now *produces* its bin entries and the kernel
+/// applies them.
+///
+/// Three clauses:
+///
+/// 1. **Nothing is applied twice and nothing is lost.** The applied indices are
+///    exactly `0..n`, each once.
+/// 2. **Application order is plan order.** Sorting the log by the position the
+///    effect was produced at — its epoch, its lane, and that lane's own count —
+///    puts the applied indices in increasing order. This is what "in lane
+///    order" means as a property of a record: a lane number is a position in
+///    the plan (§4.2), so the clause is independent of when a lane ran.
+/// 3. **No bin entry arrived any other way.** The scheduler counts every entry
+///    it has ever made; the log accounts for all of them.
+///
+/// **Clauses 1 and 2 are, on this interpreter, satisfied by construction**, in
+/// the same way and for the same reason as I23's clause 2: a sequential applier
+/// draining one lane's journal at a time cannot produce an out-of-order log. As
+/// with I22's first half, the record is not there to catch this crate. It is
+/// there so the clause can be asked of an implementation whose lanes append
+/// concurrently, where the log's row order is *not* its application order and
+/// the question has content. `kernel::raw` supplies the failing case in the
+/// meantime.
+///
+/// Clause 3 is the one with teeth here, and it is the runtime half of a
+/// compile-time guarantee: `Scheduler::enqueue` demands a `Committing` token
+/// that only `kernel::effects` can build, so an unmediated bin write does not
+/// compile outside `kernel::raw`. That is the technique §4.1 used to seal
+/// `Admission`; the count is what carries it to an implementation this crate
+/// did not compile.
+///
+/// **What the clause does not say.** Only bin entry is mediated. Mailboxes,
+/// futures, capability spaces and the object tables are still written as the
+/// step runs, and allocation is still eager — §4.3 (2) shows it has to be.
+/// Reading this clause as "effects are applied after the epoch" would be
+/// reading canonical commit as done, and it is not: the applier runs at the end
+/// of each lane, which is where a sequential interpreter already was.
+fn effect_mediated_commit(kernel: &Kernel, out: &mut Vec<Violation>) {
+    let log = kernel.effect_log();
+
+    // Clause 1.
+    let mut applied: Vec<u64> = log.iter().map(|record| record.applied).collect();
+    applied.sort_unstable();
+    for (expected, actual) in applied.iter().enumerate() {
+        if *actual != expected as u64 {
+            out.push(Violation::new(
+                Invariant::EffectMediatedCommit,
+                format!(
+                    "the effect log applies index {actual} where {expected} is missing, so an \
+                     effect was applied twice or not at all"
+                ),
+            ));
+            break;
+        }
+    }
+
+    // Clause 2. Positions are compared, not the rows: a concurrent applier's
+    // log is appended in finish order, and what it owes is that the sort by
+    // position recovers the order it applied in.
+    let mut by_position: Vec<&crate::kernel::effects::EffectRecord> = log.iter().collect();
+    by_position.sort_by_key(|record| record.position());
+    for window in by_position.windows(2) {
+        if window[0].position() == window[1].position() {
+            let (epoch, lane, sequence) = window[0].position();
+            out.push(Violation::new(
+                Invariant::EffectMediatedCommit,
+                format!(
+                    "two effects were produced at (epoch {epoch}, lane {lane}, sequence \
+                     {sequence}), so the order to apply them in is not determined"
+                ),
+            ));
+            break;
+        }
+        if window[0].applied > window[1].applied {
+            let (epoch, lane, sequence) = window[0].position();
+            let (next_epoch, next_lane, next_sequence) = window[1].position();
+            out.push(Violation::new(
+                Invariant::EffectMediatedCommit,
+                format!(
+                    "the effect produced at (epoch {epoch}, lane {lane}, sequence {sequence}) \
+                     was applied at {} but the one at (epoch {next_epoch}, lane \
+                     {next_lane}, sequence {next_sequence}) was applied at {}, so commit \
+                     did not run in plan order",
+                    window[0].applied, window[1].applied
+                ),
+            ));
+            break;
+        }
+    }
+
+    // Clause 3.
+    let admissions = kernel.scheduler().admissions();
+    if admissions != log.len() as u64 {
+        out.push(Violation::new(
+            Invariant::EffectMediatedCommit,
+            format!(
+                "{admissions} continuation(s) entered a runnable bin but the effect log \
+                 accounts for {}, so commit is not the only path into one",
+                log.len()
+            ),
+        ));
+    }
 }
 
 // ---- I23 -----------------------------------------------------------------
@@ -158,9 +275,10 @@ pub fn check(kernel: &Kernel) -> Vec<Violation> {
 ///
 /// The clause deliberately does *not* say that lanes may run in any order. It
 /// says the record of a run is reconstructible without a clock. What a lane
-/// observes still depends on when it ran relative to other lanes, because
-/// effects are still applied as they are produced; that is canonical commit,
-/// which is a different obligation and is not met.
+/// observes still depends on when it ran relative to other lanes: I24 moved bin
+/// entry to an applier, but the applier runs at the end of each lane and
+/// everything else is still written as the step runs. Canonical commit is a
+/// different obligation and is not met.
 fn position_derived_emission(kernel: &Kernel, out: &mut Vec<Violation>) {
     let events = kernel.trace_events();
 

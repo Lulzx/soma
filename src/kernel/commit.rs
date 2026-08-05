@@ -5,9 +5,16 @@
 //! (creating child continuations/processes, delivering messages, resolving
 //! futures); this phase finalizes scheduling state, status transitions, and
 //! tracing. All of it is deterministic.
+//!
+//! Since v0.3 §4.4 the scheduling half of that is *produced* rather than
+//! performed: a resume becomes an `Effect` the kernel applies when the lane
+//! ends. The status transitions that take a continuation out of the schedulable
+//! set stay immediate — nothing else in the lane can observe them, because the
+//! lane is over — and they are named in §4.4 as the part still to move.
 
 use crate::abi::continuations::ContinuationState;
 use crate::abi::{EventKind, ExitReason, ProcessState, Ref64, StepKind, StepResult};
+use crate::kernel::effects::Effect;
 use crate::kernel::Kernel;
 
 /// Terminate `process` only if it has no continuation left that could still
@@ -65,11 +72,10 @@ pub fn apply_step_result(
         }
         StepKind::Yield => {
             let rc = result.next_run_class;
-            if let Ok(c) = kernel.continuations.get_mut(cont) {
-                c.run_class = rc;
-            }
-            kernel.set_continuation_status(cont, ContinuationState::Runnable);
-            kernel.scheduler.enqueue(rc, cont);
+            kernel.emit(Effect::Resume {
+                continuation: cont,
+                run_class: rc,
+            });
             kernel.trace(EventKind::ContinuationYielded, process, cont, rc, 0);
         }
         StepKind::Await => {
@@ -98,11 +104,10 @@ pub fn apply_step_result(
             };
             if result.next_run_class != 0 {
                 // Continue in the next run class.
-                if let Ok(c) = kernel.continuations.get_mut(cont) {
-                    c.run_class = result.next_run_class;
-                }
-                kernel.set_continuation_status(cont, ContinuationState::Runnable);
-                kernel.scheduler.enqueue(result.next_run_class, cont);
+                kernel.emit(Effect::Resume {
+                    continuation: cont,
+                    run_class: result.next_run_class,
+                });
             } else {
                 // No continuation remains: the node is done.
                 kernel.set_continuation_status(cont, ContinuationState::Completed);

@@ -407,7 +407,7 @@ fn blocked_reply_does_not_respawn_children_on_re_entry() {
         .pop_front();
     let state = unsafe { raw::state(&mut kernel) };
     state.continuations.get_mut(cont).unwrap().status = ContinuationState::Runnable;
-    state.scheduler.enqueue(EXPAND_RESUME_2, cont);
+    unsafe { raw::enqueue_unmediated(&mut kernel, EXPAND_RESUME_2, cont) };
 
     kernel.run_to_quiescence(100);
 
