@@ -125,21 +125,122 @@ struct EventIdentity {
     continuation: u64,
     run_class: u32,
     auxiliary: u32,
+    subject: u64,
     causal: u64,
 }
 
 impl EventIdentity {
-    fn of(row: &TraceSnapshotRow) -> Self {
+    fn of_renamed(row: &TraceSnapshotRow, names: &IdentityMap) -> Self {
         Self {
             epoch: row.epoch,
             event_kind: row.event_kind,
-            process: row.process,
-            continuation: row.continuation,
+            process: names.rename(row.process),
+            continuation: names.rename(row.continuation),
             run_class: row.run_class,
             auxiliary: row.auxiliary,
-            causal: row.causal,
+            subject: names.rename(row.subject),
+            causal: names.rename(row.causal),
         }
     }
+}
+
+/// A correspondence between two runs' entity names.
+///
+/// An identity is a table position, and a table position is an implementation
+/// detail: two runs of one program that allocate from different partitions —
+/// which is what a device's lanes and a cluster's nodes must do — name the same
+/// entity differently and behave identically. Comparing raw `Ref64`s makes such
+/// an implementation non-conforming by construction, in exactly the way trace
+/// equality did for ordering before §2.
+///
+/// The map is *forced*, not chosen: entities are paired in the order they first
+/// appear in each trace, within their kind. A checker that got to pick the
+/// correspondence could pair whatever made the traces agree; this one cannot.
+/// Pairing two sequences of distinct names positionally is a bijection, so an
+/// implementation that dropped an entity or merged two into one produces
+/// sequences of different lengths and is reported rather than renamed away.
+#[derive(Clone, Debug, Default)]
+pub struct IdentityMap {
+    forward: BTreeMap<u64, u64>,
+}
+
+impl IdentityMap {
+    pub fn identity() -> Self {
+        Self::default()
+    }
+
+    /// Translate a candidate-run name into the reference run's namespace.
+    /// Unmapped names — the null reference, and anything the map never saw —
+    /// pass through, so a missing entry shows up as a mismatch rather than as
+    /// a silent success.
+    pub fn rename(&self, encoded: u64) -> u64 {
+        self.forward.get(&encoded).copied().unwrap_or(encoded)
+    }
+
+    /// Pair `candidate`'s entity names with `reference`'s by order of first
+    /// appearance, within each kind.
+    pub fn between(
+        reference: &[TraceSnapshotRow],
+        candidate: &[TraceSnapshotRow],
+    ) -> Result<Self, OrderViolation> {
+        let mut forward = BTreeMap::new();
+        let expected = first_appearances(reference);
+        let actual = first_appearances(candidate);
+
+        for (kind, wanted) in &expected {
+            let found = actual.get(kind).map(Vec::as_slice).unwrap_or(&[]);
+            if found.len() != wanted.len() {
+                return Err(OrderViolation::new(
+                    OrderClause::ScheduleConformance,
+                    format!(
+                        "the run named {} entities of kind {:?} where the reference named {}, so \
+                         no correspondence between them exists",
+                        found.len(),
+                        kind,
+                        wanted.len()
+                    ),
+                ));
+            }
+            for (theirs, ours) in found.iter().zip(wanted) {
+                forward.insert(*theirs, *ours);
+            }
+        }
+        for (kind, found) in &actual {
+            if !expected.contains_key(kind) && !found.is_empty() {
+                return Err(OrderViolation::new(
+                    OrderClause::ScheduleConformance,
+                    format!(
+                        "the run named {} entities of kind {kind:?}, which the reference never \
+                         mentions",
+                        found.len()
+                    ),
+                ));
+            }
+        }
+        Ok(Self { forward })
+    }
+}
+
+/// Every entity name a trace mentions, bucketed by kind, in order of first
+/// appearance.
+///
+/// The four reference-shaped fields are read in a fixed order per event, so the
+/// enumeration is a function of the trace and nothing else. `auxiliary` is
+/// deliberately absent: it is numeric, and an entity recorded there as a bare
+/// slot would be untranslatable — which is why `subject` exists.
+fn first_appearances(events: &[TraceSnapshotRow]) -> BTreeMap<u8, Vec<u64>> {
+    let mut order: BTreeMap<u8, Vec<u64>> = BTreeMap::new();
+    let mut seen: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for row in events {
+        for encoded in [row.process, row.continuation, row.subject, row.causal] {
+            if encoded == 0 || slot(encoded) == 0 || !seen.insert(encoded) {
+                continue;
+            }
+            let kind = Ref64::from_u64(encoded).kind.as_u8();
+            order.entry(kind).or_default().push(encoded);
+        }
+    }
+    order
 }
 
 fn slot(encoded: u64) -> u32 {
@@ -399,11 +500,24 @@ pub fn conforms_traces(
     let reference = &semantic_projection(reference);
     let candidate = &semantic_projection(candidate);
 
+    // Clause 0: a correspondence between the two runs' entity names exists.
+    // Without one, an implementation that allocates from a different partition
+    // fails every later clause for a reason that has nothing to do with what it
+    // did. With one, a dropped or merged entity fails *here*, which is the
+    // stronger report.
+    let names = match IdentityMap::between(reference, candidate) {
+        Ok(names) => names,
+        Err(violation) => {
+            out.push(violation);
+            return out;
+        }
+    };
+
     // Clause 1: same events, grouped by epoch. Comparing sorted multisets per
     // epoch is exactly "the same things happened in the same epoch, in some
     // order".
-    let reference_by_epoch = group_by_epoch(reference);
-    let candidate_by_epoch = group_by_epoch(candidate);
+    let reference_by_epoch = group_by_epoch(reference, &IdentityMap::identity());
+    let candidate_by_epoch = group_by_epoch(candidate, &names);
     for (epoch, expected) in &reference_by_epoch {
         match candidate_by_epoch.get(epoch) {
             Some(actual) if actual == expected => {}
@@ -442,8 +556,8 @@ pub fn conforms_traces(
     // two of a continuation's events and the derivation simply reads them in
     // the new order. Comparing against the reference is what makes program
     // order enforceable at all.
-    let reference_by_continuation = group_by_continuation(reference);
-    let candidate_by_continuation = group_by_continuation(candidate);
+    let reference_by_continuation = group_by_continuation(reference, &IdentityMap::identity());
+    let candidate_by_continuation = group_by_continuation(candidate, &names);
     for (continuation, expected) in &reference_by_continuation {
         match candidate_by_continuation.get(continuation) {
             Some(actual) if actual == expected => {}
@@ -496,7 +610,10 @@ pub fn conforms_traces(
 }
 
 /// Each continuation's own events, in trace order.
-fn group_by_continuation(events: &[TraceSnapshotRow]) -> BTreeMap<u64, Vec<EventIdentity>> {
+fn group_by_continuation(
+    events: &[TraceSnapshotRow],
+    names: &IdentityMap,
+) -> BTreeMap<u64, Vec<EventIdentity>> {
     let mut grouped: BTreeMap<u64, Vec<EventIdentity>> = BTreeMap::new();
     for row in events {
         if row.continuation == 0 || slot(row.continuation) == 0 {
@@ -506,20 +623,23 @@ fn group_by_continuation(events: &[TraceSnapshotRow]) -> BTreeMap<u64, Vec<Event
             continue;
         }
         grouped
-            .entry(row.continuation)
+            .entry(names.rename(row.continuation))
             .or_default()
-            .push(EventIdentity::of(row));
+            .push(EventIdentity::of_renamed(row, names));
     }
     grouped
 }
 
-fn group_by_epoch(events: &[TraceSnapshotRow]) -> BTreeMap<u32, Vec<EventIdentity>> {
+fn group_by_epoch(
+    events: &[TraceSnapshotRow],
+    names: &IdentityMap,
+) -> BTreeMap<u32, Vec<EventIdentity>> {
     let mut grouped: BTreeMap<u32, Vec<EventIdentity>> = BTreeMap::new();
     for row in events {
         grouped
             .entry(row.epoch)
             .or_default()
-            .push(EventIdentity::of(row));
+            .push(EventIdentity::of_renamed(row, names));
     }
     for group in grouped.values_mut() {
         group.sort();

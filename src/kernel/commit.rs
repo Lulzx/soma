@@ -82,12 +82,12 @@ pub fn apply_step_result(
             // `resolve_future` / `enqueue_message`. This is the single
             // `ContinuationWaiting` emission for every await path; `auxiliary`
             // carries the slot of whatever is being awaited.
-            kernel.trace(
+            kernel.trace_about(
                 EventKind::ContinuationWaiting,
                 process,
                 cont,
                 rc,
-                result.target.slot,
+                result.target,
             );
         }
         StepKind::Send | StepKind::Spawn => {

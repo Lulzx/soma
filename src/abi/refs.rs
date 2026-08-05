@@ -75,17 +75,21 @@ impl Kind {
 /// bits is therefore a space/churn tradeoff rather than a soundness one, and a
 /// reference still fits in 64 bits.
 ///
-/// A distributed implementation needs one more thing this does not provide: a
-/// node identity, so that two nodes allocating slot 7 do not produce colliding
-/// references. That is deliberately deferred — it changes the reference layout,
-/// and nothing before a multi-node implementation can test it.
+/// `partition` is the allocator a reference was minted by. Two allocators may
+/// hand out slot 7 at the same time and produce different references, which is
+/// what lets a device's lanes and a cluster's nodes allocate without
+/// coordinating. The sequential interpreter uses partition 0 throughout, so its
+/// references are exactly what they were.
+///
+/// It occupies the byte that used to be `flags`, which was written as zero
+/// everywhere and read nowhere, so a reference still fits in 64 bits.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Ref64 {
     pub slot: u32,
     pub generation: u16,
     pub kind: Kind,
-    pub flags: u8,
+    pub partition: u8,
 }
 
 impl Ref64 {
@@ -93,16 +97,32 @@ impl Ref64 {
         slot: 0,
         generation: 0,
         kind: Kind::Domain,
-        flags: 0,
+        partition: 0,
     };
 
+    /// A reference minted by the default allocator (partition 0).
     pub fn new(slot: u32, generation: u16, kind: Kind) -> Ref64 {
+        Ref64::in_partition(slot, generation, kind, 0)
+    }
+
+    /// A reference minted by `partition`'s allocator.
+    pub fn in_partition(slot: u32, generation: u16, kind: Kind, partition: u8) -> Ref64 {
         Ref64 {
             slot,
             generation,
             kind,
-            flags: 0,
+            partition,
         }
+    }
+
+    /// The identity of the entity a reference names, ignoring generation: the
+    /// key under which kernel-side maps that outlive a single reference — a
+    /// process's mailbox, an object's payload — are stored.
+    ///
+    /// A bare slot stopped being that key when partitions arrived, because two
+    /// allocators may both mint slot 7.
+    pub fn key(&self) -> u64 {
+        ((self.partition as u64) << 32) | (self.slot as u64)
     }
 
     pub fn is_null(&self) -> bool {
@@ -114,8 +134,8 @@ impl Ref64 {
         let slot = (self.slot as u64) & 0xFFFF_FFFF;
         let generation = (self.generation as u64) & 0xFFFF;
         let kind = (self.kind.as_u8() as u64) & 0xFF;
-        let flags = (self.flags as u64) & 0xFF;
-        slot | (generation << 32) | (kind << 48) | (flags << 56)
+        let partition = (self.partition as u64) & 0xFF;
+        slot | (generation << 32) | (kind << 48) | (partition << 56)
     }
 
     /// Rebuild a reference from its `to_u64` encoding.
@@ -123,12 +143,12 @@ impl Ref64 {
         let slot = (v & 0xFFFF_FFFF) as u32;
         let generation = ((v >> 32) & 0xFFFF) as u16;
         let kind = Kind::from_u8(((v >> 48) & 0xFF) as u8).unwrap_or(Kind::Domain);
-        let flags = ((v >> 56) & 0xFF) as u8;
+        let partition = ((v >> 56) & 0xFF) as u8;
         Ref64 {
             slot,
             generation,
             kind,
-            flags,
+            partition,
         }
     }
 }

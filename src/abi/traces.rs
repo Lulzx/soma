@@ -84,7 +84,24 @@ pub struct TraceEvent {
     pub continuation: Ref64,
 
     pub run_class: u32,
+    /// Purely numeric detail: a sequence number, a count, a right mask. Never
+    /// an entity.
+    ///
+    /// It used to carry a bare slot for four event kinds, which made those
+    /// events uncomparable across two runs that name their entities
+    /// differently: a slot number alone has no kind and no generation, so
+    /// nothing can tell it apart from a sequence number and nothing can
+    /// translate it. Entities live in `subject` now.
     pub auxiliary: u32,
+
+    /// The secondary entity an event is about: the future a continuation is
+    /// waiting on, the value a future resolved to, the process a restart
+    /// replaced, the contract a continuation was created under.
+    ///
+    /// Distinct from `causal`, which names the entity two events are ordered
+    /// *through*. An event may have both — `FutureResolved` is caused through
+    /// the future and is about the value.
+    pub subject: Ref64,
 
     /// The entity through which this event is causally related to another
     /// event: the future a wake came from, the channel or receiver a message
@@ -123,6 +140,7 @@ impl TraceEvent {
             continuation,
             run_class,
             auxiliary: 0,
+            subject: Ref64::NULL,
             causal: Ref64::NULL,
         }
     }

@@ -187,6 +187,7 @@ pub struct TraceSnapshotRow {
     pub continuation: u64,
     pub run_class: u32,
     pub auxiliary: u32,
+    pub subject: u64,
     pub causal: u64,
 }
 
@@ -527,6 +528,54 @@ impl Kernel {
         auxiliary: u32,
         causal: Ref64,
     ) {
+        self.trace_full(
+            event_kind,
+            process,
+            continuation,
+            run_class,
+            auxiliary,
+            causal,
+            Ref64::NULL,
+        );
+    }
+
+    /// Append a trace event that is *about* a second entity — the future being
+    /// awaited, the value a future took, the process a restart replaced.
+    ///
+    /// `subject` exists so that no entity is ever recorded as a bare slot
+    /// number. A slot alone carries no kind and no generation, so a checker
+    /// comparing two runs that name their entities differently cannot
+    /// translate it, and cannot even tell it apart from a sequence number.
+    pub(crate) fn trace_about(
+        &mut self,
+        event_kind: EventKind,
+        process: Ref64,
+        continuation: Ref64,
+        run_class: u32,
+        subject: Ref64,
+    ) {
+        self.trace_full(
+            event_kind,
+            process,
+            continuation,
+            run_class,
+            0,
+            Ref64::NULL,
+            subject,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn trace_full(
+        &mut self,
+        event_kind: EventKind,
+        process: Ref64,
+        continuation: Ref64,
+        run_class: u32,
+        auxiliary: u32,
+        causal: Ref64,
+        subject: Ref64,
+    ) {
         self.logical_time = self.logical_time.wrapping_add(1);
         let (lane, lane_sequence) = self.next_position();
         self.trace.push(TraceEvent::new(
@@ -540,6 +589,7 @@ impl Kernel {
         if let Some(last) = self.trace.last_mut() {
             last.auxiliary = auxiliary;
             last.causal = causal;
+            last.subject = subject;
             last.lane = lane;
             last.lane_sequence = lane_sequence;
         }
@@ -614,6 +664,7 @@ impl Kernel {
                 continuation: t.continuation.to_u64(),
                 run_class: t.run_class,
                 auxiliary: t.auxiliary,
+                subject: t.subject.to_u64(),
                 causal: t.causal.to_u64(),
             })
             .collect()
@@ -858,7 +909,7 @@ impl Kernel {
                         slot: **holder,
                         generation: 0,
                         kind: Kind::Process,
-                        flags: 0,
+                        partition: 0,
                     },
                     right,
                     target,
@@ -1343,12 +1394,12 @@ impl Kernel {
         {
             return None;
         }
-        self.trace(
+        self.trace_about(
             EventKind::ProcessRestarted,
             failed_descriptor.supervisor,
             replacement,
             0,
-            failed.slot,
+            failed,
         );
         Some(replacement)
     }
@@ -1752,12 +1803,12 @@ impl Kernel {
         }
         let continuation = self.create_continuation(actor, process, spec)?;
         self.continuations.get_mut(continuation)?.execution_contract = contract;
-        self.trace(
+        self.trace_about(
             EventKind::ContractAttached,
             process,
             continuation,
             0,
-            contract.slot,
+            contract,
         );
         Ok(continuation)
     }
@@ -1920,13 +1971,14 @@ impl Kernel {
         // order runs wake ≺ resolution. See `semantics::order` — the edge is an
         // ordering constraint taken from the transition rule, not a claim about
         // which event physically caused the other.
-        self.trace_caused(
+        self.trace_full(
             EventKind::FutureResolved,
             owner,
             Ref64::NULL,
             0,
-            value.slot,
+            0,
             future,
+            value,
         );
         Ok(())
     }

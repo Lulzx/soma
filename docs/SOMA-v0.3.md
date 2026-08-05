@@ -21,7 +21,7 @@ did not depend on it are done; the rest is scoped below.
 | **D** | Performance work on real hardware | scope (§6) |
 
 Six new clauses are now checked — I18 through I23 — and v0.2's only
-`[modelled]` clause is gone. The test suite went from 151 to 208.
+`[modelled]` clause is gone. The test suite went from 151 to 215.
 
 ---
 
@@ -99,8 +99,9 @@ edge between them would reject correct implementations.
 **I18. Schedule conformance [checked].** A candidate trace conforms to a
 reference trace when
 
+0. a correspondence between the two runs' entity names exists (§2.6);
 1. it contains the same events, per epoch — same kinds, subjects, auxiliary
-   data, and causal attribution;
+   data, and causal attribution — read through that correspondence;
 2. every continuation's own events appear in the reference's order;
 3. epochs do not move backwards; and
 4. every causal edge runs forwards.
@@ -170,6 +171,47 @@ The same trap applies to program order, which is why clause 2 of I18 compares
 against the reference rather than deriving an edge: an edge derived from the
 candidate's own positions can never be inverted, because the derivation simply
 reads the events in whatever order it finds them.
+
+### 2.6 Identity is not observable either
+
+Added while scoping §4.3, which is where the omission showed up.
+
+§2 removed one assumption the sequential interpreter had smuggled into the
+equivalence — that logical time is a total order every implementation can
+reproduce. It left a second one untouched, one level down: **that two runs of a
+program give their entities the same names.**
+
+A `Ref64` is a table position. Two allocators that never coordinate — which is
+what a device's lanes and a cluster's nodes have to be — hand out different
+positions for the same entity. Comparing raw references makes every such
+implementation non-conforming by construction, for a reason that has nothing to
+do with what it did. That is the §2.1 defect exactly, and it would have been
+discovered the moment §4.3 partitioned the allocator.
+
+So I18 compares up to a correspondence between the two runs' names. The
+correspondence is **forced, not chosen**: entities pair in the order they first
+appear, within their kind. A checker allowed to pick the pairing could pick
+whichever one made the traces agree, which would make the clause vacuous.
+Positional pairing of two sequences of distinct names is a bijection, so a run
+that dropped an entity or merged two into one produces sequences of different
+lengths and is reported rather than renamed away — the negative cases in
+`tests/identity_equivalence.rs`.
+
+The boundary worth stating, because it looks like a defect and is not:
+exchanging two entities' names *uniformly* conforms. It exchanges their
+first-appearance order too, so the forced correspondence pairs them the other
+way round and the swap cancels. The run did the same things under different
+names. Applying the same swap to only part of a run does not conform, and that
+is the case separating a renaming from a behavioural difference.
+
+**This forced one ABI change.** Four event kinds recorded an entity in
+`auxiliary` as a bare slot number: the future a continuation awaits, the value a
+future resolved to, the process a restart replaced, the contract a continuation
+was created under. A bare slot has no kind and no generation, so nothing can
+translate it and nothing can even distinguish it from the sequence numbers
+`auxiliary` also carries. `TraceEvent` gains `subject: Ref64` for the entity an
+event is *about*, distinct from `causal`, which names the entity two events are
+ordered *through*. `auxiliary` is now purely numeric.
 
 ---
 
@@ -383,9 +425,53 @@ reconstructible without a clock. What a lane observes still depends on when it
 ran relative to other lanes, because effects are still applied as they are
 produced. That is the next section's problem.
 
-### 4.3 What is left: canonical commit
+### 4.3 Canonical commit is three problems, not one
 
-The obstacle to the second obligation is structural rather than subtle: the
+Scoping this section found that the sentence below names one obstacle and there
+are three. Only the first was written down.
+
+1. **Mutation ordering.** Handlers mutate as they run, so execute and commit are
+   fused. This is the one §4.3 originally named.
+2. **Allocation identity.** A step allocates entities and then *uses* them
+   within the same step — `expand_resume_2` creates a child process and
+   immediately creates a continuation on it, and stores a freshly created
+   payload object's reference **inside the encoded frame bytes**. A symbolic
+   reference cannot survive into an opaque byte blob without a relocation table,
+   so allocation has to be eager, so concurrent lanes need an allocator that
+   hands out names without coordinating.
+3. **Read visibility.** Today lane 5 sees what lane 1 wrote in the same epoch.
+   Lanes reading a snapshot do not. That is a semantic change, not an
+   implementation detail.
+
+**(3) was measured rather than assumed.** Using the ≺ machinery from §2: across
+the Expand workload at cohort widths 1, 2 and 16 and a four-class heuristic
+search — 1025 events, 441 edges — **no ≺ edge joins two lanes of one epoch**.
+That is structural rather than lucky: the wake events (`MessageReceived`,
+`ContinuationReady`, `ChannelReceived`) are emitted by the *acting* lane, so a
+delivery edge is either within one lane or across epochs.
+
+It is not an invariant, and the specification should not claim it as one. The
+channel workloads drive their sends from outside any lane, so they do not
+exercise the case; a lane-driven `channel_send` followed by a later lane's
+receive in the same epoch is reachable in principle. It is a **precondition to
+check per run**, not a property of the model.
+
+**(2) is the same problem as C's node identity.** §1.2 deferred "a node
+identity, so that two nodes allocating slot 7 do not produce colliding
+references" to C on the grounds that nothing before a multi-node implementation
+could test it. Lane-local allocation needs exactly that field, and it is
+testable now. `Ref64.partition` is that field; it occupies the byte that was
+`flags`, written as zero everywhere and read nowhere, so a reference still fits
+in 64 bits. `Ref64::key` is the `(partition, slot)` pair that replaces a bare
+slot wherever the kernel keys a map by entity identity.
+
+Partitioned allocation was untestable until §2.6, because a run allocating from
+a different partition fails raw-reference comparison for reasons unrelated to
+its behaviour. §2.6 is done; the allocator itself is not — the tables still
+allocate from partition 0, and `tests/identity_equivalence.rs` exercises the
+shape a partitioned one produces rather than a real one.
+
+The obstacle to the first is structural rather than subtle: the
 executive's handlers take `&mut Kernel` and allocate their effects as they run
 (`create_process`, `resolve_future`, `enqueue_message`), so execute and commit
 are fused. Canonical commit requires a step to produce an effect list that the
@@ -484,7 +570,7 @@ cannot reach means the model is charging for the wrong thing.
 | ------ | ------ | ---- |
 | I1–I13, I15–I17 | checked | unchanged from v0.2 |
 | I14 progress | **superseded by I21** | was v0.2's only `[modelled]` clause |
-| I18 schedule conformance | checked | replaces trace equality (§2) |
+| I18 schedule conformance | checked | replaces trace equality (§2), up to a renaming (§2.6) |
 | I19 placement neutrality | checked | cohort width, with a non-vacuity null |
 | I20 backend agreement | checked | CPU interpreter is the definition |
 | I21 bounded progress | checked | no withholding, plus a starvation bound |

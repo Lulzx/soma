@@ -4,7 +4,7 @@ Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
 Repository: https://github.com/Lulzx/soma. The default semantic core is
-dependency-free. There are 208 integration tests (two of which need the `metal`
+dependency-free. There are 215 integration tests (two of which need the `metal`
 feature), two compile-fail doc tests, and no Clippy warnings. The optional `metal` feature adds the `metal-rs` implementation
 dependency on macOS.
 
@@ -76,7 +76,8 @@ src/
                language and its MSL codegen; examples.rs holds the example
                module both backends are checked against.
   semantics/   invariants.rs checks the executable part of the specification.
-               order.rs derives the semantic order and checks I18/I19.
+               order.rs derives the semantic order, the identity
+               correspondence, and checks I18/I19.
                schedule.rs checks I22, admission determinism.
   replay/      trace comparison for determinism checks.
   experiments/ measurement only. None of it is part of the machine.
@@ -149,6 +150,11 @@ Added in v0.3:
 - Lane-relative trace positions (I23), so the run's order is recoverable
   without a shared clock. Two of the device scheduler's four obligations;
   canonical commit is the one that gates a concurrent executive.
+- I18 up to a renaming of entity references, so an implementation whose
+  allocator names entities differently is no longer non-conforming by
+  construction. `Ref64` gains a `partition` byte in place of the unused
+  `flags`, and `TraceEvent` a `subject` field so no entity is recorded as a
+  bare slot number.
 
 ### Semantic boundary
 
@@ -384,6 +390,11 @@ decision that would otherwise depend on `HashMap` iteration order.
   a single host counter satisfies "sorted by position equals emitted order"
   perfectly — while the trace goes back to needing a shared clock. Clause 3 of
   I23 is the only thing that reports it.
+- **An entity never goes in `auxiliary`.** That field is numeric — sequence
+  numbers, counts, right masks. A slot number put there carries no kind and no
+  generation, so the identity correspondence cannot translate it and cannot
+  tell it apart from a sequence. Use `subject` for the entity an event is
+  about, `causal` for the entity two events are ordered through.
 - **Trace `causal` is load-bearing for I18.** Adding an event that participates
   in a cross-entity happens-before edge without setting `causal` silently drops
   that edge, and a dropped edge makes the conformance checker weaker without
