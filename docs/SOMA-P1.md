@@ -26,7 +26,7 @@ SOMA-P1 implements:
 
 | Component          | Phase-1 support                         |
 | ------------------ | --------------------------------------- |
-| Protection domains | Logical domains; trusted modules        |
+| Protection domains | Logical domains. Trusted modules        |
 | Processes          | Persistent, serial-state processes      |
 | Objects            | Unique mutable and frozen shared        |
 | Capabilities       | Generation-checked table references     |
@@ -44,15 +44,15 @@ SOMA-P1 implements:
 
 Deferred until later:
 
-* arbitrary untrusted shader execution;
-* hardware-enforced GPU address-space isolation;
-* tensor, tile, media, and Neural Engine execution;
-* general borrowing;
-* shared mutable objects;
-* transactional messages;
-* transparent hardware preemption;
-* distributed execution;
-* process checkpoint rollback;
+* arbitrary untrusted shader execution.
+* hardware-enforced GPU address-space isolation.
+* tensor, tile, media, and Neural Engine execution.
+* general borrowing.
+* shared mutable objects.
+* transactional messages.
+* transparent hardware preemption.
+* distributed execution.
+* process checkpoint rollback.
 * and dynamic code loading.
 
 ---
@@ -71,7 +71,7 @@ explicit ABI version numbers
 generation-checked references
 ```
 
-A SOMA program never places a raw CPU or GPU address inside persistent state.
+A SOMA program does not place raw CPU or GPU addresses in persistent state.
 
 References point into operating-system-managed tables.
 
@@ -184,12 +184,12 @@ KERNEL_OWNED
 
 Capability derivation can only reduce:
 
-* accessible range;
-* rights;
-* lifetime;
+* accessible range.
+* rights.
+* lifetime.
 * or transferability.
 
-It can never amplify authority.
+Derivation does not amplify authority.
 
 ---
 
@@ -227,7 +227,8 @@ FUTURE_VALUE
 TRACE_BUFFER
 ```
 
-The `physical_mapping_token` is private to the kernel and engine executives. User programs cannot inspect or construct it.
+The `physical_mapping_token` is private to the kernel and engine executives.
+The user API does not expose or construct it.
 
 ## 6.1 Unique mutable object
 
@@ -235,9 +236,9 @@ A unique mutable object has exactly one write-capable owner.
 
 The owner may:
 
-* read it;
-* write it;
-* freeze it;
+* read it.
+* write it.
+* freeze it.
 * or transfer ownership.
 
 Sending a unique object transfers authority atomically:
@@ -257,7 +258,7 @@ Freezing performs:
 3. Transition to immutable state.
 4. Publication to one or more readers.
 
-A frozen object cannot return to mutable state in Phase 1.
+A frozen object does not return to mutable state in Phase 1.
 
 Mutation requires allocating a new object.
 
@@ -481,7 +482,7 @@ REQUIRE_CPU
 REQUIRE_GPU
 ```
 
-The runtime may override a preference but never a requirement.
+The runtime may override a preference but must obey a requirement.
 
 ---
 
@@ -591,18 +592,18 @@ next_epoch
 
 During an epoch:
 
-* workers consume only from `current_epoch`;
-* new runnable continuations append only to `next_epoch`;
-* an atomic increment reserves each append slot;
+* workers consume only from `current_epoch`.
+* new runnable continuations append only to `next_epoch`.
+* an atomic increment reserves each append slot.
 * the buffers swap at the next scheduling boundary.
 
 Benefits:
 
-* no concurrent pop operation;
-* no per-entry reclamation;
-* no ABA problem;
-* deterministic epoch boundaries;
-* cheap grouping by run class;
+* no concurrent pop operation.
+* no per-entry reclamation.
+* no ABA problem.
+* deterministic epoch boundaries.
+* cheap grouping by run class.
 * natural bounded execution.
 
 Messages and futures may awaken continuations into the next-epoch buffer.
@@ -699,9 +700,9 @@ Phase 1 may use a static dispatch table or generated switch. Dynamic module load
 
 The CPU executive consumes:
 
-* scalar-only run classes;
-* partial GPU cohorts below the batching threshold;
-* continuations nearing a deadline;
+* scalar-only run classes.
+* partial GPU cohorts below the batching threshold.
+* continuations nearing a deadline.
 * and continuations whose divergence history predicts poor GPU efficiency.
 
 The CPU implementation uses the same:
@@ -784,37 +785,37 @@ Each epoch proceeds through eight phases.
 
 Import:
 
-* newly created processes;
-* CPU service responses;
-* external messages;
-* cancellation requests;
+* newly created processes.
+* CPU service responses.
+* external messages.
+* cancellation requests.
 * and resolved I/O futures.
 
 ## Phase B: Validate
 
 Check:
 
-* capability generations;
-* process status;
-* object ownership;
-* continuation budgets;
+* capability generations.
+* process status.
+* object ownership.
+* continuation budgets.
 * and execution-contract validity.
 
 ## Phase C: Admit
 
 Apply:
 
-* domain quotas;
-* process priorities;
-* deadline policy;
+* domain quotas.
+* process priorities.
+* deadline policy.
 * and runnable-bin capacity limits.
 
 ## Phase D: Place
 
 Assign eligible continuations to:
 
-* CPU scalar execution;
-* GPU lane execution;
+* CPU scalar execution.
+* GPU lane execution.
 * or deferred batching.
 
 ## Phase E: Cohort
@@ -829,23 +830,23 @@ Run a bounded number of continuation steps and collect `StepResult` records.
 
 Atomically publish:
 
-* state transitions;
-* messages;
-* capability transfers;
-* future resolutions;
-* child processes;
+* state transitions.
+* messages.
+* capability transfers.
+* future resolutions.
+* child processes.
 * and continuation results.
 
 ## Phase H: Account
 
 Record:
 
-* execution time;
-* active lanes;
-* queue delay;
-* bytes accessed;
-* deadline outcomes;
-* process quotas;
+* execution time.
+* active lanes.
+* queue delay.
+* bytes accessed.
+* deadline outcomes.
+* process quotas.
 * and trace events.
 
 The epoch then advances and runnable-bin buffers swap.
@@ -862,9 +863,9 @@ At most one continuation holding mutable authority over process state may be RUN
 
 A process may simultaneously have:
 
-* one active mutating continuation;
-* several waiting continuations;
-* several pure child operations;
+* one active mutating continuation.
+* several waiting continuations.
+* several pure child operations.
 * and unresolved futures.
 
 This invariant avoids general-purpose locking in the first implementation.
@@ -958,11 +959,11 @@ PROCESS_CANCELLED
 
 Deterministic replay consumes:
 
-* initial object state;
-* external inputs;
-* message order;
-* placement decisions;
-* cohort membership;
+* initial object state.
+* external inputs.
+* message order.
+* placement decisions.
+* cohort membership.
 * and random seeds.
 
 A CPU interpreter executes the same continuation state machines for debugging.
@@ -1038,8 +1039,8 @@ struct BatchEvaluateRequest {
 
 It exists to compare:
 
-* actor-by-actor lane execution;
-* explicitly batched execution;
+* actor-by-actor lane execution.
+* explicitly batched execution.
 * and runtime-generated batching.
 
 This reveals whether automatic physical shaping approaches the efficiency of manually expressed bulk work.
@@ -1278,9 +1279,9 @@ Possible outcomes include:
 
 Proceed toward:
 
-* richer process semantics;
-* more execution shapes;
-* compiler automation;
+* richer process semantics.
+* more execution shapes.
+* compiler automation.
 * and stronger isolation.
 
 ## Outcome B: Cohorting helps only for narrow synthetic workloads
@@ -1291,9 +1292,9 @@ Reframe SOMA as a specialized runtime for irregular task systems rather than a g
 
 Investigate:
 
-* coarser continuations;
-* fewer run classes;
-* compiler-generated batch fusion;
+* coarser continuations.
+* fewer run classes.
+* compiler-generated batch fusion.
 * and direct collective construction.
 
 The abstract process model may survive while dynamic cohorting is rejected.
@@ -1329,9 +1330,9 @@ The shortest evidence-producing sequence is:
 
 The CPU interpreter comes first because it provides:
 
-* semantic ground truth;
-* deterministic tests;
-* trace validation;
+* semantic ground truth.
+* deterministic tests.
+* trace validation.
 * and a debugging oracle for GPU behavior.
 
 ---
@@ -1340,8 +1341,9 @@ The CPU interpreter comes first because it provides:
 
 SOMA-P1 succeeds when it demonstrates:
 
-> A population of persistent independently evolving processes can remain resident in shared memory, become runnable through messages and futures, suspend through bounded continuations, and be dynamically repacked into coherent SIMD cohorts that outperform a generic persistent worker on irregular workloads—without returning fine-grained scheduling control to the CPU.
-
-At that point, SOMA becomes a justified kernel architecture.
+SOMA-P1 succeeds if resident processes wake through messages and futures,
+suspend through bounded continuations, and form SIMD cohorts that outperform a
+generic persistent worker on irregular workloads without fine-grained CPU
+scheduling.
 
 Before that point, it remains a strong but unproven abstract machine.

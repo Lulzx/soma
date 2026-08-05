@@ -1,6 +1,6 @@
 # SOMA Semantic Specification v0.2
 
-**Status:** draft. Machine-checked where marked; incomplete where marked.
+**Status:** draft. Machine-checked where marked. Incomplete where marked.
 
 SOMA is an abstract machine for irregular concurrent computation. It is defined
 here without reference to any hardware: no SIMD width, no device, no host, no
@@ -8,10 +8,9 @@ placement. Those belong to *implementations* of SOMA, of which the CPU reference
 interpreter in this repository is one and a GPU operating system might be
 another. If a clause below mentions hardware, it is a defect in the clause.
 
-The question this version exists to answer is whether persistent processes,
-object capabilities, continuations, dataflow readiness, and collectives form a
-coherent programming model. Coherence is testable, so most of this document is
-written to be executable.
+This version defines persistent processes, object capabilities, continuations,
+dataflow readiness, and collectives as one programming model. Most clauses map
+to executable checks against the reference interpreter.
 
 ## 0. How to read this
 
@@ -23,8 +22,7 @@ Every clause is one of:
 | **[modelled]** | Implemented in the reference interpreter, but not yet expressible as a state predicate, so it is verified only by targeted tests. |
 | **[absent]** | Named by the model and *not* implemented. The machine does not have this property. |
 
-The markers are load-bearing. An [absent] clause is not a promise about future
-work being nearly done; it means a program relying on it will not be protected.
+An [absent] clause provides no guarantee to a program that relies on it.
 `tests/semantics.rs` asserts both directions for every [checked] clause: the
 reference model satisfies it, *and* the checker catches a state that violates
 it. A checker that cannot fail is not evidence.
@@ -49,8 +47,9 @@ S  scheduler configuration: binning mode, cohort width, partial policy
 A  accounting counters
 ```
 
-Entities are never addressed by pointer. Every reference is a **generational
-reference**: a slot, a generation, a kind, and flags. A reference resolves only
+Entities are addressed by **generational references**, not pointers. Each has
+a slot, generation, kind, and flags. A
+reference resolves only
 when the slot exists, the kind matches the table, and the generation equals the
 slot's current generation. Deleting an entity increments its slot generation
 before the slot is reused, so a reference retained across a delete fails to
@@ -62,36 +61,38 @@ This is an ABA window, documented rather than solved.
 
 ### 1.1 Entities
 
-**Process** — a persistent, independently evolving unit of computation with an
+**Process**, a persistent, independently evolving unit of computation with an
 identity, private state, an inbox, a mode, and a lifecycle status. A process is
-*not* a unit of execution; it does not "run". It becomes ready, and its
+*not* a unit of execution. It does not "run". It becomes ready, and its
 continuations run.
 
-**Object** — a byte payload with an ownership state, a version, and a kind. The
-physical representation is private to the implementation; programs cannot
-construct or inspect a mapping.
+**Object**, a byte payload with an ownership state, a version, and a kind. The
+physical representation is private to the implementation. The program API does
+not construct or expose a mapping.
 
-**Continuation** — a *bounded resumable segment* of a process's execution: the
+**Continuation**, a *bounded resumable segment* of a process's execution: the
 schedulable unit. It names its process, its run class, its durable frame, what
 it depends on, and a remaining step budget. Continuations exist because the
 model does not assume preemption: a computation that must yield control does so
 by ending a continuation and naming the next one.
 
-**Frame** — an object holding a continuation's live state as a byte blob. Frames
+**Frame**, an object holding a continuation's live state as a byte blob. Frames
 are durable and position-independent, which is what allows a continuation to be
 resumed by a different executor than the one that suspended it.
 
-**Future** — a single-assignment cell. Resolving it publishes a value and makes
+**Future**, a single-assignment cell. Resolving it publishes a value and makes
 every registered waiter ready.
 
-**Run class** — the identity of a resume point. Two continuations share a run
+**Run class**, the identity of a resume point. Two continuations share a run
 class exactly when they will execute the same code over the same frame schema.
 A run class is simultaneously the interpreter's dispatch key and the scheduler's
-bin key; that they are the same value is a design commitment, not a coincidence.
+bin key. That they are the same value is a design commitment, not a coincidence.
 
-**Capability** — permission to act on an entity. **[absent]** — see §5.
+**Capability**, actor-relative permission to act on an entity. Capability
+spaces, genesis, and attenuation are implemented. Operation enforcement is
+still **[absent]**, see I10.
 
-**Channel**, **Collective**, **Domain** — named by the model, not implemented.
+**Channel**, **Collective**, **Domain**, named by the model, not implemented.
 **[absent]**
 
 ### 1.2 Observable behaviour
@@ -100,8 +101,8 @@ The observable behaviour of a run is its **trace**: a totally ordered sequence
 of events, each carrying a logical time, epoch, kind, process, continuation, run
 class, and one auxiliary field.
 
-Two runs are **equivalent** when their traces are equal. This is the only
-equivalence the model defines. Internal state that never reaches the trace is
+Two runs are **equivalent** when their traces are equal. The model defines no
+other equivalence. Internal state absent from the trace is
 not observable, and an implementation may represent it however it likes.
 
 ---
@@ -112,8 +113,8 @@ A state is **legal** when all of the following hold. `check(Σ)` returns every
 violation, not the first.
 
 **I1. Reference integrity [checked].** Every reference held by a live entity
-resolves, or is null. A continuation's process, frame, and dependency; a
-process's state object; a resolved future's value; a queued message's payload.
+resolves, or is null. A continuation's process, frame, and dependency. A
+process's state object. A resolved future's value. A queued message's payload.
 
 **I2. No continuation left running [checked].** Between transitions no
 continuation is in the `Running` state. `Running` exists only *within* a step.
@@ -122,24 +123,24 @@ continuation is in the `Running` state. `Running` exists only *within* a step.
 live, and a terminated process has no continuation that is still schedulable.
 
 > This clause is the reason `Complete` is a statement about a continuation and
-> not about its process. A process may have several continuations alive at once;
-> retiring the process when the first finishes strands the rest. The reference
-> interpreter got this wrong until this specification was written — see §6.1.
+> not about its process. A process may have several continuations alive at once.
+> Retiring the process when the first finishes strands the rest. The reference
+> interpreter got this wrong until this specification was written, see §6.1.
 
 **I4. Future single assignment [checked].** A pending future carries no value. A
-settled future was settled no later than the current epoch, and has an empty
-wait set — because resolution drains the wait set exactly once, a continuation
-registered afterwards would never wake.
+settled future was settled no later than the current epoch and has an empty
+wait set. Resolution drains the wait set exactly once. A continuation
+registered after resolution would never wake.
 
 **I5. Mailbox bound [checked].** No mailbox holds more messages than its
-capacity. Send into a full mailbox fails and registers the sender for wakeup; it
+capacity. Send into a full mailbox fails and registers the sender for wakeup. It
 does not block, spin, or drop.
 
 **I6. Message ordering [checked].** Messages from one sender to one receiver are
 delivered in send order. No ordering is defined between different senders.
 
 **I7. Scheduler well-formedness [checked].** Every continuation in a bin is
-live, is in the `Runnable` state, and sits in the bin its run class maps to
+live, is in the `Runnable` state, and is stored in the bin its run class maps to
 under the current binning mode.
 
 **I8. Frame exclusivity [checked].** No two continuations share a frame object.
@@ -150,19 +151,26 @@ published to at least one reader, and any owner it names is live. Freezing is
 one-way: mutation of a frozen object requires allocating a new object.
 
 > Only the structural half is checked. That a frozen object is never *written*
-> is not verified, because the model has no write barrier — see §5.
+> is not verified, because the model has no write barrier, see §5.
 
-**I10. Capability safety [absent].** *Intended:* no process may act on an entity
-without holding a capability conferring that right. **Not implemented.** The
-capability table exists and is never consulted. Any process can mutate any
-object it can name. There is deliberately no checker for this clause, because a
-check that cannot fail would misrepresent the machine as safe.
+**I10a. Capability attenuation [checked].** A derived capability's rights are a
+subset of its parent's rights and its byte range lies within its parent's.
+
+**I10b. Capability integrity [checked].** Every capability target resolves, its
+rights apply to the target kind, and its parent is live in the same actor's
+capability space.
+
+**I10c. No unauthorised effect [absent].** *Intended:* no process may act on an
+entity without holding a capability conferring that right. Operations name an
+actor and pass through one authorization gate, but the gate is still permissive.
+A process can therefore mutate an object it cannot access through its own space.
+The structural checks above do not enforce operation authority.
 
 **I11. Trace monotonicity [checked].** Logical time strictly increases across
-the trace; epochs never move backwards.
+the trace. Epochs never move backwards.
 
 **I12. Accounting consistency [checked].** Issued lane-slots partition exactly
-into useful and idle; full cohorts do not exceed total cohorts.
+into useful and idle. Full cohorts do not exceed total cohorts.
 
 **I13. Serial process execution [modelled].** At most one continuation holding
 mutable authority over a process's state executes per epoch. Verified by test
@@ -171,7 +179,7 @@ state.
 
 **I14. Progress [modelled].** If any continuation is runnable, an epoch executes
 at least one step. Deferral policies may delay work but may not withhold it
-indefinitely; the reference interpreter forces a partial cohort when an epoch
+indefinitely. The reference interpreter forces a partial cohort when an epoch
 would otherwise do nothing.
 
 ---
@@ -247,7 +255,7 @@ that mistake silently.
 
 A continuation step returns a **step result**: `Complete`, `Yield(next)`,
 `Await(target, next)`, `Send`, `Spawn(next)`, or `Fault`. Handlers perform their
-own side effects; the commit rule finalises scheduling and status.
+own side effects. The commit rule finalises scheduling and status.
 
 ```text
 COMMIT(c, p, result)
@@ -278,16 +286,14 @@ EPOCH(Σ) -> Σ'
 The budget check precedes dispatch deliberately. Faulting *after* commit would
 leave a faulted continuation enqueued by that commit, violating I7.
 
-Work produced during an epoch lands in the next-epoch buffer, so an epoch
+Work produced during an epoch goes into the next-epoch buffer, so an epoch
 boundary is a consistent cut. This is a property of the reference interpreter's
-scheduling, not a requirement of the model; an implementation may wake
+scheduling, not a requirement of the model. An implementation may wake
 continuations within an epoch provided it preserves I1–I12 and determinism.
 
 ---
 
-## 4. What the model does not define
-
-Stated explicitly, because silence reads as permission:
+## 4. Undefined by the model
 
 - **Placement.** Nothing in §1–§3 says where a continuation runs. An
   implementation may run everything on one executor or distribute across many.
@@ -317,7 +323,9 @@ Stated explicitly, because silence reads as permission:
 | I7 scheduler well-formed | checked | |
 | I8 frame exclusivity | checked | |
 | I9 ownership monotonicity | checked, partial | structural half only |
-| I10 capability safety | **absent** | table allocated, never consulted |
+| I10a attenuation | checked | rights and ranges only shrink |
+| I10b capability integrity | checked | actor-relative spaces and live links |
+| I10c no unauthorised effect | **absent** | operations do not consult authority |
 | I11 trace monotonicity | checked | |
 | I12 accounting consistency | checked | |
 | I13 serial execution | modelled | per-epoch, by test |
@@ -325,30 +333,31 @@ Stated explicitly, because silence reads as permission:
 
 Entities named but not implemented: **Channel**, **Collective**, **Domain**,
 execution contracts, cancellation, and supervision. Messaging is per-process
-mailboxes rather than first-class channels; there is no collective construct at
+mailboxes rather than first-class channels. There is no collective construct at
 all, so the model's claim to cover cooperative execution shapes is currently
 unsupported by any implementation.
 
-`tests/semantics.rs::capability_authority_is_unenforced_and_the_spec_says_so`
-demonstrates the I10 gap concretely: a process with no capability mutates an
-object it does not own, ownership transfer changes nothing, and the machine
-still reports itself legal.
+`tests/semantics.rs::capability_effect_authority_remains_unenforced`
+demonstrates the remaining I10c gap concretely: a process with no capability
+mutates an object it does not own, ownership transfer changes nothing, and the
+machine still reports itself legal. Separate negative tests prove that the
+I10a/I10b checkers catch amplification and a dead parent.
 
 ---
 
 ## 6. Ambiguities the executable model exposed
 
-The point of an executable specification is that writing it breaks things.
+The executable checks exposed the following ambiguities.
 
 ### 6.1 `Complete` conflated continuation and process lifetime
 
 The first run of the I3 checker failed on the `Expand` workload. `Expand` spawns
-its heuristic as a second continuation *of the same process*; when the heuristic
+its heuristic as a second continuation *of the same process*. When the heuristic
 completed, the commit rule marked the whole process terminated, leaving
 `Expand`'s main continuation waiting on a future belonging to a dead process.
 It then woke and ran normally, because nothing checked.
 
-The ambiguity was in the model, not only the code: §3.4 had never said whether
+The ambiguity was in the model, not only the code: §3.4 did not specify whether
 `Complete` is a claim about a continuation or about a process. It is about a
 continuation. A process retires when its last continuation does.
 
@@ -364,8 +373,8 @@ the answer, which is too coarse.
 
 `Fault` marks a process failed and increments a counter. Nothing says what
 happens to its other continuations, its queued messages, its unresolved futures,
-or anyone awaiting them. A future whose resolver faults is never resolved and
-its waiters wait forever — I14 does not catch this, because those continuations
+or anyone awaiting them. A future whose resolver faults is never resolved, so
+its waiters wait forever. I14 does not catch this because those continuations
 are not runnable.
 
 ### 6.4 Unresolved: cancellation
@@ -375,9 +384,7 @@ them.
 
 ---
 
-## 7. Next
-
-In order of what most constrains the rest:
+## 7. Remaining work
 
 1. **Capabilities (I10).** The largest gap between what the model claims and
    what it does. Settled in design by
@@ -389,11 +396,11 @@ In order of what most constrains the rest:
    first.
 3. **Channels and collectives.** Currently vocabulary, not machinery.
 4. **Validation workloads** beyond dynamic search: streaming pipelines, actor
-   systems, irregular dataflow — chosen to stress ordering, back-pressure, and
+   systems, irregular dataflow, chosen to stress ordering, back-pressure, and
    failure rather than throughput.
-5. **A minimal IR**, once §6.2 and §6.3 are settled — a surface syntax for a
-   model with unresolved ownership and failure semantics would encode the
-   ambiguity rather than remove it.
+5. **A minimal IR**, after §6.2 and §6.3 are settled. A surface syntax for a
+   model with unresolved ownership and failure semantics would preserve the
+   ambiguity.
 
 Performance work belongs after all of this, and the performance results already
 in this repository (`docs/SOMA-P1.md`, and the cohorting studies) should be read

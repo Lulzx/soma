@@ -1,10 +1,10 @@
-# SOMA — engineering handoff
+# SOMA engineering handoff
 
-Everything you need to pick this up. Read §1 and §6 before writing any code;
-§6 is the part that is easy to lose and expensive to rediscover.
+Read §1 for the project state and §6 for the test discipline before changing
+the code.
 
-Repo: https://github.com/Lulzx/soma · ~7,200 lines Rust · no dependencies ·
-83 tests · zero clippy lints.
+Repository: https://github.com/Lulzx/soma. About 7,200 lines of Rust, no
+dependencies, 89 tests, and no Clippy warnings.
 
 ```sh
 cargo test
@@ -22,14 +22,14 @@ cargo run --example territory_report   # distribution across territories
 
 SOMA is an **abstract machine** for irregular concurrent computation: persistent
 processes, objects, continuations, dataflow readiness, capabilities,
-collectives. It is deliberately hardware-neutral — no SIMD width, no device, no
-host, no placement. Those belong to *implementations*.
+collectives. It specifies no SIMD width, device, host, or placement. Those
+belong to implementations.
 
 The project changed shape recently and the git history reads misleadingly if you
 don't know this. It began as a GPU operating system idea ("replace kernel
 launches with persistent device-resident processes"), generalised into SOMA, and
-has now been explicitly refocused: **specify the abstract machine first; a GPU OS
-becomes one implementation of it later.** Performance work is paused.
+is now focused on the abstract machine. A GPU OS may implement it later.
+Performance work is paused.
 
 Two documents, and they are not equals:
 
@@ -50,31 +50,29 @@ src/
   abi/         Fixed-width ABI structs. Ref64 = slot+generation+kind+flags.
                Descriptors for objects, processes, continuations, cohorts,
                futures, messages, capabilities, contracts, traces.
-  table.rs     Generational slot table. Slot 0 reserved so NULL never resolves;
-               delete bumps generation so stale refs fail.
-  kernel/      The machine. mod.rs holds all state; epochs.rs is the epoch
-               lifecycle; commit.rs is the only path to runnable/terminal;
-               ownership.rs is freeze/transfer; accounting.rs is counters.
-  executives/  cpu_scalar.rs — the interpreter. One switch on run_class.
-  scheduler/   runnable_bins.rs — double-buffered per-run-class bins.
-               cohorts.rs — cohort construction + the shared dispatch-cost model.
-  compiler/    frame.rs — little-endian frame encode/decode.
-               state_machine_lowering.rs — the Expand example, lowered by hand.
-  semantics/   invariants.rs — the executable half of the specification.
+  table.rs     Generational slot table. Slot 0 is NULL. Delete bumps generation.
+               Stale references fail.
+  kernel/      The machine. mod.rs holds all state. epochs.rs runs epochs.
+               commit.rs publishes effects. ownership.rs handles object state.
+               accounting.rs records counters.
+  executives/  cpu_scalar.rs is the interpreter. One switch on run_class.
+  scheduler/   runnable_bins.rs contains double-buffered run-class bins.
+               cohorts.rs builds cohorts and computes dispatch cost.
+  compiler/    frame.rs encodes frames. state_machine_lowering.rs contains the
+               hand-lowered Expand example.
+  semantics/   invariants.rs checks the executable part of the specification.
   replay/      trace comparison for determinism checks.
-  experiments/ measurement only; none of it is part of the machine.
+  experiments/ measurement only. None of it is part of the machine.
 ```
 
-**The central design commitment.** A *run class* is the identity of a resume
-point, and it is simultaneously the interpreter's dispatch key and the
-scheduler's bin key — the same integer. A continuation that yields already names
-its next bin, so the scheduler never inspects continuation metadata to decide
-what can run together. Most of the system follows from this.
+A *run class* identifies a resume point. It is the interpreter's dispatch key
+and the scheduler's bin key. A continuation that yields names its next bin, so
+the scheduler does not inspect continuation metadata to decide what can run
+together.
 
-**Continuations exist because preemption is not assumed.** A computation that
-must yield ends a continuation and names the next one. Frames are byte blobs in
-shared memory, not register state, so a continuation can resume on a different
-executor than the one that suspended it.
+SOMA does not assume preemption. A computation that must yield ends a
+continuation and names the next one. Frames are byte blobs in shared memory, not
+register state, so another executor can resume the continuation.
 
 ---
 
@@ -89,15 +87,18 @@ executor than the one that suspended it.
   replay comparison.
 - Cohort construction with all four partial-cohort policies (§14 of the old
   contract), plus a persistent-FIFO scheduling mode as a baseline.
-- The semantic specification, with 11 of 14 invariants machine-checked.
+- The semantic specification, with 11 original invariants plus capability
+  attenuation and integrity machine-checked.
 
 ### Named by the model and NOT implemented
 
 Treat these as absent, not nearly-done:
 
-- **Capabilities.** The table is allocated and never consulted. **Any process
-  can mutate any object it can name.** `tests/semantics.rs::capability_authority_is_unenforced_and_the_spec_says_so`
-  demonstrates it.
+- **Capability enforcement.** Actor-relative spaces, genesis, derivation, I10a,
+  and I10b exist. Operations do not yet consult them, so **any process can still
+  mutate any object it can name.**
+  `tests/semantics.rs::capability_effect_authority_remains_unenforced`
+  demonstrates the remaining I10c gap.
 - **Ownership enforcement.** `freeze` / `transfer_unique` record intent. Nothing
   stops a write to a frozen object.
 - **Channels.** Messaging is per-process mailboxes. `Kind::Channel` is a
@@ -108,14 +109,14 @@ Treat these as absent, not nearly-done:
 
 ---
 
-## 4. What the measurements actually showed
+## 4. Measurements
 
-You will be tempted to quote the biggest number. Don't — it's the misleading
-one, and the sequence matters more than any single figure.
+The largest ratio uses the weakest baseline. Keep the controls and caveats with
+the result.
 
 1. **Cohorting beats a persistent FIFO by 1.85–3.27× useful lane occupancy.**
    True, and against a weak baseline.
-2. **Against a competent hand-written bulk frontier, it ties exactly — 1.00× in
+2. **Against a competent hand-written bulk frontier, it ties exactly, 1.00× in
    every level-synchronous regime.** When readiness arrives in neat levels, a
    host can sort each level by run class and get the same groups. So finding 1
    on its own oversells the mechanism.
@@ -128,11 +129,11 @@ one, and the sequence matters more than any single figure.
    0.385 (a global sort gets 0.960). Class affinity fills cohorts but idles 60
    of 64 territories. Proportional class-to-territory blocks recover both.
 
-**Caveats that must travel with these numbers.** They are *structural bounds*
-computed from how continuations group, not hardware measurements — a lane group
-spanning `k` run classes is charged `k` masked dispatches because a
-uniform-dispatch executive cannot do better; real hardware does worse. The
-irregular-arrival result is a **trace-driven policy comparison**: an arrival
+These are *structural bounds* computed from how continuations group, not
+hardware measurements. A lane group spanning `k` run classes is charged `k`
+masked dispatches because a uniform-dispatch executive cannot do better. Real
+hardware may do worse. The irregular-arrival result is a **trace-driven policy
+comparison**: an arrival
 trace is generated once and both policies are scored against it, so a node's
 ready tick is an input rather than a consequence of when its parent ran, and the
 SOMA side is a model of the scheduler's binning rather than the kernel running.
@@ -142,38 +143,38 @@ Nothing here touches throughput or scheduler overhead.
 
 ## 5. Open work, in dependency order
 
-### 5.1 Capabilities (I10) — do this first
+### 5.1 Capabilities (I10)
 
-The largest gap between what the model claims and what it does, and it
-constrains everything after it.
+Capability enforcement is the largest gap between the specification and the
+interpreter. It constrains the remaining work.
 
 **Settled in design: [docs/SOMA-CAPABILITIES.md](SOMA-CAPABILITIES.md).**
 Authority is checked at operation, not at reference resolution, and the
 operation set is closed by making kernel state private so a bypass is a compile
 error. That note carries the full check surface, a staged implementation order
-where every step lands green, and the two consequences worth arguing about
+where every step passes tests, and the two consequences worth settling
 before coding: ownership should be redefined in terms of capabilities (deleting
 `unique_owner` and collapsing I9), and failure needs a position on whether
 authority survives a faulted holder.
 
-Read it before starting. Step 1 — privatising kernel state — is the largest
-diff and the lowest risk, and nothing else is enforceable until it lands.
+Steps 1 through 4 are complete. Continue with step 5, which enforces rights one
+operation at a time, starting with `WRITE`.
 
 ### 5.2 What does a process own? (spec §6.2)
 
 Unresolved and blocking. I8 gives each continuation an exclusive frame and a
 process has a state object, but nothing says how concurrent continuations of one
 process may touch that shared state. I13 restricts *mutating* continuations to
-one per epoch without defining which continuations mutate — the interpreter uses
+one per epoch without defining which continuations mutate. The interpreter uses
 `ProcessMode` as the answer, which is too coarse.
 
 ### 5.3 Failure containment and cancellation (spec §6.3, §6.4)
 
 Both need 5.2 first. Today `Fault` marks a process failed and increments a
 counter. Nothing says what happens to its other continuations, queued messages,
-or unresolved futures. **A future whose resolver faults is never resolved and
-its waiters wait forever** — the progress invariant does not catch this, because
-those continuations are not runnable. That is a real hole, not a hypothetical.
+or unresolved futures. A future whose resolver faults is never resolved, and
+its waiters wait forever. The progress invariant does not catch this because
+those continuations are not runnable.
 
 ### 5.4 Channels and collectives
 
@@ -183,10 +184,10 @@ cooperative execution shapes and there is no implementation at all.
 ### 5.5 Validation workloads
 
 Beyond dynamic search: streaming pipelines, actor systems, irregular dataflow.
-Choose them to stress **ordering, back-pressure, and failure** — not throughput.
+Choose them to stress **ordering, back-pressure, and failure**, not throughput.
 The existing workloads exercise none of those hard.
 
-### 5.6 Minimal IR — deliberately deferred
+### 5.6 Minimal IR, deliberately deferred
 
 Do not start until 5.2 and 5.3 are settled. A surface syntax over unresolved
 ownership and failure semantics encodes the ambiguity into programs rather than
@@ -199,41 +200,37 @@ of hardware mapping and is complete and tested as far as it goes.
 
 ---
 
-## 6. How this project works — please keep these
+## 6. Test discipline
 
-These norms are why the results are trustworthy. They cost little and they are
-the first thing to erode.
-
-**A checker that cannot fail is not evidence.** Every invariant in
+Every invariant in
 `semantics/invariants.rs` has two tests: the reference model satisfies it, *and*
-it catches a state that violates it. Same for every regression test — three of
-the kernel bug fixes were verified by reintroducing the bug and confirming the
+it catches a state that violates it. The same rule applies to regression tests.
+Three kernel fixes were verified by reintroducing the bug and confirming the
 new test failed. If you add a check, add its failing case.
 
-**Every comparison needs a control that shows no effect.** The cohorting study
-reports 1.00× for a single run class; the irregular study reports 1.00× for zero
+Every comparison needs a control that shows no effect. The cohorting study
+reports 1.00× for a single run class. The irregular study reports 1.00× for zero
 irregularity and 1.00× for a zero wait budget. Those nulls are what distinguish
 measuring the mechanism from measuring the harness.
 
-**Steelman the baseline, then check you did.** The bulk frontier's first version
-sorted the frontier and then cut it into fixed lane groups, straddling class
-boundaries — SOMA came out 14% ahead. Fixing it to segment per class, which is
+Use the strongest reasonable baseline. The bulk frontier's first version
+sorted the frontier and then cut it into fixed lane groups that straddled class
+boundaries. SOMA came out 14 percent ahead. Segmenting each class, which is
 what a competent engineer would write, erased the advantage entirely. The near
 miss is the reason `dispatch_cost` and `search_step` are *shared* by both sides:
 neither can drift into different work or different scoring.
 
-**Conservation before conclusions.** The load-bearing test in the arrival
-experiments is that every policy dispatches every arrival exactly once. Any
-occupancy figure from a policy that silently drops or double-counts is
+The arrival experiments verify that every policy dispatches every arrival
+exactly once. Any occupancy figure from a policy that silently drops or double-counts is
 meaningless.
 
-**Mark absent things absent.** Do not write a vacuous check to make a table look
+Mark absent things absent. Do not write a vacuous check to make a table look
 complete. The I10 gap is recorded as a hole with a test proving it, which is
 more useful than a green tick.
 
-**Determinism is load-bearing.** Every measurement depends on two runs being
-comparable. No `HashMap` iteration order in any scheduling decision — sort
-first. `trace_snapshot` is the equality used for run comparison.
+Every measurement depends on comparable runs. Sort before any scheduling
+decision that would otherwise depend on `HashMap` iteration order.
+`trace_snapshot` is the equality used for run comparison.
 
 ---
 
@@ -241,20 +238,20 @@ first. `trace_snapshot` is the equality used for run comparison.
 
 - **`retire_process_if_idle`** in `commit.rs` is a linear scan of the
   continuation table per completion. Fine for a reference model, wrong for
-  anything real; a production implementation wants a per-process live count.
+  anything real. A production implementation wants a per-process live count.
 - **16-bit generations** bound staleness detection rather than guaranteeing it:
   a slot recycled 65,536 times wraps and a stale ref can validate. Documented in
   `abi/refs.rs`. Matters if references are ever persisted.
 - **`§n` comments refer to `docs/SOMA-P1.md`**, the historical contract, not to
   the v0.2 spec. The v0.2 spec uses `I1..I14` and `§6.x`.
 - **`experiments/` is not the machine.** Nothing there is part of SOMA's
-  semantics; it is measurement scaffolding.
+  semantics. It is measurement scaffolding.
 - **The step budget check must stay before dispatch** in `epochs.rs`. Faulting
   after commit leaves a faulted continuation enqueued by that commit, which
-  violates I7 — this was a real bug.
+  violates I7. This was a real bug.
 - **`Complete` is about a continuation, not a process.** A process retires when
   its last continuation does. Getting this wrong strands live continuations on a
-  dead process; see spec §6.1.
+  dead process. See spec §6.1.
 
 ---
 
@@ -262,11 +259,11 @@ first. `trace_snapshot` is the equality used for run comparison.
 
 1. Read `docs/SOMA-v0.2.md` end to end, then `src/semantics/invariants.rs`
    alongside `tests/semantics.rs`. That pair is the fastest way into the model.
-2. Run the examples. The numbers in §4 should reproduce exactly; if they don't,
+2. Run the examples. The numbers in §4 should reproduce exactly. If they don't,
    something is non-deterministic and that is a bug worth chasing before
    anything else.
-3. Break something on purpose — flip a condition in `commit.rs` and confirm the
+3. Break something on purpose. Flip a condition in `commit.rs` and confirm the
    invariant checker catches it. That tells you the safety net is real before
    you rely on it.
-4. Write the capability design note (§5.1) — resolution vs operation, with the
-   check surface enumerated — and settle it before implementing.
+4. Continue the capability implementation at step 5 of
+   `docs/SOMA-CAPABILITIES.md`: enforce `WRITE`, then add the remaining rights.
