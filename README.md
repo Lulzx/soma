@@ -13,6 +13,9 @@ experiments.
 Stable Rust. The semantic core has no dependencies. The optional macOS Metal
 backend is enabled with `--features metal`.
 
+**[See it run](https://lulzx.com/soma/)** — ten thousand independent ants,
+scheduled two ways.
+
 ## Run it
 
 ```sh
@@ -33,19 +36,27 @@ cargo run --example ant_colony_report      # cohorting on a population of agents
 
 ## The ant colony
 
+**Live demo: [lulzx.com/soma](https://lulzx.com/soma/)**
+
 `experiments/ant_colony.rs` is a population of persistent processes rather than a
 computation: ten thousand ants across a hundred colonies, each holding its own
 state, each deciding its own next behaviour, none of them synchronised with any
-other. An ant that finds food
-yields to `ANT_CARRY_FOOD`; an ant that walks into a rock yields to
-`ANT_AVOID_OBSTACLE`. Neither knows the other exists, and the scheduler groups
-them anyway — because the run class an ant names *is* the bin it lands in.
+other. An ant that finds food yields to `ANT_CARRY_FOOD`; an ant that walks into
+a rock yields to `ANT_AVOID_OBSTACLE`. Neither knows the other exists, and the
+scheduler groups them anyway — because the run class an ant names *is* the bin
+it lands in.
+
+To reproduce it locally:
 
 ```sh
 cargo run --release --example ant_colony_report   # the measurement
 cargo run --release --example ant_colony_trace    # write viz/data/*.jsonl
 cd viz && python3 -m http.server                  # then open localhost:8000
 ```
+
+The page is published from `viz/` by `.github/workflows/pages.yml`, which
+regenerates the traces on every deploy and runs the test suite first — so it
+cannot show numbers that disagree with the code that produced them.
 
 The same population, the same seed, the same world, binned two ways — ten
 thousand ants on a 320x320 grid over 260 epochs:
