@@ -107,7 +107,8 @@ fn expand_resume_0(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResu
                 0,
                 hb,
                 DEFAULT_MAX_STEPS,
-            );
+            )
+            .expect("a process may create its own continuation");
 
             store_frame(kernel, process, cont, &frame);
             match kernel.await_future(process, cont, fut, EXPAND_RESUME_1) {
@@ -153,7 +154,9 @@ fn expand_resume_2(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResu
         let cframe = SearchFrame::leaf(m, 0);
         let mut cb = Vec::new();
         cframe.encode(&mut cb);
-        kernel.create_continuation(process, child, SEARCH_BRANCH, 0, cb, DEFAULT_MAX_STEPS);
+        kernel
+            .create_continuation(process, child, SEARCH_BRANCH, 0, cb, DEFAULT_MAX_STEPS)
+            .expect("the creator holds WRITE on the child process");
         frame.move_index += 1;
     }
 
@@ -234,7 +237,9 @@ fn search_branch(kernel: &mut Kernel, cont: Ref64, process: Ref64, index: u32) -
             let run_class = cframe.run_class();
             let mut cb = Vec::new();
             cframe.encode(&mut cb);
-            kernel.create_continuation(process, child, run_class, 0, cb, DEFAULT_MAX_STEPS);
+            kernel
+                .create_continuation(process, child, run_class, 0, cb, DEFAULT_MAX_STEPS)
+                .expect("the creator holds WRITE on the child process");
         }
         // Spawn with no continuation: the commit phase terminates this node.
         StepResult::spawn(process, 0)

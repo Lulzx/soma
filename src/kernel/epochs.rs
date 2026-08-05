@@ -187,11 +187,11 @@ impl Kernel {
     /// Execute a single continuation: enforce the step budget, dispatch to the
     /// interpreter, and commit the result.
     fn execute_cont(&mut self, cont: Ref64, process: Ref64) -> usize {
-        let (run_class, remaining) = self
+        let (run_class, remaining, dependency) = self
             .continuations
             .get(cont)
-            .map(|c| (c.run_class, c.remaining_steps))
-            .unwrap_or((0, 0));
+            .map(|c| (c.run_class, c.remaining_steps, c.dependency))
+            .unwrap_or((0, 0, Ref64::NULL));
 
         // Step budget (§8): a continuation must not exceed its declared maximum.
         // The check happens *before* dispatch, so an exhausted continuation is
@@ -201,6 +201,20 @@ impl Kernel {
         if remaining == 0 {
             let over = crate::abi::StepResult::fault(process, run_class);
             let _ = commit::apply_step_result(self, cont, process, over);
+            return 0;
+        }
+
+        // Authority is checked again at resume, not captured when the
+        // continuation parked. Revoking AWAIT therefore takes effect before
+        // any resumed instruction executes (§5.1).
+        if dependency.kind == crate::abi::Kind::Future
+            && !dependency.is_null()
+            && self
+                .authorize(process, crate::abi::Rights::AWAIT, dependency)
+                .is_err()
+        {
+            let denied = crate::abi::StepResult::fault(process, run_class);
+            let _ = commit::apply_step_result(self, cont, process, denied);
             return 0;
         }
 

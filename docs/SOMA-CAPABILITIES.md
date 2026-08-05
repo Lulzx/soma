@@ -1,7 +1,8 @@
 # Design note: capability enforcement (I10)
 
-**Status:** partially implemented. Actor-relative spaces, genesis, derivation,
-I10a, and I10b exist. `WRITE` authority is enforced; other rights are not.
+**Status:** operation enforcement implemented. Actor-relative spaces, genesis,
+derivation, I10a, I10b, and every right used by a reachable operation exist.
+Trace events and trace-level I10c remain open.
 
 **Decision: check at operation, with the operation set closed by construction.**
 
@@ -18,9 +19,11 @@ semantics. See §7.
 a version pin, and a `transferred_capability` slot on every message.
 
 Actor-relative capability spaces, genesis, derivation, and the I10a/I10b state
-checks are implemented. Operations pass through one authorization gate. `WRITE`
-consults the actor's space, epoch bound, version pin, and live parent at use;
-other rights remain permissive.
+checks are implemented. Operations pass through one authorization gate. Every
+reachable operation right consults the actor's space, epoch bound, and live
+parent chain at use; object operations also check the version pin and require a
+range covering the whole object exposed by the current API. `AWAIT` authority
+is rechecked when a parked continuation resumes. `DESTROY` has no operation yet.
 
 Three prerequisites for enforcement are complete:
 
@@ -227,11 +230,10 @@ the same actor, right, and target. This clause says the
 machine is safe, and it is checkable only because §5.2 makes authority
 observable.
 
-Then flip the marker in `docs/SOMA-v0.2.md` §5 from **absent** to **checked**,
-and rewrite
-`tests/semantics.rs::write_authority_is_enforced_while_other_rights_remain_permissive`
-into a full-denial test. The current test deliberately records the boundary
-between enforced `WRITE` and the remaining permissive rights.
+Then flip the marker in `docs/SOMA-v0.2.md` §5 from **absent** to **checked**.
+`tests/semantics.rs::operation_rights_are_enforced_while_i10c_awaits_trace_proof`
+already supplies the full operation-denial boundary; it remains partial only
+because authority decisions are not observable in the trace.
 
 ---
 
@@ -308,9 +310,11 @@ Each step should land green.
    operations name their principal and pass through one gate. This checkpoint
    originally landed permissive to isolate API churn from semantic change;
    step 5 now enables rights incrementally.
-5. **Enforce rights, in progress.** `WRITE` is complete, including expiry and
-   parent-revocation checks at use. Continue one right at a time across the
-   remaining operation surface.
+5. **Enforce rights. Complete.** Every right used by a reachable operation is
+   checked at use, including expiry and parent-revocation. Object access also
+   checks version and whole-object range. Message sends delegate attenuated
+   payload `READ`; `AWAIT` is rechecked on resume. `DESTROY` remains dormant
+   because no delete operation is exposed.
 6. **Trace events and I10c.**
 7. **Unify ownership (§7.1)**, delete `unique_owner`, collapse I9.
 8. **Settle failure (§7.2)** and update the spec.

@@ -89,7 +89,8 @@ pub fn build_in(mut kernel: Kernel, knobs: &ControlKnobs) -> Kernel {
             0,
             bytes,
             DEFAULT_MAX_STEPS,
-        );
+        )
+        .expect("system may create root continuations");
     }
     kernel
 }

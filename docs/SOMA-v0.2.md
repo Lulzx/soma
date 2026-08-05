@@ -89,8 +89,8 @@ A run class is simultaneously the interpreter's dispatch key and the scheduler's
 bin key. That they are the same value is a design commitment, not a coincidence.
 
 **Capability**, actor-relative permission to act on an entity. Capability
-spaces, genesis, attenuation, and `WRITE` enforcement are implemented. Full
-operation enforcement is still **[absent]**, see I10.
+spaces, genesis, attenuation, and enforcement for every reachable operation
+right are implemented. Trace-level proof is still **[absent]**, see I10.
 
 **Channel**, **Collective**, **Domain**, named by the model, not implemented.
 **[absent]**
@@ -162,9 +162,9 @@ capability space.
 
 **I10c. No unauthorised effect [absent, partial implementation].** *Intended:*
 no process may act on an entity without holding a capability conferring that
-right. `WRITE` is enforced at use, including expiry, version, and live-parent
-checks. Other rights remain permissive and authority decisions are not yet in
-the trace, so the full clause is not checked.
+right. Every right used by a reachable operation is enforced at use, including
+expiry and live-parent checks; object operations also check version and range.
+Authority decisions are not yet in the trace, so the full clause is not checked.
 
 **I11. Trace monotonicity [checked].** Logical time strictly increases across
 the trace. Epochs never move backwards.
@@ -325,7 +325,7 @@ continuations within an epoch provided it preserves I1–I12 and determinism.
 | I9 ownership monotonicity | checked, partial | structural half only |
 | I10a attenuation | checked | rights and ranges only shrink |
 | I10b capability integrity | checked | actor-relative spaces and live links |
-| I10c no unauthorised effect | **absent, partial** | `WRITE` enforced; other rights and trace proof missing |
+| I10c no unauthorised effect | **absent, partial** | operation rights enforced; trace proof missing |
 | I11 trace monotonicity | checked | |
 | I12 accounting consistency | checked | |
 | I13 serial execution | modelled | per-epoch, by test |
@@ -337,10 +337,11 @@ mailboxes rather than first-class channels. There is no collective construct at
 all, so the model's claim to cover cooperative execution shapes is currently
 unsupported by any implementation.
 
-`tests/semantics.rs::write_authority_is_enforced_while_other_rights_remain_permissive`
-demonstrates the current I10c boundary: an unauthorised write is denied while an
-unauthorised freeze still succeeds. Separate negative tests prove that the
-I10a/I10b checkers catch amplification and a dead parent.
+`tests/semantics.rs::operation_rights_are_enforced_while_i10c_awaits_trace_proof`
+demonstrates the current I10c boundary: unauthorised operations are denied, but
+the trace cannot yet prove which authority decision preceded an effect.
+Separate negative tests prove that the I10a/I10b checkers catch amplification
+and a dead parent.
 
 ---
 

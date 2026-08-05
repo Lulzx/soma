@@ -21,7 +21,9 @@ use soma::semantics::invariants::{assert_legal, check, Invariant};
 fn leaf(kernel: &mut Kernel, process: Ref64) -> Ref64 {
     let mut bytes = Vec::new();
     SearchFrame::leaf(1, 0).encode(&mut bytes);
-    kernel.create_continuation(process, process, SEARCH_BRANCH, 0, bytes, DEFAULT_MAX_STEPS)
+    kernel
+        .create_continuation(process, process, SEARCH_BRANCH, 0, bytes, DEFAULT_MAX_STEPS)
+        .unwrap()
 }
 
 fn violated(kernel: &Kernel, invariant: Invariant) -> bool {
@@ -305,14 +307,19 @@ fn i12_catches_inconsistent_accounting() {
 // ---- the honest gap ------------------------------------------------------
 
 #[test]
-fn write_authority_is_enforced_while_other_rights_remain_permissive() {
-    // WRITE is the first enforced right. I10c remains partial until every
-    // operation in the check surface is gated and traced.
+fn operation_rights_are_enforced_while_i10c_awaits_trace_proof() {
+    // Operation checks are live. I10c remains incomplete until every granted
+    // and denied decision is represented in the trace.
     let mut kernel = Kernel::new();
     let object = kernel.create_object(SYSTEM_PRINCIPAL, ObjectKind::RawBytes, vec![9]);
     let stranger = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
 
-    // A process that holds no capability over `object` cannot mutate it.
+    // A process that holds no capability over `object` can neither read,
+    // mutate, freeze, nor transfer it.
+    assert!(matches!(
+        kernel.object_bytes(stranger, object),
+        Err(soma::kernel::RuntimeError::AuthorityDenied)
+    ));
     assert!(matches!(
         kernel.object_bytes_mut(stranger, object),
         Err(soma::kernel::RuntimeError::AuthorityDenied)
@@ -324,15 +331,21 @@ fn write_authority_is_enforced_while_other_rights_remain_permissive() {
         "the stranger has no authority over this object"
     );
 
-    // FREEZE is not enabled yet, so the same stranger can still freeze it.
-    soma::kernel::ownership::freeze(&mut kernel, stranger, object).unwrap();
+    assert!(matches!(
+        soma::kernel::ownership::freeze(&mut kernel, stranger, object),
+        Err(soma::kernel::RuntimeError::AuthorityDenied)
+    ));
+    assert!(matches!(
+        soma::kernel::ownership::transfer_unique(&mut kernel, stranger, object, stranger),
+        Err(soma::kernel::RuntimeError::AuthorityDenied)
+    ));
     assert_eq!(
         soma::kernel::ownership::ownership_state(&kernel, object).unwrap(),
-        OwnershipState::FrozenShared
+        OwnershipState::UniqueMutable
     );
 
-    // Structural capability invariants remain legal; full effect-level I10c
-    // arrives only after every right is enforced and authority is traced.
+    // Structural capability invariants remain legal; trace-level I10c follows
+    // when authority decisions become observable.
     assert_legal(&kernel);
     assert_eq!(Kind::Capability, kernel.capability_table_kind());
 }

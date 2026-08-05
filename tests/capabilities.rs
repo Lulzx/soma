@@ -1,7 +1,26 @@
-use soma::abi::{ObjectKind, Ref64, Rights};
+use soma::abi::{ObjectKind, ProcessMode, ProcessState, Ref64, Rights};
+use soma::compiler::frame::Frame;
+use soma::compiler::run_classes::{DEFAULT_MAX_STEPS, SEARCH_BRANCH};
+use soma::compiler::state_machine_lowering::SearchFrame;
 use soma::kernel::{Kernel, RuntimeError, SYSTEM_PRINCIPAL};
 use soma::kernel::raw;
+use soma::kernel::ownership::freeze;
 use soma::semantics::invariants::assert_legal;
+
+fn leaf(kernel: &mut Kernel, process: Ref64) -> Ref64 {
+    let mut bytes = Vec::new();
+    SearchFrame::leaf(1, 0).encode(&mut bytes);
+    kernel
+        .create_continuation(
+            process,
+            process,
+            SEARCH_BRANCH,
+            0,
+            bytes,
+            DEFAULT_MAX_STEPS,
+        )
+        .unwrap()
+}
 
 #[test]
 fn genesis_mints_full_target_appropriate_rights() {
@@ -145,4 +164,174 @@ fn a_subrange_capability_cannot_open_whole_object_mutation() {
         kernel.object_bytes_mut(actor, object),
         Err(RuntimeError::AuthorityDenied)
     ));
+}
+
+#[test]
+fn messaging_and_future_operations_require_their_specific_rights() {
+    let mut kernel = Kernel::new();
+    let owner = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let stranger = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let receiver = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let owner_cont = leaf(&mut kernel, owner);
+    let receiver_cont = leaf(&mut kernel, receiver);
+    let future = kernel.create_future(owner);
+    let payload = kernel.create_object(owner, ObjectKind::MessagePayload, vec![7]);
+
+    assert!(matches!(
+        kernel.await_future(stranger, owner_cont, future, SEARCH_BRANCH),
+        Err(RuntimeError::AuthorityDenied)
+    ));
+    assert!(matches!(
+        kernel.resolve_future(stranger, future, payload),
+        Err(RuntimeError::AuthorityDenied)
+    ));
+    assert!(matches!(
+        kernel.receive_message(stranger, receiver_cont),
+        Err(RuntimeError::AuthorityDenied)
+    ));
+    assert!(matches!(
+        kernel.enqueue_message(owner, receiver, payload, owner_cont),
+        Err(RuntimeError::AuthorityDenied)
+    ));
+
+    kernel
+        .grant_capability(
+            SYSTEM_PRINCIPAL,
+            owner,
+            receiver,
+            Rights::SEND,
+            0,
+            0,
+        )
+        .unwrap();
+    kernel
+        .enqueue_message(owner, receiver, payload, owner_cont)
+        .unwrap();
+    let message = kernel
+        .receive_message(receiver, receiver_cont)
+        .unwrap()
+        .unwrap();
+    assert!(!message.transferred_capability.is_null());
+    assert_eq!(kernel.object_bytes(receiver, message.payload).unwrap(), &[7]);
+}
+
+#[test]
+fn creating_execution_requires_write_on_the_target_process() {
+    let mut kernel = Kernel::new();
+    let owner = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let stranger = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let mut bytes = Vec::new();
+    SearchFrame::leaf(1, 0).encode(&mut bytes);
+
+    assert!(matches!(
+        kernel.create_continuation(
+            stranger,
+            owner,
+            SEARCH_BRANCH,
+            0,
+            bytes,
+            DEFAULT_MAX_STEPS,
+        ),
+        Err(RuntimeError::AuthorityDenied)
+    ));
+}
+
+#[test]
+fn await_authority_is_rechecked_when_a_continuation_resumes() {
+    let mut kernel = Kernel::new();
+    let process = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let continuation = leaf(&mut kernel, process);
+    let future = kernel.create_future(process);
+    kernel
+        .await_future(process, continuation, future, SEARCH_BRANCH)
+        .unwrap();
+
+    let capability = kernel
+        .find_capability(process, future, Rights::AWAIT)
+        .unwrap();
+    unsafe { raw::state(&mut kernel) }
+        .capability_spaces
+        .get_mut(&process.slot)
+        .unwrap()
+        .get_mut(capability)
+        .unwrap()
+        .valid_until_epoch = 0;
+
+    // Drain the parked continuation's original bin and advance beyond expiry.
+    kernel.run_epoch();
+    let value = kernel.create_object(SYSTEM_PRINCIPAL, ObjectKind::FutureValue, vec![0; 8]);
+    kernel
+        .resolve_future(SYSTEM_PRINCIPAL, future, value)
+        .unwrap();
+    kernel.run_epoch();
+
+    assert_eq!(kernel.process_state(process).unwrap(), ProcessState::Failed);
+}
+
+#[test]
+fn grants_require_transfer_authority_and_must_attenuate() {
+    let mut kernel = Kernel::new();
+    let owner = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let stranger = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let receiver = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let object = kernel.create_object(owner, ObjectKind::RawBytes, vec![0; 4]);
+
+    assert_eq!(
+        kernel.grant_capability(stranger, receiver, object, Rights::READ, 0, 4),
+        Err(RuntimeError::AuthorityDenied)
+    );
+    assert_eq!(
+        kernel.grant_capability(owner, receiver, object, Rights::READ, 0, 5),
+        Err(RuntimeError::InvalidCapabilityDerivation)
+    );
+
+    let granted = kernel
+        .grant_capability(owner, receiver, object, Rights::READ, 1, 2)
+        .unwrap();
+    let entry = kernel.capability_entry(receiver, granted).unwrap();
+    assert_eq!(entry.rights, Rights::READ);
+    assert_eq!((entry.offset, entry.length), (1, 2));
+}
+
+#[test]
+fn external_ingest_is_reserved_for_the_system_principal() {
+    let mut kernel = Kernel::new();
+    let sender = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let receiver = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let payload = kernel.create_object(sender, ObjectKind::MessagePayload, vec![1]);
+
+    assert_eq!(
+        kernel.ingest_message(sender, sender, receiver, payload, Ref64::NULL),
+        Err(RuntimeError::AuthorityDenied)
+    );
+    assert!(kernel.mailbox_entries(receiver).unwrap().is_empty());
+}
+
+#[test]
+fn freezing_replaces_mutable_authority_with_read_authority_for_the_new_version() {
+    let mut kernel = Kernel::new();
+    let owner = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let object = kernel.create_object(owner, ObjectKind::RawBytes, vec![1, 2]);
+    let old_write = kernel.find_capability(owner, object, Rights::WRITE).unwrap();
+    let old_version = kernel.capability_entry(owner, old_write).unwrap().object_version;
+
+    let new_version = freeze(&mut kernel, owner, object).unwrap();
+
+    assert_eq!(new_version, old_version + 1);
+    assert_eq!(kernel.object_bytes(owner, object).unwrap(), &[1, 2]);
+    assert_eq!(
+        kernel.object_bytes_mut(owner, object),
+        Err(RuntimeError::AuthorityDenied)
+    );
+    let has_current_read = unsafe { raw::state(&mut kernel) }
+        .capability_spaces
+        .get(&owner.slot)
+        .unwrap()
+        .iter()
+        .any(|(_, entry)| {
+            entry.target == object
+                && entry.rights & Rights::READ == Rights::READ
+                && entry.object_version == new_version
+        });
+    assert!(has_current_read);
 }

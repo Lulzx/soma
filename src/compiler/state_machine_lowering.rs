@@ -187,6 +187,19 @@ pub fn create_expand(kernel: &mut Kernel, request_value: u64) -> (Ref64, Ref64) 
     // Search process.
     let expand = kernel.create_process(crate::kernel::SYSTEM_PRINCIPAL, ProcessMode::Serial);
 
+    // The search process may reply to the requester. A process reference alone
+    // carries no authority, so delegate SEND explicitly.
+    kernel
+        .grant_capability(
+            crate::kernel::SYSTEM_PRINCIPAL,
+            expand,
+            requester,
+            crate::abi::Rights::SEND,
+            0,
+            0,
+        )
+        .expect("system created both processes");
+
     // Payload object for the ExpandRequest message.
     let payload = kernel.create_object(
         crate::kernel::SYSTEM_PRINCIPAL,
@@ -205,7 +218,8 @@ pub fn create_expand(kernel: &mut Kernel, request_value: u64) -> (Ref64, Ref64) 
         EXPAND_RESUME_0,
         bytes,
         DEFAULT_MAX_STEPS,
-    );
+    )
+    .expect("system may create the initial continuation");
 
     // Ingest the request message into the search process's mailbox (§18 Phase A).
     // This wakes resume_0 if it is already waiting; otherwise it is consumed on

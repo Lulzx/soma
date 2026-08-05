@@ -407,15 +407,75 @@ impl Kernel {
             .map_err(RuntimeError::from)
     }
 
-    /// Central authority gate. Enforcement is landing one right at a time;
-    /// WRITE is the first enabled right and all others remain permissive.
+    /// Copy attenuated authority from `actor` into `receiver`'s space.
+    /// Exported authority is a new root: grants survive the exporting holder,
+    /// matching the failure policy chosen in the capability design note.
+    pub fn grant_capability(
+        &mut self,
+        actor: Ref64,
+        receiver: Ref64,
+        target: Ref64,
+        rights: u32,
+        offset: u64,
+        length: u64,
+    ) -> Result<Ref64, RuntimeError> {
+        let _ = self.processes.get(receiver)?;
+        let source_ref = self
+            .find_authorized_capability(actor, crate::abi::Rights::TRANSFER, target)
+            .ok_or(RuntimeError::AuthorityDenied)?;
+        let source = self
+            .capability_spaces
+            .get(&actor.slot)
+            .ok_or(RuntimeError::MissingCapabilitySpace)?
+            .get(source_ref)?
+            .clone();
+        let end = offset
+            .checked_add(length)
+            .ok_or(RuntimeError::InvalidCapabilityDerivation)?;
+        let source_end = source
+            .offset
+            .checked_add(source.length)
+            .ok_or(RuntimeError::InvalidCapabilityDerivation)?;
+        if rights & !source.rights != 0 || offset < source.offset || end > source_end {
+            return Err(RuntimeError::InvalidCapabilityDerivation);
+        }
+
+        let mut exported = source;
+        exported.rights = rights;
+        exported.offset = offset;
+        exported.length = length;
+        exported.parent_capability = Ref64::NULL;
+        Ok(self
+            .capability_spaces
+            .get_mut(&receiver.slot)
+            .ok_or(RuntimeError::MissingCapabilitySpace)?
+            .alloc(exported))
+    }
+
+    /// Central authority gate for every currently reachable operation right.
     fn authorize(&self, actor: Ref64, right: u32, target: Ref64) -> Result<(), RuntimeError> {
-        if actor == SYSTEM_PRINCIPAL || right != crate::abi::Rights::WRITE {
+        // DESTROY has no operation yet. The explicit system principal is the
+        // implementation escape hatch described in §8 of the design note.
+        if actor == SYSTEM_PRINCIPAL || right == crate::abi::Rights::DESTROY {
             return Ok(());
         }
-        let Some(space) = self.capability_spaces.get(&actor.slot) else {
-            return Err(RuntimeError::AuthorityDenied);
-        };
+        if self
+            .find_authorized_capability(actor, right, target)
+            .is_some()
+        {
+            Ok(())
+        } else {
+            Err(RuntimeError::AuthorityDenied)
+        }
+    }
+
+    fn find_authorized_capability(
+        &self,
+        actor: Ref64,
+        right: u32,
+        target: Ref64,
+    ) -> Option<Ref64> {
+        let space = self.capability_spaces.get(&actor.slot)?;
         let object_metadata = if target.kind == Kind::Object {
             self.objects
                 .get(target)
@@ -424,24 +484,28 @@ impl Kernel {
         } else {
             None
         };
-        let granted = space.iter().any(|(capability_ref, capability)| {
-            capability.target == target
+        space.iter().find_map(|(capability_ref, capability)| {
+            let full_object_access = object_metadata
+                .map(|(_, byte_length)| {
+                    capability.offset == 0 && capability.length >= byte_length
+                })
+                .unwrap_or(true);
+            let range_is_sufficient = !matches!(
+                right,
+                crate::abi::Rights::READ
+                    | crate::abi::Rights::WRITE
+                    | crate::abi::Rights::FREEZE
+            ) || full_object_access;
+            (capability.target == target
                 && capability.rights & right == right
                 && capability.valid_until_epoch >= self.epoch
                 && Self::capability_chain_is_live(space, capability_ref)
                 && object_metadata
-                    .map(|(version, byte_length)| {
-                        capability.object_version == version
-                            && capability.offset == 0
-                            && capability.length >= byte_length
-                    })
+                    .map(|(version, _)| capability.object_version == version)
                     .unwrap_or(true)
-        });
-        if granted {
-            Ok(())
-        } else {
-            Err(RuntimeError::AuthorityDenied)
-        }
+                && range_is_sufficient)
+                .then_some(capability_ref)
+        })
     }
 
     fn capability_chain_is_live(
@@ -461,6 +525,72 @@ impl Kernel {
             current = entry.parent_capability;
         }
         false
+    }
+
+    pub(super) fn mint_object_read(
+        &mut self,
+        actor: Ref64,
+        object: Ref64,
+        byte_length: u64,
+        version: u32,
+    ) -> Ref64 {
+        let mut capability = CapabilityEntry::new(object, crate::abi::Rights::READ);
+        capability.length = byte_length;
+        capability.object_version = version;
+        self.capability_spaces
+            .entry(actor.slot)
+            .or_insert_with(|| GenTable::new(Kind::Capability))
+            .alloc(capability)
+    }
+
+    pub(super) fn move_target_authority(
+        &mut self,
+        actor: Ref64,
+        receiver: Ref64,
+        target: Ref64,
+    ) -> Result<(), RuntimeError> {
+        let source_ref = self
+            .find_authorized_capability(actor, crate::abi::Rights::TRANSFER, target)
+            .ok_or(RuntimeError::AuthorityDenied)?;
+        let mut exported = self
+            .capability_spaces
+            .get(&actor.slot)
+            .ok_or(RuntimeError::MissingCapabilitySpace)?
+            .get(source_ref)?
+            .clone();
+        exported.parent_capability = Ref64::NULL;
+
+        if actor != receiver {
+            self.capability_spaces
+                .get_mut(&receiver.slot)
+                .ok_or(RuntimeError::MissingCapabilitySpace)?
+                .alloc(exported);
+            let space = self
+                .capability_spaces
+                .get_mut(&actor.slot)
+                .ok_or(RuntimeError::MissingCapabilitySpace)?;
+            Self::revoke_capability_tree(space, source_ref);
+        }
+        Ok(())
+    }
+
+    fn revoke_capability_tree(space: &mut GenTable<CapabilityEntry>, root: Ref64) {
+        let mut revoked = vec![root];
+        let mut index = 0;
+        while index < revoked.len() {
+            let parent = revoked[index];
+            let children: Vec<Ref64> = space
+                .iter()
+                .filter_map(|(r, capability)| {
+                    (capability.parent_capability == parent && !revoked.contains(&r)).then_some(r)
+                })
+                .collect();
+            revoked.extend(children);
+            index += 1;
+        }
+        for capability in revoked.into_iter().rev() {
+            let _ = space.delete(capability);
+        }
     }
 
     pub fn object_bytes(&self, actor: Ref64, obj: Ref64) -> Result<&[u8], RuntimeError> {
@@ -543,9 +673,8 @@ impl Kernel {
         resume_point: u32,
         frame_bytes: Vec<u8>,
         max_steps: u32,
-    ) -> Ref64 {
-        self.authorize(actor, crate::abi::Rights::WRITE, process)
-            .expect("permissive authorization gate");
+    ) -> Result<Ref64, RuntimeError> {
+        self.authorize(actor, crate::abi::Rights::WRITE, process)?;
         let frame_obj = self.create_object_for(process, ObjectKind::ContinuationFrame, frame_bytes);
         let r = self.continuations.alloc(
             crate::abi::continuations::ContinuationDescriptor::new(process, run_class, resume_point),
@@ -561,7 +690,7 @@ impl Kernel {
         self.scheduler.enqueue(run_class, r);
         self.mint_genesis(process, r, 0, 0);
         self.trace(EventKind::ContinuationReady, process, r, run_class, 0);
-        r
+        Ok(r)
     }
 
     pub fn continuation_state(
@@ -679,7 +808,26 @@ impl Kernel {
         sender_cont: Ref64,
     ) -> Result<(), RuntimeError> {
         self.authorize(actor, crate::abi::Rights::SEND, receiver)?;
-        self.push_message(actor, receiver, payload, sender_cont, true)
+        if self.mailbox_is_full(receiver)? {
+            return self.push_message(
+                actor,
+                receiver,
+                payload,
+                Ref64::NULL,
+                sender_cont,
+                true,
+            );
+        }
+        let byte_length = self.objects.get(payload)?.byte_length;
+        let transferred = self.grant_capability(
+            actor,
+            receiver,
+            payload,
+            crate::abi::Rights::READ,
+            0,
+            byte_length,
+        )?;
+        self.push_message(actor, receiver, payload, transferred, sender_cont, true)
     }
 
     /// Deliver an externally-ingested message (§18 Phase A: external messages)
@@ -692,8 +840,32 @@ impl Kernel {
         payload: Ref64,
         sender_cont: Ref64,
     ) -> Result<(), RuntimeError> {
-        debug_assert_eq!(actor, SYSTEM_PRINCIPAL);
-        self.push_message(sender, receiver, payload, sender_cont, false)
+        if actor != SYSTEM_PRINCIPAL {
+            return Err(RuntimeError::AuthorityDenied);
+        }
+        if self.mailbox_is_full(receiver)? {
+            return self.push_message(
+                sender,
+                receiver,
+                payload,
+                Ref64::NULL,
+                sender_cont,
+                false,
+            );
+        }
+        let object = self.objects.get(payload)?;
+        let byte_length = object.byte_length;
+        let version = object.version;
+        let transferred = self.mint_object_read(receiver, payload, byte_length, version);
+        self.push_message(sender, receiver, payload, transferred, sender_cont, false)
+    }
+
+    fn mailbox_is_full(&self, receiver: Ref64) -> Result<bool, RuntimeError> {
+        let mailbox = self
+            .mailboxes
+            .get(&receiver.slot)
+            .ok_or(RuntimeError::MissingMailbox)?;
+        Ok(mailbox.entries.len() >= mailbox.capacity)
     }
 
     fn push_message(
@@ -701,6 +873,7 @@ impl Kernel {
         sender: Ref64,
         receiver: Ref64,
         payload: Ref64,
+        transferred_capability: Ref64,
         sender_cont: Ref64,
         trace_send: bool,
     ) -> Result<(), RuntimeError> {
@@ -712,6 +885,7 @@ impl Kernel {
             v
         };
         let mut msg = MessageDescriptor::new(sender, receiver, payload);
+        msg.transferred_capability = transferred_capability;
         msg.sender_sequence = seq;
         msg.logical_timestamp = self.logical_time;
 

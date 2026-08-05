@@ -35,6 +35,7 @@ fn spawn_leaf(kernel: &mut Kernel, process: Ref64) -> Ref64 {
         leaf_bytes(),
         DEFAULT_MAX_STEPS,
     )
+    .unwrap()
 }
 
 // ---- §19: the serial-process invariant -----------------------------------
@@ -80,7 +81,9 @@ fn exhausted_step_budget_faults_before_dispatch_and_leaves_no_bin_entry() {
     ExpandFrame::initial(5, p).encode(&mut bytes);
     // A budget of exactly one step: resume_1 runs once, yields into resume_2's
     // bin, and is left with nothing to spend.
-    let cont = kernel.create_continuation(p, p, EXPAND_RESUME_1, EXPAND_RESUME_1, bytes, 1);
+    let cont = kernel
+        .create_continuation(p, p, EXPAND_RESUME_1, EXPAND_RESUME_1, bytes, 1)
+        .unwrap();
 
     kernel.run_epoch();
     assert_eq!(
@@ -180,6 +183,19 @@ fn every_blocked_sender_is_registered_and_woken_in_order() {
     let receiver = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
     let sender_a = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
     let sender_b = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+
+    for sender in [sender_a, sender_b] {
+        kernel
+            .grant_capability(
+                SYSTEM_PRINCIPAL,
+                sender,
+                receiver,
+                soma::abi::Rights::SEND,
+                0,
+                0,
+            )
+            .unwrap();
+    }
 
     let cont_a = spawn_leaf(&mut kernel, sender_a);
     let cont_b = spawn_leaf(&mut kernel, sender_b);

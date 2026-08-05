@@ -16,15 +16,16 @@ use crate::kernel::RuntimeError;
 /// 3. transition to immutable state,
 /// 4. publish to readers (increment reader count).
 pub fn freeze(kernel: &mut Kernel, actor: Ref64, object: Ref64) -> Result<u32, RuntimeError> {
-    kernel.authorize(actor, crate::abi::Rights::FREEZE, object)?;
     let _ = kernel.objects.get(object)?;
-    let (version, ownership) = {
+    let (version, byte_length, ownership) = {
         let o = kernel.objects.get(object)?;
-        (o.version, o.ownership_state)
+        (o.version, o.byte_length, o.ownership_state)
     };
     if ownership == OwnershipState::FrozenShared {
+        kernel.authorize(actor, crate::abi::Rights::READ, object)?;
         return Ok(version);
     }
+    kernel.authorize(actor, crate::abi::Rights::FREEZE, object)?;
     let new_version = version.wrapping_add(1);
     {
         let o = kernel.objects.get_mut(object)?;
@@ -32,6 +33,7 @@ pub fn freeze(kernel: &mut Kernel, actor: Ref64, object: Ref64) -> Result<u32, R
         o.ownership_state = OwnershipState::FrozenShared;
         o.reader_count = 1;
     }
+    let _ = kernel.mint_object_read(actor, object, byte_length, new_version);
     Ok(new_version)
 }
 
@@ -45,13 +47,11 @@ pub fn transfer_unique(
 ) -> Result<(), RuntimeError> {
     kernel.authorize(actor, crate::abi::Rights::TRANSFER, object)?;
     let _ = kernel.objects.get(object)?;
-    {
-        let o = kernel.objects.get_mut(object)?;
-        if o.ownership_state == OwnershipState::FrozenShared {
-            return Err(RuntimeError::Abi(crate::abi::AbiError::NoAuthority));
-        }
-        o.unique_owner = new_owner;
+    if kernel.objects.get(object)?.ownership_state == OwnershipState::FrozenShared {
+        return Err(RuntimeError::Abi(crate::abi::AbiError::NoAuthority));
     }
+    kernel.move_target_authority(actor, new_owner, object)?;
+    kernel.objects.get_mut(object)?.unique_owner = new_owner;
     Ok(())
 }
 

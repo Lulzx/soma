@@ -4,7 +4,7 @@ Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
 Repository: https://github.com/Lulzx/soma. About 7,200 lines of Rust, no
-dependencies, 91 tests, and no Clippy warnings.
+dependencies, 97 tests, and no Clippy warnings.
 
 ```sh
 cargo test
@@ -94,13 +94,16 @@ register state, so another executor can resume the continuation.
 
 Treat these as absent, not nearly-done:
 
-- **Capability enforcement.** Actor-relative spaces, genesis, derivation, I10a,
-  and I10b exist. `WRITE` checks live, unexpired authority at use. Other rights
-  remain permissive, so I10c is still partial.
-  `tests/semantics.rs::write_authority_is_enforced_while_other_rights_remain_permissive`
+- **Trace-level capability proof.** Actor-relative spaces, genesis, derivation,
+  I10a, I10b, and operation checks are implemented. Every right used by a
+  reachable operation is checked at use; `DESTROY` has no operation yet.
+  Authority grants and denials are not trace events, so I10c remains partial.
+  `tests/semantics.rs::operation_rights_are_enforced_while_i10c_awaits_trace_proof`
   demonstrates the boundary.
-- **Ownership enforcement.** `freeze` / `transfer_unique` record intent. Nothing
-  stops a write to a frozen object.
+- **Unified ownership.** `freeze` invalidates the old mutable version and
+  `transfer_unique` moves authority, but `ObjectDescriptor.unique_owner` still
+  duplicates what capabilities should define. Capability design step 7 removes
+  that second mechanism and collapses I9 into I10.
 - **Channels.** Messaging is per-process mailboxes. `Kind::Channel` is a
   discriminant with no implementation.
 - **Collectives, domains, execution contracts, cancellation, supervision.**
@@ -157,8 +160,10 @@ before coding: ownership should be redefined in terms of capabilities (deleting
 `unique_owner` and collapsing I9), and failure needs a position on whether
 authority survives a faulted holder.
 
-Steps 1 through 4 are complete. Step 5 is in progress: `WRITE` is enforced;
-continue with the remaining rights one operation at a time.
+Steps 1 through 5 are complete. Every right used by a reachable operation is
+enforced, message sends delegate payload `READ` authority, and parked `AWAIT`
+authority is rechecked on resume. Step 6 is next: emit authority grant/denial
+events and make trace-level I10c executable.
 
 ### 5.2 What does a process own? (spec §6.2)
 
