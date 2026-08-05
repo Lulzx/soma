@@ -380,8 +380,11 @@ them.
 In order of what most constrains the rest:
 
 1. **Capabilities (I10).** The largest gap between what the model claims and
-   what it does. Requires deciding whether authority is checked at reference
-   resolution or at operation.
+   what it does. Settled in design by
+   [docs/SOMA-CAPABILITIES.md](SOMA-CAPABILITIES.md): checked at operation, with
+   the operation set closed by making kernel state private. That note also
+   proposes collapsing I9 into I10 by defining ownership in terms of
+   capabilities, which is why capabilities come before §6.2 rather than after.
 2. **Failure and cancellation (§6.3, §6.4).** Both need the answer to §6.2
    first.
 3. **Channels and collectives.** Currently vocabulary, not machinery.

@@ -147,19 +147,17 @@ Nothing here touches throughput or scheduler overhead.
 The largest gap between what the model claims and what it does, and it
 constrains everything after it.
 
-The design decision to make first: **is authority checked at reference
-resolution, or at operation?**
+**Settled in design: [docs/SOMA-CAPABILITIES.md](SOMA-CAPABILITIES.md).**
+Authority is checked at operation, not at reference resolution, and the
+operation set is closed by making kernel state private so a bypass is a compile
+error. That note carries the full check surface, a staged implementation order
+where every step lands green, and the two consequences worth arguing about
+before coding: ownership should be redefined in terms of capabilities (deleting
+`unique_owner` and collapsing I9), and failure needs a position on whether
+authority survives a faulted holder.
 
-- *At resolution* — a `Ref64` is only dereferenceable by a holder of a matching
-  capability. Uniform, and every table lookup pays for it.
-- *At operation* — `send`, `freeze`, `mutate`, `spawn` each check. Cheaper,
-  but the check surface is every operation and it is easy to miss one.
-
-Whichever you choose, add the corresponding I10 checker to
-`src/semantics/invariants.rs` and flip the marker in `docs/SOMA-v0.2.md` §5.
-There is a test asserting capabilities are *unenforced*; it is meant to fail
-when you implement this. Update it rather than deleting it — it should become
-the test that enforcement works.
+Read it before starting. Step 1 — privatising kernel state — is the largest
+diff and the lowest risk, and nothing else is enforceable until it lands.
 
 ### 5.2 What does a process own? (spec §6.2)
 
