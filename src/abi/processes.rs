@@ -1,0 +1,79 @@
+//! Process ABI (§7).
+
+use super::refs::Ref64;
+use super::AbiHeader;
+
+/// Phase-1 process modes (§7).
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessMode {
+    Serial = 1,
+    Pure = 2,
+    System = 3,
+}
+
+/// Process states (§7). A process contains no permanently assigned execution
+/// thread.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessState {
+    Created = 1,
+    Runnable = 2,
+    Running = 3,
+    Waiting = 4,
+    CancelPending = 5,
+    Failed = 6,
+    Terminated = 7,
+}
+
+/// Process descriptor (§7).
+#[derive(Clone, Debug)]
+pub struct ProcessDescriptor {
+    pub header: AbiHeader,
+
+    pub id: Ref64,
+    pub domain: Ref64,
+    pub supervisor: Ref64,
+
+    pub state: super::refs::Ref64, // CapRef
+    pub inbox: Ref64,
+    pub urgent_inbox: Ref64,
+
+    pub active_continuation: Ref64,
+    pub waiting_on: Ref64,
+
+    pub status: u32,
+    pub process_mode: ProcessMode,
+    pub base_priority: u16,
+
+    pub compute_quota: u64,
+    pub memory_quota: u64,
+    pub deadline_ns: u64,
+
+    pub last_committed_epoch: u32,
+    pub failure_count: u32,
+}
+
+impl ProcessDescriptor {
+    pub fn new(mode: ProcessMode) -> ProcessDescriptor {
+        ProcessDescriptor {
+            header: AbiHeader::new(2, std::mem::size_of::<ProcessDescriptor>() as u32),
+            id: Ref64::NULL,
+            domain: Ref64::NULL,
+            supervisor: Ref64::NULL,
+            state: Ref64::NULL,
+            inbox: Ref64::NULL,
+            urgent_inbox: Ref64::NULL,
+            active_continuation: Ref64::NULL,
+            waiting_on: Ref64::NULL,
+            status: 0,
+            process_mode: mode,
+            base_priority: 0,
+            compute_quota: 0,
+            memory_quota: 0,
+            deadline_ns: 0,
+            last_committed_epoch: 0,
+            failure_count: 0,
+        }
+    }
+}

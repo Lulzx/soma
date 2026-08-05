@@ -1,0 +1,11 @@
+[package]
+name = "soma"
+version = "0.1.0"
+edition = "2021"
+description = "SOMA-P1: minimal executable kernel contract — ABI + deterministic CPU continuation interpreter"
+license = "MIT"
+
+[dependencies]
+
+[profile.release]
+debug = true
