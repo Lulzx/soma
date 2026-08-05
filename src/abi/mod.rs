@@ -22,7 +22,8 @@ pub use contracts::{
     ContractFlags, DeterminismPolicy, ExecutionContract, PlacementPolicy, PrecisionPolicy, Shape,
 };
 pub use continuations::{
-    ContinuationDescriptor, ContinuationState, RunClassDescriptor, StepKind, StepResult,
+    ContinuationDescriptor, ContinuationState, RunClassDescriptor, StateAccess, StepKind,
+    StepResult,
 };
 pub use futures::{FutureDescriptor, FutureState};
 pub use messages::MessageDescriptor;

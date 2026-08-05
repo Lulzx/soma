@@ -28,6 +28,7 @@ pub enum RuntimeError {
     MissingPayload,
     MissingMailbox,
     MailboxFull,
+    InvalidStateAccess,
     AlreadyResolved,
     NotResolved,
     MissingCapabilitySpace,
@@ -82,6 +83,36 @@ pub enum AwaitOutcome {
     /// would park the continuation forever, since `resolve_future` drains its
     /// waiter list exactly once.
     AlreadyResolved,
+}
+
+/// Inputs for creating one runnable continuation. Grouped so the access
+/// declaration cannot be separated from the frame and dispatch metadata it
+/// governs.
+#[derive(Clone, Debug)]
+pub struct ContinuationSpec {
+    pub state_access: crate::abi::StateAccess,
+    pub run_class: u32,
+    pub resume_point: u32,
+    pub frame_bytes: Vec<u8>,
+    pub max_steps: u32,
+}
+
+impl ContinuationSpec {
+    pub fn new(
+        state_access: crate::abi::StateAccess,
+        run_class: u32,
+        resume_point: u32,
+        frame_bytes: Vec<u8>,
+        max_steps: u32,
+    ) -> Self {
+        Self {
+            state_access,
+            run_class,
+            resume_point,
+            frame_bytes,
+            max_steps,
+        }
+    }
 }
 
 /// One comparable row of a trace snapshot (§21). Two runs are identical exactly
@@ -672,6 +703,9 @@ impl Kernel {
         actor: Ref64,
         obj: Ref64,
     ) -> Result<&mut Vec<u8>, RuntimeError> {
+        if self.objects.get(obj)?.object_kind == ObjectKind::ProcessState {
+            return Err(RuntimeError::InvalidStateAccess);
+        }
         self.authorize(actor, crate::abi::Rights::WRITE, obj)?;
         let _ = self.objects.get(obj)?;
         self.authority_effect(actor, crate::abi::Rights::WRITE, obj);
@@ -688,6 +722,35 @@ impl Kernel {
         }
         let arr: [u8; 8] = b[..8].try_into().ok()?;
         Some(u64::from_le_bytes(arr))
+    }
+
+    /// Mutate a process's canonical state under an explicitly mutable
+    /// continuation. This is the only write entry point for `ProcessState`
+    /// objects, so the I13 declaration cannot be bypassed through generic
+    /// object access.
+    pub fn process_state_bytes_mut(
+        &mut self,
+        actor: Ref64,
+        continuation: Ref64,
+        process: Ref64,
+    ) -> Result<&mut Vec<u8>, RuntimeError> {
+        let state = self.processes.get(process)?.state;
+        if actor != SYSTEM_PRINCIPAL {
+            let descriptor = self.continuations.get(continuation)?;
+            let active = self.processes.get(process)?.active_continuation;
+            if actor != process
+                || descriptor.process != process
+                || descriptor.state_access != crate::abi::StateAccess::Mutable
+                || active != continuation
+            {
+                return Err(RuntimeError::InvalidStateAccess);
+            }
+        }
+        self.authorize(actor, crate::abi::Rights::WRITE, state)?;
+        self.authority_effect(actor, crate::abi::Rights::WRITE, state);
+        self.object_payloads
+            .get_mut(&state.slot)
+            .ok_or(RuntimeError::MissingPayload)
     }
 
     // ---- processes -------------------------------------------------------
@@ -735,28 +798,39 @@ impl Kernel {
         &mut self,
         actor: Ref64,
         process: Ref64,
-        run_class: u32,
-        resume_point: u32,
-        frame_bytes: Vec<u8>,
-        max_steps: u32,
+        spec: ContinuationSpec,
     ) -> Result<Ref64, RuntimeError> {
         self.authorize(actor, crate::abi::Rights::WRITE, process)?;
+        if self.processes.get(process)?.process_mode == ProcessMode::Pure
+            && spec.state_access == crate::abi::StateAccess::Mutable
+        {
+            return Err(RuntimeError::InvalidStateAccess);
+        }
         self.authority_effect(actor, crate::abi::Rights::WRITE, process);
-        let frame_obj = self.create_object_for(process, ObjectKind::ContinuationFrame, frame_bytes);
+        let frame_obj = self.create_object_for(
+            process,
+            ObjectKind::ContinuationFrame,
+            spec.frame_bytes,
+        );
         let r = self.continuations.alloc(
-            crate::abi::continuations::ContinuationDescriptor::new(process, run_class, resume_point),
+            crate::abi::continuations::ContinuationDescriptor::new(
+                process,
+                spec.state_access,
+                spec.run_class,
+                spec.resume_point,
+            ),
         );
         {
             let c = self.continuations.get_mut(r).expect("fresh continuation");
             c.id = r;
             c.frame = frame_obj;
-            c.remaining_steps = max_steps;
+            c.remaining_steps = spec.max_steps;
             c.status = crate::abi::continuations::ContinuationState::Runnable;
             c.created_epoch = self.epoch;
         }
-        self.scheduler.enqueue(run_class, r);
+        self.scheduler.enqueue(spec.run_class, r);
         self.mint_genesis(process, r, 0, 0);
-        self.trace(EventKind::ContinuationReady, process, r, run_class, 0);
+        self.trace(EventKind::ContinuationReady, process, r, spec.run_class, 0);
         Ok(r)
     }
 

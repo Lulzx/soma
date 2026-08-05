@@ -1,8 +1,8 @@
-use soma::abi::{ObjectKind, ProcessMode, ProcessState, Ref64, Rights};
+use soma::abi::{ObjectKind, ProcessMode, ProcessState, Ref64, Rights, StateAccess};
 use soma::compiler::frame::Frame;
 use soma::compiler::run_classes::{DEFAULT_MAX_STEPS, SEARCH_BRANCH};
 use soma::compiler::state_machine_lowering::SearchFrame;
-use soma::kernel::{Kernel, RuntimeError, SYSTEM_PRINCIPAL};
+use soma::kernel::{ContinuationSpec, Kernel, RuntimeError, SYSTEM_PRINCIPAL};
 use soma::kernel::raw;
 use soma::kernel::ownership::freeze;
 use soma::semantics::invariants::assert_legal;
@@ -14,10 +14,13 @@ fn leaf(kernel: &mut Kernel, process: Ref64) -> Ref64 {
         .create_continuation(
             process,
             process,
-            SEARCH_BRANCH,
-            0,
-            bytes,
-            DEFAULT_MAX_STEPS,
+            ContinuationSpec::new(
+                StateAccess::ReadOnly,
+                SEARCH_BRANCH,
+                0,
+                bytes,
+                DEFAULT_MAX_STEPS,
+            ),
         )
         .unwrap()
 }
@@ -227,10 +230,13 @@ fn creating_execution_requires_write_on_the_target_process() {
         kernel.create_continuation(
             stranger,
             owner,
-            SEARCH_BRANCH,
-            0,
-            bytes,
-            DEFAULT_MAX_STEPS,
+            ContinuationSpec::new(
+                StateAccess::ReadOnly,
+                SEARCH_BRANCH,
+                0,
+                bytes,
+                DEFAULT_MAX_STEPS,
+            ),
         ),
         Err(RuntimeError::AuthorityDenied)
     ));
@@ -352,7 +358,11 @@ fn exported_authority_survives_when_the_exporting_process_faults() {
         .unwrap();
 
     kernel
-        .create_continuation(exporter, exporter, u32::MAX, 0, Vec::new(), 1)
+        .create_continuation(
+            exporter,
+            exporter,
+            ContinuationSpec::new(StateAccess::ReadOnly, u32::MAX, 0, Vec::new(), 1),
+        )
         .unwrap();
     kernel.run_epoch();
 

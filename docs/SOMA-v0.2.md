@@ -73,9 +73,10 @@ implementation. The program API does not construct or expose a mapping.
 
 **Continuation**, a *bounded resumable segment* of a process's execution: the
 schedulable unit. It names its process, its run class, its durable frame, what
-it depends on, and a remaining step budget. Continuations exist because the
-model does not assume preemption: a computation that must yield control does so
-by ending a continuation and naming the next one.
+it depends on, a `ReadOnly` or `Mutable` declaration for canonical process
+state, and a remaining step budget. Continuations exist because the model does
+not assume preemption: a computation that must yield control does so by ending
+a continuation and naming the next one.
 
 **Frame**, an object holding a continuation's live state as a byte blob. Frames
 are durable and position-independent, which is what allows a continuation to be
@@ -174,10 +175,10 @@ the trace. Epochs never move backwards.
 **I12. Accounting consistency [checked].** Issued lane-slots partition exactly
 into useful and idle. Full cohorts do not exceed total cohorts.
 
-**I13. Serial process execution [modelled].** At most one continuation holding
-mutable authority over a process's state executes per epoch. Verified by test
-rather than by predicate, because it is a property of a transition, not of a
-state.
+**I13. Process-state serialisation [checked, trace-level].** At most one
+continuation declaring `Mutable` access to a process's canonical state starts in
+an epoch. Read-only continuations may share the epoch. State mutation also
+requires the declared continuation to be the process's active continuation.
 
 **I14. Progress [modelled].** If any continuation is runnable, an epoch executes
 at least one step. Deferral policies may delay work but may not withhold it
@@ -200,9 +201,10 @@ CREATE-PROCESS(mode) -> p
   effect  fresh process, fresh state object, empty mailbox, status = Created
   trace   ProcessCreated
 
-CREATE-CONTINUATION(p, run_class, frame_bytes, budget) -> c
-  pre     p resolves
+CREATE-CONTINUATION(p, state_access, run_class, frame_bytes, budget) -> c
+  pre     p resolves; a Pure process rejects Mutable state_access
   effect  fresh frame object holding frame_bytes;
+          c.state_access := state_access;
           c.status = Runnable; c enqueued in bin(run_class)
   trace   ContinuationReady
 
@@ -278,8 +280,8 @@ what makes I7 checkable: no other code path may enqueue.
 ```text
 EPOCH(Σ) -> Σ'
   1. Boundary   promote each bin's next buffer to current
-  2. Admit      drop non-runnable entries; claim at most one mutating
-                continuation per serial process (I13); defer the rest
+  2. Admit      drop non-runnable entries; claim at most one Mutable
+                state-access continuation per process (I13); defer the rest
   3. Group      partition admitted work by run class
   4. Execute    for each continuation: if budget exhausted, Fault without
                 dispatching; else dispatch, then COMMIT, then charge the budget
@@ -292,7 +294,7 @@ leave a faulted continuation enqueued by that commit, violating I7.
 Work produced during an epoch goes into the next-epoch buffer, so an epoch
 boundary is a consistent cut. This is a property of the reference interpreter's
 scheduling, not a requirement of the model. An implementation may wake
-continuations within an epoch provided it preserves I1–I12 and determinism.
+continuations within an epoch provided it preserves I1–I13 and determinism.
 
 ---
 
@@ -331,7 +333,7 @@ continuations within an epoch provided it preserves I1–I12 and determinism.
 | I10c no unauthorised effect | checked | adjacent decision/effect trace proof |
 | I11 trace monotonicity | checked | |
 | I12 accounting consistency | checked | |
-| I13 serial execution | modelled | per-epoch, by test |
+| I13 process-state serialisation | checked | trace-level, with fault injection |
 | I14 progress | modelled | by test |
 
 Entities named but not implemented: **Channel**, **Collective**, **Domain**,
@@ -363,13 +365,16 @@ The ambiguity was in the model, not only the code: §3.4 did not specify whether
 `Complete` is a claim about a continuation or about a process. It is about a
 continuation. A process retires when its last continuation does.
 
-### 6.2 Unresolved: what does a process *own*?
+### 6.2 Process-state ownership
 
-I8 gives each continuation an exclusive frame, and a process has a state object,
-but nothing says how concurrent continuations of one process may touch that
-shared state. I13 restricts *mutating* continuations to one per epoch without
-defining which continuations mutate. The reference interpreter treats mode as
-the answer, which is too coarse.
+A process owns one canonical state object through its capability space. Each
+continuation explicitly declares `ReadOnly` or `Mutable` access to that state.
+The scheduler serialises mutable declarations per process and I13 checks the
+trace. During execution, `process_state_bytes_mut` requires the named mutable
+continuation to be active; generic object mutation cannot open a process-state
+object. Private continuation frames remain governed separately by I8. A `Pure`
+process cannot create a mutable-state continuation, so purity is a construction
+rule rather than a scheduler guess based on process mode.
 
 ### 6.3 Unresolved: failure containment
 
@@ -392,16 +397,15 @@ them.
 
 ## 7. Remaining work
 
-1. **Failure and cancellation (§6.3, §6.4).** Both need the answer to §6.2
-   first.
+1. **Failure and cancellation (§6.3, §6.4).** Process-state ownership is now
+   settled, so this is the next semantic dependency.
 2. **Channels and collectives.** Currently vocabulary, not machinery.
 3. **Validation workloads** beyond the existing domain-neutral dynamic
    constraint search: streaming pipelines, actor systems, and irregular
    dataflow, chosen to stress ordering, back-pressure, and failure rather than
    throughput.
-4. **A minimal IR**, after §6.2 and §6.3 are settled. A surface syntax for a
-   model with unresolved process ownership and failure semantics would preserve
-   the ambiguity.
+4. **A minimal IR**, after §6.3 is settled. A surface syntax for unresolved
+   failure semantics would preserve the ambiguity.
 
 Performance work belongs after all of this, and the performance results already
 in this repository (`docs/SOMA-P1.md`, and the cohorting studies) should be read

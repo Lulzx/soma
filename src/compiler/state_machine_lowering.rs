@@ -19,10 +19,10 @@
 //! initial kernel state for a workload, so tests and experiments don't repeat
 //! the ABI plumbing.
 
-use crate::abi::{ObjectKind, ProcessMode, Ref64};
+use crate::abi::{ObjectKind, ProcessMode, Ref64, StateAccess};
 use crate::compiler::frame::{put_ref64, put_u64, put_vec_u64, ByteCursor, Frame, FrameError};
 use crate::compiler::run_classes::{DEFAULT_MAX_STEPS, EXPAND_RESUME_0};
-use crate::kernel::Kernel;
+use crate::kernel::{ContinuationSpec, Kernel};
 
 /// Frame for the `Expand` state machine across all three resume points.
 ///
@@ -214,10 +214,13 @@ pub fn create_expand(kernel: &mut Kernel, request_value: u64) -> (Ref64, Ref64) 
     let cont = kernel.create_continuation(
         crate::kernel::SYSTEM_PRINCIPAL,
         expand,
-        EXPAND_RESUME_0,
-        EXPAND_RESUME_0,
-        bytes,
-        DEFAULT_MAX_STEPS,
+        ContinuationSpec::new(
+            StateAccess::ReadOnly,
+            EXPAND_RESUME_0,
+            EXPAND_RESUME_0,
+            bytes,
+            DEFAULT_MAX_STEPS,
+        ),
     )
     .expect("system may create the initial continuation");
 

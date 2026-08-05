@@ -3,6 +3,15 @@
 use super::refs::Ref64;
 use super::AbiHeader;
 
+/// A continuation's declared access to its process's canonical state object.
+/// Private continuation frames are governed separately by I8.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateAccess {
+    ReadOnly = 1,
+    Mutable = 2,
+}
+
 /// Continuation states (§8).
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,13 +141,19 @@ pub struct ContinuationDescriptor {
     pub remaining_steps: u32,
     pub priority: u16,
     pub status: ContinuationState,
+    pub state_access: StateAccess,
 
     pub created_epoch: u32,
     pub last_run_epoch: u32,
 }
 
 impl ContinuationDescriptor {
-    pub fn new(process: Ref64, run_class: u32, resume_point: u32) -> ContinuationDescriptor {
+    pub fn new(
+        process: Ref64,
+        state_access: StateAccess,
+        run_class: u32,
+        resume_point: u32,
+    ) -> ContinuationDescriptor {
         ContinuationDescriptor {
             header: AbiHeader::new(5, std::mem::size_of::<ContinuationDescriptor>() as u32),
             id: Ref64::NULL,
@@ -151,6 +166,7 @@ impl ContinuationDescriptor {
             remaining_steps: 0,
             priority: 0,
             status: ContinuationState::New,
+            state_access,
             created_epoch: 0,
             last_run_epoch: 0,
         }

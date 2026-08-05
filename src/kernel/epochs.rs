@@ -1,6 +1,6 @@
 //! The epoch lifecycle (§18): Ingest (nothing external yet) → Validate/Admit
-//! (per-process serial guard) → Cohort → Execute → Commit → Account, then swap
-//! the runnable-bin buffers and advance the epoch.
+//! (per-process mutable-state guard) → Cohort → Execute → Commit → Account,
+//! then swap the runnable-bin buffers and advance the epoch.
 //!
 //! Phase E (Cohort) partitions each bin's admitted continuations into width-`W`
 //! SIMD dispatches (§14). Execution itself is still the CPU scalar executive, so
@@ -13,7 +13,7 @@ use std::collections::HashSet;
 
 use crate::abi::cohorts::PartialCohortPolicy;
 use crate::abi::continuations::ContinuationState;
-use crate::abi::ProcessMode;
+use crate::abi::StateAccess;
 use crate::abi::Ref64;
 use crate::executives::cpu_scalar;
 use crate::kernel::commit;
@@ -34,12 +34,13 @@ impl Kernel {
         // collected per bin before any of it runs, so cohort construction sees
         // the whole epoch's eligible work rather than a prefix of it.
         //
-        // Serial-process invariant (§19): at most one mutating continuation of a
-        // serial process runs per epoch. Sequential execution cannot overlap two
-        // continuations *within* a step, but a parallel executive would run a
-        // whole epoch's cohorts concurrently — so the invariant must hold at
-        // epoch granularity, and a slot claimed here is held for the rest of the
-        // epoch. Later continuations of the same process defer to the next epoch.
+        // Process-state invariant (I13): at most one continuation declaring
+        // mutable state access runs per process per epoch. Sequential execution
+        // cannot overlap two continuations *within* a step, but a parallel
+        // executive would run a whole epoch's cohorts concurrently — so the
+        // invariant must hold at epoch granularity. A slot claimed here is held
+        // for the rest of the epoch; later mutable continuations of that process
+        // defer to the next epoch.
         let mut claimed_procs: HashSet<u32> = HashSet::new();
         let mut admitted: Vec<(u32, Vec<(Ref64, u32)>)> = Vec::new();
 
@@ -52,13 +53,8 @@ impl Kernel {
         for bin in bins {
             let mut lanes: Vec<(Ref64, u32)> = Vec::new();
             for cont in self.scheduler.drain(bin) {
-                let (process, run_class, mode, status) = match self.continuations.get(cont) {
-                    Ok(c) => (
-                        c.process,
-                        c.run_class,
-                        self.process_mode(c.process),
-                        c.status,
-                    ),
+                let (process, run_class, state_access, status) = match self.continuations.get(cont) {
+                    Ok(c) => (c.process, c.run_class, c.state_access, c.status),
                     Err(_) => continue,
                 };
                 // Only runnable continuations execute. Nothing in the current
@@ -69,7 +65,7 @@ impl Kernel {
                 if status != ContinuationState::Runnable {
                     continue;
                 }
-                let mutating = mode == ProcessMode::Serial || mode == ProcessMode::System;
+                let mutating = state_access == StateAccess::Mutable;
                 if mutating && !claimed_procs.insert(process.slot) {
                     self.scheduler.enqueue(run_class, cont);
                     self.accounting.serial_deferrals += 1;
@@ -177,13 +173,6 @@ impl Kernel {
         self.scheduler.runnable_counts()
     }
 
-    fn process_mode(&self, p: Ref64) -> ProcessMode {
-        self.processes
-            .get(p)
-            .map(|pd| pd.process_mode)
-            .unwrap_or(ProcessMode::System)
-    }
-
     /// Execute a single continuation: enforce the step budget, dispatch to the
     /// interpreter, and commit the result.
     fn execute_cont(&mut self, cont: Ref64, process: Ref64) -> usize {
@@ -225,7 +214,13 @@ impl Kernel {
             run_class,
             0,
         );
+        if let Ok(descriptor) = self.processes.get_mut(process) {
+            descriptor.active_continuation = cont;
+        }
         let result = cpu_scalar::dispatch(self, cont, process);
+        if let Ok(descriptor) = self.processes.get_mut(process) {
+            descriptor.active_continuation = Ref64::NULL;
+        }
         let consumed = commit::apply_step_result(self, cont, process, result);
 
         if let Ok(c) = self.continuations.get_mut(cont) {

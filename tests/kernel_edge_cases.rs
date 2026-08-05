@@ -8,14 +8,14 @@
 
 use soma::abi::continuations::ContinuationState;
 use soma::abi::objects::OwnershipState;
-use soma::abi::{Kind, ObjectKind, ProcessMode, ProcessState, Ref64};
+use soma::abi::{Kind, ObjectKind, ProcessMode, ProcessState, Ref64, StateAccess};
 use soma::compiler::frame::Frame;
 use soma::compiler::run_classes::{
     DEFAULT_MAX_STEPS, EXPAND_RESUME_1, EXPAND_RESUME_2, SEARCH_BRANCH,
 };
 use soma::compiler::state_machine_lowering::{create_expand, ExpandFrame, SearchFrame};
 use soma::kernel::ownership::{assert_live, freeze, ownership_state, transfer_unique};
-use soma::kernel::{AwaitOutcome, Kernel, RuntimeError, SYSTEM_PRINCIPAL};
+use soma::kernel::{AwaitOutcome, ContinuationSpec, Kernel, RuntimeError, SYSTEM_PRINCIPAL};
 use soma::kernel::raw;
 
 /// A leaf search frame: one node that does no work, spawns nothing, completes.
@@ -27,13 +27,24 @@ fn leaf_bytes() -> Vec<u8> {
 
 /// Attach a runnable leaf continuation to `process`.
 fn spawn_leaf(kernel: &mut Kernel, process: Ref64) -> Ref64 {
+    spawn_leaf_with_access(kernel, process, StateAccess::ReadOnly)
+}
+
+fn spawn_leaf_with_access(
+    kernel: &mut Kernel,
+    process: Ref64,
+    state_access: StateAccess,
+) -> Ref64 {
     kernel.create_continuation(
         process,
         process,
-        SEARCH_BRANCH,
-        0,
-        leaf_bytes(),
-        DEFAULT_MAX_STEPS,
+        ContinuationSpec::new(
+            state_access,
+            SEARCH_BRANCH,
+            0,
+            leaf_bytes(),
+            DEFAULT_MAX_STEPS,
+        ),
     )
     .unwrap()
 }
@@ -41,11 +52,11 @@ fn spawn_leaf(kernel: &mut Kernel, process: Ref64) -> Ref64 {
 // ---- §19: the serial-process invariant -----------------------------------
 
 #[test]
-fn serial_process_runs_at_most_one_continuation_per_epoch() {
+fn mutable_process_state_access_runs_at_most_one_continuation_per_epoch() {
     let mut kernel = Kernel::new();
     let p = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
-    let first = spawn_leaf(&mut kernel, p);
-    let second = spawn_leaf(&mut kernel, p);
+    let first = spawn_leaf_with_access(&mut kernel, p, StateAccess::Mutable);
+    let second = spawn_leaf_with_access(&mut kernel, p, StateAccess::Mutable);
 
     kernel.run_epoch();
 
@@ -56,7 +67,7 @@ fn serial_process_runs_at_most_one_continuation_per_epoch() {
     assert_eq!(
         kernel.continuation_state(second).unwrap(),
         ContinuationState::Runnable,
-        "a second continuation of the same serial process must defer, not run"
+        "a second mutable continuation of the same process must defer, not run"
     );
     assert_eq!(kernel.total_pending(), 1, "the deferred continuation is requeued");
 
@@ -68,6 +79,89 @@ fn serial_process_runs_at_most_one_continuation_per_epoch() {
         "the deferred continuation runs in the following epoch"
     );
     assert_eq!(kernel.total_pending(), 0);
+}
+
+#[test]
+fn read_only_continuations_of_one_process_can_share_an_epoch() {
+    let mut kernel = Kernel::new();
+    let process = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let first = spawn_leaf(&mut kernel, process);
+    let second = spawn_leaf(&mut kernel, process);
+
+    kernel.run_epoch();
+
+    assert_eq!(
+        kernel.continuation_state(first).unwrap(),
+        ContinuationState::Completed
+    );
+    assert_eq!(
+        kernel.continuation_state(second).unwrap(),
+        ContinuationState::Completed
+    );
+}
+
+#[test]
+fn process_state_mutation_requires_the_active_mutable_continuation() {
+    let mut kernel = Kernel::new();
+    let process = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let read_only = spawn_leaf(&mut kernel, process);
+    let mutable = spawn_leaf_with_access(&mut kernel, process, StateAccess::Mutable);
+    let state_object = unsafe { raw::state(&mut kernel) }
+        .processes
+        .get(process)
+        .unwrap()
+        .state;
+
+    assert_eq!(
+        kernel.object_bytes_mut(process, state_object),
+        Err(RuntimeError::InvalidStateAccess)
+    );
+
+    unsafe { raw::state(&mut kernel) }
+        .processes
+        .get_mut(process)
+        .unwrap()
+        .active_continuation = read_only;
+    assert_eq!(
+        kernel.process_state_bytes_mut(process, read_only, process),
+        Err(RuntimeError::InvalidStateAccess)
+    );
+
+    unsafe { raw::state(&mut kernel) }
+        .processes
+        .get_mut(process)
+        .unwrap()
+        .active_continuation = mutable;
+    kernel
+        .process_state_bytes_mut(process, mutable, process)
+        .unwrap()
+        .push(7);
+    unsafe { raw::state(&mut kernel) }
+        .processes
+        .get_mut(process)
+        .unwrap()
+        .active_continuation = Ref64::NULL;
+}
+
+#[test]
+fn pure_processes_reject_mutable_state_continuations() {
+    let mut kernel = Kernel::new();
+    let process = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Pure);
+
+    assert_eq!(
+        kernel.create_continuation(
+            process,
+            process,
+            ContinuationSpec::new(
+                StateAccess::Mutable,
+                SEARCH_BRANCH,
+                0,
+                leaf_bytes(),
+                DEFAULT_MAX_STEPS,
+            ),
+        ),
+        Err(RuntimeError::InvalidStateAccess)
+    );
 }
 
 // ---- §8: the step budget --------------------------------------------------
@@ -82,7 +176,17 @@ fn exhausted_step_budget_faults_before_dispatch_and_leaves_no_bin_entry() {
     // A budget of exactly one step: resume_1 runs once, yields into resume_2's
     // bin, and is left with nothing to spend.
     let cont = kernel
-        .create_continuation(p, p, EXPAND_RESUME_1, EXPAND_RESUME_1, bytes, 1)
+        .create_continuation(
+            p,
+            p,
+            ContinuationSpec::new(
+                StateAccess::ReadOnly,
+                EXPAND_RESUME_1,
+                EXPAND_RESUME_1,
+                bytes,
+                1,
+            ),
+        )
         .unwrap();
 
     kernel.run_epoch();

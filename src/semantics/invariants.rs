@@ -16,7 +16,7 @@
 //! not immediately paired with the matching successful authority decision.
 
 use crate::abi::continuations::ContinuationState;
-use crate::abi::{FutureState, Kind, ProcessMode, ProcessState, Ref64};
+use crate::abi::{FutureState, Kind, ProcessState, Ref64, StateAccess};
 use crate::kernel::Kernel;
 
 /// Which clause of the specification a violation belongs to.
@@ -49,6 +49,8 @@ pub enum Invariant {
     TraceMonotonicity,
     /// I12. Accounting counters are mutually consistent.
     AccountingConsistency,
+    /// I13. At most one mutable process-state continuation starts per epoch.
+    SerialProcessExecution,
 }
 
 /// A specific way in which a state was illegal.
@@ -90,6 +92,7 @@ pub fn check(kernel: &Kernel) -> Vec<Violation> {
     no_unauthorized_effect(kernel, &mut v);
     trace_monotonicity(kernel, &mut v);
     accounting_consistency(kernel, &mut v);
+    serial_process_execution(kernel, &mut v);
     v.sort();
     v
 }
@@ -528,11 +531,40 @@ fn accounting_consistency(kernel: &Kernel, out: &mut Vec<Violation>) {
     }
 }
 
-/// Whether a process is serial, i.e. bound by the one-mutator rule.
-pub fn is_serial(kernel: &Kernel, process: Ref64) -> bool {
+// ---- I13 -----------------------------------------------------------------
+
+fn serial_process_execution(kernel: &Kernel, out: &mut Vec<Violation>) {
+    use crate::abi::EventKind;
+
+    let mut claimed = std::collections::HashSet::new();
+    for (index, event) in kernel.trace_events().iter().enumerate() {
+        if event.event_kind != EventKind::ContinuationStarted {
+            continue;
+        }
+        let Ok(continuation) = kernel.continuations().get(event.continuation) else {
+            continue;
+        };
+        if continuation.state_access != StateAccess::Mutable {
+            continue;
+        }
+        let key = (event.epoch, continuation.process.slot);
+        if !claimed.insert(key) {
+            out.push(Violation::new(
+                Invariant::SerialProcessExecution,
+                format!(
+                    "trace event {index} starts a second mutable continuation for process {} in epoch {}",
+                    continuation.process.slot, event.epoch
+                ),
+            ));
+        }
+    }
+}
+
+/// Whether a continuation declares mutable access to its process state.
+pub fn mutates_process_state(kernel: &Kernel, continuation: Ref64) -> bool {
     kernel
-        .processes()
-        .get(process)
-        .map(|p| matches!(p.process_mode, ProcessMode::Serial | ProcessMode::System))
+        .continuations()
+        .get(continuation)
+        .map(|c| c.state_access == StateAccess::Mutable)
         .unwrap_or(false)
 }

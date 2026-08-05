@@ -156,6 +156,8 @@ Implemented now:
 - Trace-driven irregular-arrival and execution-territory experiments
 - Actor-relative capabilities with operation checks and trace-checked effects
 - Capability-derived unique/frozen object ownership
+- Explicit continuation state-access declarations with checked one-mutator
+  scheduling
 - A domain-neutral dynamic constraint-search validation workload
 
 Not implemented:
@@ -165,9 +167,9 @@ Not implemented:
 - GPU execution, CPU/GPU migration, and spill
 
 The current job is to finish the machine semantics before adding a surface
-language or GPU backend. Open questions include process ownership, the fate of a
-failed process's futures and waiters, and cancellation. Encoding those questions
-in an IR would only make the ambiguity harder to remove.
+language or GPU backend. Open questions include the fate of a failed process's
+futures and waiters, and cancellation. Encoding those questions in an IR would
+only make the ambiguity harder to remove.
 
 ## License
 

@@ -6,11 +6,11 @@
 //! yields. It exists to map the regime in which continuation cohorting helps or
 //! fails — not to be a realistic application.
 
-use crate::abi::ProcessMode;
+use crate::abi::{ProcessMode, StateAccess};
 use crate::compiler::frame::Frame;
 use crate::compiler::run_classes::DEFAULT_MAX_STEPS;
 use crate::compiler::state_machine_lowering::SearchFrame;
-use crate::kernel::Kernel;
+use crate::kernel::{ContinuationSpec, Kernel};
 
 /// Control variables exposed by §25.1.
 #[derive(Clone, Copy, Debug)]
@@ -85,10 +85,13 @@ pub fn build_in(mut kernel: Kernel, knobs: &ControlKnobs) -> Kernel {
         kernel.create_continuation(
             crate::kernel::SYSTEM_PRINCIPAL,
             p,
-            run_class,
-            0,
-            bytes,
-            DEFAULT_MAX_STEPS,
+            ContinuationSpec::new(
+                StateAccess::ReadOnly,
+                run_class,
+                0,
+                bytes,
+                DEFAULT_MAX_STEPS,
+            ),
         )
         .expect("system may create root continuations");
     }

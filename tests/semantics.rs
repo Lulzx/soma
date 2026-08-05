@@ -8,21 +8,37 @@
 
 use soma::abi::continuations::ContinuationState;
 use soma::abi::objects::OwnershipState;
-use soma::abi::{EventKind, Kind, ObjectKind, ProcessMode, ProcessState, Ref64, Rights, TraceEvent};
+use soma::abi::{
+    EventKind, Kind, ObjectKind, ProcessMode, ProcessState, Ref64, Rights, StateAccess, TraceEvent,
+};
 use soma::compiler::frame::Frame;
 use soma::compiler::run_classes::{DEFAULT_MAX_STEPS, SEARCH_BRANCH};
 use soma::compiler::state_machine_lowering::{create_expand, SearchFrame};
 use soma::experiments::dynamic_search::{build, ControlKnobs};
-use soma::kernel::{Kernel, SYSTEM_PRINCIPAL};
+use soma::kernel::{ContinuationSpec, Kernel, SYSTEM_PRINCIPAL};
 use soma::kernel::raw;
 use soma::scheduler::runnable_bins::SchedulingMode;
 use soma::semantics::invariants::{assert_legal, check, Invariant};
 
 fn leaf(kernel: &mut Kernel, process: Ref64) -> Ref64 {
+    leaf_with_access(kernel, process, StateAccess::ReadOnly)
+}
+
+fn leaf_with_access(kernel: &mut Kernel, process: Ref64, state_access: StateAccess) -> Ref64 {
     let mut bytes = Vec::new();
     SearchFrame::leaf(1, 0).encode(&mut bytes);
     kernel
-        .create_continuation(process, process, SEARCH_BRANCH, 0, bytes, DEFAULT_MAX_STEPS)
+        .create_continuation(
+            process,
+            process,
+            ContinuationSpec::new(
+                state_access,
+                SEARCH_BRANCH,
+                0,
+                bytes,
+                DEFAULT_MAX_STEPS,
+            ),
+        )
         .unwrap()
 }
 
@@ -310,6 +326,30 @@ fn i12_catches_inconsistent_accounting() {
     accounting.useful_lane_slots = 10;
     accounting.lane_slots = 4;
     assert!(violated(&kernel, Invariant::AccountingConsistency));
+}
+
+#[test]
+fn i13_catches_two_mutable_continuations_started_in_one_epoch() {
+    let mut kernel = Kernel::new();
+    let process = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let first = leaf_with_access(&mut kernel, process, StateAccess::Mutable);
+    let second = leaf_with_access(&mut kernel, process, StateAccess::Mutable);
+    kernel.run_epoch();
+    assert!(!violated(&kernel, Invariant::SerialProcessExecution));
+
+    let trace = unsafe { raw::state(&mut kernel) }.trace;
+    let logical_time = trace.last().map(|event| event.logical_time + 1).unwrap_or(1);
+    trace.push(TraceEvent::new(
+        logical_time,
+        0,
+        EventKind::ContinuationStarted,
+        process,
+        second,
+        SEARCH_BRANCH,
+    ));
+
+    assert!(violated(&kernel, Invariant::SerialProcessExecution));
+    assert_ne!(first, second);
 }
 
 // ---- I10c ---------------------------------------------------------------

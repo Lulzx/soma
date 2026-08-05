@@ -4,7 +4,7 @@ Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
 Repository: https://github.com/Lulzx/soma. About 7,200 lines of Rust, no
-dependencies, 99 tests, and no Clippy warnings.
+dependencies, 103 tests, and no Clippy warnings.
 
 ```sh
 cargo test
@@ -92,6 +92,8 @@ register state, so another executor can resume the continuation.
   attenuation, integrity, and effect authorization machine-checked.
 - Capability-derived object ownership: one mutable holder, linear `WRITE`
   transfer, and freeze by revoking write-bearing capability trees.
+- Explicit `ReadOnly`/`Mutable` continuation declarations for canonical process
+  state, with active-continuation enforcement and trace-checked I13 admission.
 
 ### Named by the model and NOT implemented
 
@@ -160,21 +162,24 @@ advisory owner/mode/count fields are gone and I9 is subsumed by I10b. A fault
 reclaims the failed process's local capability space, while exported roots in
 other spaces remain valid.
 
-### 5.2 What does a process own? (spec §6.2)
+### 5.2 Process-state ownership (spec §6.2)
 
-Unresolved and blocking. I8 gives each continuation an exclusive frame and a
-process has a state object, but nothing says how concurrent continuations of one
-process may touch that shared state. I13 restricts *mutating* continuations to
-one per epoch without defining which continuations mutate. The interpreter uses
-`ProcessMode` as the answer, which is too coarse.
+Settled. Every continuation declares `ReadOnly` or `Mutable` access to its
+process's canonical state object. Admission permits any number of read-only
+continuations but at most one mutable declaration per process per epoch.
+`process_state_bytes_mut` also requires that exact continuation to be active;
+the generic object mutation API rejects process-state objects. `Pure` processes
+reject mutable continuation creation. I13 checks the resulting trace and has a
+negative fault-injection test.
 
 ### 5.3 Failure containment and cancellation (spec §6.3, §6.4)
 
-Both need 5.2 first. Today `Fault` marks a process failed and increments a
-counter. Nothing says what happens to its other continuations, queued messages,
-or unresolved futures. A future whose resolver faults is never resolved, and
-its waiters wait forever. The progress invariant does not catch this because
-those continuations are not runnable.
+This is now the next semantic dependency. Today `Fault` marks a process failed,
+reclaims its local capability space, and increments a counter. Nothing says what
+happens to its other continuations, queued messages, or unresolved futures. A
+future whose resolver faults is never resolved, and its waiters wait forever.
+The progress invariant does not catch this because those continuations are not
+runnable.
 
 ### 5.4 Channels and collectives
 

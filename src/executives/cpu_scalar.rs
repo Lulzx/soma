@@ -11,7 +11,7 @@
 //! model, step result, and message semantics are used here as everywhere else.
 
 use crate::abi::Ref64;
-use crate::abi::{MessageDescriptor, StepResult};
+use crate::abi::{MessageDescriptor, StateAccess, StepResult};
 use crate::compiler::frame::{ByteCursor, Frame};
 use crate::compiler::run_classes::{
     search_class_index, DEFAULT_MAX_STEPS, EXPAND_RESUME_0, EXPAND_RESUME_1, EXPAND_RESUME_2,
@@ -20,7 +20,7 @@ use crate::compiler::run_classes::{
 use crate::compiler::state_machine_lowering::{
     search_step, ExpandFrame, HeuristicFrame, SearchFrame,
 };
-use crate::kernel::{AwaitOutcome, Kernel, RuntimeError};
+use crate::kernel::{AwaitOutcome, ContinuationSpec, Kernel, RuntimeError};
 
 /// Run-class identifiers recognized by this executive (mirrors §15's switch).
 pub mod run_classes {
@@ -103,10 +103,13 @@ fn expand_resume_0(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResu
             kernel.create_continuation(
                 process,
                 process,
-                SEARCH_HEURISTIC,
-                0,
-                hb,
-                DEFAULT_MAX_STEPS,
+                ContinuationSpec::new(
+                    StateAccess::ReadOnly,
+                    SEARCH_HEURISTIC,
+                    0,
+                    hb,
+                    DEFAULT_MAX_STEPS,
+                ),
             )
             .expect("a process may create its own continuation");
 
@@ -155,7 +158,17 @@ fn expand_resume_2(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResu
         let mut cb = Vec::new();
         cframe.encode(&mut cb);
         kernel
-            .create_continuation(process, child, SEARCH_BRANCH, 0, cb, DEFAULT_MAX_STEPS)
+            .create_continuation(
+                process,
+                child,
+                ContinuationSpec::new(
+                    StateAccess::ReadOnly,
+                    SEARCH_BRANCH,
+                    0,
+                    cb,
+                    DEFAULT_MAX_STEPS,
+                ),
+            )
             .expect("the creator holds WRITE on the child process");
         frame.move_index += 1;
     }
@@ -238,7 +251,17 @@ fn search_branch(kernel: &mut Kernel, cont: Ref64, process: Ref64, index: u32) -
             let mut cb = Vec::new();
             cframe.encode(&mut cb);
             kernel
-                .create_continuation(process, child, run_class, 0, cb, DEFAULT_MAX_STEPS)
+                .create_continuation(
+                    process,
+                    child,
+                    ContinuationSpec::new(
+                        StateAccess::ReadOnly,
+                        run_class,
+                        0,
+                        cb,
+                        DEFAULT_MAX_STEPS,
+                    ),
+                )
                 .expect("the creator holds WRITE on the child process");
         }
         // Spawn with no continuation: the commit phase terminates this node.
