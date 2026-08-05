@@ -57,4 +57,59 @@ pub mod run_classes {
 
     /// Bounded step budget applied to runnable continuations (§10 `maximum_steps`).
     pub const DEFAULT_MAX_STEPS: u32 = 16;
+
+    /// Ant-colony workload (`experiments::ant_colony`). Each behaviour an ant can
+    /// be in is its own resume point and therefore its own run class, which is
+    /// the whole point of the workload: an ant's *next* class is decided by the
+    /// ant, from its own state, and the scheduler groups on it without asking
+    /// what the ant is doing.
+    ///
+    /// The block is contiguous so a bin index maps to a behaviour by subtraction,
+    /// exactly as the search block does.
+    pub const ANT_BASE: u32 = 20;
+    /// Wander, biased by nothing but the ant's own generator.
+    pub const ANT_EXPLORE: u32 = ANT_BASE;
+    /// Climb the food-trail gradient.
+    pub const ANT_FOLLOW_TRAIL: u32 = ANT_BASE + 1;
+    /// Carry food home, laying a food trail behind.
+    pub const ANT_CARRY_FOOD: u32 = ANT_BASE + 2;
+    /// Blocked last step; pick a new heading before resuming.
+    pub const ANT_AVOID_OBSTACLE: u32 = ANT_BASE + 3;
+    /// Head for the nest without cargo.
+    pub const ANT_RETURN_HOME: u32 = ANT_BASE + 4;
+    /// Idle for a bounded number of epochs.
+    pub const ANT_WAIT: u32 = ANT_BASE + 5;
+
+    /// How many distinct ant behaviours the block reserves.
+    pub const ANT_CLASS_COUNT: u32 = 6;
+
+    /// Aggregate one colony's ants' deposits into the colony's summary.
+    pub const COLONY_AGGREGATE: u32 = ANT_BASE + 6;
+    /// Fold every colony summary into the pheromone field, decay it, and swap
+    /// the double buffer.
+    pub const WORLD_STEP: u32 = ANT_BASE + 7;
+
+    /// Whether `run_class` is one of the ant behaviours, and its index if so.
+    pub fn ant_class_index(run_class: u32) -> Option<u32> {
+        if (ANT_BASE..ANT_BASE + ANT_CLASS_COUNT).contains(&run_class) {
+            Some(run_class - ANT_BASE)
+        } else {
+            None
+        }
+    }
+
+    /// A short name per ant behaviour, for reports and the trace export.
+    pub fn ant_class_name(run_class: u32) -> Option<&'static str> {
+        match run_class {
+            ANT_EXPLORE => Some("Explore"),
+            ANT_FOLLOW_TRAIL => Some("FollowTrail"),
+            ANT_CARRY_FOOD => Some("CarryFood"),
+            ANT_AVOID_OBSTACLE => Some("AvoidObstacle"),
+            ANT_RETURN_HOME => Some("ReturnHome"),
+            ANT_WAIT => Some("Wait"),
+            COLONY_AGGREGATE => Some("ColonyAggregate"),
+            WORLD_STEP => Some("WorldStep"),
+            _ => None,
+        }
+    }
 }

@@ -1,5 +1,6 @@
 //! Engine executives (§16): scalar semantics plus physical batch backends.
 
+pub mod ant_colony;
 pub mod batch;
 pub mod cpu_scalar;
 

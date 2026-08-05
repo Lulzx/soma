@@ -14,9 +14,10 @@ use crate::abi::Ref64;
 use crate::abi::{MessageDescriptor, StateAccess, StepResult};
 use crate::compiler::frame::{ByteCursor, Frame};
 use crate::compiler::run_classes::{
-    search_class_index, DEFAULT_MAX_STEPS, EXPAND_RESUME_0, EXPAND_RESUME_1, EXPAND_RESUME_2,
-    SEARCH_BRANCH, SEARCH_HEURISTIC,
+    ant_class_index, search_class_index, COLONY_AGGREGATE, DEFAULT_MAX_STEPS, EXPAND_RESUME_0,
+    EXPAND_RESUME_1, EXPAND_RESUME_2, SEARCH_BRANCH, SEARCH_HEURISTIC, WORLD_STEP,
 };
+use crate::executives::ant_colony;
 use crate::compiler::state_machine_lowering::{
     search_step, ExpandFrame, HeuristicFrame, SearchFrame,
 };
@@ -41,11 +42,19 @@ pub fn dispatch(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResult 
         EXPAND_RESUME_1 => expand_resume_1(kernel, cont, process),
         EXPAND_RESUME_2 => expand_resume_2(kernel, cont, process),
         SEARCH_HEURISTIC => heuristic(kernel, cont, process),
+        COLONY_AGGREGATE => ant_colony::colony_aggregate(kernel, cont, process),
+        WORLD_STEP => ant_colony::world_step(kernel, cont, process),
         // The search classes occupy a contiguous block; each is a distinct
         // case of this switch with its own arithmetic (§25.1).
         rc => match search_class_index(rc) {
             Some(index) => search_branch(kernel, cont, process, index),
-            None => StepResult::fault(process, rc),
+            // The ant behaviours are their own contiguous block. Each is a
+            // separate case for the same reason the search classes are: a
+            // cohort really can only hold one of them.
+            None => match ant_class_index(rc) {
+                Some(behaviour) => ant_colony::ant_step(kernel, cont, process, behaviour),
+                None => StepResult::fault(process, rc),
+            },
         },
     }
 }
@@ -72,13 +81,13 @@ fn set_frame_bytes(kernel: &mut Kernel, actor: Ref64, cont: Ref64, bytes: Vec<u8
     }
 }
 
-fn load_frame<F: Frame>(kernel: &mut Kernel, actor: Ref64, cont: Ref64, fallback: F) -> F {
+pub(crate) fn load_frame<F: Frame>(kernel: &mut Kernel, actor: Ref64, cont: Ref64, fallback: F) -> F {
     let bytes = frame_bytes(kernel, actor, cont);
     let mut c = ByteCursor::new(&bytes);
     F::decode(&mut c).unwrap_or(fallback)
 }
 
-fn store_frame<F: Frame>(kernel: &mut Kernel, actor: Ref64, cont: Ref64, frame: &F) {
+pub(crate) fn store_frame<F: Frame>(kernel: &mut Kernel, actor: Ref64, cont: Ref64, frame: &F) {
     let mut bytes = Vec::new();
     frame.encode(&mut bytes);
     set_frame_bytes(kernel, actor, cont, bytes);
