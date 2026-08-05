@@ -348,7 +348,7 @@ when adding an operation.
 | `send_channel` | `SEND` | channel | Also requires `READ|TRANSFER` on the payload; escrow retains a root `READ` capability until delivery. |
 | `receive_channel` | `RECEIVE` | channel | Installs escrowed payload `READ` authority in the receiver's space. |
 | `close_channel` | `DESTROY` | channel | Rejects new sends while allowing the existing FIFO to drain. |
-| `create_batch_evaluate` | `READ` | frozen input array | Creation mints the collective and completion future. |
+| `create_batch_evaluate` / `create_batch_evaluate_for` | `READ` | frozen input array | Creation mints the collective and completion future; the IR form also records a stable evaluator ID. |
 | `complete_batch_evaluate` | `WRITE`, `RESOLVE`, `READ` | collective, future, frozen output array | Publishes outputs exactly once through the completion future. |
 | `run_epoch` and scheduling | system | none | The machine acting as itself. |
 

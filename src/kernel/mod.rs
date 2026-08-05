@@ -1454,11 +1454,23 @@ impl Kernel {
         element_count: u32,
         element_stride: u32,
     ) -> Result<(Ref64, Ref64), RuntimeError> {
+        self.create_batch_evaluate_for(actor, 0, inputs, element_count, element_stride)
+    }
+
+    pub fn create_batch_evaluate_for(
+        &mut self,
+        actor: Ref64,
+        evaluator_id: u32,
+        inputs: Ref64,
+        element_count: u32,
+        element_stride: u32,
+    ) -> Result<(Ref64, Ref64), RuntimeError> {
         self.authorize(actor, crate::abi::Rights::READ, inputs)?;
         self.validate_frozen_array(inputs, element_count, element_stride)?;
         let completion = self.create_future(actor);
         let collective = self.collectives.alloc(CollectiveDescriptor::batch_evaluate(
             actor,
+            evaluator_id,
             inputs,
             element_count,
             element_stride,
@@ -1514,6 +1526,10 @@ impl Kernel {
 
     pub fn collective_state(&self, collective: Ref64) -> Result<CollectiveState, RuntimeError> {
         Ok(self.collectives.get(collective)?.state)
+    }
+
+    pub fn collective_evaluator(&self, collective: Ref64) -> Result<u32, RuntimeError> {
+        Ok(self.collectives.get(collective)?.evaluator_id)
     }
 
     fn validate_frozen_array(

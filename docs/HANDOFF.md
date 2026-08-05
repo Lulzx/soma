@@ -4,7 +4,7 @@ Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
 Repository: https://github.com/Lulzx/soma. About 7,500 lines of Rust, no
-dependencies, 112 integration tests, one doc test, and no Clippy warnings.
+dependencies, 118 integration tests, one doc test, and no Clippy warnings.
 
 ```sh
 cargo test
@@ -14,6 +14,7 @@ cargo run --example baseline_report    # vs a hand-written bulk frontier
 cargo run --example irregular_report   # occupancy/latency frontiers
 cargo run --example regime_map         # where cohorting helps and fails
 cargo run --example territory_report   # distribution across territories
+cargo run --example streaming_report   # channel back-pressure + failure
 ```
 
 ---
@@ -101,6 +102,8 @@ register state, so another executor can resume the continuation.
   back-pressure, FIFO delivery, and kernel escrow of payload `READ` authority.
 - A `BatchEvaluate` collective lifecycle over frozen arrays, publishing one
   frozen output array through a completion future.
+- A generic bounded streaming-graph validation workload and a minimal
+  hardware-neutral evaluator IR with frozen-array schema and resume points.
 
 ### Named by the model and NOT implemented
 
@@ -201,18 +204,21 @@ the evaluator body belongs to the future module/IR layer.
 
 ### 5.5 Validation workloads
 
-Beyond dynamic search: a theoretical dynamic constraint search, streaming
-pipelines, actor systems, and irregular dataflow. The constraint search is
-defined by a state, transition relation, goal predicate, and optional
-asynchronous score rather than a named application. Choose workloads to stress
-**ordering, back-pressure, and failure**, not throughput. The existing
-workloads exercise none of those hard.
+Dynamic constraint search and a theoretical bounded streaming graph now exist.
+The stream uses numbered records, deterministic source/sink stages, bounded
+first-class channels, and optional producer failure. It verifies FIFO ordering,
+lossless back-pressure, and survival of the committed prefix. Actor systems and
+irregular dataflow remain useful future validations, especially for
+supervision and multi-input readiness.
 
-### 5.6 Minimal IR, deliberately deferred
+### 5.6 Minimal IR
 
-The ownership, failure, channel, and collective blockers are settled. Keep the
-first IR deliberately small: enough to name an evaluator and its frozen-array
-schema without embedding a hardware execution model.
+Implemented in `compiler/ir.rs`. A module names batch evaluators, one
+frozen-array element stride, and entry/completion resume points with run classes
+and state-access declarations. Validation rejects empty/duplicate identities,
+zero strides, and ambiguous resume points. Instantiation records the evaluator
+ID in the `BatchEvaluate` descriptor. There is intentionally no device, lane
+width, placement, or launch concept.
 
 ### 5.7 Later: GPU OS as an implementation
 
@@ -286,6 +292,5 @@ decision that would otherwise depend on `HashMap` iteration order.
 3. Break something on purpose. Flip a condition in `commit.rs` and confirm the
    invariant checker catches it. That tells you the safety net is real before
    you rely on it.
-4. Build the first channel-heavy validation workload: a generic bounded
-   streaming graph with deterministic stages, back-pressure, and injected
-   producer failure.
+4. Read `compiler/ir.rs` and the streaming report, then choose whether the next
+   semantic slice should be supervision or domains/contracts.

@@ -22,6 +22,7 @@ cargo run --example cohort_report
 cargo run --example baseline_report
 cargo run --example irregular_report
 cargo run --example regime_map
+cargo run --example streaming_report
 ```
 
 Read [docs/SOMA-v0.2.md](docs/SOMA-v0.2.md) for the current machine. The older
@@ -167,6 +168,10 @@ Implemented now:
 - A generic `BatchEvaluate` collective over frozen input/output arrays with a
   single-assignment completion future
 - A domain-neutral dynamic constraint-search validation workload
+- A generic bounded streaming-graph workload that measures back-pressure and
+  proves committed FIFO data survives producer failure
+- A minimal hardware-neutral evaluator IR with frozen-array schemas and resume
+  points, connected to `BatchEvaluate` creation
 
 Not implemented:
 
@@ -174,8 +179,8 @@ Not implemented:
 - GPU execution, CPU/GPU migration, and spill
 
 The current job is to finish the machine semantics before adding a surface
-language or GPU backend. The largest remaining semantic gap is supervision;
-the next validation work should exercise the new channel and collective paths.
+language or GPU backend. The largest remaining semantic gaps are domains,
+execution contracts, and supervision.
 
 ## License
 

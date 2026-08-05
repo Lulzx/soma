@@ -5,6 +5,7 @@
 //! (§22); frames are byte blobs with a per-run-class layout (see `frame`).
 
 pub mod frame;
+pub mod ir;
 pub mod state_machine_lowering;
 
 /// Run-class identifiers. Every resume point of every state machine is its own

@@ -22,6 +22,7 @@ pub struct CollectiveDescriptor {
     pub header: AbiHeader,
     pub id: Ref64,
     pub owner_process: Ref64,
+    pub evaluator_id: u32,
     pub collective_kind: CollectiveKind,
     pub state: CollectiveState,
     pub inputs: Ref64,
@@ -34,6 +35,7 @@ pub struct CollectiveDescriptor {
 impl CollectiveDescriptor {
     pub fn batch_evaluate(
         owner_process: Ref64,
+        evaluator_id: u32,
         inputs: Ref64,
         element_count: u32,
         element_stride: u32,
@@ -43,6 +45,7 @@ impl CollectiveDescriptor {
             header: AbiHeader::new(23, std::mem::size_of::<Self>() as u32),
             id: Ref64::NULL,
             owner_process,
+            evaluator_id,
             collective_kind: CollectiveKind::BatchEvaluate,
             state: CollectiveState::Pending,
             inputs,

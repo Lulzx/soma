@@ -101,7 +101,8 @@ read authority in kernel escrow until delivery. **[checked]**
 
 **Collective**, a coordinated operation with an owner and completion future.
 The implemented `BatchEvaluate` form consumes a frozen input array and
-publishes a frozen output array. **[checked]**
+publishes a frozen output array. It carries the stable evaluator ID selected by
+the minimal IR. **[checked]**
 
 **Domain**, named by the model, not implemented. **[absent]**
 
@@ -293,7 +294,7 @@ distinguish a value from failure or cancellation.
 `BatchEvaluate` is the first collective:
 
 ```text
-CREATE-BATCH-EVALUATE(owner, inputs, count, stride) -> (op, done)
+CREATE-BATCH-EVALUATE(owner, evaluator, inputs, count, stride) -> (op, done)
   pre     inputs is a frozen array of at least count * stride bytes
   effect  fresh Pending collective and Pending completion future
   trace   CollectiveCreated
@@ -307,8 +308,10 @@ COMPLETE-BATCH-EVALUATE(owner, op, outputs)
 ```
 
 The collective specifies lifecycle and publication, not evaluator code or
-parallel execution strategy. Owner failure or cancellation settles the pending
-collective and its completion future together.
+parallel execution strategy. The minimal IR gives `evaluator` a stable integer
+identity, frozen-array element stride, and entry/completion resume points. Owner
+failure or cancellation settles the pending collective and its completion
+future together.
 
 ### 3.4 Execution and commit
 
@@ -464,14 +467,13 @@ ending in `Cancelled`. Cancellation does not preempt a continuation mid-step.
 
 ## 7. Remaining work
 
-1. **Validation workloads** beyond the existing domain-neutral dynamic
-   constraint search: streaming pipelines, actor systems, and irregular
-   dataflow, chosen to stress ordering, back-pressure, and failure rather than
-   throughput.
-2. **A minimal IR.** Ownership, failure, channel, and collective semantics are
-   settled. Keep the first IR small: evaluator identity, frozen-array schema,
-   and continuation resume points.
-3. **Domains, execution contracts, and supervision.** Still vocabulary rather
+The generic bounded streaming graph now covers FIFO ordering, lossless
+back-pressure, and committed-message survival across producer failure. The
+minimal evaluator IR is also implemented and connected to `BatchEvaluate`.
+
+1. **Actor and irregular-dataflow validation**, especially multi-input
+   readiness and supervised failure propagation.
+2. **Domains, execution contracts, and supervision.** Still vocabulary rather
    than machinery.
 
 Performance work belongs after all of this, and the performance results already
