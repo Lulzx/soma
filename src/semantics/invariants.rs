@@ -11,14 +11,9 @@
 //! and any rule that can produce an illegal state gets caught, without having
 //! to anticipate which rule.
 //!
-//! # What is deliberately not checked
-//!
-//! Capability safety (§I10 in the spec) is absent, not passing. The reference
-//! implementation allocates a capability table and never consults it, so there
-//! is no authority to verify and a check here would report success for a
-//! property the machine does not have. An invariant that cannot fail is worse
-//! than a missing one, because it reads as evidence. See the conformance table
-//! in the specification.
+//! Capability safety is split into structural attenuation/integrity checks and
+//! a trace-level effect check. The latter rejects every governed effect that is
+//! not immediately paired with the matching successful authority decision.
 
 use crate::abi::continuations::ContinuationState;
 use crate::abi::{FutureState, Kind, ProcessMode, ProcessState, Ref64};
@@ -50,6 +45,8 @@ pub enum Invariant {
     CapabilityAttenuation,
     /// I10b. Capability targets and parent links resolve with valid rights.
     CapabilityIntegrity,
+    /// I10c. Every governed effect immediately follows matching authority.
+    NoUnauthorizedEffect,
     /// I11. The trace is a strictly increasing logical clock.
     TraceMonotonicity,
     /// I12. Accounting counters are mutually consistent.
@@ -93,6 +90,7 @@ pub fn check(kernel: &Kernel) -> Vec<Violation> {
     ownership_monotonicity(kernel, &mut v);
     capability_attenuation(kernel, &mut v);
     capability_integrity(kernel, &mut v);
+    no_unauthorized_effect(kernel, &mut v);
     trace_monotonicity(kernel, &mut v);
     accounting_consistency(kernel, &mut v);
     v.sort();
@@ -460,6 +458,33 @@ fn capability_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
                     ),
                 ));
             }
+        }
+    }
+}
+
+fn no_unauthorized_effect(kernel: &Kernel, out: &mut Vec<Violation>) {
+    use crate::abi::EventKind;
+
+    for (index, effect) in kernel.trace_events().iter().enumerate() {
+        if effect.event_kind != EventKind::AuthorityEffect {
+            continue;
+        }
+        let authorized = index.checked_sub(1).and_then(|previous| {
+            let decision = &kernel.trace_events()[previous];
+            (decision.event_kind == EventKind::AuthorityGranted
+                && decision.process == effect.process
+                && decision.continuation == effect.continuation
+                && decision.run_class == effect.run_class)
+                .then_some(())
+        });
+        if authorized.is_none() {
+            out.push(Violation::new(
+                Invariant::NoUnauthorizedEffect,
+                format!(
+                    "trace event {index} applies right {} by actor {} to target {} without an adjacent grant",
+                    effect.run_class, effect.process.slot, effect.continuation.slot
+                ),
+            ));
         }
     }
 }

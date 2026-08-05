@@ -52,7 +52,7 @@ pub fn dispatch(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResult 
 
 // ---- frame access helpers ------------------------------------------------
 
-fn frame_bytes(kernel: &Kernel, actor: Ref64, cont: Ref64) -> Vec<u8> {
+fn frame_bytes(kernel: &mut Kernel, actor: Ref64, cont: Ref64) -> Vec<u8> {
     let obj = kernel
         .continuations()
         .get(cont)
@@ -69,7 +69,7 @@ fn set_frame_bytes(kernel: &mut Kernel, actor: Ref64, cont: Ref64, bytes: Vec<u8
     }
 }
 
-fn load_frame<F: Frame>(kernel: &Kernel, actor: Ref64, cont: Ref64, fallback: F) -> F {
+fn load_frame<F: Frame>(kernel: &mut Kernel, actor: Ref64, cont: Ref64, fallback: F) -> F {
     let bytes = frame_bytes(kernel, actor, cont);
     let mut c = ByteCursor::new(&bytes);
     F::decode(&mut c).unwrap_or(fallback)

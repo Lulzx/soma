@@ -68,9 +68,9 @@ checker that cannot reject anything proves nothing.
 Capability spaces, creator genesis, derivation, attenuation, and the structural
 I10a/I10b checks exist. Every right used by a reachable operation is enforced
 at use, including expiry, object-version, range, and parent-chain checks.
-Authority decisions are not yet traced, so trace-level I10c proof remains
-incomplete. Channels, collectives, domains, cancellation, and supervision are
-also absent.
+Authority decisions and governed effects are traced, and I10c rejects any
+effect without an adjacent matching grant. Channels, collectives, domains,
+cancellation, and supervision are still absent.
 
 The specification has already caught a lifetime bug. `Complete` once retired a
 process when one continuation finished. A second live continuation could then

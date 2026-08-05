@@ -420,6 +420,7 @@ impl Kernel {
         length: u64,
     ) -> Result<Ref64, RuntimeError> {
         let _ = self.processes.get(receiver)?;
+        self.authorize(actor, crate::abi::Rights::TRANSFER, target)?;
         let source_ref = self
             .find_authorized_capability(actor, crate::abi::Rights::TRANSFER, target)
             .ok_or(RuntimeError::AuthorityDenied)?;
@@ -445,6 +446,7 @@ impl Kernel {
         exported.offset = offset;
         exported.length = length;
         exported.parent_capability = Ref64::NULL;
+        self.authority_effect(actor, crate::abi::Rights::TRANSFER, target);
         Ok(self
             .capability_spaces
             .get_mut(&receiver.slot)
@@ -453,20 +455,31 @@ impl Kernel {
     }
 
     /// Central authority gate for every currently reachable operation right.
-    fn authorize(&self, actor: Ref64, right: u32, target: Ref64) -> Result<(), RuntimeError> {
-        // DESTROY has no operation yet. The explicit system principal is the
-        // implementation escape hatch described in §8 of the design note.
-        if actor == SYSTEM_PRINCIPAL || right == crate::abi::Rights::DESTROY {
-            return Ok(());
-        }
-        if self
-            .find_authorized_capability(actor, right, target)
-            .is_some()
-        {
+    fn authorize(&mut self, actor: Ref64, right: u32, target: Ref64) -> Result<(), RuntimeError> {
+        // The explicit system principal is the implementation escape hatch
+        // described in §8 of the capability design note.
+        let granted = actor == SYSTEM_PRINCIPAL
+            || self
+                .find_authorized_capability(actor, right, target)
+                .is_some();
+        let decision = if granted {
+            EventKind::AuthorityGranted
+        } else {
+            EventKind::AuthorityDenied
+        };
+        self.trace(decision, actor, target, right, 0);
+        if granted {
             Ok(())
         } else {
             Err(RuntimeError::AuthorityDenied)
         }
+    }
+
+    /// Record the boundary at which a successful authorization takes effect.
+    /// I10c requires this marker to be immediately preceded by the matching
+    /// `AuthorityGranted` decision.
+    pub(super) fn authority_effect(&mut self, actor: Ref64, right: u32, target: Ref64) {
+        self.trace(EventKind::AuthorityEffect, actor, target, right, 0);
     }
 
     fn find_authorized_capability(
@@ -593,7 +606,7 @@ impl Kernel {
         }
     }
 
-    pub fn object_bytes(&self, actor: Ref64, obj: Ref64) -> Result<&[u8], RuntimeError> {
+    pub fn object_bytes(&mut self, actor: Ref64, obj: Ref64) -> Result<&[u8], RuntimeError> {
         self.authorize(actor, crate::abi::Rights::READ, obj)?;
         let _ = self.objects.get(obj)?;
         self.object_payloads
@@ -609,13 +622,14 @@ impl Kernel {
     ) -> Result<&mut Vec<u8>, RuntimeError> {
         self.authorize(actor, crate::abi::Rights::WRITE, obj)?;
         let _ = self.objects.get(obj)?;
+        self.authority_effect(actor, crate::abi::Rights::WRITE, obj);
         self.object_payloads
             .get_mut(&obj.slot)
             .ok_or(RuntimeError::MissingPayload)
     }
 
     /// Read the first 8 bytes of an object's payload as a little-endian u64.
-    pub fn read_u64_object(&self, actor: Ref64, obj: Ref64) -> Option<u64> {
+    pub fn read_u64_object(&mut self, actor: Ref64, obj: Ref64) -> Option<u64> {
         let b = self.object_bytes(actor, obj).ok()?;
         if b.len() < 8 {
             return None;
@@ -675,6 +689,7 @@ impl Kernel {
         max_steps: u32,
     ) -> Result<Ref64, RuntimeError> {
         self.authorize(actor, crate::abi::Rights::WRITE, process)?;
+        self.authority_effect(actor, crate::abi::Rights::WRITE, process);
         let frame_obj = self.create_object_for(process, ObjectKind::ContinuationFrame, frame_bytes);
         let r = self.continuations.alloc(
             crate::abi::continuations::ContinuationDescriptor::new(process, run_class, resume_point),
@@ -730,6 +745,8 @@ impl Kernel {
     ) -> Result<AwaitOutcome, RuntimeError> {
         self.authorize(actor, crate::abi::Rights::AWAIT, future)?;
         let resolved = self.futures.get(future)?.state != FutureState::Pending;
+        let _ = self.continuations.get(cont)?;
+        self.authority_effect(actor, crate::abi::Rights::AWAIT, future);
         {
             let c = self.continuations.get_mut(cont)?;
             c.run_class = next_run_class;
@@ -756,11 +773,12 @@ impl Kernel {
         value: Ref64,
     ) -> Result<(), RuntimeError> {
         self.authorize(actor, crate::abi::Rights::RESOLVE, future)?;
+        if self.futures.get(future)?.state != FutureState::Pending {
+            return Err(RuntimeError::AlreadyResolved);
+        }
+        self.authority_effect(actor, crate::abi::Rights::RESOLVE, future);
         {
             let f = self.futures.get_mut(future)?;
-            if f.state != FutureState::Pending {
-                return Err(RuntimeError::AlreadyResolved);
-            }
             f.state = FutureState::Resolved;
             f.value = value;
             f.resolved_epoch = self.epoch;
@@ -809,6 +827,7 @@ impl Kernel {
     ) -> Result<(), RuntimeError> {
         self.authorize(actor, crate::abi::Rights::SEND, receiver)?;
         if self.mailbox_is_full(receiver)? {
+            self.authority_effect(actor, crate::abi::Rights::SEND, receiver);
             return self.push_message(
                 actor,
                 receiver,
@@ -827,6 +846,10 @@ impl Kernel {
             0,
             byte_length,
         )?;
+        // Capability delegation emits its own TRANSFER decision/effect pair.
+        // Recheck SEND so its effect marker remains immediately paired for I10c.
+        self.authorize(actor, crate::abi::Rights::SEND, receiver)?;
+        self.authority_effect(actor, crate::abi::Rights::SEND, receiver);
         self.push_message(actor, receiver, payload, transferred, sender_cont, true)
     }
 
@@ -935,6 +958,11 @@ impl Kernel {
     ) -> Result<Option<MessageDescriptor>, RuntimeError> {
         let process = self.continuations.get(cont)?.process;
         self.authorize(actor, crate::abi::Rights::RECEIVE, process)?;
+        let _ = self
+            .mailboxes
+            .get(&process.slot)
+            .ok_or(RuntimeError::MissingMailbox)?;
+        self.authority_effect(actor, crate::abi::Rights::RECEIVE, process);
         let mailbox = self
             .mailboxes
             .get_mut(&process.slot)

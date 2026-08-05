@@ -8,7 +8,7 @@
 
 use soma::abi::continuations::ContinuationState;
 use soma::abi::objects::OwnershipState;
-use soma::abi::{Kind, ObjectKind, ProcessMode, ProcessState, Ref64, Rights};
+use soma::abi::{EventKind, Kind, ObjectKind, ProcessMode, ProcessState, Ref64, Rights, TraceEvent};
 use soma::compiler::frame::Frame;
 use soma::compiler::run_classes::{DEFAULT_MAX_STEPS, SEARCH_BRANCH};
 use soma::compiler::state_machine_lowering::{create_expand, SearchFrame};
@@ -304,12 +304,10 @@ fn i12_catches_inconsistent_accounting() {
     assert!(violated(&kernel, Invariant::AccountingConsistency));
 }
 
-// ---- the honest gap ------------------------------------------------------
+// ---- I10c ---------------------------------------------------------------
 
 #[test]
-fn operation_rights_are_enforced_while_i10c_awaits_trace_proof() {
-    // Operation checks are live. I10c remains incomplete until every granted
-    // and denied decision is represented in the trace.
+fn i10c_records_grants_denials_and_authorized_effects() {
     let mut kernel = Kernel::new();
     let object = kernel.create_object(SYSTEM_PRINCIPAL, ObjectKind::RawBytes, vec![9]);
     let stranger = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
@@ -324,6 +322,10 @@ fn operation_rights_are_enforced_while_i10c_awaits_trace_proof() {
         kernel.object_bytes_mut(stranger, object),
         Err(soma::kernel::RuntimeError::AuthorityDenied)
     ));
+    assert_eq!(
+        kernel.trace_events().last().unwrap().event_kind,
+        EventKind::AuthorityDenied
+    );
     assert_eq!(kernel.object_bytes(SYSTEM_PRINCIPAL, object).unwrap(), &[9]);
     assert_eq!(
         kernel.find_capability(stranger, object, Rights::WRITE),
@@ -344,8 +346,35 @@ fn operation_rights_are_enforced_while_i10c_awaits_trace_proof() {
         OwnershipState::UniqueMutable
     );
 
-    // Structural capability invariants remain legal; trace-level I10c follows
-    // when authority decisions become observable.
+    kernel.object_bytes_mut(SYSTEM_PRINCIPAL, object).unwrap()[0] = 10;
+    let pair = &kernel.trace_events()[kernel.trace_events().len() - 2..];
+    assert_eq!(pair[0].event_kind, EventKind::AuthorityGranted);
+    assert_eq!(pair[1].event_kind, EventKind::AuthorityEffect);
+    assert_eq!(pair[0].process, pair[1].process);
+    assert_eq!(pair[0].continuation, pair[1].continuation);
+    assert_eq!(pair[0].run_class, pair[1].run_class);
+
     assert_legal(&kernel);
     assert_eq!(Kind::Capability, kernel.capability_table_kind());
+}
+
+#[test]
+fn i10c_catches_an_effect_without_an_adjacent_grant() {
+    let mut kernel = Kernel::new();
+    let actor = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let object = kernel.create_object(actor, ObjectKind::RawBytes, vec![0]);
+    assert!(!violated(&kernel, Invariant::NoUnauthorizedEffect));
+
+    let trace = unsafe { raw::state(&mut kernel) }.trace;
+    let logical_time = trace.last().map(|event| event.logical_time + 1).unwrap_or(1);
+    trace.push(TraceEvent::new(
+        logical_time,
+        0,
+        EventKind::AuthorityEffect,
+        actor,
+        object,
+        Rights::WRITE,
+    ));
+
+    assert!(violated(&kernel, Invariant::NoUnauthorizedEffect));
 }

@@ -4,7 +4,7 @@ Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
 Repository: https://github.com/Lulzx/soma. About 7,200 lines of Rust, no
-dependencies, 97 tests, and no Clippy warnings.
+dependencies, 98 tests, and no Clippy warnings.
 
 ```sh
 cargo test
@@ -88,18 +88,12 @@ register state, so another executor can resume the continuation.
 - Cohort construction with all four partial-cohort policies (§14 of the old
   contract), plus a persistent-FIFO scheduling mode as a baseline.
 - The semantic specification, with 11 original invariants plus capability
-  attenuation and integrity machine-checked.
+  attenuation, integrity, and effect authorization machine-checked.
 
 ### Named by the model and NOT implemented
 
 Treat these as absent, not nearly-done:
 
-- **Trace-level capability proof.** Actor-relative spaces, genesis, derivation,
-  I10a, I10b, and operation checks are implemented. Every right used by a
-  reachable operation is checked at use; `DESTROY` has no operation yet.
-  Authority grants and denials are not trace events, so I10c remains partial.
-  `tests/semantics.rs::operation_rights_are_enforced_while_i10c_awaits_trace_proof`
-  demonstrates the boundary.
 - **Unified ownership.** `freeze` invalidates the old mutable version and
   `transfer_unique` moves authority, but `ObjectDescriptor.unique_owner` still
   duplicates what capabilities should define. Capability design step 7 removes
@@ -160,10 +154,11 @@ before coding: ownership should be redefined in terms of capabilities (deleting
 `unique_owner` and collapsing I9), and failure needs a position on whether
 authority survives a faulted holder.
 
-Steps 1 through 5 are complete. Every right used by a reachable operation is
-enforced, message sends delegate payload `READ` authority, and parked `AWAIT`
-authority is rechecked on resume. Step 6 is next: emit authority grant/denial
-events and make trace-level I10c executable.
+Steps 1 through 6 are complete. Every right used by a reachable operation is
+enforced, message sends delegate payload `READ` authority, parked `AWAIT`
+authority is rechecked on resume, and authority decisions/effects make I10c
+trace-checkable. Step 7 is next: remove `unique_owner`, define unique/frozen
+ownership entirely through live capabilities, and collapse I9 into I10.
 
 ### 5.2 What does a process own? (spec §6.2)
 

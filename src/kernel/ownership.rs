@@ -26,6 +26,7 @@ pub fn freeze(kernel: &mut Kernel, actor: Ref64, object: Ref64) -> Result<u32, R
         return Ok(version);
     }
     kernel.authorize(actor, crate::abi::Rights::FREEZE, object)?;
+    kernel.authority_effect(actor, crate::abi::Rights::FREEZE, object);
     let new_version = version.wrapping_add(1);
     {
         let o = kernel.objects.get_mut(object)?;
@@ -50,6 +51,8 @@ pub fn transfer_unique(
     if kernel.objects.get(object)?.ownership_state == OwnershipState::FrozenShared {
         return Err(RuntimeError::Abi(crate::abi::AbiError::NoAuthority));
     }
+    let _ = kernel.processes.get(new_owner)?;
+    kernel.authority_effect(actor, crate::abi::Rights::TRANSFER, object);
     kernel.move_target_authority(actor, new_owner, object)?;
     kernel.objects.get_mut(object)?.unique_owner = new_owner;
     Ok(())

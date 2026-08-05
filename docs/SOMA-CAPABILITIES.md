@@ -1,8 +1,8 @@
 # Design note: capability enforcement (I10)
 
-**Status:** operation enforcement implemented. Actor-relative spaces, genesis,
-derivation, I10a, I10b, and every right used by a reachable operation exist.
-Trace events and trace-level I10c remain open.
+**Status:** capability enforcement implemented through I10c. Actor-relative
+spaces, genesis, derivation, operation checks, authority trace events, and the
+I10a/I10b/I10c checkers exist. Ownership unification is the next step.
 
 **Decision: check at operation, with the operation set closed by construction.**
 
@@ -186,8 +186,9 @@ encode/decode boundary.
 ### 5.2 Authority decisions are observable
 
 A denial changes the program, so it belongs in the trace and must be
-deterministic. Two runs of the same program
-must deny identically. Add `AuthorityGranted` / `AuthorityDenied` event kinds.
+deterministic. Two runs of the same program must deny identically.
+`AuthorityGranted` / `AuthorityDenied` record decisions. A successful governed
+mutation then emits `AuthorityEffect` with the same actor, right, and target.
 
 Emitting on grant as well as denial roughly doubles trace volume for mutating
 operations, and buys the strongest form of I10 (§6, I10c). Make it a build
@@ -224,16 +225,17 @@ the capability spaces checks this rule.
 its kind is one the rights apply to, and its parent (if any) is live. Same shape
 as I1.
 
-**I10c. No unauthorised effect [checked, trace-level].** Every state-changing
-event in the trace is immediately preceded by an `AuthorityGranted` event naming
-the same actor, right, and target. This clause says the
-machine is safe, and it is checkable only because §5.2 makes authority
-observable.
+**I10c. No unauthorised effect [checked, trace-level].** Every
+`AuthorityEffect` operation boundary in the trace is immediately preceded by an
+`AuthorityGranted` event naming the same actor, right, and target. Other trace
+events describe internal consequences of that operation rather than new
+program-authority boundaries. This clause is checkable because §5.2 makes both
+the decision and governed effect observable.
 
-Then flip the marker in `docs/SOMA-v0.2.md` §5 from **absent** to **checked**.
-`tests/semantics.rs::operation_rights_are_enforced_while_i10c_awaits_trace_proof`
-already supplies the full operation-denial boundary; it remains partial only
-because authority decisions are not observable in the trace.
+The marker in `docs/SOMA-v0.2.md` §5 is now **checked**.
+`tests/semantics.rs::i10c_records_grants_denials_and_authorized_effects` exercises
+the positive path, while `i10c_catches_an_effect_without_an_adjacent_grant`
+proves the checker rejects a forged effect.
 
 ---
 
@@ -315,7 +317,9 @@ Each step should land green.
    checks version and whole-object range. Message sends delegate attenuated
    payload `READ`; `AWAIT` is rechecked on resume. `DESTROY` remains dormant
    because no delete operation is exposed.
-6. **Trace events and I10c.**
+6. **Trace events and I10c. Complete.** Granted and denied decisions are
+   observable, governed mutations emit adjacent effect markers, and the I10c
+   checker has positive and fault-injection coverage.
 7. **Unify ownership (§7.1)**, delete `unique_owner`, collapse I9.
 8. **Settle failure (§7.2)** and update the spec.
 

@@ -90,7 +90,8 @@ bin key. That they are the same value is a design commitment, not a coincidence.
 
 **Capability**, actor-relative permission to act on an entity. Capability
 spaces, genesis, attenuation, and enforcement for every reachable operation
-right are implemented. Trace-level proof is still **[absent]**, see I10.
+right are implemented. Authority decisions and governed effects are observable,
+making I10c trace-checkable.
 
 **Channel**, **Collective**, **Domain**, named by the model, not implemented.
 **[absent]**
@@ -151,7 +152,10 @@ published to at least one reader, and any owner it names is live. Freezing is
 one-way: mutation of a frozen object requires allocating a new object.
 
 > Only the structural half is checked. That a frozen object is never *written*
-> is not verified, because the model has no write barrier, see §5.
+> is now enforced by version-pinned capabilities, but the descriptor's
+> `unique_owner` field still duplicates capability authority. Step 7 of the
+> capability design removes that second mechanism and folds this clause into
+> I10.
 
 **I10a. Capability attenuation [checked].** A derived capability's rights are a
 subset of its parent's rights and its byte range lies within its parent's.
@@ -160,11 +164,11 @@ subset of its parent's rights and its byte range lies within its parent's.
 rights apply to the target kind, and its parent is live in the same actor's
 capability space.
 
-**I10c. No unauthorised effect [absent, partial implementation].** *Intended:*
-no process may act on an entity without holding a capability conferring that
-right. Every right used by a reachable operation is enforced at use, including
-expiry and live-parent checks; object operations also check version and range.
-Authority decisions are not yet in the trace, so the full clause is not checked.
+**I10c. No unauthorised effect [checked].** No process may apply a governed
+effect without holding a capability conferring that right. Every reachable
+operation records its granted or denied decision. A governed mutation emits an
+adjacent `AuthorityEffect` with the same actor, right, and target; the checker
+rejects an effect without that matching grant.
 
 **I11. Trace monotonicity [checked].** Logical time strictly increases across
 the trace. Epochs never move backwards.
@@ -325,7 +329,7 @@ continuations within an epoch provided it preserves I1–I12 and determinism.
 | I9 ownership monotonicity | checked, partial | structural half only |
 | I10a attenuation | checked | rights and ranges only shrink |
 | I10b capability integrity | checked | actor-relative spaces and live links |
-| I10c no unauthorised effect | **absent, partial** | operation rights enforced; trace proof missing |
+| I10c no unauthorised effect | checked | adjacent decision/effect trace proof |
 | I11 trace monotonicity | checked | |
 | I12 accounting consistency | checked | |
 | I13 serial execution | modelled | per-epoch, by test |
@@ -337,11 +341,10 @@ mailboxes rather than first-class channels. There is no collective construct at
 all, so the model's claim to cover cooperative execution shapes is currently
 unsupported by any implementation.
 
-`tests/semantics.rs::operation_rights_are_enforced_while_i10c_awaits_trace_proof`
-demonstrates the current I10c boundary: unauthorised operations are denied, but
-the trace cannot yet prove which authority decision preceded an effect.
-Separate negative tests prove that the I10a/I10b checkers catch amplification
-and a dead parent.
+`tests/semantics.rs::i10c_records_grants_denials_and_authorized_effects` exercises
+grants, denials, and an authorized write. The adjacent fault-injection test
+proves that I10c catches an effect without a matching grant. Separate negative
+tests prove that the I10a/I10b checkers catch amplification and a dead parent.
 
 ---
 

@@ -20,7 +20,7 @@ fn run_expand(request_value: u64) -> (Kernel, soma::abi::Ref64, soma::abi::Ref64
 
 #[test]
 fn expand_process_terminates_and_replies() {
-    let (kernel, expand, requester) = run_expand(7);
+    let (mut kernel, expand, requester) = run_expand(7);
 
     // The search process completed.
     assert_eq!(kernel.process_state(expand).unwrap(), ProcessState::Terminated);
@@ -29,8 +29,8 @@ fn expand_process_terminates_and_replies() {
     assert_eq!(kernel.mailbox_len(requester), 1);
 
     // The reply payload is the heuristic result: input*2+1.
-    let msg = kernel.mailbox_entries(requester).unwrap().front().unwrap();
-    assert_eq!(kernel.read_u64_object(requester, msg.payload), Some(15));
+    let payload = kernel.mailbox_entries(requester).unwrap().front().unwrap().payload;
+    assert_eq!(kernel.read_u64_object(requester, payload), Some(15));
 
     // Three children (moves 7,14,21) plus requester, expand, all terminated.
     assert_eq!(kernel.process_count(), 5);
@@ -73,10 +73,10 @@ fn expand_is_deterministic() {
 
 #[test]
 fn expand_reply_value_tracks_input() {
-    let (kernel, _expand, requester) = run_expand(100);
+    let (mut kernel, _expand, requester) = run_expand(100);
     assert_eq!(kernel.mailbox_len(requester), 1);
-    let msg = kernel.mailbox_entries(requester).unwrap().front().unwrap();
-    assert_eq!(kernel.read_u64_object(requester, msg.payload), Some(201));
+    let payload = kernel.mailbox_entries(requester).unwrap().front().unwrap().payload;
+    assert_eq!(kernel.read_u64_object(requester, payload), Some(201));
     assert!(event_count(&kernel) > 0);
     assert!(!summarize(&kernel).is_empty());
     assert!(events_of(&kernel, EventKind::FutureResolved).count() >= 1);

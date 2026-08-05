@@ -18,6 +18,12 @@ pub enum EventKind {
     FutureResolved = 11,
     ProcessFailed = 12,
     ProcessCancelled = 13,
+    AuthorityGranted = 14,
+    AuthorityDenied = 15,
+    /// Boundary marker for a state-changing governed operation. Its actor,
+    /// target, and right use the same fields as the immediately preceding
+    /// `AuthorityGranted` event.
+    AuthorityEffect = 16,
 }
 
 /// Compact trace record (§21).
