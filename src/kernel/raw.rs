@@ -8,11 +8,11 @@ use std::collections::HashMap;
 use crate::abi::capabilities::CapabilityEntry;
 use crate::abi::continuations::ContinuationDescriptor;
 use crate::abi::{
-    ChannelDescriptor, CollectiveDescriptor, FutureDescriptor, ObjectDescriptor, ProcessDescriptor,
-    Ref64, TraceEvent,
+    ChannelDescriptor, CollectiveDescriptor, DomainDescriptor, ExecutionContract, FutureDescriptor,
+    ModuleDescriptor, ObjectDescriptor, ProcessDescriptor, Ref64, TraceEvent,
 };
 use crate::kernel::accounting::Accounting;
-use crate::kernel::{Kernel, Mailbox};
+use crate::kernel::{Kernel, Mailbox, SupervisionQueue};
 use crate::scheduler::runnable_bins::Scheduler;
 use crate::table::GenTable;
 
@@ -21,6 +21,9 @@ pub struct State<'a> {
     pub epoch: &'a mut u32,
     pub trace: &'a mut Vec<TraceEvent>,
     pub processes: &'a mut GenTable<ProcessDescriptor>,
+    pub domains: &'a mut GenTable<DomainDescriptor>,
+    pub contracts: &'a mut GenTable<ExecutionContract>,
+    pub modules: &'a mut GenTable<ModuleDescriptor>,
     pub objects: &'a mut GenTable<ObjectDescriptor>,
     pub capability_spaces: &'a mut HashMap<u32, GenTable<CapabilityEntry>>,
     pub continuations: &'a mut GenTable<ContinuationDescriptor>,
@@ -29,6 +32,7 @@ pub struct State<'a> {
     pub collectives: &'a mut GenTable<CollectiveDescriptor>,
     pub mailboxes: &'a mut HashMap<u32, Mailbox>,
     pub future_waiters: &'a mut HashMap<u32, Vec<Ref64>>,
+    pub supervision_queues: &'a mut HashMap<u32, SupervisionQueue>,
     pub scheduler: &'a mut Scheduler,
     pub accounting: &'a mut Accounting,
 }
@@ -45,6 +49,9 @@ pub unsafe fn state(kernel: &mut Kernel) -> State<'_> {
         epoch: &mut kernel.epoch,
         trace: &mut kernel.trace,
         processes: &mut kernel.processes,
+        domains: &mut kernel.domains,
+        contracts: &mut kernel.contracts,
+        modules: &mut kernel.modules,
         objects: &mut kernel.objects,
         capability_spaces: &mut kernel.capability_spaces,
         continuations: &mut kernel.continuations,
@@ -53,6 +60,7 @@ pub unsafe fn state(kernel: &mut Kernel) -> State<'_> {
         collectives: &mut kernel.collectives,
         mailboxes: &mut kernel.mailboxes,
         future_waiters: &mut kernel.future_waiters,
+        supervision_queues: &mut kernel.supervision_queues,
         scheduler: &mut kernel.scheduler,
         accounting: &mut kernel.accounting,
     }

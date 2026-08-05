@@ -53,7 +53,7 @@ impl<'a> ByteCursor<'a> {
         Ok(Ref64::from_u64(self.u64()?))
     }
 
-    /// Read a length-prefixed Vec<u64>. Length is a u32 prefix.
+    /// Read a length-prefixed `Vec<u64>`. Length is a u32 prefix.
     pub fn vec_u64(&mut self) -> Result<Vec<u64>, FrameError> {
         let n = self.u32()? as usize;
         let mut v = Vec::with_capacity(n);

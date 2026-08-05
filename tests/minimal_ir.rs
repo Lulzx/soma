@@ -40,6 +40,57 @@ fn module_rejects_empty_shapes_and_names() {
     invalid.name = "score".into();
     invalid.schema.element_stride = 0;
     assert_eq!(Module::new(vec![invalid]), Err(IrError::ZeroStride));
+    assert_eq!(Module::new(vec![]), Err(IrError::EmptyModule));
+}
+
+#[test]
+fn textual_module_loads_and_links_its_collective() {
+    let module = Module::parse(
+        "module scoring\n\
+         evaluator 7 theoretical-score 8 1 101 ro 2 102 ro\n",
+    )
+    .unwrap();
+    assert_eq!(module.name(), "scoring");
+
+    let mut kernel = Kernel::new();
+    let owner = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let loaded = module.load(&mut kernel, owner).unwrap();
+    let inputs = kernel.create_object(owner, ObjectKind::FrozenArray, vec![0; 16]);
+    freeze(&mut kernel, owner, inputs).unwrap();
+    let (collective, _) = module
+        .instantiate_loaded_batch(&mut kernel, owner, loaded, 7, inputs, 2)
+        .unwrap();
+
+    assert_eq!(kernel.collective_module(collective).unwrap(), loaded);
+    assert_eq!(kernel.collective_evaluator(collective).unwrap(), 7);
+    soma::semantics::invariants::assert_legal(&kernel);
+}
+
+#[test]
+fn textual_module_rejects_ambiguous_surface_syntax() {
+    assert_eq!(Module::parse("evaluator 1 x"), Err(IrError::Syntax));
+    assert_eq!(
+        Module::parse("module x\nevaluator 1 score 8 1 101 maybe 2 102 ro"),
+        Err(IrError::InvalidAccess)
+    );
+}
+
+#[test]
+fn loaded_instantiation_rejects_a_different_module_with_reused_ids() {
+    let expected = Module::named("expected", vec![evaluator(7, "score", 1)]).unwrap();
+    let mut other_evaluator = evaluator(7, "score", 3);
+    other_evaluator.schema.element_stride = 4;
+    let other = Module::named("other", vec![other_evaluator]).unwrap();
+    let mut kernel = Kernel::new();
+    let owner = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let loaded_other = other.load(&mut kernel, owner).unwrap();
+    let inputs = kernel.create_object(owner, ObjectKind::FrozenArray, vec![0; 16]);
+    freeze(&mut kernel, owner, inputs).unwrap();
+
+    assert_eq!(
+        expected.instantiate_loaded_batch(&mut kernel, owner, loaded_other, 7, inputs, 2),
+        Err(IrError::ModuleMismatch)
+    );
 }
 
 #[test]

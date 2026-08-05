@@ -27,6 +27,41 @@ pub enum ProcessState {
     Cancelled = 8,
 }
 
+/// Why a supervised process reached a terminal state.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitReason {
+    Completed = 1,
+    Failed = 2,
+    Cancelled = 3,
+}
+
+/// Kernel response when this process fails under a direct supervisor.
+/// `Notify` contains the failure at the child; `Escalate` additionally fails
+/// the direct supervisor after delivering the child's notice; `Restart`
+/// creates a new process identity from a registered entry template and
+/// escalates after its bounded retry budget is exhausted.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SupervisionPolicy {
+    #[default]
+    Notify = 1,
+    Escalate = 2,
+    Restart = 3,
+}
+
+/// Kernel-owned notification delivered to a process when one of its directly
+/// supervised children exits. It is deliberately separate from the bounded
+/// user mailbox: supervision cannot be lost because ordinary traffic filled
+/// the inbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SupervisionNotice {
+    pub child: Ref64,
+    pub replacement: Ref64,
+    pub reason: ExitReason,
+    pub failure_count: u32,
+}
+
 /// Process descriptor (§7).
 #[derive(Clone, Debug)]
 pub struct ProcessDescriptor {
@@ -35,6 +70,10 @@ pub struct ProcessDescriptor {
     pub id: Ref64,
     pub domain: Ref64,
     pub supervisor: Ref64,
+    pub supervision_policy: SupervisionPolicy,
+    pub restart_of: Ref64,
+    pub restart_attempt: u32,
+    pub restart_limit: u32,
 
     pub state: super::refs::Ref64, // CapRef
     pub inbox: Ref64,
@@ -62,6 +101,10 @@ impl ProcessDescriptor {
             id: Ref64::NULL,
             domain: Ref64::NULL,
             supervisor: Ref64::NULL,
+            supervision_policy: SupervisionPolicy::Notify,
+            restart_of: Ref64::NULL,
+            restart_attempt: 0,
+            restart_limit: 0,
             state: Ref64::NULL,
             inbox: Ref64::NULL,
             urgent_inbox: Ref64::NULL,

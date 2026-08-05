@@ -3,18 +3,24 @@
 Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
-Repository: https://github.com/Lulzx/soma. About 7,500 lines of Rust, no
-dependencies, 118 integration tests, one doc test, and no Clippy warnings.
+Repository: https://github.com/Lulzx/soma. The default semantic core is
+dependency-free. There are 151 integration tests, one doc test, and no Clippy
+warnings. The optional `metal` feature adds the `metal-rs` implementation
+dependency on macOS.
 
 ```sh
 cargo test
 cargo clippy --all-targets
+cargo test --all-features            # real Metal dispatch on macOS
+cargo clippy --all-targets --all-features
 cargo run --example cohort_report      # cohorting vs a persistent FIFO
 cargo run --example baseline_report    # vs a hand-written bulk frontier
 cargo run --example irregular_report   # occupancy/latency frontiers
 cargo run --example regime_map         # where cohorting helps and fails
 cargo run --example territory_report   # distribution across territories
 cargo run --example streaming_report   # channel back-pressure + failure
+cargo run --example supervision_report # notification vs failure escalation
+cargo run --example multi_input_report # atomic join + skew/failure controls
 ```
 
 ---
@@ -51,14 +57,15 @@ src/
   abi/         Fixed-width ABI structs. Ref64 = slot+generation+kind+flags.
                Descriptors for objects, processes, continuations, cohorts,
                futures, messages, channels, collectives, capabilities,
-               contracts, traces.
+               domains, contracts, traces.
   table.rs     Generational slot table. Slot 0 is NULL. Delete bumps generation.
                Stale references fail.
   kernel/      The machine. mod.rs holds all state. epochs.rs runs epochs.
                commit.rs publishes effects. ownership.rs derives object state
                from live capabilities.
                accounting.rs records counters.
-  executives/  cpu_scalar.rs is the interpreter. One switch on run_class.
+  executives/  cpu_scalar.rs is the continuation interpreter. batch.rs is the
+               physical backend/publication boundary; metal.rs is optional.
   scheduler/   runnable_bins.rs contains double-buffered run-class bins.
                cohorts.rs builds cohorts and computes dispatch cost.
   compiler/    frame.rs encodes frames. state_machine_lowering.rs contains the
@@ -91,7 +98,8 @@ register state, so another executor can resume the continuation.
 - Cohort construction with all four partial-cohort policies (§14 of the old
   contract), plus a persistent-FIFO scheduling mode as a baseline.
 - The semantic specification, with 11 original invariants plus capability
-  attenuation, integrity, and effect authorization machine-checked.
+  attenuation, integrity, effect authorization, and supervision integrity
+  machine-checked.
 - Capability-derived object ownership: one mutable holder, linear `WRITE`
   transfer, and freeze by revoking write-bearing capability trees.
 - Explicit `ReadOnly`/`Mutable` continuation declarations for canonical process
@@ -104,12 +112,25 @@ register state, so another executor can resume the continuation.
   frozen output array through a completion future.
 - A generic bounded streaming-graph validation workload and a minimal
   hardware-neutral evaluator IR with frozen-array schema and resume points.
+- Direct parent/child supervision with reliable typed terminal notices and
+  deterministic waiter wakeup, opt-in failure escalation, and bounded restart
+  through fresh replacement identities.
+- Atomic all-input channel receive plus an irregular two-input join validation.
+- Logical domains with authority and creation quotas; hardware-neutral
+  execution contracts that bound continuation steps and frame bytes.
+- A textual evaluator-module surface, immutable loaded manifests, and I17
+  checking every module-linked collective.
+- A physical batch backend boundary with a scalar reference evaluator, CPU
+  spill, placement-change accounting, and an optional real Metal compute
+  implementation.
 
-### Named by the model and NOT implemented
+### Semantic boundary
 
-Treat these as absent, not nearly-done:
-
-- **Domains, execution contracts, supervision.** Vocabulary only.
+No entity or invariant named by `SOMA-v0.2.md` remains absent. The minimal
+module language/loader and a collective-level Metal backend now exist as
+extensions. A general language, device-resident scheduler, and distributed
+implementation remain beyond v0.2 conformance, not guarantees silently claimed
+by the current machine.
 
 ---
 
@@ -145,12 +166,11 @@ Nothing here touches throughput or scheduler overhead.
 
 ---
 
-## 5. Open work, in dependency order
+## 5. Semantic slices, in dependency order
 
 ### 5.1 Capabilities (I10)
 
-Capability enforcement is the largest gap between the specification and the
-interpreter. It constrains the remaining work.
+Capability enforcement was the dependency that constrained every later slice.
 
 **Settled in design: [docs/SOMA-CAPABILITIES.md](SOMA-CAPABILITIES.md).**
 Authority is checked at operation, not at reference resolution, and the
@@ -199,31 +219,80 @@ messages to drain. I1, I5, I6, and I10b cover channel state.
 `BatchEvaluate` accepts a frozen input array plus count and stride and creates a
 completion future. Completion requires a frozen output array, resolves the
 future exactly once, and failure or cancellation of the owner settles both
-entities consistently. This is orchestration and publication semantics only;
-the evaluator body belongs to the future module/IR layer.
+entities consistently. This is orchestration and publication semantics only.
+The minimal module layer names evaluator bodies; the CPU and Metal reference
+backends currently realize the example `2*x+1` body used to validate
+placement-independent publication.
 
 ### 5.5 Validation workloads
 
 Dynamic constraint search and a theoretical bounded streaming graph now exist.
 The stream uses numbered records, deterministic source/sink stages, bounded
 first-class channels, and optional producer failure. It verifies FIFO ordering,
-lossless back-pressure, and survival of the committed prefix. Actor systems and
-irregular dataflow remain useful future validations, especially for
-supervision and multi-input readiness.
+lossless back-pressure, and survival of the committed prefix. The controlled
+actor tree covers supervision propagation and restart. The irregular two-input
+join verifies atomic readiness, waiter migration, FIFO pairing, skew-induced
+back-pressure, and committed-prefix survival after producer failure.
 
-### 5.6 Minimal IR
+### 5.6 Supervision
+
+The semantic core is implemented. A supervisor may create a direct child; the
+child's completion, failure, or cancellation appends exactly one typed notice
+to a reliable kernel control queue. This queue is intentionally separate from
+the bounded user mailbox, so failure reporting cannot be dropped by ordinary
+back-pressure. One waiting supervisor continuation wakes deterministically.
+Relationships select notification-only containment or escalation. On an
+escalating child failure, the direct supervisor fails after the child notice is
+committed; its own relationship may propagate failure farther up the tree. I15
+checks relationship, notice, waiter, required-escalation, restart lineage, and
+retry-exhaustion integrity. Restart creates a fresh process identity from a
+registered entry-continuation template; exhaustion escalates.
+
+`experiments/supervision_tree.rs` supplies the control that selected this slice.
+With no fault, notification and escalation are identical. With one failed leaf,
+notification leaves its branch alive and the root uninformed; escalation fails
+that branch and delivers one root notice; restart replaces only the failed leaf.
+All policies preserve the sibling branch and share the same fault-free control.
+
+### 5.7 Minimal IR
 
 Implemented in `compiler/ir.rs`. A module names batch evaluators, one
 frozen-array element stride, and entry/completion resume points with run classes
 and state-access declarations. Validation rejects empty/duplicate identities,
 zero strides, and ambiguous resume points. Instantiation records the evaluator
-ID in the `BatchEvaluate` descriptor. There is intentionally no device, lane
-width, placement, or launch concept.
+ID in the `BatchEvaluate` descriptor. `Module::parse` provides a deliberately
+small line-oriented surface; `Module::load` creates an actor-relative immutable
+manifest, and loaded instantiation links the collective to it. I17 rejects
+invalid manifests and evaluator/stride mismatches. There is intentionally no
+device, lane width, placement, or launch concept in this IR.
 
-### 5.7 Later: GPU OS as an implementation
+### 5.8 Domains and execution contracts
 
-The original thesis, parked. `src/experiments/territories.rs` is the beginning
-of hardware mapping and is complete and tested as far as it goes.
+Implemented. Every process and object belongs to a live logical domain. Domain
+creation and explicit placement require actor-relative authority, and a domain's
+monotonic process-creation quota is checked by I16. Execution contracts are
+first-class capability targets attached to continuations; I16 checks step and
+frame-byte bounds. Hardware placement, lane shape, relaxed determinism, and
+wall-clock deadlines are rejected because the abstract machine cannot enforce
+them.
+
+### 5.9 Physical batch implementation
+
+`executives/batch.rs` is the boundary between semantic collectives and physical
+execution. A backend receives only frozen bytes and shape metadata. The common
+path freezes its output and completes the collective, so backends cannot bypass
+capability or publication rules. Underfilled work and `Unavailable` accelerator
+responses spill to CPU; switching backend for an evaluator at a collective
+boundary increments migration accounting.
+
+With `--features metal` on macOS, `MetalBatchBackend` compiles a Metal Shading
+Language compute kernel, dispatches it through shared buffers, waits for command
+completion, and returns bytes through that common path. The integration test
+runs on real Apple GPU hardware and compares its output and semantic trace with
+the CPU path.
+This is not yet a persistent device scheduler, arbitrary evaluator compiler, or
+hardware performance result. `src/experiments/territories.rs` remains the
+placement-policy model.
 
 ---
 
@@ -270,7 +339,7 @@ decision that would otherwise depend on `HashMap` iteration order.
   a slot recycled 65,536 times wraps and a stale ref can validate. Documented in
   `abi/refs.rs`. Matters if references are ever persisted.
 - **`§n` comments refer to `docs/SOMA-P1.md`**, the historical contract, not to
-  the v0.2 spec. The v0.2 spec uses `I1..I14` and `§6.x`.
+  the v0.2 spec. The v0.2 spec uses `I1..I17` and `§6.x`.
 - **`experiments/` is not the machine.** Nothing there is part of SOMA's
   semantics. It is measurement scaffolding.
 - **The step budget check must stay before dispatch** in `epochs.rs`. Faulting
@@ -292,5 +361,6 @@ decision that would otherwise depend on `HashMap` iteration order.
 3. Break something on purpose. Flip a condition in `commit.rs` and confirm the
    invariant checker catches it. That tells you the safety net is real before
    you rely on it.
-4. Read `compiler/ir.rs` and the streaming report, then choose whether the next
-   semantic slice should be supervision or domains/contracts.
+4. Read the supervision-tree and multi-input reports, then choose an extension:
+   a general evaluator compiler, persistent device scheduling, or a
+   trace-equivalent distributed implementation.

@@ -7,7 +7,7 @@
 //! tracing. All of it is deterministic.
 
 use crate::abi::continuations::ContinuationState;
-use crate::abi::{EventKind, ProcessState, Ref64, StepKind, StepResult};
+use crate::abi::{EventKind, ExitReason, ProcessState, Ref64, StepKind, StepResult};
 use crate::kernel::Kernel;
 
 /// Terminate `process` only if it has no continuation left that could still
@@ -35,11 +35,19 @@ fn retire_process_if_idle(kernel: &mut Kernel, process: Ref64) {
                     | ContinuationState::Running
             )
     });
+    let mut terminated = false;
     if let Ok(p) = kernel.processes.get_mut(process) {
         p.active_continuation = Ref64::NULL;
-        if !still_live && p.status != ProcessState::CancelPending as u32 {
+        if !still_live
+            && p.status != ProcessState::CancelPending as u32
+            && p.status != ProcessState::Terminated as u32
+        {
             p.status = ProcessState::Terminated as u32;
+            terminated = true;
         }
+    }
+    if terminated {
+        kernel.notify_supervisor(process, ExitReason::Completed);
     }
 }
 
@@ -135,6 +143,7 @@ pub fn apply_step_result(
                 result.next_run_class,
                 0,
             );
+            kernel.notify_supervisor(process, ExitReason::Failed);
         }
     }
     if result.kind != StepKind::Fault

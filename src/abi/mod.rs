@@ -9,10 +9,12 @@ pub mod capabilities;
 pub mod channels;
 pub mod cohorts;
 pub mod collectives;
-pub mod contracts;
 pub mod continuations;
+pub mod contracts;
+pub mod domains;
 pub mod futures;
 pub mod messages;
+pub mod modules;
 pub mod objects;
 pub mod processes;
 pub mod refs;
@@ -22,17 +24,21 @@ pub use capabilities::{CapabilityEntry, Rights};
 pub use channels::ChannelDescriptor;
 pub use cohorts::{CohortDescriptor, PartialCohortPolicy, MAX_COHORT_WIDTH};
 pub use collectives::{CollectiveDescriptor, CollectiveKind, CollectiveState};
-pub use contracts::{
-    ContractFlags, DeterminismPolicy, ExecutionContract, PlacementPolicy, PrecisionPolicy, Shape,
-};
 pub use continuations::{
     ContinuationDescriptor, ContinuationState, RunClassDescriptor, StateAccess, StepKind,
     StepResult,
 };
+pub use contracts::{
+    ContractFlags, DeterminismPolicy, ExecutionContract, PlacementPolicy, PrecisionPolicy, Shape,
+};
+pub use domains::DomainDescriptor;
 pub use futures::{FutureDescriptor, FutureState};
 pub use messages::MessageDescriptor;
+pub use modules::ModuleDescriptor;
 pub use objects::{ObjectDescriptor, ObjectKind, OwnershipState};
-pub use processes::{ProcessDescriptor, ProcessMode, ProcessState};
+pub use processes::{
+    ExitReason, ProcessDescriptor, ProcessMode, ProcessState, SupervisionNotice, SupervisionPolicy,
+};
 pub use refs::{Kind, Ref64};
 pub use traces::{EventKind, TraceEvent};
 

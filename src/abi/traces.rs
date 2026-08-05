@@ -34,6 +34,12 @@ pub enum EventKind {
     CollectiveCompleted = 24,
     CollectiveFailed = 25,
     CollectiveCancelled = 26,
+    SupervisionNotified = 27,
+    ProcessRestarted = 28,
+    DomainCreated = 29,
+    ContractCreated = 30,
+    ContractAttached = 31,
+    ModuleLoaded = 32,
 }
 
 /// Compact trace record (§21).

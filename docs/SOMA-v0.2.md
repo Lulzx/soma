@@ -39,10 +39,10 @@ A SOMA machine state Σ is:
 E  epoch counter
 τ  logical clock and event trace
 T  entity tables, one per kind: processes, objects, continuations,
-   futures, channels, collectives, capabilities
+   futures, channels, collectives, capabilities, domains, contracts, modules
 Q  runnable bins: a mapping from bin key to a queue of continuations
 M  mailboxes and channel queues: bounded ordered message stores
-W  wait sets: future, mailbox, and channel continuations awaiting readiness
+W  wait sets: future, mailbox, channel, multi-input, and supervision readiness
 S  scheduler configuration: binning mode, cohort width, partial policy
 A  accounting counters
 ```
@@ -104,7 +104,31 @@ The implemented `BatchEvaluate` form consumes a frozen input array and
 publishes a frozen output array. It carries the stable evaluator ID selected by
 the minimal IR. **[checked]**
 
-**Domain**, named by the model, not implemented. **[absent]**
+**Domain**, a logical authority and allocation boundary. Every process and
+object belongs to one generationally referenced domain. A domain may nest under
+another domain and may bound total process creation. Domain creation and
+cross-domain process creation require actor-relative authority. **[checked]**
+
+**Execution contract**, an actor-relative constraint attached to a
+continuation. The current hardware-neutral contract bounds steps and frame
+bytes and requires scalar, deterministic, placement-neutral execution with no
+wall-clock deadline. Hardware placement, lane shape, and relaxed determinism
+are rejected rather than promised without machinery. **[checked]**
+
+**Module**, an immutable loaded manifest that gives a set of batch evaluators
+stable identities and element strides. A module is created from the validated
+minimal textual IR, is an actor-relative capability target, and is linked from
+each collective instantiated through it. **[checked]**
+
+**Supervision** is a direct parent/child relation. When a supervised child
+terminates, fails, or is cancelled, the kernel appends exactly one typed exit
+notice to the supervisor's reliable control queue and wakes one continuation
+waiting on that queue. Notices are separate from bounded user mailboxes, so
+ordinary traffic cannot cause a child exit to be dropped. Each relationship
+selects notification-only containment, failure escalation, or bounded restart.
+Restart preserves the failed identity for observation, creates a fresh process
+identity with the registered entry-continuation template, records lineage in
+the notice, and escalates when its retry budget is exhausted. **[checked]**
 
 ### 1.2 Observable behaviour
 
@@ -124,10 +148,11 @@ A state is **legal** when all of the following hold. `check(Σ)` returns every
 violation, not the first.
 
 **I1. Reference integrity [checked].** Every reference held by a live entity
-resolves, or is null. A continuation's process, frame, and dependency. A
-process's state object. A resolved future's value. A queued message's payload.
-A channel's escrow target and waiters. A collective's owner, arrays, and
-completion future.
+resolves, or is null. A continuation's process, frame, dependency, and contract.
+A process and object's domain. A domain's parent. A resolved future's value. A
+queued message's payload. A channel's escrow target and waiters. A collective's
+owner, arrays, completion future, and optional module. A supervision notice's
+child and optional replacement.
 
 **I2. No continuation left running [checked].** Between transitions no
 continuation is in the `Running` state. `Running` exists only *within* a step.
@@ -196,6 +221,25 @@ at least one step. Deferral policies may delay work but may not withhold it
 indefinitely. The reference interpreter forces a partial cohort when an epoch
 would otherwise do nothing.
 
+**I15. Supervision integrity [checked].** A process cannot supervise itself.
+Every non-null supervisor and every child named by a queued notice resolves.
+Each notice belongs to the child's declared direct supervisor, agrees with the
+child's terminal state and failure count, and every registered waiter belongs
+to the supervisor whose queue it waits on. A failed child whose relationship
+requires escalation has a failed direct supervisor.
+
+**I16. Domain and contract integrity [checked].** The root domain resolves and
+has no parent. Domain parent links are acyclic at creation, stored process counts
+equal actual membership, and bounded domains do not exceed their creation
+quota. Every object and process names a live domain. Every execution contract
+is valid for the hardware-neutral machine; an attached continuation stays
+within the contract's step and frame-byte bounds.
+
+**I17. Module integrity [checked].** Every loaded module's identity and
+evaluator count agree with its immutable manifest. Evaluator IDs are nonzero
+and unique, and strides are nonzero. Every module-linked collective names an
+evaluator present in that module with the same element stride.
+
 ---
 
 ## 3. Transitions
@@ -208,8 +252,15 @@ clock, a random source, or an iteration order over an unordered container.
 ### 3.1 Entity creation
 
 ```text
-CREATE-PROCESS(mode) -> p
-  effect  fresh process, fresh state object, empty mailbox, status = Created
+CREATE-DOMAIN(parent, max_processes) -> d
+  pre     caller has WRITE on parent
+  effect  fresh logical domain, process count = 0
+  trace   DomainCreated
+
+CREATE-PROCESS(domain, mode) -> p
+  pre     caller has WRITE on domain; domain creation quota is not exhausted
+  effect  fresh process and state object in domain, empty mailbox,
+          status = Created; increment domain process count
   trace   ProcessCreated
 
 CREATE-CONTINUATION(p, state_access, run_class, frame_bytes, budget) -> c
@@ -221,6 +272,28 @@ CREATE-CONTINUATION(p, state_access, run_class, frame_bytes, budget) -> c
 
 CREATE-FUTURE() -> f
   effect  fresh future, state = Pending, value = null
+
+CREATE-SUPERVISED-PROCESS(supervisor, mode, policy) -> p
+  pre     supervisor resolves and is non-terminal
+  effect  CREATE-PROCESS(mode); p.supervisor := supervisor;
+          p.supervision_policy := policy
+
+CREATE-CONTRACT(step_limit, frame_byte_limit, deterministic) -> k
+  pre     scalar shape; placement neutral; deterministic; no wall-clock deadline
+  effect  fresh actor-relative execution contract
+  trace   ContractCreated
+
+CREATE-CONTRACTED-CONTINUATION(p, k, frame, budget) -> c
+  pre     caller has READ on k; budget <= k.step_limit;
+          bytes(frame) <= k.frame_byte_limit when that limit is nonzero
+  effect  CREATE-CONTINUATION(...); c.execution_contract := k
+  trace   ContractAttached
+
+LOAD-MODULE(name, evaluators[]) -> m
+  pre     caller is live; name is non-empty; evaluator IDs are nonzero and
+          unique; evaluator strides are nonzero
+  effect  fresh immutable module manifest; caller receives genesis authority
+  trace   ModuleLoaded
 ```
 
 ### 3.2 Messaging
@@ -269,6 +342,34 @@ CLOSE-CHANNEL(actor, ch)
   trace   ChannelClosed
 ```
 
+Supervision uses a reliable kernel control queue rather than the user mailbox:
+
+```text
+NOTIFY-SUPERVISOR(child, reason)
+  pre     child has a non-null supervisor and just became terminal
+  effect  append (child, reason, failure_count) exactly once;
+          wake the oldest registered supervisor continuation, if any;
+          if reason = Failed and policy = Escalate, fail the supervisor;
+          if policy = Restart and retries remain, create a fresh replacement
+          from the entry template and include it in the notice;
+          if policy = Restart and retries are exhausted, fail the supervisor
+  trace   SupervisionNotified
+
+RECEIVE-SUPERVISION(supervisor, c) -> notice?
+  pre     supervisor has RECEIVE on itself; c belongs to supervisor
+  effect  pop the oldest notice, or register c if the queue is empty
+```
+
+For an irregular all-input join, receive is atomic across its input set:
+
+```text
+RECEIVE-ALL(actor, channels[], c) -> messages[]?
+  pre     channels is non-empty and duplicate-free; actor has RECEIVE on each
+  effect  if every channel is non-empty: pop exactly one from each, in input
+          order; otherwise consume nothing and register c on missing inputs
+          retry removes stale registrations before re-evaluating the whole set
+```
+
 ### 3.3 Dataflow readiness
 
 ```text
@@ -298,6 +399,11 @@ CREATE-BATCH-EVALUATE(owner, evaluator, inputs, count, stride) -> (op, done)
   pre     inputs is a frozen array of at least count * stride bytes
   effect  fresh Pending collective and Pending completion future
   trace   CollectiveCreated
+
+CREATE-BATCH-EVALUATE-IN-MODULE(owner, module, evaluator, inputs, count)
+  pre     owner has READ on module; evaluator occurs in module's manifest
+  effect  CREATE-BATCH-EVALUATE using the manifest stride;
+          op.module := module
 
 COMPLETE-BATCH-EVALUATE(owner, op, outputs)
   pre     owner has WRITE on op and RESOLVE on done;
@@ -364,7 +470,7 @@ leave a faulted continuation enqueued by that commit, violating I7.
 Work produced during an epoch goes into the next-epoch buffer, so an epoch
 boundary is a consistent cut. This is a property of the reference interpreter's
 scheduling, not a requirement of the model. An implementation may wake
-continuations within an epoch provided it preserves I1–I13 and determinism.
+continuations within an epoch provided it preserves I1–I13, I15–I17, and determinism.
 
 ---
 
@@ -378,8 +484,8 @@ continuations within an epoch provided it preserves I1–I13 and determinism.
   an implementation strategy the model *enables* by making run class explicit.
   It is not part of the semantics, and a conforming implementation need not do
   it.
-- **Time.** There is no wall clock. `deadline_ns` exists in the ABI and is
-  inert.
+- **Time.** There is no wall clock. Legacy `deadline_ns` fields remain inert,
+  and a current execution contract with a nonzero deadline is invalid.
 - **Fairness.** Beyond I14, no fairness guarantee is made. A run class may
   starve another.
 
@@ -405,11 +511,14 @@ continuations within an epoch provided it preserves I1–I13 and determinism.
 | I12 accounting consistency | checked | |
 | I13 process-state serialisation | checked | trace-level, with fault injection |
 | I14 progress | modelled | by test |
+| I15 supervision integrity | checked | notices, escalation, bounded restart, replacement lineage |
+| I16 domain/contract integrity | checked | membership, quotas, contract bounds |
+| I17 module integrity | checked | manifests and collective evaluator links |
 
-Entities named but not implemented: **Domain**, execution contracts, and
-supervision. Channels and the `BatchEvaluate` collective are implemented and
-covered by reference-integrity, boundedness, ordering, capability-integrity,
-and future-consistency checks plus targeted lifecycle tests.
+No entity named by this v0.2 specification remains **[absent]**. Domains,
+execution contracts, supervision, channels, modules, and the `BatchEvaluate`
+collective are covered by structural invariants plus targeted lifecycle and
+negative tests.
 
 `tests/semantics.rs::i10c_records_grants_denials_and_authorized_effects` exercises
 grants, denials, and an authorized write. The adjacent fault-injection test
@@ -465,16 +574,23 @@ ending in `Cancelled`. Cancellation does not preempt a continuation mid-step.
 
 ---
 
-## 7. Remaining work
+## 7. Extensions beyond v0.2 conformance
 
-The generic bounded streaming graph now covers FIFO ordering, lossless
-back-pressure, and committed-message survival across producer failure. The
-minimal evaluator IR is also implemented and connected to `BatchEvaluate`.
+The semantic core is complete for every entity and invariant named above. The
+bounded stream covers FIFO, back-pressure, and producer failure; the controlled
+actor tree covers notification, escalation, restart, and sibling containment;
+the irregular two-input join covers atomic readiness, skew, back-pressure, and
+committed-prefix survival. The minimal textual evaluator IR loads immutable
+manifests and is connected to module-linked `BatchEvaluate`. A backend-neutral
+execution boundary realizes the reference evaluator on CPU or optional Apple
+Metal, with CPU spill and collective-boundary placement accounting.
 
-1. **Actor and irregular-dataflow validation**, especially multi-input
-   readiness and supervised failure propagation.
-2. **Domains, execution contracts, and supervision.** Still vocabulary rather
-   than machinery.
+Future work extends rather than completes this specification:
+
+1. A general-purpose language/compiler for arbitrary evaluator bodies.
+2. Additional contract dimensions only when an implementation can enforce them.
+3. A persistent device scheduler or distributed implementation proven
+   trace-equivalent to this machine.
 
 Performance work belongs after all of this, and the performance results already
 in this repository (`docs/SOMA-P1.md`, and the cohorting studies) should be read

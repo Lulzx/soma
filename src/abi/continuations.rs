@@ -132,6 +132,7 @@ pub struct ContinuationDescriptor {
 
     pub run_class: u32,
     pub resume_point: u32,
+    pub execution_contract: Ref64,
 
     pub frame: Ref64, // CapRef
     pub dependency: Ref64,
@@ -160,6 +161,7 @@ impl ContinuationDescriptor {
             process,
             run_class,
             resume_point,
+            execution_contract: Ref64::NULL,
             frame: Ref64::NULL,
             dependency: Ref64::NULL,
             deadline_ns: 0,

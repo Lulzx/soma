@@ -15,8 +15,8 @@ use soma::compiler::frame::Frame;
 use soma::compiler::run_classes::{DEFAULT_MAX_STEPS, SEARCH_BRANCH};
 use soma::compiler::state_machine_lowering::{create_expand, SearchFrame};
 use soma::experiments::dynamic_search::{build, ControlKnobs};
-use soma::kernel::{ContinuationSpec, Kernel, SYSTEM_PRINCIPAL};
 use soma::kernel::raw;
+use soma::kernel::{ContinuationSpec, Kernel, SYSTEM_PRINCIPAL};
 use soma::scheduler::runnable_bins::SchedulingMode;
 use soma::semantics::invariants::{assert_legal, check, Invariant};
 
@@ -31,13 +31,7 @@ fn leaf_with_access(kernel: &mut Kernel, process: Ref64, state_access: StateAcce
         .create_continuation(
             process,
             process,
-            ContinuationSpec::new(
-                state_access,
-                SEARCH_BRANCH,
-                0,
-                bytes,
-                DEFAULT_MAX_STEPS,
-            ),
+            ContinuationSpec::new(state_access, SEARCH_BRANCH, 0, bytes, DEFAULT_MAX_STEPS),
         )
         .unwrap()
 }
@@ -127,8 +121,11 @@ fn i2_catches_a_continuation_left_running() {
     let cont = leaf(&mut kernel, p);
     assert!(!violated(&kernel, Invariant::NoContinuationLeftRunning));
 
-    unsafe { raw::state(&mut kernel) }.continuations.get_mut(cont).unwrap().status =
-        ContinuationState::Running;
+    unsafe { raw::state(&mut kernel) }
+        .continuations
+        .get_mut(cont)
+        .unwrap()
+        .status = ContinuationState::Running;
     assert!(violated(&kernel, Invariant::NoContinuationLeftRunning));
 }
 
@@ -142,8 +139,11 @@ fn i3_catches_schedulable_work_on_a_terminated_process() {
         Invariant::ProcessContinuationConsistency
     ));
 
-    unsafe { raw::state(&mut kernel) }.processes.get_mut(p).unwrap().status =
-        ProcessState::Terminated as u32;
+    unsafe { raw::state(&mut kernel) }
+        .processes
+        .get_mut(p)
+        .unwrap()
+        .status = ProcessState::Terminated as u32;
     assert!(violated(&kernel, Invariant::ProcessContinuationConsistency));
 }
 
@@ -173,10 +173,16 @@ fn i5_catches_an_overfull_mailbox() {
     let p = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
     assert!(!violated(&kernel, Invariant::MailboxBound));
 
-    let mailbox = unsafe { raw::state(&mut kernel) }.mailboxes.get_mut(&p.slot).unwrap();
+    let mailbox = unsafe { raw::state(&mut kernel) }
+        .mailboxes
+        .get_mut(&p.slot)
+        .unwrap();
     mailbox.capacity = 0;
     let filler = kernel.create_object(p, ObjectKind::MessagePayload, vec![0; 8]);
-    let mailbox = unsafe { raw::state(&mut kernel) }.mailboxes.get_mut(&p.slot).unwrap();
+    let mailbox = unsafe { raw::state(&mut kernel) }
+        .mailboxes
+        .get_mut(&p.slot)
+        .unwrap();
     mailbox
         .entries
         .push_back(soma::abi::MessageDescriptor::new(p, p, filler));
@@ -198,7 +204,10 @@ fn i6_catches_messages_delivered_out_of_send_order() {
     assert!(!violated(&kernel, Invariant::MessageOrdering));
 
     // Swap two messages from the same sender.
-    let mailbox = unsafe { raw::state(&mut kernel) }.mailboxes.get_mut(&receiver.slot).unwrap();
+    let mailbox = unsafe { raw::state(&mut kernel) }
+        .mailboxes
+        .get_mut(&receiver.slot)
+        .unwrap();
     mailbox.entries.make_contiguous().swap(0, 1);
     assert!(violated(&kernel, Invariant::MessageOrdering));
 }
@@ -212,8 +221,11 @@ fn i7_catches_unrunnable_work_sitting_in_a_bin() {
     let cont = leaf(&mut kernel, p);
     assert!(!violated(&kernel, Invariant::SchedulerWellFormed));
 
-    unsafe { raw::state(&mut kernel) }.continuations.get_mut(cont).unwrap().status =
-        ContinuationState::Faulted;
+    unsafe { raw::state(&mut kernel) }
+        .continuations
+        .get_mut(cont)
+        .unwrap()
+        .status = ContinuationState::Faulted;
     assert!(violated(&kernel, Invariant::SchedulerWellFormed));
 }
 
@@ -225,8 +237,11 @@ fn i7_catches_a_continuation_in_the_wrong_bin() {
     assert!(!violated(&kernel, Invariant::SchedulerWellFormed));
 
     // Change the run class without moving the continuation between bins.
-    unsafe { raw::state(&mut kernel) }.continuations.get_mut(cont).unwrap().run_class =
-        SEARCH_BRANCH + 1;
+    unsafe { raw::state(&mut kernel) }
+        .continuations
+        .get_mut(cont)
+        .unwrap()
+        .run_class = SEARCH_BRANCH + 1;
     assert!(violated(&kernel, Invariant::SchedulerWellFormed));
 }
 
@@ -250,7 +265,9 @@ fn i10b_catches_multiple_mutable_authority_holders() {
     let owner = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
     let other = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
     let object = kernel.create_object(owner, ObjectKind::RawBytes, vec![0]);
-    let capability = kernel.find_capability(owner, object, Rights::WRITE).unwrap();
+    let capability = kernel
+        .find_capability(owner, object, Rights::WRITE)
+        .unwrap();
     let duplicate = kernel.capability_entry(owner, capability).unwrap().clone();
     assert!(!violated(&kernel, Invariant::CapabilityIntegrity));
 
@@ -338,7 +355,10 @@ fn i13_catches_two_mutable_continuations_started_in_one_epoch() {
     assert!(!violated(&kernel, Invariant::SerialProcessExecution));
 
     let trace = unsafe { raw::state(&mut kernel) }.trace;
-    let logical_time = trace.last().map(|event| event.logical_time + 1).unwrap_or(1);
+    let logical_time = trace
+        .last()
+        .map(|event| event.logical_time + 1)
+        .unwrap_or(1);
     trace.push(TraceEvent::new(
         logical_time,
         0,
@@ -350,6 +370,149 @@ fn i13_catches_two_mutable_continuations_started_in_one_epoch() {
 
     assert!(violated(&kernel, Invariant::SerialProcessExecution));
     assert_ne!(first, second);
+}
+
+#[test]
+fn i15_catches_self_supervision() {
+    let mut kernel = Kernel::new();
+    let process = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    assert!(!violated(&kernel, Invariant::SupervisionIntegrity));
+
+    unsafe { raw::state(&mut kernel) }
+        .processes
+        .get_mut(process)
+        .unwrap()
+        .supervisor = process;
+
+    assert!(violated(&kernel, Invariant::SupervisionIntegrity));
+}
+
+#[test]
+fn i15_catches_a_required_failure_that_was_not_escalated() {
+    let mut kernel = Kernel::new();
+    let supervisor = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let child = kernel
+        .create_supervised_process(supervisor, supervisor, ProcessMode::Serial)
+        .unwrap();
+    leaf(&mut kernel, child);
+    let continuation = {
+        let state = unsafe { raw::state(&mut kernel) };
+        let continuation = state
+            .continuations
+            .iter()
+            .find_map(|(reference, descriptor)| (descriptor.process == child).then_some(reference))
+            .unwrap();
+        state.scheduler.remove(continuation);
+        continuation
+    };
+    soma::kernel::commit::apply_step_result(
+        &mut kernel,
+        continuation,
+        child,
+        soma::abi::StepResult::fault(child, 0),
+    );
+    assert!(!violated(&kernel, Invariant::SupervisionIntegrity));
+
+    unsafe { raw::state(&mut kernel) }
+        .processes
+        .get_mut(child)
+        .unwrap()
+        .supervision_policy = soma::abi::SupervisionPolicy::Escalate;
+
+    assert!(violated(&kernel, Invariant::SupervisionIntegrity));
+}
+
+#[test]
+fn i15_catches_a_restart_notice_without_its_replacement() {
+    let mut kernel = Kernel::new();
+    let supervisor = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let mut bytes = Vec::new();
+    SearchFrame::leaf(1, 0).encode(&mut bytes);
+    kernel
+        .create_restartable_process(
+            supervisor,
+            supervisor,
+            ProcessMode::Serial,
+            1,
+            ContinuationSpec::new(StateAccess::ReadOnly, SEARCH_BRANCH, 0, bytes, 0),
+        )
+        .unwrap();
+    kernel.run_epoch();
+    assert!(!violated(&kernel, Invariant::SupervisionIntegrity));
+
+    unsafe { raw::state(&mut kernel) }
+        .supervision_queues
+        .get_mut(&supervisor.slot)
+        .unwrap()
+        .notices
+        .front_mut()
+        .unwrap()
+        .replacement = Ref64::NULL;
+
+    assert!(violated(&kernel, Invariant::SupervisionIntegrity));
+}
+
+#[test]
+fn i16_catches_incorrect_domain_accounting() {
+    let mut kernel = Kernel::new();
+    kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    assert!(!violated(&kernel, Invariant::DomainContractIntegrity));
+
+    let root = kernel.root_domain();
+    unsafe { raw::state(&mut kernel) }
+        .domains
+        .get_mut(root)
+        .unwrap()
+        .processes_created += 1;
+
+    assert!(violated(&kernel, Invariant::DomainContractIntegrity));
+}
+
+#[test]
+fn i16_catches_a_continuation_over_its_contract_budget() {
+    let mut kernel = Kernel::new();
+    let process = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let mut descriptor = soma::abi::ExecutionContract::new(
+        soma::abi::Shape::Scalar,
+        soma::abi::PlacementPolicy::Any,
+    );
+    descriptor.maximum_steps = 4;
+    let contract = kernel
+        .create_execution_contract(process, descriptor)
+        .unwrap();
+    let continuation = kernel
+        .create_contracted_continuation(
+            process,
+            process,
+            contract,
+            ContinuationSpec::new(StateAccess::ReadOnly, SEARCH_BRANCH, 0, vec![], 4),
+        )
+        .unwrap();
+    assert!(!violated(&kernel, Invariant::DomainContractIntegrity));
+
+    unsafe { raw::state(&mut kernel) }
+        .continuations
+        .get_mut(continuation)
+        .unwrap()
+        .remaining_steps = 5;
+
+    assert!(violated(&kernel, Invariant::DomainContractIntegrity));
+}
+
+#[test]
+fn i17_catches_a_module_manifest_count_mismatch() {
+    let mut kernel = Kernel::new();
+    let owner = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let module = kernel.load_module(owner, "scoring", &[(7, 8)]).unwrap();
+    assert!(!violated(&kernel, Invariant::ModuleIntegrity));
+
+    unsafe { raw::state(&mut kernel) }
+        .modules
+        .get_mut(module)
+        .unwrap()
+        .evaluator_count = 2;
+
+    assert!(violated(&kernel, Invariant::ModuleIntegrity));
 }
 
 // ---- I10c ---------------------------------------------------------------
@@ -414,7 +577,10 @@ fn i10c_catches_an_effect_without_an_adjacent_grant() {
     assert!(!violated(&kernel, Invariant::NoUnauthorizedEffect));
 
     let trace = unsafe { raw::state(&mut kernel) }.trace;
-    let logical_time = trace.last().map(|event| event.logical_time + 1).unwrap_or(1);
+    let logical_time = trace
+        .last()
+        .map(|event| event.logical_time + 1)
+        .unwrap_or(1);
     trace.push(TraceEvent::new(
         logical_time,
         0,

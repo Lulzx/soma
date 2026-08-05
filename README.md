@@ -10,19 +10,24 @@ implementation choices. This repository contains the semantic specification, a
 deterministic Rust interpreter, executable invariant checks, and scheduler
 experiments.
 
-Stable Rust. No dependencies.
+Stable Rust. The semantic core has no dependencies. The optional macOS Metal
+backend is enabled with `--features metal`.
 
 ## Run it
 
 ```sh
 cargo test
 cargo clippy --all-targets
+cargo test --all-features                 # includes a real Metal dispatch on macOS
+cargo clippy --all-targets --all-features
 
 cargo run --example cohort_report
 cargo run --example baseline_report
 cargo run --example irregular_report
 cargo run --example regime_map
 cargo run --example streaming_report
+cargo run --example supervision_report
+cargo run --example multi_input_report
 ```
 
 Read [docs/SOMA-v0.2.md](docs/SOMA-v0.2.md) for the current machine. The older
@@ -54,7 +59,7 @@ continuation boundary.
 
 ## Specification
 
-The specification defines fourteen original invariants. Each clause has one of
+The specification defines seventeen numbered invariants. Each clause has one of
 three states:
 
 - `checked`: evaluated against interpreter state after each transition
@@ -70,10 +75,23 @@ Capability spaces, creator genesis, derivation, attenuation, and the structural
 I10a/I10b checks exist. Every right used by a reachable operation is enforced
 at use, including expiry, object-version, range, and parent-chain checks.
 Authority decisions and governed effects are traced, and I10c rejects any
-effect without an adjacent matching grant. Failure containment and cooperative
-cancellation settle sibling work, futures, mailboxes, channels, collectives,
-and waiters. First-class bounded channels and the `BatchEvaluate` collective
-are implemented; domains, execution contracts, and supervision remain absent.
+effect without an adjacent matching grant. Failure containment, direct-child
+supervision, and cooperative cancellation settle sibling work, futures,
+mailboxes, channels, collectives, and waiters. Supervised child exits produce
+reliable typed terminal notices and wake a waiting supervisor continuation.
+Relationships may also escalate a failed child by failing its direct supervisor
+after notice delivery, while leaving sibling branches unaffected.
+Bounded restart creates a fresh replacement identity from the registered entry
+template and escalates when retries are exhausted. Atomic all-input channel
+receive supports irregular joins without consuming a partial input set.
+First-class bounded channels and the `BatchEvaluate` collective
+are implemented. Logical domains enforce authority and process-creation quotas;
+hardware-neutral execution contracts bound continuation steps and frame bytes.
+A small textual module surface loads immutable evaluator manifests and links
+collectives to them. I17 checks those links. A physical backend boundary can
+execute a batch on CPU or Metal, spill unavailable or underfilled work to CPU,
+and record collective-boundary placement changes without exposing kernel state
+to either backend.
 
 The specification has already caught a lifetime bug. `Complete` once retired a
 process when one continuation finished. A second live continuation could then
@@ -138,7 +156,7 @@ src/
   abi/          references and fixed-width descriptors
   table.rs      generational slot table
   kernel/       machine state, epochs, commit, ownership, accounting
-  executives/   scalar continuation interpreter
+  executives/   scalar interpreter and physical batch backends
   scheduler/    run-class bins and cohort construction
   compiler/     frame encoding and hand-written state-machine lowering
   replay/       trace reader and deterministic comparison
@@ -172,15 +190,28 @@ Implemented now:
   proves committed FIFO data survives producer failure
 - A minimal hardware-neutral evaluator IR with frozen-array schemas and resume
   points, connected to `BatchEvaluate` creation
+- Direct parent/child supervision with reliable completion, failure, and
+  cancellation notices, deterministic waiter wakeup, and opt-in failure
+  escalation or bounded restart with replacement lineage
+- Atomic multi-input channel receive and a skew/failure-controlled join workload
+- Logical domains with actor-relative authority and process-creation quotas
+- First-class execution contracts that enforce step and frame-byte bounds
+- A minimal textual module surface, immutable loaded evaluator manifests, and
+  module-linked `BatchEvaluate` creation
+- A backend-neutral batch execution boundary with CPU spill and
+  collective-boundary migration accounting
+- An optional real Apple Metal compute backend, validated against the CPU
+  result and the semantic invariant checker
 
 Not implemented:
 
-- Domains, execution contracts, and supervision
-- GPU execution, CPU/GPU migration, and spill
+- A general-purpose language or compiler for arbitrary evaluator bodies
+- A complete device-resident scheduler/executive or distributed backend
+- Hardware throughput, scheduler-overhead, and end-to-end migration benchmarks
 
-The current job is to finish the machine semantics before adding a surface
-language or GPU backend. The largest remaining semantic gaps are domains,
-execution contracts, and supervision.
+Every entity and invariant named by the v0.2 machine is now implemented. The
+remaining work extends the completed semantic core beyond the deliberately
+small module surface and collective-level Metal implementation.
 
 ## License
 

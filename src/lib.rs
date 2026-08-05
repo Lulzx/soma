@@ -1,18 +1,19 @@
-//! SOMA-P1: minimal executable kernel contract — Phase 1 (steps 1–3).
+//! SOMA: executable abstract-machine semantics and reference implementations.
 //!
-//! This crate implements the first slice of the evidence-producing path from
-//! §30:
+//! The crate contains the dependency-free semantic core, executable invariants,
+//! validation workloads, and physical batch backends:
 //!
 //! 1. Fixed ABI references and generational tables (`abi`, `table`);
-//! 2. A deterministic CPU continuation interpreter (`executives::cpu_scalar`);
+//! 2. A deterministic CPU continuation interpreter (`executives::cpu_scalar`)
+//!    and an optional Metal batch backend (`executives::metal`);
 //! 3. Processes, messages, futures, and double-buffered runnable bins over a
 //!    single-threaded epoch lifecycle (`kernel`, `scheduler`), together with
 //!    the `Expand` state machine and a synthetic branching-search workload
 //!    (`compiler`, `experiments`) that prove resumable continuations run
 //!    deterministically.
 //!
-//! GPU execution, real SIMD cohort construction, migration, and the baselines
-//! are later slices.
+//! The Metal backend is a collective-level implementation, not a persistent
+//! device-resident scheduler.
 
 pub mod abi;
 pub mod compiler;

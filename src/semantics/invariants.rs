@@ -51,6 +51,12 @@ pub enum Invariant {
     AccountingConsistency,
     /// I13. At most one mutable process-state continuation starts per epoch.
     SerialProcessExecution,
+    /// I15. Supervision links and queued exit notices are structurally sound.
+    SupervisionIntegrity,
+    /// I16. Domain membership/quotas and attached contracts are valid.
+    DomainContractIntegrity,
+    /// I17. Loaded module manifests and linked evaluator uses agree.
+    ModuleIntegrity,
 }
 
 /// A specific way in which a state was illegal.
@@ -93,8 +99,129 @@ pub fn check(kernel: &Kernel) -> Vec<Violation> {
     trace_monotonicity(kernel, &mut v);
     accounting_consistency(kernel, &mut v);
     serial_process_execution(kernel, &mut v);
+    supervision_integrity(kernel, &mut v);
+    domain_contract_integrity(kernel, &mut v);
+    module_integrity(kernel, &mut v);
     v.sort();
     v
+}
+
+// ---- I17 -----------------------------------------------------------------
+
+fn module_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
+    for (module_ref, module) in kernel.modules().iter() {
+        let valid = kernel
+            .module_manifest(module_ref)
+            .map(|manifest| {
+                module.id == module_ref
+                    && module.evaluator_count == manifest.len() as u32
+                    && !manifest.is_empty()
+                    && manifest.iter().all(|(id, stride)| *id != 0 && *stride != 0)
+                    && manifest.windows(2).all(|pair| pair[0].0 < pair[1].0)
+            })
+            .unwrap_or(false);
+        if !valid {
+            out.push(Violation::new(
+                Invariant::ModuleIntegrity,
+                format!("module {} has an invalid manifest", module_ref.slot),
+            ));
+        }
+    }
+    for (collective_ref, collective) in kernel.collectives().iter() {
+        if collective.module.is_null() {
+            continue;
+        }
+        let linked = kernel
+            .module_manifest(collective.module)
+            .map(|manifest| {
+                manifest.iter().any(|(id, stride)| {
+                    *id == collective.evaluator_id && *stride == collective.element_stride
+                })
+            })
+            .unwrap_or(false);
+        if !linked {
+            out.push(Violation::new(
+                Invariant::ModuleIntegrity,
+                format!(
+                    "collective {} is not linked to its module evaluator",
+                    collective_ref.slot
+                ),
+            ));
+        }
+    }
+}
+
+// ---- I16 -----------------------------------------------------------------
+
+fn domain_contract_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
+    let root = kernel.root_domain();
+    if kernel
+        .domains()
+        .get(root)
+        .map(|domain| !domain.parent.is_null())
+        .unwrap_or(true)
+    {
+        out.push(Violation::new(
+            Invariant::DomainContractIntegrity,
+            "root domain is missing or has a parent",
+        ));
+    }
+
+    for (domain_ref, domain) in kernel.domains().iter() {
+        let actual = kernel
+            .processes()
+            .iter()
+            .filter(|(_, process)| process.domain == domain_ref)
+            .count() as u32;
+        if domain.parent == domain_ref
+            || domain.processes_created != actual
+            || (domain.max_processes != 0 && actual > domain.max_processes)
+        {
+            out.push(Violation::new(
+                Invariant::DomainContractIntegrity,
+                format!(
+                    "domain {} has invalid parent, count, or quota",
+                    domain_ref.slot
+                ),
+            ));
+        }
+    }
+
+    for (contract_ref, contract) in kernel.contracts().iter() {
+        if !Kernel::contract_is_valid(contract) {
+            out.push(Violation::new(
+                Invariant::DomainContractIntegrity,
+                format!("contract {} is invalid for this machine", contract_ref.slot),
+            ));
+        }
+    }
+
+    for (continuation_ref, continuation) in kernel.continuations().iter() {
+        if continuation.execution_contract.is_null() {
+            continue;
+        }
+        let valid = kernel
+            .contracts()
+            .get(continuation.execution_contract)
+            .ok()
+            .and_then(|contract| {
+                kernel.objects().get(continuation.frame).ok().map(|frame| {
+                    continuation.remaining_steps <= contract.maximum_steps
+                        && (contract.local_memory_bytes == 0
+                            || frame.byte_length <= u64::from(contract.local_memory_bytes))
+                })
+            })
+            .unwrap_or(false);
+        if !valid {
+            out.push(Violation::new(
+                Invariant::DomainContractIntegrity,
+                format!(
+                    "continuation {} violates its execution contract",
+                    continuation_ref.slot
+                ),
+            ));
+        }
+    }
 }
 
 /// Panic with every violation, for use as a test postcondition.
@@ -117,6 +244,7 @@ pub fn assert_legal(kernel: &Kernel) {
 fn live(kernel: &Kernel, r: Ref64) -> bool {
     match r.kind {
         Kind::Process => kernel.processes().get(r).is_ok(),
+        Kind::Domain => kernel.domains().get(r).is_ok(),
         Kind::Object => kernel.objects().get(r).is_ok(),
         Kind::Continuation => kernel.continuations().get(r).is_ok(),
         Kind::Future => kernel.futures().get(r).is_ok(),
@@ -125,9 +253,8 @@ fn live(kernel: &Kernel, r: Ref64) -> bool {
         Kind::Capability => true,
         Kind::Channel => kernel.channels().get(r).is_ok(),
         Kind::Collective => kernel.collectives().get(r).is_ok(),
-        // Domains, contracts and modules have no table in the reference model;
-        // a reference to one cannot yet be validated.
-        _ => true,
+        Kind::Contract => kernel.contracts().get(r).is_ok(),
+        Kind::Module => kernel.modules().get(r).is_ok(),
     }
 }
 
@@ -143,6 +270,18 @@ fn reference_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
             out.push(Violation::new(
                 Invariant::ReferenceIntegrity,
                 format!("process {} has a dangling state object", r.slot),
+            ));
+        }
+        if !live(kernel, p.domain) {
+            out.push(Violation::new(
+                Invariant::ReferenceIntegrity,
+                format!("process {} has a dangling domain", r.slot),
+            ));
+        }
+        if !p.supervisor.is_null() && !live(kernel, p.supervisor) {
+            out.push(Violation::new(
+                Invariant::ReferenceIntegrity,
+                format!("process {} has a dangling supervisor", r.slot),
             ));
         }
     }
@@ -166,6 +305,12 @@ fn reference_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
                 format!("continuation {} depends on a dead entity", r.slot),
             ));
         }
+        if !c.execution_contract.is_null() && !live(kernel, c.execution_contract) {
+            out.push(Violation::new(
+                Invariant::ReferenceIntegrity,
+                format!("continuation {} has a dangling contract", r.slot),
+            ));
+        }
     }
 
     for (r, f) in kernel.futures().iter() {
@@ -180,6 +325,49 @@ fn reference_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
                 Invariant::ReferenceIntegrity,
                 format!("future {} resolved to a dead object", r.slot),
             ));
+        }
+    }
+
+    for (r, object) in kernel.objects().iter() {
+        if !live(kernel, object.owner_domain) {
+            out.push(Violation::new(
+                Invariant::ReferenceIntegrity,
+                format!("object {} has a dangling owner domain", r.slot),
+            ));
+        }
+    }
+
+    for (r, domain) in kernel.domains().iter() {
+        if domain.id != r || (!domain.parent.is_null() && !live(kernel, domain.parent)) {
+            out.push(Violation::new(
+                Invariant::ReferenceIntegrity,
+                format!("domain {} has an invalid identity or parent", r.slot),
+            ));
+        }
+    }
+
+    for (r, contract) in kernel.contracts().iter() {
+        if contract.id != r {
+            out.push(Violation::new(
+                Invariant::ReferenceIntegrity,
+                format!("contract {} has an invalid identity", r.slot),
+            ));
+        }
+    }
+
+    for queue in kernel.supervision_queues().values() {
+        for notice in &queue.notices {
+            if !live(kernel, notice.child)
+                || (!notice.replacement.is_null() && !live(kernel, notice.replacement))
+            {
+                out.push(Violation::new(
+                    Invariant::ReferenceIntegrity,
+                    format!(
+                        "supervision notice for child {} has a dangling reference",
+                        notice.child.slot
+                    ),
+                ));
+            }
         }
     }
 
@@ -230,6 +418,7 @@ fn reference_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
             || (!collective.owner_process.is_null() && !live(kernel, collective.owner_process))
             || !live(kernel, collective.inputs)
             || !live(kernel, collective.completion_future)
+            || (!collective.module.is_null() && !live(kernel, collective.module))
             || (!collective.outputs.is_null() && !live(kernel, collective.outputs))
         {
             out.push(Violation::new(
@@ -239,6 +428,172 @@ fn reference_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
                     r.slot
                 ),
             ));
+        }
+    }
+}
+
+// ---- I15 -----------------------------------------------------------------
+
+fn supervision_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
+    for (process_ref, process) in kernel.processes().iter() {
+        if process.supervisor == process_ref {
+            out.push(Violation::new(
+                Invariant::SupervisionIntegrity,
+                format!("process {} supervises itself", process_ref.slot),
+            ));
+        }
+        if process.supervision_policy == crate::abi::SupervisionPolicy::Restart {
+            if process.supervisor.is_null()
+                || process.restart_limit == 0
+                || process.restart_attempt > process.restart_limit
+                || !kernel.has_restart_blueprint(process_ref)
+            {
+                out.push(Violation::new(
+                    Invariant::SupervisionIntegrity,
+                    format!(
+                        "process {} has an invalid restart contract",
+                        process_ref.slot
+                    ),
+                ));
+            }
+        } else if !process.restart_of.is_null()
+            || process.restart_attempt != 0
+            || process.restart_limit != 0
+        {
+            out.push(Violation::new(
+                Invariant::SupervisionIntegrity,
+                format!(
+                    "process {} has restart lineage without restart policy",
+                    process_ref.slot
+                ),
+            ));
+        }
+        if !process.restart_of.is_null() {
+            let valid_predecessor = kernel
+                .processes()
+                .get(process.restart_of)
+                .map(|predecessor| {
+                    predecessor.status == ProcessState::Failed as u32
+                        && predecessor.supervisor == process.supervisor
+                        && predecessor.restart_attempt + 1 == process.restart_attempt
+                })
+                .unwrap_or(false);
+            if !valid_predecessor {
+                out.push(Violation::new(
+                    Invariant::SupervisionIntegrity,
+                    format!("process {} has invalid restart lineage", process_ref.slot),
+                ));
+            }
+        }
+    }
+
+    for (supervisor_slot, queue) in kernel.supervision_queues() {
+        for notice in &queue.notices {
+            let Ok(child) = kernel.processes().get(notice.child) else {
+                // The dangling child is also reported by the more general
+                // reference checker when held from a descriptor.
+                out.push(Violation::new(
+                    Invariant::SupervisionIntegrity,
+                    format!("supervisor {supervisor_slot} has notice for a dead child"),
+                ));
+                continue;
+            };
+            let expected_status = match notice.reason {
+                crate::abi::ExitReason::Completed => ProcessState::Terminated,
+                crate::abi::ExitReason::Failed => ProcessState::Failed,
+                crate::abi::ExitReason::Cancelled => ProcessState::Cancelled,
+            };
+            if child.supervisor.slot != *supervisor_slot
+                || child.status != expected_status as u32
+                || notice.failure_count != child.failure_count
+            {
+                out.push(Violation::new(
+                    Invariant::SupervisionIntegrity,
+                    format!(
+                        "supervisor {supervisor_slot} has an inconsistent notice for child {}",
+                        notice.child.slot
+                    ),
+                ));
+            }
+            if notice.reason == crate::abi::ExitReason::Failed
+                && child.supervision_policy == crate::abi::SupervisionPolicy::Escalate
+            {
+                let supervisor_failed = kernel
+                    .processes()
+                    .get(child.supervisor)
+                    .map(|supervisor| supervisor.status == ProcessState::Failed as u32)
+                    .unwrap_or(false);
+                if !supervisor_failed {
+                    out.push(Violation::new(
+                        Invariant::SupervisionIntegrity,
+                        format!(
+                            "failed child {} required escalation but supervisor {} did not fail",
+                            notice.child.slot, supervisor_slot
+                        ),
+                    ));
+                }
+            }
+            if notice.reason == crate::abi::ExitReason::Failed
+                && child.supervision_policy == crate::abi::SupervisionPolicy::Restart
+            {
+                if notice.replacement.is_null() {
+                    let supervisor_failed = kernel
+                        .processes()
+                        .get(child.supervisor)
+                        .map(|supervisor| supervisor.status == ProcessState::Failed as u32)
+                        .unwrap_or(false);
+                    if !supervisor_failed {
+                        out.push(Violation::new(
+                            Invariant::SupervisionIntegrity,
+                            format!(
+                                "failed child {} was neither restarted nor escalated",
+                                notice.child.slot
+                            ),
+                        ));
+                    }
+                } else {
+                    let valid_replacement = kernel
+                        .processes()
+                        .get(notice.replacement)
+                        .map(|replacement| {
+                            replacement.restart_of == notice.child
+                                && replacement.supervisor == child.supervisor
+                                && replacement.process_mode == child.process_mode
+                                && replacement.supervision_policy
+                                    == crate::abi::SupervisionPolicy::Restart
+                                && replacement.restart_attempt == child.restart_attempt + 1
+                                && replacement.restart_limit == child.restart_limit
+                        })
+                        .unwrap_or(false);
+                    if !valid_replacement {
+                        out.push(Violation::new(
+                            Invariant::SupervisionIntegrity,
+                            format!(
+                                "failed child {} has an invalid replacement",
+                                notice.child.slot
+                            ),
+                        ));
+                    }
+                }
+            } else if !notice.replacement.is_null() {
+                out.push(Violation::new(
+                    Invariant::SupervisionIntegrity,
+                    format!("child {} has an unexpected replacement", notice.child.slot),
+                ));
+            }
+        }
+        for waiter in &queue.waiters {
+            let valid = kernel
+                .continuations()
+                .get(*waiter)
+                .map(|continuation| continuation.process.slot == *supervisor_slot)
+                .unwrap_or(false);
+            if !valid {
+                out.push(Violation::new(
+                    Invariant::SupervisionIntegrity,
+                    format!("supervisor {supervisor_slot} has a foreign or dead waiter"),
+                ));
+            }
         }
     }
 }
@@ -515,8 +870,10 @@ fn capability_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
                 Kind::Future => kernel.futures().get(cap.target).is_ok(),
                 Kind::Channel => kernel.channels().get(cap.target).is_ok(),
                 Kind::Collective => kernel.collectives().get(cap.target).is_ok(),
+                Kind::Domain => kernel.domains().get(cap.target).is_ok(),
+                Kind::Contract => kernel.contracts().get(cap.target).is_ok(),
+                Kind::Module => kernel.modules().get(cap.target).is_ok(),
                 Kind::Capability => space.get(cap.target).is_ok(),
-                _ => false,
             };
             if !target_live {
                 out.push(Violation::new(

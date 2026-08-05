@@ -1,6 +1,7 @@
 //! Kernel: the tables and operations that make SOMA's processes, continuations,
-//! messages, and futures real (§7, §8, §11, §12). Phase 1 is single-threaded and
-//! deterministic; every table is generation-checked (§4).
+//! messages, futures, domains, modules, and collectives real. The reference
+//! transition system is single-threaded and deterministic; every table is
+//! generation-checked (§4 of the historical Phase-1 contract).
 
 pub mod accounting;
 pub mod commit;
@@ -14,9 +15,10 @@ use std::collections::{HashMap, VecDeque};
 use crate::abi::capabilities::CapabilityEntry;
 use crate::abi::cohorts::PartialCohortPolicy;
 use crate::abi::{
-    AbiError, ChannelDescriptor, CollectiveDescriptor, CollectiveState, EventKind,
-    FutureDescriptor, FutureState, Kind, MessageDescriptor, ObjectDescriptor, ObjectKind,
-    ProcessDescriptor, ProcessMode, ProcessState, Ref64, TraceEvent,
+    AbiError, ChannelDescriptor, CollectiveDescriptor, CollectiveState, DomainDescriptor,
+    EventKind, ExecutionContract, ExitReason, FutureDescriptor, FutureState, Kind,
+    MessageDescriptor, ModuleDescriptor, ObjectDescriptor, ObjectKind, ProcessDescriptor,
+    ProcessMode, ProcessState, Ref64, SupervisionNotice, SupervisionPolicy, TraceEvent,
 };
 use crate::kernel::accounting::Accounting;
 use crate::scheduler::runnable_bins::{Scheduler, SchedulingMode};
@@ -37,6 +39,11 @@ pub enum RuntimeError {
     NotResolved,
     MissingCapabilitySpace,
     InvalidCapabilityDerivation,
+    InvalidSupervisionPolicy,
+    InvalidMultiInput,
+    DomainQuotaExceeded,
+    InvalidContract,
+    InvalidModule,
     AuthorityDenied,
 }
 
@@ -88,6 +95,18 @@ struct ChannelQueue {
     send_waiters: VecDeque<Ref64>,
     receive_waiters: VecDeque<Ref64>,
     next_sequence: u64,
+}
+
+/// Reliable kernel control queue for direct-child exit notifications.
+#[derive(Debug, Default)]
+pub struct SupervisionQueue {
+    pub notices: VecDeque<SupervisionNotice>,
+    pub waiters: VecDeque<Ref64>,
+}
+
+#[derive(Clone, Debug)]
+struct RestartBlueprint {
+    entry: ContinuationSpec,
 }
 
 pub(crate) struct ChannelQueueSnapshot {
@@ -184,6 +203,10 @@ pub struct Kernel {
     epoch_runnable: Vec<usize>,
 
     processes: GenTable<ProcessDescriptor>,
+    domains: GenTable<DomainDescriptor>,
+    contracts: GenTable<ExecutionContract>,
+    modules: GenTable<ModuleDescriptor>,
+    root_domain: Ref64,
     objects: GenTable<ObjectDescriptor>,
     /// Capability references are relative to the acting process. Slot zero is
     /// the explicit system principal.
@@ -203,6 +226,9 @@ pub struct Kernel {
     channel_queues: HashMap<u32, ChannelQueue>,
     /// Per (sender, receiver) pair, the next `sender_sequence` value (§11).
     send_sequences: HashMap<(u32, u32), u64>,
+    supervision_queues: HashMap<u32, SupervisionQueue>,
+    restart_blueprints: HashMap<u32, RestartBlueprint>,
+    module_evaluators: HashMap<u32, Vec<(u32, u32)>>,
 
     scheduler: Scheduler,
 
@@ -227,12 +253,16 @@ impl Kernel {
     }
 
     fn with_scheduler(scheduler: Scheduler) -> Kernel {
-        Kernel {
+        let mut kernel = Kernel {
             epoch: 0,
             logical_time: 0,
             trace: Vec::new(),
             epoch_runnable: Vec::new(),
             processes: GenTable::new(Kind::Process),
+            domains: GenTable::new(Kind::Domain),
+            contracts: GenTable::new(Kind::Contract),
+            modules: GenTable::new(Kind::Module),
+            root_domain: Ref64::NULL,
             objects: GenTable::new(Kind::Object),
             capability_spaces: HashMap::from([(0, GenTable::new(Kind::Capability))]),
             continuations: GenTable::new(Kind::Continuation),
@@ -244,11 +274,19 @@ impl Kernel {
             future_waiters: HashMap::new(),
             channel_queues: HashMap::new(),
             send_sequences: HashMap::new(),
+            supervision_queues: HashMap::new(),
+            restart_blueprints: HashMap::new(),
+            module_evaluators: HashMap::new(),
             scheduler,
             cohort_width: 1,
             partial_policy: PartialCohortPolicy::default(),
             accounting: Accounting::default(),
-        }
+        };
+        let root = kernel.domains.alloc(DomainDescriptor::new(Ref64::NULL, 0));
+        kernel.domains.get_mut(root).expect("fresh root domain").id = root;
+        kernel.root_domain = root;
+        kernel.mint_genesis(SYSTEM_PRINCIPAL, root, 0, 0);
+        kernel
     }
 
     // ---- configuration and observation ---------------------------------
@@ -269,6 +307,10 @@ impl Kernel {
 
     pub fn process_count(&self) -> usize {
         self.processes.len()
+    }
+
+    pub fn root_domain(&self) -> Ref64 {
+        self.root_domain
     }
 
     pub fn continuation_count(&self) -> usize {
@@ -312,6 +354,18 @@ impl Kernel {
 
     pub(crate) fn processes(&self) -> &GenTable<ProcessDescriptor> {
         &self.processes
+    }
+
+    pub(crate) fn domains(&self) -> &GenTable<DomainDescriptor> {
+        &self.domains
+    }
+
+    pub(crate) fn contracts(&self) -> &GenTable<ExecutionContract> {
+        &self.contracts
+    }
+
+    pub(crate) fn modules(&self) -> &GenTable<ModuleDescriptor> {
+        &self.modules
     }
 
     pub(crate) fn objects(&self) -> &GenTable<ObjectDescriptor> {
@@ -374,6 +428,10 @@ impl Kernel {
         &self.future_waiters
     }
 
+    pub(crate) fn supervision_queues(&self) -> &HashMap<u32, SupervisionQueue> {
+        &self.supervision_queues
+    }
+
     pub(crate) fn scheduler(&self) -> &Scheduler {
         &self.scheduler
     }
@@ -432,6 +490,14 @@ impl Kernel {
     }
 
     fn create_object_for(&mut self, actor: Ref64, kind: ObjectKind, bytes: Vec<u8>) -> Ref64 {
+        let owner_domain = if actor == SYSTEM_PRINCIPAL {
+            self.root_domain
+        } else {
+            self.processes
+                .get(actor)
+                .map(|process| process.domain)
+                .unwrap_or(self.root_domain)
+        };
         let r = self
             .objects
             .alloc(ObjectDescriptor::new(kind, bytes.len() as u64));
@@ -440,6 +506,7 @@ impl Kernel {
         {
             let o = self.objects.get_mut(r).expect("fresh object");
             o.id = r;
+            o.owner_domain = owner_domain;
         }
         self.mint_genesis(actor, r, byte_length, 0);
         r
@@ -827,25 +894,346 @@ impl Kernel {
     // ---- processes -------------------------------------------------------
 
     pub fn create_process(&mut self, actor: Ref64, mode: ProcessMode) -> Ref64 {
+        let domain = if actor == SYSTEM_PRINCIPAL {
+            self.root_domain
+        } else {
+            self.processes
+                .get(actor)
+                .map(|process| process.domain)
+                .unwrap_or(self.root_domain)
+        };
+        self.allocate_process(actor, domain, mode)
+            .expect("default domain is unbounded and resolves")
+    }
+
+    pub fn create_process_in_domain(
+        &mut self,
+        actor: Ref64,
+        domain: Ref64,
+        mode: ProcessMode,
+    ) -> Result<Ref64, RuntimeError> {
+        self.authorize(actor, crate::abi::Rights::WRITE, domain)?;
+        let descriptor = self.domains.get(domain)?;
+        if descriptor.max_processes != 0 && descriptor.processes_created >= descriptor.max_processes
+        {
+            return Err(RuntimeError::DomainQuotaExceeded);
+        }
+        self.authorize(actor, crate::abi::Rights::WRITE, domain)?;
+        self.authority_effect(actor, crate::abi::Rights::WRITE, domain);
+        self.allocate_process(actor, domain, mode)
+    }
+
+    fn allocate_process(
+        &mut self,
+        actor: Ref64,
+        domain: Ref64,
+        mode: ProcessMode,
+    ) -> Result<Ref64, RuntimeError> {
+        let domain_descriptor = self.domains.get(domain)?;
+        if domain_descriptor.max_processes != 0
+            && domain_descriptor.processes_created >= domain_descriptor.max_processes
+        {
+            return Err(RuntimeError::DomainQuotaExceeded);
+        }
         let r = self.processes.alloc(ProcessDescriptor::new(mode));
+        {
+            let process = self.processes.get_mut(r).expect("fresh process");
+            process.id = r;
+            process.domain = domain;
+            process.inbox = r;
+            process.status = ProcessState::Created as u32;
+        }
         self.capability_spaces
             .insert(r.slot, GenTable::new(Kind::Capability));
         self.mint_genesis(r, r, 0, 0);
+        self.mint_genesis(r, domain, 0, 0);
         let state_obj = self.create_object_for(r, ObjectKind::ProcessState, Vec::new());
         if actor != r {
             self.mint_genesis(actor, r, 0, 0);
         }
         self.mailboxes.insert(r.slot, Mailbox::new(8));
+        self.supervision_queues
+            .insert(r.slot, SupervisionQueue::default());
         {
             let p = self.processes.get_mut(r).expect("fresh process");
-            p.id = r;
-            p.domain = r;
             p.state = state_obj;
-            p.inbox = r;
-            p.status = ProcessState::Created as u32;
         }
+        let domain_descriptor = self.domains.get_mut(domain)?;
+        domain_descriptor.processes_created = domain_descriptor.processes_created.saturating_add(1);
         self.trace(EventKind::ProcessCreated, r, Ref64::NULL, 0, mode as u32);
-        r
+        Ok(r)
+    }
+
+    // ---- domains ---------------------------------------------------------
+
+    pub fn create_domain(
+        &mut self,
+        actor: Ref64,
+        parent: Ref64,
+        max_processes: u32,
+    ) -> Result<Ref64, RuntimeError> {
+        let _ = self.domains.get(parent)?;
+        self.authorize(actor, crate::abi::Rights::WRITE, parent)?;
+        self.authority_effect(actor, crate::abi::Rights::WRITE, parent);
+        let domain = self
+            .domains
+            .alloc(DomainDescriptor::new(parent, max_processes));
+        self.domains.get_mut(domain)?.id = domain;
+        self.mint_genesis(actor, domain, 0, 0);
+        self.trace(EventKind::DomainCreated, actor, domain, 0, max_processes);
+        Ok(domain)
+    }
+
+    pub fn process_domain(&self, process: Ref64) -> Result<Ref64, RuntimeError> {
+        Ok(self.processes.get(process)?.domain)
+    }
+
+    pub fn domain_processes_created(&self, domain: Ref64) -> Result<u32, RuntimeError> {
+        Ok(self.domains.get(domain)?.processes_created)
+    }
+
+    /// Create a direct child whose terminal outcome is reliably reported to
+    /// `supervisor`. Only the supervisor itself (or the system principal) may
+    /// establish the relationship.
+    pub fn create_supervised_process(
+        &mut self,
+        actor: Ref64,
+        supervisor: Ref64,
+        mode: ProcessMode,
+    ) -> Result<Ref64, RuntimeError> {
+        self.create_supervised_process_with_policy(
+            actor,
+            supervisor,
+            mode,
+            SupervisionPolicy::Notify,
+        )
+    }
+
+    pub fn create_supervised_process_with_policy(
+        &mut self,
+        actor: Ref64,
+        supervisor: Ref64,
+        mode: ProcessMode,
+        policy: SupervisionPolicy,
+    ) -> Result<Ref64, RuntimeError> {
+        if policy == SupervisionPolicy::Restart {
+            return Err(RuntimeError::InvalidSupervisionPolicy);
+        }
+        if actor != SYSTEM_PRINCIPAL && actor != supervisor {
+            return Err(RuntimeError::AuthorityDenied);
+        }
+        if matches!(
+            self.process_state(supervisor)?,
+            ProcessState::Failed | ProcessState::Terminated | ProcessState::Cancelled
+        ) {
+            return Err(RuntimeError::ProcessUnavailable);
+        }
+        let domain = self.processes.get(supervisor)?.domain;
+        let child = self.allocate_process(actor, domain, mode)?;
+        let descriptor = self.processes.get_mut(child)?;
+        descriptor.supervisor = supervisor;
+        descriptor.supervision_policy = policy;
+        Ok(child)
+    }
+
+    /// Create a supervised process that is replaced with a fresh generational
+    /// identity and the same entry continuation when it fails. `restart_limit`
+    /// counts replacements; exhausting it escalates failure to the supervisor.
+    pub fn create_restartable_process(
+        &mut self,
+        actor: Ref64,
+        supervisor: Ref64,
+        mode: ProcessMode,
+        restart_limit: u32,
+        entry: ContinuationSpec,
+    ) -> Result<Ref64, RuntimeError> {
+        if restart_limit == 0
+            || (mode == ProcessMode::Pure && entry.state_access == crate::abi::StateAccess::Mutable)
+        {
+            return Err(RuntimeError::InvalidSupervisionPolicy);
+        }
+        let child = self.create_supervised_process(actor, supervisor, mode)?;
+        {
+            let descriptor = self.processes.get_mut(child)?;
+            descriptor.supervision_policy = SupervisionPolicy::Restart;
+            descriptor.restart_limit = restart_limit;
+        }
+        self.restart_blueprints.insert(
+            child.slot,
+            RestartBlueprint {
+                entry: entry.clone(),
+            },
+        );
+        self.create_continuation(child, child, entry)?;
+        Ok(child)
+    }
+
+    pub fn process_restart_lineage(
+        &self,
+        process: Ref64,
+    ) -> Result<(Ref64, u32, u32), RuntimeError> {
+        let descriptor = self.processes.get(process)?;
+        Ok((
+            descriptor.restart_of,
+            descriptor.restart_attempt,
+            descriptor.restart_limit,
+        ))
+    }
+
+    pub(crate) fn has_restart_blueprint(&self, process: Ref64) -> bool {
+        self.restart_blueprints.contains_key(&process.slot)
+    }
+
+    pub fn process_supervisor(&self, process: Ref64) -> Result<Ref64, RuntimeError> {
+        Ok(self.processes.get(process)?.supervisor)
+    }
+
+    /// Receive the oldest direct-child exit notice, or register `continuation`
+    /// to be awakened by the next one. The supervisor's RECEIVE authority over
+    /// its own process gates access to this kernel control queue.
+    pub fn receive_supervision(
+        &mut self,
+        actor: Ref64,
+        continuation: Ref64,
+    ) -> Result<Option<SupervisionNotice>, RuntimeError> {
+        self.authorize(actor, crate::abi::Rights::RECEIVE, actor)?;
+        if !continuation.is_null() && self.continuations.get(continuation)?.process != actor {
+            return Err(RuntimeError::InvalidStateAccess);
+        }
+        self.authority_effect(actor, crate::abi::Rights::RECEIVE, actor);
+        let queue = self
+            .supervision_queues
+            .get_mut(&actor.slot)
+            .ok_or(RuntimeError::MissingMailbox)?;
+        if let Some(notice) = queue.notices.pop_front() {
+            return Ok(Some(notice));
+        }
+        if !continuation.is_null() && !queue.waiters.contains(&continuation) {
+            queue.waiters.push_back(continuation);
+        }
+        Ok(None)
+    }
+
+    pub fn pending_supervision_notices(&self, supervisor: Ref64) -> usize {
+        self.supervision_queues
+            .get(&supervisor.slot)
+            .map(|queue| queue.notices.len())
+            .unwrap_or(0)
+    }
+
+    pub(super) fn notify_supervisor(&mut self, child: Ref64, reason: ExitReason) {
+        let Some((supervisor, failure_count, policy)) =
+            self.processes.get(child).ok().map(|process| {
+                (
+                    process.supervisor,
+                    process.failure_count,
+                    process.supervision_policy,
+                )
+            })
+        else {
+            return;
+        };
+        if supervisor.is_null() {
+            return;
+        }
+        let replacement = if reason == ExitReason::Failed && policy == SupervisionPolicy::Restart {
+            self.restart_process(child).unwrap_or(Ref64::NULL)
+        } else {
+            Ref64::NULL
+        };
+        let waiter = self
+            .supervision_queues
+            .get_mut(&supervisor.slot)
+            .and_then(|queue| {
+                queue.notices.push_back(SupervisionNotice {
+                    child,
+                    replacement,
+                    reason,
+                    failure_count,
+                });
+                queue.waiters.pop_front()
+            });
+        if let Some(waiter) = waiter {
+            self.wake_waiting_continuation(waiter);
+        }
+        self.trace(
+            EventKind::SupervisionNotified,
+            supervisor,
+            child,
+            0,
+            reason as u32,
+        );
+        if reason == ExitReason::Failed && policy == SupervisionPolicy::Escalate {
+            self.fail_process_from_supervision(supervisor, child);
+        }
+        if reason == ExitReason::Failed
+            && policy == SupervisionPolicy::Restart
+            && replacement.is_null()
+        {
+            self.fail_process_from_supervision(supervisor, child);
+        }
+    }
+
+    fn restart_process(&mut self, failed: Ref64) -> Option<Ref64> {
+        let failed_descriptor = self.processes.get(failed).ok()?.clone();
+        if failed_descriptor.restart_attempt >= failed_descriptor.restart_limit {
+            return None;
+        }
+        let blueprint = self.restart_blueprints.get(&failed.slot)?.clone();
+        let replacement = self
+            .allocate_process(
+                failed_descriptor.supervisor,
+                failed_descriptor.domain,
+                failed_descriptor.process_mode,
+            )
+            .ok()?;
+        {
+            let descriptor = self.processes.get_mut(replacement).ok()?;
+            descriptor.supervisor = failed_descriptor.supervisor;
+            descriptor.supervision_policy = SupervisionPolicy::Restart;
+            descriptor.restart_of = failed;
+            descriptor.restart_attempt = failed_descriptor.restart_attempt + 1;
+            descriptor.restart_limit = failed_descriptor.restart_limit;
+            descriptor.base_priority = failed_descriptor.base_priority;
+            descriptor.compute_quota = failed_descriptor.compute_quota;
+            descriptor.memory_quota = failed_descriptor.memory_quota;
+            descriptor.deadline_ns = failed_descriptor.deadline_ns;
+        }
+        self.restart_blueprints
+            .insert(replacement.slot, blueprint.clone());
+        if self
+            .create_continuation(replacement, replacement, blueprint.entry)
+            .is_err()
+        {
+            return None;
+        }
+        self.trace(
+            EventKind::ProcessRestarted,
+            failed_descriptor.supervisor,
+            replacement,
+            0,
+            failed.slot,
+        );
+        Some(replacement)
+    }
+
+    fn fail_process_from_supervision(&mut self, process: Ref64, failed_child: Ref64) {
+        let Ok(status) = self.process_state(process) else {
+            return;
+        };
+        if matches!(
+            status,
+            ProcessState::Failed | ProcessState::Terminated | ProcessState::Cancelled
+        ) {
+            return;
+        }
+        if let Ok(descriptor) = self.processes.get_mut(process) {
+            descriptor.status = ProcessState::Failed as u32;
+            descriptor.failure_count = descriptor.failure_count.wrapping_add(1);
+        }
+        self.contain_process_failure(process, Ref64::NULL);
+        self.trace(EventKind::ProcessFailed, process, failed_child, 0, 1);
+        self.notify_supervisor(process, ExitReason::Failed);
     }
 
     pub fn process_state(&self, p: Ref64) -> Result<ProcessState, RuntimeError> {
@@ -903,6 +1291,7 @@ impl Kernel {
             descriptor.active_continuation = Ref64::NULL;
         }
         self.trace(EventKind::ProcessCancelled, process, Ref64::NULL, 0, 0);
+        self.notify_supervisor(process, ExitReason::Cancelled);
     }
 
     fn cancel_process_continuations(&mut self, process: Ref64, except: Option<Ref64>) {
@@ -956,6 +1345,9 @@ impl Kernel {
             channel
                 .receive_waiters
                 .retain(|waiter| !cancelled.contains(waiter));
+        }
+        for queue in self.supervision_queues.values_mut() {
+            queue.waiters.retain(|waiter| !cancelled.contains(waiter));
         }
     }
 
@@ -1124,6 +1516,134 @@ impl Kernel {
     ) -> Result<crate::abi::continuations::ContinuationState, RuntimeError> {
         let cd = self.continuations.get(c)?;
         Ok(cd.status)
+    }
+
+    // ---- execution contracts -------------------------------------------
+
+    pub(crate) fn contract_is_valid(contract: &ExecutionContract) -> bool {
+        contract.shape == crate::abi::Shape::Scalar
+            && contract.placement_policy == crate::abi::PlacementPolicy::Any
+            && contract.determinism_policy == crate::abi::DeterminismPolicy::Deterministic
+            && contract.minimum_parallelism == 1
+            && contract.preferred_parallelism == 1
+            && contract.maximum_steps > 0
+            && contract.deadline_ns == 0
+    }
+
+    pub fn create_execution_contract(
+        &mut self,
+        actor: Ref64,
+        mut contract: ExecutionContract,
+    ) -> Result<Ref64, RuntimeError> {
+        if !Self::contract_is_valid(&contract) {
+            return Err(RuntimeError::InvalidContract);
+        }
+        let reference = self.contracts.alloc(contract.clone());
+        contract.id = reference;
+        *self.contracts.get_mut(reference)? = contract;
+        self.mint_genesis(actor, reference, 0, 0);
+        self.trace(
+            EventKind::ContractCreated,
+            actor,
+            reference,
+            0,
+            self.contracts.get(reference)?.maximum_steps,
+        );
+        Ok(reference)
+    }
+
+    pub fn create_contracted_continuation(
+        &mut self,
+        actor: Ref64,
+        process: Ref64,
+        contract: Ref64,
+        spec: ContinuationSpec,
+    ) -> Result<Ref64, RuntimeError> {
+        self.authorize(actor, crate::abi::Rights::READ, contract)?;
+        let descriptor = self.contracts.get(contract)?;
+        if !Self::contract_is_valid(descriptor)
+            || spec.max_steps > descriptor.maximum_steps
+            || (descriptor.local_memory_bytes != 0
+                && spec.frame_bytes.len() > descriptor.local_memory_bytes as usize)
+        {
+            return Err(RuntimeError::InvalidContract);
+        }
+        let continuation = self.create_continuation(actor, process, spec)?;
+        self.continuations.get_mut(continuation)?.execution_contract = contract;
+        self.trace(
+            EventKind::ContractAttached,
+            process,
+            continuation,
+            0,
+            contract.slot,
+        );
+        Ok(continuation)
+    }
+
+    pub fn continuation_contract(&self, continuation: Ref64) -> Result<Ref64, RuntimeError> {
+        Ok(self.continuations.get(continuation)?.execution_contract)
+    }
+
+    // ---- modules ---------------------------------------------------------
+
+    fn module_name_hash(name: &str) -> u64 {
+        name.as_bytes()
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            })
+    }
+
+    pub fn load_module(
+        &mut self,
+        actor: Ref64,
+        name: &str,
+        evaluators: &[(u32, u32)],
+    ) -> Result<Ref64, RuntimeError> {
+        if name.trim().is_empty() || evaluators.is_empty() {
+            return Err(RuntimeError::InvalidModule);
+        }
+        let mut manifest = evaluators.to_vec();
+        manifest.sort_unstable_by_key(|entry| entry.0);
+        if manifest.iter().any(|(id, stride)| *id == 0 || *stride == 0)
+            || manifest.windows(2).any(|pair| pair[0].0 == pair[1].0)
+        {
+            return Err(RuntimeError::InvalidModule);
+        }
+        let module = self.modules.alloc(ModuleDescriptor::new(
+            Self::module_name_hash(name.trim()),
+            manifest.len() as u32,
+        ));
+        self.modules.get_mut(module)?.id = module;
+        self.module_evaluators.insert(module.slot, manifest);
+        self.mint_genesis(actor, module, 0, 0);
+        self.trace(
+            EventKind::ModuleLoaded,
+            actor,
+            module,
+            0,
+            evaluators.len() as u32,
+        );
+        Ok(module)
+    }
+
+    pub(crate) fn module_manifest(&self, module: Ref64) -> Option<&[(u32, u32)]> {
+        self.module_evaluators.get(&module.slot).map(Vec::as_slice)
+    }
+
+    pub(crate) fn module_matches(
+        &self,
+        module: Ref64,
+        name: &str,
+        evaluators: &[(u32, u32)],
+    ) -> bool {
+        let Ok(descriptor) = self.modules.get(module) else {
+            return false;
+        };
+        let mut expected = evaluators.to_vec();
+        expected.sort_unstable_by_key(|entry| entry.0);
+        descriptor.name_hash == Self::module_name_hash(name.trim())
+            && self.module_manifest(module) == Some(expected.as_slice())
     }
 
     // ---- futures ---------------------------------------------------------
@@ -1360,6 +1880,112 @@ impl Kernel {
         Ok(Some(entry.descriptor))
     }
 
+    /// Atomically receive one message from every channel in `channels`.
+    /// Nothing is consumed until all inputs are ready. If any open input is
+    /// empty, `continuation` is registered on those inputs and `None` is
+    /// returned; retry removes stale registrations before re-evaluating the
+    /// whole set.
+    pub fn receive_channels_all(
+        &mut self,
+        actor: Ref64,
+        channels: &[Ref64],
+        continuation: Ref64,
+    ) -> Result<Option<Vec<MessageDescriptor>>, RuntimeError> {
+        if channels.is_empty() {
+            return Err(RuntimeError::InvalidMultiInput);
+        }
+        let mut identities = channels
+            .iter()
+            .map(|channel| channel.to_u64())
+            .collect::<Vec<_>>();
+        identities.sort_unstable();
+        identities.dedup();
+        if identities.len() != channels.len() {
+            return Err(RuntimeError::InvalidMultiInput);
+        }
+        if !continuation.is_null() && self.continuations.get(continuation)?.process != actor {
+            return Err(RuntimeError::InvalidStateAccess);
+        }
+        for channel in channels {
+            let _ = self.channels.get(*channel)?;
+            let _ = self
+                .channel_queues
+                .get(&channel.slot)
+                .ok_or(RuntimeError::MissingMailbox)?;
+            self.authorize(actor, crate::abi::Rights::RECEIVE, *channel)?;
+        }
+        for channel in channels {
+            self.authorize(actor, crate::abi::Rights::RECEIVE, *channel)?;
+            self.authority_effect(actor, crate::abi::Rights::RECEIVE, *channel);
+        }
+
+        if !continuation.is_null() {
+            for queue in self.channel_queues.values_mut() {
+                queue
+                    .receive_waiters
+                    .retain(|waiter| *waiter != continuation);
+            }
+        }
+        let mut missing = Vec::new();
+        for channel in channels {
+            let descriptor = self.channels.get(*channel)?;
+            let queue = self
+                .channel_queues
+                .get(&channel.slot)
+                .ok_or(RuntimeError::MissingMailbox)?;
+            if queue.entries.is_empty() {
+                if descriptor.closed != 0 {
+                    return Err(RuntimeError::ChannelClosed);
+                }
+                missing.push(*channel);
+            }
+        }
+        if !missing.is_empty() {
+            if !continuation.is_null() {
+                for channel in missing {
+                    let queue = self
+                        .channel_queues
+                        .get_mut(&channel.slot)
+                        .ok_or(RuntimeError::MissingMailbox)?;
+                    queue.receive_waiters.push_back(continuation);
+                }
+            }
+            return Ok(None);
+        }
+
+        let mut messages = Vec::with_capacity(channels.len());
+        for channel in channels {
+            let (mut entry, sender_waiter) = {
+                let queue = self
+                    .channel_queues
+                    .get_mut(&channel.slot)
+                    .ok_or(RuntimeError::MissingMailbox)?;
+                (
+                    queue.entries.pop_front().expect("all inputs prechecked"),
+                    queue.send_waiters.pop_front(),
+                )
+            };
+            if let Some(waiter) = sender_waiter {
+                self.wake_waiting_continuation(waiter);
+            }
+            let transferred = self
+                .capability_spaces
+                .get_mut(&actor.slot)
+                .ok_or(RuntimeError::MissingCapabilitySpace)?
+                .alloc(entry.payload_authority);
+            entry.descriptor.transferred_capability = transferred;
+            self.trace(
+                EventKind::ChannelReceived,
+                actor,
+                *channel,
+                0,
+                entry.descriptor.sender_sequence as u32,
+            );
+            messages.push(entry.descriptor);
+        }
+        Ok(Some(messages))
+    }
+
     pub fn close_channel(&mut self, actor: Ref64, channel: Ref64) -> Result<(), RuntimeError> {
         self.authorize(actor, crate::abi::Rights::DESTROY, channel)?;
         if self.channels.get(channel)?.closed != 0 {
@@ -1488,6 +2114,29 @@ impl Kernel {
         Ok((collective, completion))
     }
 
+    pub fn create_batch_evaluate_in_module(
+        &mut self,
+        actor: Ref64,
+        module: Ref64,
+        evaluator_id: u32,
+        inputs: Ref64,
+        element_count: u32,
+    ) -> Result<(Ref64, Ref64), RuntimeError> {
+        self.authorize(actor, crate::abi::Rights::READ, module)?;
+        let stride = self
+            .module_manifest(module)
+            .and_then(|manifest| {
+                manifest
+                    .iter()
+                    .find_map(|(id, stride)| (*id == evaluator_id).then_some(*stride))
+            })
+            .ok_or(RuntimeError::InvalidModule)?;
+        let result =
+            self.create_batch_evaluate_for(actor, evaluator_id, inputs, element_count, stride)?;
+        self.collectives.get_mut(result.0)?.module = module;
+        Ok(result)
+    }
+
     pub fn complete_batch_evaluate(
         &mut self,
         actor: Ref64,
@@ -1530,6 +2179,28 @@ impl Kernel {
 
     pub fn collective_evaluator(&self, collective: Ref64) -> Result<u32, RuntimeError> {
         Ok(self.collectives.get(collective)?.evaluator_id)
+    }
+
+    pub fn collective_module(&self, collective: Ref64) -> Result<Ref64, RuntimeError> {
+        Ok(self.collectives.get(collective)?.module)
+    }
+
+    pub fn batch_evaluate_request(
+        &self,
+        collective: Ref64,
+    ) -> Result<(u32, Ref64, u32, u32), RuntimeError> {
+        let descriptor = self.collectives.get(collective)?;
+        if descriptor.collective_kind != crate::abi::CollectiveKind::BatchEvaluate
+            || descriptor.state != CollectiveState::Pending
+        {
+            return Err(RuntimeError::InvalidCollective);
+        }
+        Ok((
+            descriptor.evaluator_id,
+            descriptor.inputs,
+            descriptor.element_count,
+            descriptor.element_stride,
+        ))
     }
 
     fn validate_frozen_array(

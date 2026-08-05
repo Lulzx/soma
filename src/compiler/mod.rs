@@ -1,8 +1,9 @@
-//! Compiler / source-lowering layer (§22, §24).
+//! Compiler and source-lowering layer (§22 and §24 of the historical contract).
 //!
-//! In Phase 1 the source model is realized through generated state machines
-//! rather than a complete language. Each resume point becomes a run class
-//! (§22); frames are byte blobs with a per-run-class layout (see `frame`).
+//! Generated state machines cover continuation programs. The deliberately
+//! small textual module surface in `ir` names batch evaluators and their resume
+//! points; it is not a general-purpose language. Each resume point becomes a
+//! run class; frames are byte blobs with a per-run-class layout (see `frame`).
 
 pub mod frame;
 pub mod ir;

@@ -58,7 +58,10 @@ fn frame_bytes(kernel: &mut Kernel, actor: Ref64, cont: Ref64) -> Vec<u8> {
         .get(cont)
         .map(|c| c.frame)
         .unwrap_or(Ref64::NULL);
-    kernel.object_bytes(actor, obj).map(|b| b.to_vec()).unwrap_or_default()
+    kernel
+        .object_bytes(actor, obj)
+        .map(|b| b.to_vec())
+        .unwrap_or_default()
 }
 
 fn set_frame_bytes(kernel: &mut Kernel, actor: Ref64, cont: Ref64, bytes: Vec<u8>) {
@@ -100,18 +103,19 @@ fn expand_resume_0(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResu
             };
             let mut hb = Vec::new();
             hframe.encode(&mut hb);
-            kernel.create_continuation(
-                process,
-                process,
-                ContinuationSpec::new(
-                    StateAccess::ReadOnly,
-                    SEARCH_HEURISTIC,
-                    0,
-                    hb,
-                    DEFAULT_MAX_STEPS,
-                ),
-            )
-            .expect("a process may create its own continuation");
+            kernel
+                .create_continuation(
+                    process,
+                    process,
+                    ContinuationSpec::new(
+                        StateAccess::ReadOnly,
+                        SEARCH_HEURISTIC,
+                        0,
+                        hb,
+                        DEFAULT_MAX_STEPS,
+                    ),
+                )
+                .expect("a process may create its own continuation");
 
             store_frame(kernel, process, cont, &frame);
             match kernel.await_future(process, cont, fut, EXPAND_RESUME_1) {
@@ -131,7 +135,8 @@ fn expand_resume_0(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResu
 /// `Expand.resume_1`: load the heuristic result and generate a bounded group of
 /// moves, then yield to `EXPAND_RESUME_2`.
 fn expand_resume_1(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResult {
-    let mut frame: ExpandFrame = load_frame(kernel, process, cont, ExpandFrame::initial(0, process));
+    let mut frame: ExpandFrame =
+        load_frame(kernel, process, cont, ExpandFrame::initial(0, process));
     if let Some(vobj) = kernel.future_value(frame.heuristic_future) {
         frame.heuristic_result = kernel.read_u64_object(process, vobj).unwrap_or(0);
     }
@@ -149,7 +154,8 @@ fn expand_resume_1(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResu
 /// therefore recorded in the frame as they happen, so re-entry resumes where it
 /// left off rather than repeating side effects (§8).
 fn expand_resume_2(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResult {
-    let mut frame: ExpandFrame = load_frame(kernel, process, cont, ExpandFrame::initial(0, process));
+    let mut frame: ExpandFrame =
+        load_frame(kernel, process, cont, ExpandFrame::initial(0, process));
 
     while (frame.move_index as usize) < frame.moves.len() {
         let m = frame.moves[frame.move_index as usize];
@@ -184,7 +190,9 @@ fn expand_resume_2(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResu
 
     match kernel.enqueue_message(process, frame.reply_receiver, frame.reply_payload, cont) {
         Ok(()) => StepResult::complete(),
-        Err(RuntimeError::MailboxFull) => StepResult::await_on(frame.reply_receiver, EXPAND_RESUME_2),
+        Err(RuntimeError::MailboxFull) => {
+            StepResult::await_on(frame.reply_receiver, EXPAND_RESUME_2)
+        }
         Err(_) => StepResult::fault(process, EXPAND_RESUME_2),
     }
 }

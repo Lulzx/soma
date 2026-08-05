@@ -32,7 +32,9 @@ pub mod Rights {
             Kind::Capability => TRANSFER | DESTROY,
             Kind::Channel => SEND | RECEIVE | TRANSFER | DESTROY,
             Kind::Collective => READ | WRITE | TRANSFER | DESTROY,
-            _ => DESTROY,
+            Kind::Domain => READ | WRITE | TRANSFER | DESTROY,
+            Kind::Contract => READ | TRANSFER | DESTROY,
+            Kind::Module => READ | TRANSFER | DESTROY,
         }
     }
 }
