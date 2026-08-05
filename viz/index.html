@@ -36,7 +36,7 @@
   }
   section { background: var(--bg); padding: 12px 18px; min-width: 0; min-height: 0; }
   section.stage { display: flex; flex-direction: column; }
-  section.panel { overflow: auto; }
+  section.panel { overflow: auto; display: flex; flex-direction: column; }
   #stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; }
   #world {
     /* Drawn oversized and scaled down to the stage, so the world is as large as
@@ -54,28 +54,41 @@
   input[type=range] { flex: 1; min-width: 120px; accent-color: var(--accent); }
   .modes { display: flex; flex-direction: column; gap: 4px; }
   .modes label {
-    display: flex; align-items: baseline; gap: 8px; padding: 5px 9px; cursor: pointer;
+    display: flex; align-items: baseline; gap: 8px; padding: 4px 9px; cursor: pointer;
     border: 1px solid var(--line); border-radius: 3px; background: var(--panel);
   }
   .modes label.on { border-color: var(--accent); }
   .modes .note { color: var(--dim); font-size: 11px; margin-left: auto; }
   h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .12em; color: var(--dim);
-       margin: 14px 0 6px; font-weight: 600; }
+       margin: 14px 0 2px; font-weight: 600; }
+  .cap { color: var(--dim); font-size: 11px; margin-bottom: 6px; line-height: 1.35; }
+  .cap em { color: var(--ink); font-style: normal; }
+  #intro { border-left: 2px solid var(--accent); padding-left: 10px; margin-bottom: 6px;
+           font-size: 11.5px; line-height: 1.5; color: var(--dim); }
+  #intro strong { color: var(--ink); font-weight: 600; }
+  #metrics th { font-size: 10px; text-transform: uppercase; letter-spacing: .08em;
+                color: var(--dim); font-weight: 600; text-align: right; padding-bottom: 3px; }
+  #metrics th.l { text-align: left; }
+  td.other { text-align: right; color: var(--dim); }
+  td.win { color: var(--accent); }
   h2:first-of-type { margin-top: 0; }
-  .bar { display: grid; grid-template-columns: 104px 1fr 40px; gap: 8px; align-items: center;
+  .bar { display: grid; grid-template-columns: 118px 1fr 40px; gap: 8px; align-items: center;
          height: 16px; }
   .bar .track { display: block; height: 10px; background: #161b24; border-radius: 2px; overflow: hidden; }
   .bar .fill { display: block; height: 100%; min-width: 2px; transition: width .12s linear; }
   .bar .n { text-align: right; color: var(--dim); font-variant-numeric: tabular-nums; }
-  #lanes { display: flex; flex-direction: column; gap: 1px; }
-  #more { height: 16px; }
+  #lanes { display: flex; flex-direction: column; gap: 1px;
+           flex: 1 1 auto; min-height: 0; overflow: hidden; }
+  #more { height: 15px; flex: none; }
+  .panel > h2, .panel > .cap, .panel > .modes, .panel > #bins,
+  .panel > #intro, .panel > table { flex: none; }
   .cohort { display: flex; gap: 1px; align-items: center; height: 10px; }
-  .cohort .tag { width: 104px; font-size: 10px; color: var(--dim); flex: none;
+  .cohort .tag { width: 118px; font-size: 10px; color: var(--dim); flex: none;
                  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .lane { width: 6px; height: 9px; border-radius: 1px; flex: none; }
   .lane.idle { background: #1b2029; }
   table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-  td { padding: 1px 0; }
+  td { padding: 0; font-size: 12px; line-height: 1.4; }
   td.k { color: var(--dim); }
   td.v { text-align: right; }
   .flag { color: var(--warn); }
@@ -112,12 +125,15 @@
 
   <section class="panel">
     <h2>Scheduler</h2>
+    <div class="cap">Same work, binned two ways. <em>Watch the lane groups.</em></div>
     <div class="modes" id="modes"></div>
 
     <h2>Ready continuations</h2>
+    <div class="cap">Ants waiting to run, by chosen behaviour.</div>
     <div id="bins"></div>
 
     <h2>Physical lane groups</h2>
+<div class="cap">One row = one 32-lane dispatch. Grey = wasted lane.</div>
     <div id="lanes"></div>
     <div id="more" class="sub"></div>
 
@@ -127,6 +143,13 @@
 </main>
 
 <footer>
+  <div id="intro">
+    Every ant is its own process, choosing its own next <strong>behaviour</strong> and knowing about no
+    other ant. SOMA packs the ants about to run the <strong>same</strong> behaviour into one SIMD dispatch.
+    Switching scheduler reruns the <strong>identical colony</strong> — the world never changes by a single
+    ant, only how the machine packs it. <strong>predator</strong> kills 48 ants of one colony at epoch 200:
+    the failure is contained to that colony and the rest keep foraging.
+  </div>
   Lane occupancy is a <strong>structural</strong> quantity, computed from how continuations group — a lane
   group spanning <em>k</em> run classes is charged <em>k</em> masked dispatches because a uniform-dispatch
   executive cannot do better. The reference executive runs a cohort's lanes one after another, so nothing
@@ -258,7 +281,7 @@ function drawWorld(run, epoch) {
 // times the dispatches a cohorted one does — and letting the row count drive the
 // layout made the whole panel jump on every frame. Reserving the space costs a
 // little blank area and makes the numbers readable while they change.
-const BIN_ROWS = 8, LANE_ROWS = 13;
+const BIN_ROWS = 8, LANE_ROWS = 26;
 
 function drawBins(run, epoch) {
   const names = run.header.run_classes;
@@ -294,6 +317,25 @@ function drawLanes(run, epoch) {
     ? `+ ${cohorts.length - shown.length} more dispatches this epoch` : '';
 }
 
+// The comparison is the point, and asking someone to toggle back and forth and
+// remember six numbers is a bad way to make it. Both traces are already loaded,
+// so the other scheduler's numbers for the same epoch go in a second column.
+const COMPARE = { 'run-class': 'persistent-fifo', 'persistent-fifo': 'run-class', 'predator': 'run-class' };
+
+function epochStats(run, epoch) {
+  const e = run.epochs[Math.min(epoch, run.epochs.length - 1)];
+  const m = e.metrics;
+  return {
+    occ: m.lane_slots ? m.useful_lane_slots / m.lane_slots : 0,
+    dispatches: m.dispatches,
+    full: m.full_cohorts,
+    waiting: e.bins.reduce((a, [, n]) => a + n, 0),
+    alive: e.ants_alive,
+    launches: m.host_launches,
+    failures: m.failures, notices: m.notices, restarts: m.restarts,
+  };
+}
+
 function drawMetrics(run, epoch) {
   const m = run.epochs[epoch].metrics;
   const e = run.epochs[epoch];
@@ -309,12 +351,25 @@ function drawMetrics(run, epoch) {
     ['Continuations waiting', waiting, 'k'],
     ['Processes alive', e.ants_alive, 'k'],
     ['Host launches', m.host_launches, 'k'],
-    ['Processes failed', m.failures, flag(m.failures)],
-    ['Terminal notices', m.notices, flag(m.notices)],
-    ['Restarts', m.restarts, flag(m.restarts)],
+    // One row rather than three: they are zero for most of a run, and three
+    // rows that only matter together cost three rows of height always.
+    ['Failed / notices', `${m.failures} / ${m.notices}`, flag(m.failures + m.notices)],
   ];
-  document.getElementById('metrics').innerHTML =
-    rows.map(([k, v, cls]) => `<tr><td class="${cls}">${k}</td><td class="v">${v}</td></tr>`).join('');
+  const otherName = COMPARE[current];
+  const other = runs[otherName] ? epochStats(runs[otherName], epoch) : null;
+  const pct = n => (n * 100).toFixed(1) + '%';
+  const otherCol = other ? [
+    pct(other.occ), other.dispatches, other.full, other.waiting,
+    other.alive, other.launches, `${other.failures} / ${other.notices}`,
+  ] : rows.map(() => '');
+
+  // Highlight the two numbers that carry the claim.
+  const highlight = new Set([0, 1, 2]);
+  const head = `<tr><th class="l"></th><th>${current}</th><th>${otherName || ''}</th></tr>`;
+  document.getElementById('metrics').innerHTML = head + rows.map(([k, v, cls], i) =>
+    `<tr><td class="${cls}">${k}</td>` +
+    `<td class="v${highlight.has(i) ? ' win' : ''}">${v}</td>` +
+    `<td class="other">${otherCol[i]}</td></tr>`).join('');
 }
 
 function render() {
