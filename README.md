@@ -69,8 +69,9 @@ Capability spaces, creator genesis, derivation, attenuation, and the structural
 I10a/I10b checks exist. Every right used by a reachable operation is enforced
 at use, including expiry, object-version, range, and parent-chain checks.
 Authority decisions and governed effects are traced, and I10c rejects any
-effect without an adjacent matching grant. Channels, collectives, domains,
-cancellation, and supervision are still absent.
+effect without an adjacent matching grant. Failure containment and cooperative
+cancellation settle sibling work, futures, mailboxes, and waiters. Channels,
+collectives, domains, and supervision are still absent.
 
 The specification has already caught a lifetime bug. `Complete` once retired a
 process when one continuation finished. A second live continuation could then
@@ -158,6 +159,8 @@ Implemented now:
 - Capability-derived unique/frozen object ownership
 - Explicit continuation state-access declarations with checked one-mutator
   scheduling
+- Contained process failure and cooperative cancellation with terminal futures
+  and waiter wakeup
 - A domain-neutral dynamic constraint-search validation workload
 
 Not implemented:
@@ -167,9 +170,8 @@ Not implemented:
 - GPU execution, CPU/GPU migration, and spill
 
 The current job is to finish the machine semantics before adding a surface
-language or GPU backend. Open questions include the fate of a failed process's
-futures and waiters, and cancellation. Encoding those questions in an IR would
-only make the ambiguity harder to remove.
+language or GPU backend. The largest remaining semantic gaps are channels,
+collectives, and supervision.
 
 ## License
 

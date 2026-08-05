@@ -236,7 +236,7 @@ just the first (I5).
 ### 3.3 Dataflow readiness
 
 ```text
-AWAIT(c, f, next_run_class) -> Registered | AlreadyResolved
+AWAIT(c, f, next_run_class) -> Registered | AlreadySettled(state)
   pre     f resolves
   effect  c.run_class := next_run_class; c.dependency := f
           if f is pending: c.status := Waiting; c joins f's wait set
@@ -250,10 +250,10 @@ RESOLVE(f, v)
   trace   ContinuationReady per waiter, then FutureResolved
 ```
 
-The `AlreadyResolved` outcome is not an optimisation. Resolution drains the wait
-set once and never revisits it, so registering on a settled future is a
-permanent stall (I4). The rule returns the distinction so callers cannot make
-that mistake silently.
+The `AlreadySettled` outcome is not an optimisation. Resolution, failure, and
+cancellation drain the wait set once and never revisit it, so registering on a
+settled future is a permanent stall (I4). The returned state lets the caller
+distinguish a value from failure or cancellation.
 
 ### 3.4 Execution and commit
 
@@ -269,7 +269,19 @@ COMMIT(c, p, result)
   Await(t, n)   c.run_class := n; c.status := Waiting; NOT enqueued
   Send | Spawn  if next ≠ 0: continue as Yield; else as Complete
   Fault         c.status := Faulted; p.status := Failed; failure count += 1;
+                cancel sibling continuations; fail p-owned pending futures;
+                drain p's mailbox and wake external waiters/senders;
                 reclaim p's local capability space
+
+CANCEL(actor, p)
+  pre     actor has WRITE on p; p is not terminal
+  effect  if p has an active continuation: p.status := CancelPending and
+          finalize at that continuation's commit boundary;
+          otherwise finalize immediately;
+          finalization cancels live continuations, cancels p-owned pending
+          futures, drains the mailbox, wakes external waiters/senders,
+          reclaims local capabilities, and sets p.status := Cancelled
+  trace   ProcessCancelled
 ```
 
 A continuation becomes runnable or terminal *only* through this rule. That is
@@ -337,7 +349,7 @@ continuations within an epoch provided it preserves I1–I13 and determinism.
 | I14 progress | modelled | by test |
 
 Entities named but not implemented: **Channel**, **Collective**, **Domain**,
-execution contracts, cancellation, and supervision. Messaging is per-process
+execution contracts, and supervision. Messaging is per-process
 mailboxes rather than first-class channels. There is no collective construct at
 all, so the model's claim to cover cooperative execution shapes is currently
 unsupported by any implementation.
@@ -376,36 +388,35 @@ object. Private continuation frames remain governed separately by I8. A `Pure`
 process cannot create a mutable-state continuation, so purity is a construction
 rule rather than a scheduler guess based on process mode.
 
-### 6.3 Unresolved: failure containment
+### 6.3 Failure containment
 
-One authority-lifetime rule is settled: `Fault` reclaims the failed process's
-local capability space, while capabilities already exported as roots into other
-spaces survive. Failure does not cause transitive revocation outside the failed
-holder.
+`Fault` is a containment boundary. The triggering continuation becomes
+`Faulted`; every other live continuation of the process becomes `Cancelled` and
+is removed from scheduler and wait structures. Pending futures owned by the
+process become `Failed`; external waiters become runnable so they can observe
+the terminal future state. The mailbox is drained and external senders blocked
+on its capacity are woken; subsequent sends fail with `ProcessUnavailable`.
+Local capabilities are reclaimed, while previously exported roots survive.
 
-The rest remains unresolved. Nothing says what happens to the failed process's
-other continuations, queued messages, unresolved futures, or anyone awaiting
-them. A future whose resolver faults is never resolved, so its waiters wait
-forever. I14 does not catch this because those continuations are not runnable.
+### 6.4 Cooperative cancellation
 
-### 6.4 Unresolved: cancellation
-
-`CancelPending` and `Cancelled` exist as states with no transition reaching
-them.
+`CANCEL(actor, p)` requires `WRITE` on the target process. With no active
+continuation it finalizes immediately. During execution it records
+`CancelPending`; the active continuation reaches its commit boundary, then the
+same containment cleanup runs with futures becoming `Cancelled` and the process
+ending in `Cancelled`. Cancellation does not preempt a continuation mid-step.
 
 ---
 
 ## 7. Remaining work
 
-1. **Failure and cancellation (§6.3, §6.4).** Process-state ownership is now
-   settled, so this is the next semantic dependency.
-2. **Channels and collectives.** Currently vocabulary, not machinery.
-3. **Validation workloads** beyond the existing domain-neutral dynamic
+1. **Channels and collectives.** Currently vocabulary, not machinery.
+2. **Validation workloads** beyond the existing domain-neutral dynamic
    constraint search: streaming pipelines, actor systems, and irregular
    dataflow, chosen to stress ordering, back-pressure, and failure rather than
    throughput.
-4. **A minimal IR**, after §6.3 is settled. A surface syntax for unresolved
-   failure semantics would preserve the ambiguity.
+3. **A minimal IR.** The ownership and failure blockers are settled; keep the
+   first IR small while channels and collectives remain absent.
 
 Performance work belongs after all of this, and the performance results already
 in this repository (`docs/SOMA-P1.md`, and the cohorting studies) should be read

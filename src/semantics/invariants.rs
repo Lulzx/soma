@@ -167,6 +167,12 @@ fn reference_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
     }
 
     for (r, f) in kernel.futures().iter() {
+        if !f.owner_process.is_null() && !live(kernel, f.owner_process) {
+            out.push(Violation::new(
+                Invariant::ReferenceIntegrity,
+                format!("future {} references a dead owner process", r.slot),
+            ));
+        }
         if f.state == FutureState::Resolved && !f.value.is_null() && !live(kernel, f.value) {
             out.push(Violation::new(
                 Invariant::ReferenceIntegrity,
@@ -213,11 +219,14 @@ fn process_continuation_consistency(kernel: &Kernel, out: &mut Vec<Violation>) {
             c.status,
             ContinuationState::Runnable | ContinuationState::Waiting
         );
-        if schedulable && process.status == ProcessState::Terminated as u32 {
+        let terminal = process.status == ProcessState::Failed as u32
+            || process.status == ProcessState::Terminated as u32
+            || process.status == ProcessState::Cancelled as u32;
+        if schedulable && terminal {
             out.push(Violation::new(
                 Invariant::ProcessContinuationConsistency,
                 format!(
-                    "continuation {} is {:?} but its process {} has terminated",
+                    "continuation {} is {:?} but its process {} is terminal",
                     r.slot, c.status, c.process.slot
                 ),
             ));

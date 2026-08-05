@@ -19,7 +19,7 @@ pub struct FutureDescriptor {
     pub header: AbiHeader,
 
     pub id: Ref64,
-    pub owner_domain: Ref64,
+    pub owner_process: Ref64,
 
     pub state: FutureState,
     pub waiter_count: u32,
@@ -37,7 +37,7 @@ impl FutureDescriptor {
         FutureDescriptor {
             header: AbiHeader::new(7, std::mem::size_of::<FutureDescriptor>() as u32),
             id: Ref64::NULL,
-            owner_domain: Ref64::NULL,
+            owner_process: Ref64::NULL,
             state: FutureState::Pending,
             waiter_count: 0,
             value: Ref64::NULL,

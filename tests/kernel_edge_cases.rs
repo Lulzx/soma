@@ -17,6 +17,7 @@ use soma::compiler::state_machine_lowering::{create_expand, ExpandFrame, SearchF
 use soma::kernel::ownership::{assert_live, freeze, ownership_state, transfer_unique};
 use soma::kernel::{AwaitOutcome, ContinuationSpec, Kernel, RuntimeError, SYSTEM_PRINCIPAL};
 use soma::kernel::raw;
+use soma::semantics::invariants::assert_legal;
 
 /// A leaf search frame: one node that does no work, spawns nothing, completes.
 fn leaf_bytes() -> Vec<u8> {
@@ -162,6 +163,155 @@ fn pure_processes_reject_mutable_state_continuations() {
         ),
         Err(RuntimeError::InvalidStateAccess)
     );
+}
+
+#[test]
+fn failure_cancels_siblings_and_fails_owned_futures_without_stranding_waiters() {
+    let mut kernel = Kernel::new();
+    let owner = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let waiter_process = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let faulting = kernel
+        .create_continuation(
+            owner,
+            owner,
+            ContinuationSpec::new(StateAccess::ReadOnly, 0, 0, Vec::new(), 1),
+        )
+        .unwrap();
+    let sibling = spawn_leaf(&mut kernel, owner);
+    let future = kernel.create_future(owner);
+    kernel
+        .grant_capability(
+            owner,
+            waiter_process,
+            future,
+            soma::abi::Rights::AWAIT,
+            0,
+            0,
+        )
+        .unwrap();
+    let waiter = spawn_leaf(&mut kernel, waiter_process);
+    kernel
+        .await_future(waiter_process, waiter, future, SEARCH_BRANCH)
+        .unwrap();
+    let queued = kernel.create_object(owner, ObjectKind::MessagePayload, vec![1]);
+    kernel
+        .ingest_message(SYSTEM_PRINCIPAL, owner, owner, queued, Ref64::NULL)
+        .unwrap();
+
+    kernel.run_epoch();
+
+    assert_eq!(kernel.process_state(owner).unwrap(), ProcessState::Failed);
+    assert_eq!(
+        kernel.continuation_state(faulting).unwrap(),
+        ContinuationState::Faulted
+    );
+    assert_eq!(
+        kernel.continuation_state(sibling).unwrap(),
+        ContinuationState::Cancelled
+    );
+    assert_eq!(kernel.future_state(future).unwrap(), soma::abi::FutureState::Failed);
+    assert_eq!(
+        kernel.continuation_state(waiter).unwrap(),
+        ContinuationState::Runnable
+    );
+    assert_eq!(kernel.mailbox_len(owner), 0);
+    assert_eq!(kernel.find_capability(owner, future, soma::abi::Rights::AWAIT), None);
+    assert_legal(&kernel);
+}
+
+#[test]
+fn cancellation_settles_futures_and_wakes_senders_blocked_on_the_mailbox() {
+    let mut kernel = Kernel::new();
+    let target = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let sender = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let target_continuation = spawn_leaf(&mut kernel, target);
+    let sender_continuation = spawn_leaf(&mut kernel, sender);
+    let future = kernel.create_future(target);
+    kernel
+        .grant_capability(
+            SYSTEM_PRINCIPAL,
+            sender,
+            target,
+            soma::abi::Rights::SEND,
+            0,
+            0,
+        )
+        .unwrap();
+    for _ in 0..8 {
+        let payload = kernel.create_object(sender, ObjectKind::MessagePayload, vec![0]);
+        kernel
+            .ingest_message(SYSTEM_PRINCIPAL, sender, target, payload, Ref64::NULL)
+            .unwrap();
+    }
+    let blocked_payload = kernel.create_object(sender, ObjectKind::MessagePayload, vec![1]);
+    assert_eq!(
+        kernel.enqueue_message(sender, target, blocked_payload, sender_continuation),
+        Err(RuntimeError::MailboxFull)
+    );
+    {
+        let state = unsafe { raw::state(&mut kernel) };
+        state.scheduler.remove(sender_continuation);
+        state
+            .continuations
+            .get_mut(sender_continuation)
+            .unwrap()
+            .status = ContinuationState::Waiting;
+    }
+
+    kernel.cancel_process(SYSTEM_PRINCIPAL, target).unwrap();
+
+    assert_eq!(kernel.process_state(target).unwrap(), ProcessState::Cancelled);
+    assert_eq!(
+        kernel.continuation_state(target_continuation).unwrap(),
+        ContinuationState::Cancelled
+    );
+    assert_eq!(kernel.future_state(future).unwrap(), soma::abi::FutureState::Cancelled);
+    assert_eq!(kernel.mailbox_len(target), 0);
+    assert_eq!(
+        kernel.continuation_state(sender_continuation).unwrap(),
+        ContinuationState::Runnable
+    );
+    assert_eq!(
+        kernel.enqueue_message(sender, target, blocked_payload, sender_continuation),
+        Err(RuntimeError::ProcessUnavailable)
+    );
+    assert!(kernel
+        .trace_events()
+        .iter()
+        .any(|event| event.event_kind == soma::abi::EventKind::ProcessCancelled));
+    assert_legal(&kernel);
+}
+
+#[test]
+fn cancellation_requested_during_execution_finalizes_at_the_commit_boundary() {
+    let mut kernel = Kernel::new();
+    let process = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let continuation = spawn_leaf(&mut kernel, process);
+    {
+        let state = unsafe { raw::state(&mut kernel) };
+        state.scheduler.remove(continuation);
+        state
+            .processes
+            .get_mut(process)
+            .unwrap()
+            .active_continuation = continuation;
+    }
+
+    kernel.cancel_process(SYSTEM_PRINCIPAL, process).unwrap();
+    assert_eq!(
+        kernel.process_state(process).unwrap(),
+        ProcessState::CancelPending
+    );
+
+    soma::kernel::commit::apply_step_result(
+        &mut kernel,
+        continuation,
+        process,
+        soma::abi::StepResult::complete(),
+    );
+
+    assert_eq!(kernel.process_state(process).unwrap(), ProcessState::Cancelled);
+    assert_legal(&kernel);
 }
 
 // ---- §8: the step budget --------------------------------------------------
@@ -369,7 +519,7 @@ fn awaiting_a_resolved_future_yields_instead_of_parking() {
     // list exactly once, and that already happened.
     assert_eq!(
         kernel.await_future(p, cont, resolved, EXPAND_RESUME_1).unwrap(),
-        AwaitOutcome::AlreadyResolved
+        AwaitOutcome::AlreadySettled(soma::abi::FutureState::Resolved)
     );
     assert_eq!(
         kernel.continuation_state(cont).unwrap(),

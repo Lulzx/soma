@@ -176,6 +176,15 @@ impl Kernel {
     /// Execute a single continuation: enforce the step budget, dispatch to the
     /// interpreter, and commit the result.
     fn execute_cont(&mut self, cont: Ref64, process: Ref64) -> usize {
+        if self
+            .continuations
+            .get(cont)
+            .map(|descriptor| descriptor.status)
+            .ok()
+            != Some(ContinuationState::Runnable)
+        {
+            return 0;
+        }
         let (run_class, remaining, dependency) = self
             .continuations
             .get(cont)

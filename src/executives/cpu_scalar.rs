@@ -118,7 +118,7 @@ fn expand_resume_0(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResu
                 Ok(AwaitOutcome::Registered) => StepResult::await_on(fut, EXPAND_RESUME_1),
                 // The heuristic already resolved, so there is nothing to wait
                 // for; go straight to the next resume point.
-                Ok(AwaitOutcome::AlreadyResolved) => StepResult::yield_next(EXPAND_RESUME_1),
+                Ok(AwaitOutcome::AlreadySettled(_)) => StepResult::yield_next(EXPAND_RESUME_1),
                 Err(_) => StepResult::fault(process, EXPAND_RESUME_0),
             }
         }

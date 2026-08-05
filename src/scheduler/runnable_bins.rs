@@ -49,6 +49,11 @@ impl DoubleBin {
         self.next.len()
     }
 
+    fn remove(&mut self, continuation: Ref64) {
+        self.current.retain(|entry| *entry != continuation);
+        self.next.retain(|entry| *entry != continuation);
+    }
+
     /// Swap `next` into `current` at the epoch boundary.
     fn swap(&mut self) {
         std::mem::swap(&mut self.current, &mut self.next);
@@ -119,6 +124,13 @@ impl Scheduler {
             .entry(bin)
             .or_insert_with(|| DoubleBin::new(u32::MAX))
             .enqueue(cont);
+    }
+
+    /// Remove a continuation from both epoch buffers of every bin.
+    pub fn remove(&mut self, continuation: Ref64) {
+        for bin in self.bins.values_mut() {
+            bin.remove(continuation);
+        }
     }
 
     /// Total runnable continuations in current-epoch buffers (all classes).

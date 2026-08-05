@@ -24,6 +24,7 @@ pub enum ProcessState {
     CancelPending = 5,
     Failed = 6,
     Terminated = 7,
+    Cancelled = 8,
 }
 
 /// Process descriptor (§7).

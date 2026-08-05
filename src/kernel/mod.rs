@@ -28,6 +28,7 @@ pub enum RuntimeError {
     MissingPayload,
     MissingMailbox,
     MailboxFull,
+    ProcessUnavailable,
     InvalidStateAccess,
     AlreadyResolved,
     NotResolved,
@@ -82,7 +83,7 @@ pub enum AwaitOutcome {
     /// The caller should return `StepResult::yield_next` instead — registering
     /// would park the continuation forever, since `resolve_future` drains its
     /// waiter list exactly once.
-    AlreadyResolved,
+    AlreadySettled(FutureState),
 }
 
 /// Inputs for creating one runnable continuation. Grouped so the access
@@ -786,8 +787,190 @@ impl Kernel {
             5 => ProcessState::CancelPending,
             6 => ProcessState::Failed,
             7 => ProcessState::Terminated,
+            8 => ProcessState::Cancelled,
             _ => ProcessState::Created,
         })
+    }
+
+    pub fn cancel_process(&mut self, actor: Ref64, process: Ref64) -> Result<(), RuntimeError> {
+        self.authorize(actor, crate::abi::Rights::WRITE, process)?;
+        let status = self.process_state(process)?;
+        if matches!(
+            status,
+            ProcessState::Failed | ProcessState::Terminated | ProcessState::Cancelled
+        ) {
+            return Err(RuntimeError::ProcessUnavailable);
+        }
+        self.authority_effect(actor, crate::abi::Rights::WRITE, process);
+        let active = {
+            let descriptor = self.processes.get_mut(process)?;
+            descriptor.status = ProcessState::CancelPending as u32;
+            descriptor.active_continuation
+        };
+        if active.is_null() {
+            self.finalize_process_cancellation(process);
+        }
+        Ok(())
+    }
+
+    pub(super) fn contain_process_failure(&mut self, process: Ref64, faulted: Ref64) {
+        self.cancel_process_continuations(process, Some(faulted));
+        self.settle_owned_futures(process, FutureState::Failed);
+        self.drain_terminal_mailbox(process);
+        self.capability_spaces.remove(&process.slot);
+    }
+
+    pub(super) fn finalize_process_cancellation(&mut self, process: Ref64) {
+        self.cancel_process_continuations(process, None);
+        self.settle_owned_futures(process, FutureState::Cancelled);
+        self.drain_terminal_mailbox(process);
+        self.capability_spaces.remove(&process.slot);
+        if let Ok(descriptor) = self.processes.get_mut(process) {
+            descriptor.status = ProcessState::Cancelled as u32;
+            descriptor.active_continuation = Ref64::NULL;
+        }
+        self.trace(EventKind::ProcessCancelled, process, Ref64::NULL, 0, 0);
+    }
+
+    fn cancel_process_continuations(&mut self, process: Ref64, except: Option<Ref64>) {
+        let cancelled: Vec<Ref64> = self
+            .continuations
+            .iter()
+            .filter_map(|(continuation, descriptor)| {
+                (descriptor.process == process
+                    && Some(continuation) != except
+                    && matches!(
+                        descriptor.status,
+                        crate::abi::continuations::ContinuationState::New
+                            | crate::abi::continuations::ContinuationState::Runnable
+                            | crate::abi::continuations::ContinuationState::Waiting
+                            | crate::abi::continuations::ContinuationState::Running
+                    ))
+                .then_some(continuation)
+            })
+            .collect();
+
+        for continuation in &cancelled {
+            self.scheduler.remove(*continuation);
+            if let Ok(descriptor) = self.continuations.get_mut(*continuation) {
+                descriptor.status = crate::abi::continuations::ContinuationState::Cancelled;
+                descriptor.last_run_epoch = self.epoch;
+            }
+            self.trace(
+                EventKind::ContinuationCancelled,
+                process,
+                *continuation,
+                0,
+                0,
+            );
+        }
+
+        for waiters in self.future_waiters.values_mut() {
+            waiters.retain(|waiter| !cancelled.contains(waiter));
+        }
+        for mailbox in self.mailboxes.values_mut() {
+            mailbox
+                .recv_waiters
+                .retain(|waiter| !cancelled.contains(waiter));
+            mailbox
+                .full_waiters
+                .retain(|waiter| !cancelled.contains(waiter));
+        }
+    }
+
+    fn settle_owned_futures(&mut self, process: Ref64, terminal: FutureState) {
+        let futures: Vec<Ref64> = self
+            .futures
+            .iter()
+            .filter_map(|(future, descriptor)| {
+                (descriptor.owner_process == process && descriptor.state == FutureState::Pending)
+                    .then_some(future)
+            })
+            .collect();
+
+        for future in futures {
+            if let Ok(descriptor) = self.futures.get_mut(future) {
+                descriptor.state = terminal;
+                descriptor.resolved_epoch = self.epoch;
+                if terminal == FutureState::Failed {
+                    descriptor.failure = process;
+                }
+            }
+            let waiters = self.future_waiters.remove(&future.slot).unwrap_or_default();
+            for waiter in waiters {
+                let Some((waiter_process, run_class, status)) = self
+                    .continuations
+                    .get(waiter)
+                    .ok()
+                    .map(|descriptor| {
+                        (descriptor.process, descriptor.run_class, descriptor.status)
+                    })
+                else {
+                    continue;
+                };
+                if waiter_process == process
+                    || status != crate::abi::continuations::ContinuationState::Waiting
+                {
+                    continue;
+                }
+                if let Ok(descriptor) = self.continuations.get_mut(waiter) {
+                    descriptor.status = crate::abi::continuations::ContinuationState::Runnable;
+                }
+                self.scheduler.enqueue(run_class, waiter);
+                self.trace(
+                    EventKind::ContinuationReady,
+                    waiter_process,
+                    waiter,
+                    run_class,
+                    0,
+                );
+            }
+            let event = if terminal == FutureState::Failed {
+                EventKind::FutureFailed
+            } else {
+                EventKind::FutureCancelled
+            };
+            self.trace(event, process, Ref64::NULL, 0, future.slot);
+        }
+    }
+
+    fn drain_terminal_mailbox(&mut self, process: Ref64) {
+        let full_waiters = if let Some(mailbox) = self.mailboxes.get_mut(&process.slot) {
+            mailbox.entries.clear();
+            mailbox.recv_waiters.clear();
+            std::mem::take(&mut mailbox.full_waiters)
+        } else {
+            VecDeque::new()
+        };
+
+        for waiter in full_waiters {
+            let Some((waiter_process, run_class, status)) = self
+                .continuations
+                .get(waiter)
+                .ok()
+                .map(|descriptor| {
+                    (descriptor.process, descriptor.run_class, descriptor.status)
+                })
+            else {
+                continue;
+            };
+            if waiter_process == process
+                || status != crate::abi::continuations::ContinuationState::Waiting
+            {
+                continue;
+            }
+            if let Ok(descriptor) = self.continuations.get_mut(waiter) {
+                descriptor.status = crate::abi::continuations::ContinuationState::Runnable;
+            }
+            self.scheduler.enqueue(run_class, waiter);
+            self.trace(
+                EventKind::ContinuationReady,
+                waiter_process,
+                waiter,
+                run_class,
+                0,
+            );
+        }
     }
 
     // ---- continuations ---------------------------------------------------
@@ -801,6 +984,12 @@ impl Kernel {
         spec: ContinuationSpec,
     ) -> Result<Ref64, RuntimeError> {
         self.authorize(actor, crate::abi::Rights::WRITE, process)?;
+        if matches!(
+            self.process_state(process)?,
+            ProcessState::Failed | ProcessState::Terminated | ProcessState::Cancelled
+        ) {
+            return Err(RuntimeError::ProcessUnavailable);
+        }
         if self.processes.get(process)?.process_mode == ProcessMode::Pure
             && spec.state_access == crate::abi::StateAccess::Mutable
         {
@@ -849,7 +1038,7 @@ impl Kernel {
         {
             let f = self.futures.get_mut(r).expect("fresh future");
             f.id = r;
-            f.owner_domain = r;
+            f.owner_process = actor;
         }
         self.mint_genesis(actor, r, 0, 0);
         r
@@ -859,7 +1048,7 @@ impl Kernel {
     /// `next_run_class` and the WAITING state. It is woken by `resolve_future`.
     ///
     /// If the future is *already* resolved, nothing is registered and
-    /// `AlreadyResolved` is returned: the caller must yield rather than await,
+    /// `AlreadySettled` is returned: the caller must yield rather than await,
     /// because `resolve_future` has already drained the waiter list and will
     /// never revisit it.
     pub fn await_future(
@@ -870,19 +1059,20 @@ impl Kernel {
         next_run_class: u32,
     ) -> Result<AwaitOutcome, RuntimeError> {
         self.authorize(actor, crate::abi::Rights::AWAIT, future)?;
-        let resolved = self.futures.get(future)?.state != FutureState::Pending;
+        let future_state = self.futures.get(future)?.state;
+        let settled = future_state != FutureState::Pending;
         let _ = self.continuations.get(cont)?;
         self.authority_effect(actor, crate::abi::Rights::AWAIT, future);
         {
             let c = self.continuations.get_mut(cont)?;
             c.run_class = next_run_class;
             c.dependency = future;
-            if !resolved {
+            if !settled {
                 c.status = crate::abi::continuations::ContinuationState::Waiting;
             }
         }
-        if resolved {
-            return Ok(AwaitOutcome::AlreadyResolved);
+        if settled {
+            return Ok(AwaitOutcome::AlreadySettled(future_state));
         }
         self.future_waiters.entry(future.slot).or_default().push(cont);
         // The `ContinuationWaiting` trace is emitted once, by the commit phase
@@ -910,7 +1100,7 @@ impl Kernel {
             f.resolved_epoch = self.epoch;
         }
         let waiters = self.future_waiters.remove(&future.slot).unwrap_or_default();
-        let owner = self.futures.get(future)?.owner_domain;
+        let owner = self.futures.get(future)?.owner_process;
         for w in waiters {
             let (process, rc) = {
                 let c = self.continuations.get(w).ok();
@@ -938,6 +1128,10 @@ impl Kernel {
         }
     }
 
+    pub fn future_state(&self, future: Ref64) -> Result<FutureState, RuntimeError> {
+        Ok(self.futures.get(future)?.state)
+    }
+
     // ---- messages --------------------------------------------------------
 
     /// Send a message from a continuation into `receiver`'s mailbox with
@@ -952,6 +1146,12 @@ impl Kernel {
         sender_cont: Ref64,
     ) -> Result<(), RuntimeError> {
         self.authorize(actor, crate::abi::Rights::SEND, receiver)?;
+        if matches!(
+            self.process_state(receiver)?,
+            ProcessState::Failed | ProcessState::Terminated | ProcessState::Cancelled
+        ) {
+            return Err(RuntimeError::ProcessUnavailable);
+        }
         if self.mailbox_is_full(receiver)? {
             self.authority_effect(actor, crate::abi::Rights::SEND, receiver);
             return self.push_message(
@@ -991,6 +1191,12 @@ impl Kernel {
     ) -> Result<(), RuntimeError> {
         if actor != SYSTEM_PRINCIPAL {
             return Err(RuntimeError::AuthorityDenied);
+        }
+        if matches!(
+            self.process_state(receiver)?,
+            ProcessState::Failed | ProcessState::Terminated | ProcessState::Cancelled
+        ) {
+            return Err(RuntimeError::ProcessUnavailable);
         }
         if self.mailbox_is_full(receiver)? {
             return self.push_message(
@@ -1084,6 +1290,12 @@ impl Kernel {
     ) -> Result<Option<MessageDescriptor>, RuntimeError> {
         let process = self.continuations.get(cont)?.process;
         self.authorize(actor, crate::abi::Rights::RECEIVE, process)?;
+        if matches!(
+            self.process_state(process)?,
+            ProcessState::Failed | ProcessState::Terminated | ProcessState::Cancelled
+        ) {
+            return Err(RuntimeError::ProcessUnavailable);
+        }
         let _ = self
             .mailboxes
             .get(&process.slot)

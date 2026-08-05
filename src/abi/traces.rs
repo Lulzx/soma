@@ -24,6 +24,9 @@ pub enum EventKind {
     /// target, and right use the same fields as the immediately preceding
     /// `AuthorityGranted` event.
     AuthorityEffect = 16,
+    ContinuationCancelled = 17,
+    FutureFailed = 18,
+    FutureCancelled = 19,
 }
 
 /// Compact trace record (§21).

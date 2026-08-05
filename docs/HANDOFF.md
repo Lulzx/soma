@@ -4,7 +4,7 @@ Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
 Repository: https://github.com/Lulzx/soma. About 7,200 lines of Rust, no
-dependencies, 103 tests, and no Clippy warnings.
+dependencies, 106 tests, and no Clippy warnings.
 
 ```sh
 cargo test
@@ -94,6 +94,8 @@ register state, so another executor can resume the continuation.
   transfer, and freeze by revoking write-bearing capability trees.
 - Explicit `ReadOnly`/`Mutable` continuation declarations for canonical process
   state, with active-continuation enforcement and trace-checked I13 admission.
+- Contained process failure and cancellation: sibling continuations terminate,
+  owned futures settle, mailboxes drain, and external waiters/senders wake.
 
 ### Named by the model and NOT implemented
 
@@ -101,9 +103,7 @@ Treat these as absent, not nearly-done:
 
 - **Channels.** Messaging is per-process mailboxes. `Kind::Channel` is a
   discriminant with no implementation.
-- **Collectives, domains, execution contracts, cancellation, supervision.**
-  Vocabulary only. `CancelPending` and `Cancelled` are states no transition
-  reaches.
+- **Collectives, domains, execution contracts, supervision.** Vocabulary only.
 
 ---
 
@@ -174,12 +174,13 @@ negative fault-injection test.
 
 ### 5.3 Failure containment and cancellation (spec §6.3, §6.4)
 
-This is now the next semantic dependency. Today `Fault` marks a process failed,
-reclaims its local capability space, and increments a counter. Nothing says what
-happens to its other continuations, queued messages, or unresolved futures. A
-future whose resolver faults is never resolved, and its waiters wait forever.
-The progress invariant does not catch this because those continuations are not
-runnable.
+Settled. `Fault` marks the triggering continuation faulted and its siblings
+cancelled. Explicit cancellation is immediate at quiescence or enters
+`CancelPending` until the active continuation commits. Both paths settle every
+owned pending future (`Failed` or `Cancelled`), drain the mailbox, wake external
+future waiters and capacity-blocked senders, remove local waiter registrations,
+and reclaim the local capability space. Terminal mailboxes reject new sends.
+Exported authority roots remain valid.
 
 ### 5.4 Channels and collectives
 
@@ -197,9 +198,8 @@ workloads exercise none of those hard.
 
 ### 5.6 Minimal IR, deliberately deferred
 
-Do not start until 5.2 and 5.3 are settled. A surface syntax over unresolved
-ownership and failure semantics encodes the ambiguity into programs rather than
-removing it.
+The ownership/failure blockers are settled. Keep the first IR deliberately
+small and avoid encoding channels or collectives before their semantics exist.
 
 ### 5.7 Later: GPU OS as an implementation
 

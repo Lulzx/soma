@@ -319,8 +319,8 @@ Each step should land green.
    spaces; advisory owner/mode/count fields are deleted, `WRITE` is linear
    across processes, freeze revokes it, and I9 is subsumed by I10b.
 8. **Settle failure (§7.2). Complete.** A fault reclaims the failed holder's
-   local space; exported roots survive. The broader failure/cancellation work
-   remains explicitly outside this capability decision.
+   local space; exported roots survive. Broader failure/cancellation semantics
+   are now specified separately in `docs/SOMA-v0.2.md` §6.3–§6.4.
 
 ---
 

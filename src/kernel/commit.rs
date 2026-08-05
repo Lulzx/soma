@@ -37,7 +37,7 @@ fn retire_process_if_idle(kernel: &mut Kernel, process: Ref64) {
     });
     if let Ok(p) = kernel.processes.get_mut(process) {
         p.active_continuation = Ref64::NULL;
-        if !still_live {
+        if !still_live && p.status != ProcessState::CancelPending as u32 {
             p.status = ProcessState::Terminated as u32;
         }
     }
@@ -116,12 +116,14 @@ pub fn apply_step_result(kernel: &mut Kernel, cont: Ref64, process: Ref64, resul
                 p.status = ProcessState::Failed as u32;
                 p.failure_count = p.failure_count.wrapping_add(1);
             }
-            // Failure reclaims the holder's local authority. Capabilities
-            // previously exported into other spaces are independent roots and
-            // deliberately survive (§7.2 of the capability design note).
-            kernel.capability_spaces.remove(&process.slot);
+            kernel.contain_process_failure(process, cont);
             kernel.trace(EventKind::ProcessFailed, process, cont, result.next_run_class, 0);
         }
+    }
+    if result.kind != StepKind::Fault
+        && kernel.process_state(process).ok() == Some(ProcessState::CancelPending)
+    {
+        kernel.finalize_process_cancellation(process);
     }
     result.consumed_steps.max(1) as usize
 }
