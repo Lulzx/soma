@@ -18,6 +18,9 @@ fn evaluator(id: u32, name: &str, resume_base: u32) -> BatchEvaluator {
             run_class: resume_base + 101,
             state_access: StateAccess::ReadOnly,
         },
+        // These cases are about identity and stride validation, which is what
+        // I17 covers and which applies to bodyless evaluators too.
+        body: None,
     }
 }
 

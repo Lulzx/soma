@@ -21,20 +21,13 @@ use crate::kernel::Kernel;
 /// against a terminated process. The semantic checker reports that as an I3
 /// violation, which is how this was found.
 ///
-/// This is a linear scan of the continuation table per completion. The
-/// reference model is written for clarity over speed; a real implementation
-/// would keep a per-process count.
+/// The answer comes from `ProcessDescriptor::live_continuations`, maintained
+/// incrementally by `Kernel::set_continuation_status`. This used to be a linear
+/// scan of the continuation table on every completion, which is O(n) per commit
+/// and not survivable under a concurrent scheduler. I3 checks the count against
+/// an actual scan, so the fast path cannot drift from the truth unnoticed.
 fn retire_process_if_idle(kernel: &mut Kernel, process: Ref64) {
-    let still_live = kernel.continuations.iter().any(|(_, c)| {
-        c.process == process
-            && matches!(
-                c.status,
-                ContinuationState::New
-                    | ContinuationState::Runnable
-                    | ContinuationState::Waiting
-                    | ContinuationState::Running
-            )
-    });
+    let still_live = kernel.has_live_continuation(process);
     let mut terminated = false;
     if let Ok(p) = kernel.processes.get_mut(process) {
         p.active_continuation = Ref64::NULL;
@@ -60,10 +53,7 @@ pub fn apply_step_result(
 ) -> usize {
     match result.kind {
         StepKind::Complete => {
-            if let Ok(c) = kernel.continuations.get_mut(cont) {
-                c.status = ContinuationState::Completed;
-                c.last_run_epoch = kernel.epoch;
-            }
+            kernel.set_continuation_status(cont, ContinuationState::Completed);
             retire_process_if_idle(kernel, process);
             kernel.trace(
                 EventKind::ContinuationCompleted,
@@ -77,9 +67,8 @@ pub fn apply_step_result(
             let rc = result.next_run_class;
             if let Ok(c) = kernel.continuations.get_mut(cont) {
                 c.run_class = rc;
-                c.status = ContinuationState::Runnable;
-                c.last_run_epoch = kernel.epoch;
             }
+            kernel.set_continuation_status(cont, ContinuationState::Runnable);
             kernel.scheduler.enqueue(rc, cont);
             kernel.trace(EventKind::ContinuationYielded, process, cont, rc, 0);
         }
@@ -87,9 +76,8 @@ pub fn apply_step_result(
             let rc = result.next_run_class;
             if let Ok(c) = kernel.continuations.get_mut(cont) {
                 c.run_class = rc;
-                c.status = ContinuationState::Waiting;
-                c.last_run_epoch = kernel.epoch;
             }
+            kernel.set_continuation_status(cont, ContinuationState::Waiting);
             // No immediate re-enqueue: the waiter is woken later by
             // `resolve_future` / `enqueue_message`. This is the single
             // `ContinuationWaiting` emission for every await path; `auxiliary`
@@ -111,26 +99,19 @@ pub fn apply_step_result(
             if result.next_run_class != 0 {
                 // Continue in the next run class.
                 if let Ok(c) = kernel.continuations.get_mut(cont) {
-                    c.status = ContinuationState::Runnable;
                     c.run_class = result.next_run_class;
-                    c.last_run_epoch = kernel.epoch;
                 }
+                kernel.set_continuation_status(cont, ContinuationState::Runnable);
                 kernel.scheduler.enqueue(result.next_run_class, cont);
             } else {
                 // No continuation remains: the node is done.
-                if let Ok(c) = kernel.continuations.get_mut(cont) {
-                    c.status = ContinuationState::Completed;
-                    c.last_run_epoch = kernel.epoch;
-                }
+                kernel.set_continuation_status(cont, ContinuationState::Completed);
                 retire_process_if_idle(kernel, process);
             }
             kernel.trace(kind, process, cont, result.next_run_class, 0);
         }
         StepKind::Fault => {
-            if let Ok(c) = kernel.continuations.get_mut(cont) {
-                c.status = ContinuationState::Faulted;
-                c.last_run_epoch = kernel.epoch;
-            }
+            kernel.set_continuation_status(cont, ContinuationState::Faulted);
             if let Ok(p) = kernel.processes.get_mut(process) {
                 p.status = ProcessState::Failed as u32;
                 p.failure_count = p.failure_count.wrapping_add(1);

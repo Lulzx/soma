@@ -4,7 +4,7 @@ Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
 Repository: https://github.com/Lulzx/soma. The default semantic core is
-dependency-free. There are 151 integration tests, one doc test, and no Clippy
+dependency-free. There are 192 integration tests, one doc test, and no Clippy
 warnings. The optional `metal` feature adds the `metal-rs` implementation
 dependency on macOS.
 
@@ -43,7 +43,7 @@ Two documents, and they are not equals:
 | Doc | Status |
 | --- | --- |
 | `docs/SOMA-v0.2.md` | **Current.** The semantic specification. Start here. |
-| `docs/SOMA-v0.3.md` | Scope for the next version. Nothing in it is implemented. Read after v0.2 if you are picking up new work. |
+| `docs/SOMA-v0.3.md` | **Current for anything added since v0.2.** §1–§3 are implemented and checked: the equivalence relation, evaluator bodies, and the carried debts. §4–§6 scope the device scheduler, the distributed implementation, and performance work, none of which has started. |
 | `docs/SOMA-P1.md` | Historical. The original broad Phase-1 contract, still referenced by `§n` markers in code comments. Useful context, but it describes a wider system than the one being built, and its framing is what the refocus moved away from. |
 
 The directory is still named `gpu-os` and the crate `soma`. Harmless, but expect
@@ -70,8 +70,11 @@ src/
   scheduler/   runnable_bins.rs contains double-buffered run-class bins.
                cohorts.rs builds cohorts and computes dispatch cost.
   compiler/    frame.rs encodes frames. state_machine_lowering.rs contains the
-               hand-lowered Expand example.
+               hand-lowered Expand example. body.rs is the evaluator body
+               language and its MSL codegen; examples.rs holds the example
+               module both backends are checked against.
   semantics/   invariants.rs checks the executable part of the specification.
+               order.rs derives the semantic order and checks I18/I19.
   replay/      trace comparison for determinism checks.
   experiments/ measurement only. None of it is part of the machine.
 ```
@@ -125,13 +128,27 @@ register state, so another executor can resume the continuation.
   spill, placement-change accounting, and an optional real Metal compute
   implementation.
 
+Added in v0.3:
+
+- A semantic order ≺ derived from the transition rules, and conformance
+  (I18) and placement-neutrality (I19) checks against it. Trace equality no
+  longer excludes every parallel implementation by construction.
+- An evaluator body language with one source lowered to both the CPU
+  interpreter and generated Metal Shading Language, and backend agreement
+  (I20) checked against real GPU hardware. The hardcoded `2*x + 1` in both
+  backends is gone.
+- Bounded progress (I21), which absorbs v0.2's only `[modelled]` clause and
+  adds a starvation bound.
+- Per-process live-continuation counts in place of a table scan per commit,
+  and generation-exhausted slots retired rather than wrapped.
+
 ### Semantic boundary
 
-No entity or invariant named by `SOMA-v0.2.md` remains absent. The minimal
-module language/loader and a collective-level Metal backend now exist as
-extensions. A general language, device-resident scheduler, and distributed
-implementation remain beyond v0.2 conformance, not guarantees silently claimed
-by the current machine.
+No entity or invariant named by `SOMA-v0.2.md` remains absent, and v0.3 §1–§3
+are implemented and checked. A device-resident scheduler, a distributed
+implementation, and hardware performance results remain beyond conformance —
+scoped in v0.3 §4–§6, and not guarantees silently claimed by the current
+machine.
 
 ---
 
@@ -333,12 +350,19 @@ decision that would otherwise depend on `HashMap` iteration order.
 
 ## 7. Traps
 
-- **`retire_process_if_idle`** in `commit.rs` is a linear scan of the
-  continuation table per completion. Fine for a reference model, wrong for
-  anything real. A production implementation wants a per-process live count.
-- **16-bit generations** bound staleness detection rather than guaranteeing it:
-  a slot recycled 65,536 times wraps and a stale ref can validate. Documented in
-  `abi/refs.rs`. Matters if references are ever persisted.
+- **Continuation status must change through `set_continuation_status`.**
+  `retire_process_if_idle` no longer scans the continuation table; it reads the
+  per-process count that helper maintains. A status write that bypasses it
+  leaves the count stale, which I3 reports. (Was a trap; now a rule.)
+- **16-bit generations** no longer wrap: `GenTable::delete` retires an exhausted
+  slot instead. Staleness detection is guaranteed rather than bounded, at a cost
+  of one withdrawn slot per 65,535 recycles. What is *still* missing for a
+  distributed implementation is a node identity in `Ref64`, so two nodes cannot
+  allocate colliding references. See v0.3 §1.2.
+- **Trace `causal` is load-bearing for I18.** Adding an event that participates
+  in a cross-entity happens-before edge without setting `causal` silently drops
+  that edge, and a dropped edge makes the conformance checker weaker without
+  making any test fail. `trace_caused` is the way to set it.
 - **`§n` comments refer to `docs/SOMA-P1.md`**, the historical contract, not to
   the v0.2 spec. The v0.2 spec uses `I1..I17` and `§6.x`.
 - **`experiments/` is not the machine.** Nothing there is part of SOMA's
@@ -362,9 +386,7 @@ decision that would otherwise depend on `HashMap` iteration order.
 3. Break something on purpose. Flip a condition in `commit.rs` and confirm the
    invariant checker catches it. That tells you the safety net is real before
    you rely on it.
-4. Read the supervision-tree and multi-input reports, then read
-   `docs/SOMA-v0.3.md`. It scopes the four extensions — a general evaluator
-   compiler, persistent device scheduling, a trace-equivalent distributed
-   implementation, and hardware performance work — and identifies the one
-   specification change that blocks three of them. Two carried debts from §7
-   above are on its critical path and neither needs the spec settled first.
+4. Read `docs/SOMA-v0.3.md`. §2 and §3 explain the two pieces of machinery
+   most likely to surprise you — why trace equality had to go, and why both
+   backends used to agree about nothing. Then pick up §4 (the persistent device
+   scheduler), which is unblocked and is the next piece.

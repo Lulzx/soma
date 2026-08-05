@@ -7,6 +7,7 @@
 //! worse than no checker, because it would read as evidence.
 
 use soma::abi::continuations::ContinuationState;
+use soma::abi::cohorts::PartialCohortPolicy;
 use soma::abi::objects::OwnershipState;
 use soma::abi::{
     EventKind, Kind, ObjectKind, ProcessMode, ProcessState, Ref64, Rights, StateAccess, TraceEvent,
@@ -591,4 +592,126 @@ fn i10c_catches_an_effect_without_an_adjacent_grant() {
     ));
 
     assert!(violated(&kernel, Invariant::NoUnauthorizedEffect));
+}
+
+// ---- I21: bounded progress -----------------------------------------------
+
+#[test]
+fn i21_holds_across_every_partial_cohort_policy() {
+    // The `Defer` policy is the one that could withhold work indefinitely, so
+    // it is the one worth running to quiescence. The forward-progress re-plan
+    // in `run_epoch` is what keeps it legal.
+    for policy in [
+        PartialCohortPolicy::RunPartial,
+        PartialCohortPolicy::Defer,
+        PartialCohortPolicy::SendToCpu,
+        PartialCohortPolicy::MergeWithGenericClass,
+    ] {
+        let mut kernel = build(&ControlKnobs {
+            branching_factor: 3,
+            depth: 3,
+            process_count: 2,
+            class_count: 4,
+            ..ControlKnobs::default()
+        });
+        kernel.configure_cohorts(8, policy);
+        kernel.run_to_quiescence(500);
+        assert!(
+            !violated(&kernel, Invariant::BoundedProgress),
+            "{policy:?} starved or withheld work"
+        );
+        assert_eq!(kernel.accounting().stalled_epochs, 0);
+    }
+}
+
+#[test]
+fn i21_catches_an_epoch_that_admitted_work_and_dispatched_none() {
+    let mut kernel = Kernel::new();
+    let process = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    leaf(&mut kernel, process);
+    assert!(!violated(&kernel, Invariant::BoundedProgress));
+
+    // Fault injection for the no-withholding half: a scheduler that admits
+    // work and dispatches nothing must be reported, or a deferral policy could
+    // idle forever and look healthy.
+    unsafe { raw::state(&mut kernel) }.accounting.stalled_epochs = 1;
+
+    assert!(violated(&kernel, Invariant::BoundedProgress));
+}
+
+#[test]
+fn i21_catches_a_continuation_starved_past_the_bound() {
+    let mut kernel = Kernel::new();
+    let process = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let continuation = leaf(&mut kernel, process);
+    kernel.set_deferral_bound(4);
+    assert!(!violated(&kernel, Invariant::BoundedProgress));
+
+    // Fault injection for the no-starvation half: age the machine past the
+    // bound without ever running this runnable continuation.
+    {
+        let state = unsafe { raw::state(&mut kernel) };
+        *state.epoch = 100;
+        let descriptor = state.continuations.get_mut(continuation).unwrap();
+        descriptor.created_epoch = 0;
+        descriptor.last_run_epoch = 0;
+    }
+
+    assert!(violated(&kernel, Invariant::BoundedProgress));
+}
+
+#[test]
+fn the_deferral_bound_is_what_decides_starvation() {
+    // The control for the test above: the same aged state is legal under a
+    // bound wide enough to admit it, so the violation reports the bound rather
+    // than the age.
+    let mut kernel = Kernel::new();
+    let process = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let continuation = leaf(&mut kernel, process);
+    {
+        let state = unsafe { raw::state(&mut kernel) };
+        *state.epoch = 100;
+        let descriptor = state.continuations.get_mut(continuation).unwrap();
+        descriptor.created_epoch = 0;
+        descriptor.last_run_epoch = 0;
+    }
+
+    kernel.set_deferral_bound(4);
+    assert!(violated(&kernel, Invariant::BoundedProgress));
+
+    kernel.set_deferral_bound(1000);
+    assert!(!violated(&kernel, Invariant::BoundedProgress));
+}
+
+#[test]
+fn i3_catches_a_stale_live_continuation_count() {
+    // `retire_process_if_idle` used to scan the whole continuation table on
+    // every completion. It now reads a cached per-process count, which is
+    // derived state and can drift if any status write bypasses
+    // `set_continuation_status`. I3 recomputes it the slow way, so the fast
+    // path cannot go wrong unnoticed.
+    let mut kernel = Kernel::new();
+    let process = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    leaf(&mut kernel, process);
+    assert!(!violated(&kernel, Invariant::ProcessContinuationConsistency));
+
+    unsafe { raw::state(&mut kernel) }
+        .processes
+        .get_mut(process)
+        .unwrap()
+        .live_continuations += 1;
+
+    assert!(violated(&kernel, Invariant::ProcessContinuationConsistency));
+}
+
+#[test]
+fn the_live_continuation_count_tracks_a_whole_workload() {
+    // The count is only useful if it agrees with reality through spawns,
+    // completions, and failures — not just at rest.
+    let mut kernel = Kernel::new();
+    create_expand(&mut kernel, 7);
+    for _ in 0..20 {
+        kernel.run_epoch();
+        assert!(!violated(&kernel, Invariant::ProcessContinuationConsistency));
+    }
 }

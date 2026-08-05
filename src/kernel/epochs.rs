@@ -97,6 +97,14 @@ impl Kernel {
                 .collect();
         }
 
+        // I21, first half: an epoch that admitted work must dispatch some of
+        // it. The re-plan above is what makes this hold under `Defer`; the
+        // counter exists so that a future policy which withholds work cannot
+        // do so silently. A deferral policy may delay work, not withhold it.
+        if !admitted.is_empty() && plans.iter().all(|plan| plan.is_empty()) {
+            self.accounting.stalled_epochs += 1;
+        }
+
         // Phase F: Execute (CPU scalar — a cohort's lanes run in lane order).
         let mut steps = 0;
         for plan in &plans {

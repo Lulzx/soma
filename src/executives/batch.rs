@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 use crate::abi::{ObjectKind, Ref64};
+use crate::compiler::body::EvaluatorProgram;
 use crate::kernel::ownership::freeze;
 use crate::kernel::{Kernel, RuntimeError};
 
@@ -34,6 +35,15 @@ impl From<RuntimeError> for BackendError {
 pub trait BatchBackend {
     fn kind(&self) -> BackendKind;
 
+    /// Make `program` available to this backend under its evaluator id.
+    ///
+    /// A backend answers only for bodies it has been given. Before v0.3 the
+    /// trait took an `evaluator_id` that every implementation ignored while
+    /// hardcoding one function, so nothing could tell a correct backend from
+    /// one returning arbitrary bytes. Installation is what makes
+    /// `UnsupportedEvaluator` an honest answer rather than a guess.
+    fn install(&mut self, program: &EvaluatorProgram) -> Result<(), BackendError>;
+
     fn evaluate(
         &mut self,
         evaluator_id: u32,
@@ -43,41 +53,80 @@ pub trait BatchBackend {
     ) -> Result<Vec<u8>, BackendError>;
 }
 
-/// Dependency-free scalar reference backend for the example evaluator:
-/// transform the first little-endian u32 in each element as `2*x + 1` and
-/// preserve any remaining bytes in the element.
+/// Split `inputs` into elements, apply `element` to each, and return the
+/// result. Shared by every backend's argument checking so that two backends
+/// cannot disagree about what a malformed request is.
+pub fn evaluate_elementwise(
+    inputs: &[u8],
+    element_count: u32,
+    element_stride: u32,
+    mut element: impl FnMut(&[u8], &mut [u8]),
+) -> Result<Vec<u8>, BackendError> {
+    let stride = element_stride as usize;
+    if stride == 0 {
+        return Err(BackendError::InvalidInput);
+    }
+    let required = (element_count as usize)
+        .checked_mul(stride)
+        .ok_or(BackendError::InvalidInput)?;
+    if inputs.len() < required {
+        return Err(BackendError::InvalidInput);
+    }
+    // The output starts as a copy of the input, so fields a body does not
+    // store keep their incoming bytes.
+    let mut outputs = inputs[..required].to_vec();
+    for index in 0..element_count as usize {
+        let range = index * stride..(index + 1) * stride;
+        let source = inputs[range.clone()].to_vec();
+        element(&source, &mut outputs[range]);
+    }
+    Ok(outputs)
+}
+
+/// Dependency-free scalar backend. It interprets whatever body it was given,
+/// and under I20 it is the definition every other backend is checked against.
 #[derive(Debug, Default)]
-pub struct CpuReferenceBackend;
+pub struct CpuReferenceBackend {
+    programs: HashMap<u32, EvaluatorProgram>,
+}
+
+impl CpuReferenceBackend {
+    pub fn with(programs: &[&EvaluatorProgram]) -> Self {
+        let mut backend = Self::default();
+        for program in programs {
+            let _ = backend.install(program);
+        }
+        backend
+    }
+}
 
 impl BatchBackend for CpuReferenceBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Cpu
     }
 
+    fn install(&mut self, program: &EvaluatorProgram) -> Result<(), BackendError> {
+        self.programs.insert(program.id(), program.clone());
+        Ok(())
+    }
+
     fn evaluate(
         &mut self,
-        _evaluator_id: u32,
+        evaluator_id: u32,
         inputs: &[u8],
         element_count: u32,
         element_stride: u32,
     ) -> Result<Vec<u8>, BackendError> {
-        let stride = element_stride as usize;
-        let required = (element_count as usize)
-            .checked_mul(stride)
-            .ok_or(BackendError::InvalidInput)?;
-        if stride < 4 || inputs.len() < required {
+        let program = self
+            .programs
+            .get(&evaluator_id)
+            .ok_or(BackendError::UnsupportedEvaluator)?;
+        if program.stride() != element_stride {
             return Err(BackendError::InvalidInput);
         }
-        let mut outputs = inputs[..required].to_vec();
-        for element in outputs.chunks_exact_mut(stride) {
-            let value = u32::from_le_bytes(
-                element[..4]
-                    .try_into()
-                    .map_err(|_| BackendError::InvalidInput)?,
-            );
-            element[..4].copy_from_slice(&value.wrapping_mul(2).wrapping_add(1).to_le_bytes());
-        }
-        Ok(outputs)
+        evaluate_elementwise(inputs, element_count, element_stride, |source, target| {
+            program.evaluate_element(source, target)
+        })
     }
 }
 
@@ -119,6 +168,81 @@ fn publish(
     freeze(kernel, actor, output)?;
     kernel.complete_batch_evaluate(actor, collective, output)?;
     Ok(output)
+}
+
+/// One way two backends disagreed about a body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgreementViolation {
+    pub evaluator: u32,
+    pub detail: String,
+}
+
+impl std::fmt::Display for AgreementViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "evaluator {}: {}", self.evaluator, self.detail)
+    }
+}
+
+/// **I20. Backend agreement.**
+///
+/// For a given evaluator and frozen input, every backend claiming to realize
+/// that evaluator produces identical output bytes. A backend that cannot
+/// realize a body must return `UnsupportedEvaluator` rather than an
+/// approximation — an approximation is indistinguishable from a correct answer
+/// to every other invariant in the machine, which is exactly why this clause
+/// has to exist separately.
+///
+/// The first backend in `backends` is the definition; the rest are checked
+/// against it. Ordering matters and the CPU interpreter should come first,
+/// because it is the one whose behaviour the body language specifies.
+pub fn check_agreement(
+    program: &EvaluatorProgram,
+    inputs: &[u8],
+    element_count: u32,
+    backends: &mut [&mut dyn BatchBackend],
+) -> Vec<AgreementViolation> {
+    let mut out = Vec::new();
+    let stride = program.stride();
+    let Some((first, rest)) = backends.split_first_mut() else {
+        return out;
+    };
+    let expected = match first.evaluate(program.id(), inputs, element_count, stride) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            out.push(AgreementViolation {
+                evaluator: program.id(),
+                detail: format!("the defining backend could not evaluate it: {error:?}"),
+            });
+            return out;
+        }
+    };
+    for backend in rest.iter_mut() {
+        match backend.evaluate(program.id(), inputs, element_count, stride) {
+            Ok(actual) if actual == expected => {}
+            Ok(actual) => {
+                let position = actual
+                    .iter()
+                    .zip(&expected)
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(expected.len().min(actual.len()));
+                out.push(AgreementViolation {
+                    evaluator: program.id(),
+                    detail: format!(
+                        "{:?} backend differs from the definition at byte {}",
+                        backend.kind(),
+                        position
+                    ),
+                });
+            }
+            // Declining is allowed. Answering wrongly is not.
+            Err(BackendError::UnsupportedEvaluator) => {}
+            Err(error) => out.push(AgreementViolation {
+                evaluator: program.id(),
+                detail: format!("{:?} backend failed: {error:?}", backend.kind()),
+            }),
+        }
+    }
+    out
 }
 
 pub fn execute_with_spill(

@@ -1,4 +1,6 @@
 use soma::abi::{ObjectKind, ProcessMode};
+use soma::compiler::body::EvaluatorProgram;
+use soma::compiler::examples;
 use soma::executives::batch::{
     execute_with_spill, BackendError, BackendKind, BatchBackend, CpuReferenceBackend,
     PlacementStats,
@@ -6,12 +8,20 @@ use soma::executives::batch::{
 use soma::kernel::ownership::freeze;
 use soma::kernel::{Kernel, SYSTEM_PRINCIPAL};
 
+/// An "accelerator" that is really the CPU interpreter. It exists to exercise
+/// the placement and spill machinery without a GPU; agreement between it and
+/// the CPU path is therefore not evidence about codegen, which is what
+/// `tests/evaluator_bodies.rs` and `tests/metal_backend.rs` are for.
 #[derive(Default)]
 struct ReferenceAccelerator(CpuReferenceBackend);
 
 impl BatchBackend for ReferenceAccelerator {
     fn kind(&self) -> BackendKind {
         BackendKind::Accelerator
+    }
+
+    fn install(&mut self, program: &EvaluatorProgram) -> Result<(), BackendError> {
+        self.0.install(program)
     }
 
     fn evaluate(
@@ -33,6 +43,10 @@ impl BatchBackend for UnavailableAccelerator {
         BackendKind::Accelerator
     }
 
+    fn install(&mut self, _program: &EvaluatorProgram) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     fn evaluate(
         &mut self,
         _evaluator_id: u32,
@@ -42,6 +56,19 @@ impl BatchBackend for UnavailableAccelerator {
     ) -> Result<Vec<u8>, BackendError> {
         Err(BackendError::Unavailable)
     }
+}
+
+/// The CPU backend with every example body installed.
+fn cpu_backend() -> CpuReferenceBackend {
+    CpuReferenceBackend::with(&examples::module().programs())
+}
+
+fn reference_accelerator() -> ReferenceAccelerator {
+    let mut backend = ReferenceAccelerator::default();
+    for program in examples::module().programs() {
+        backend.install(program).unwrap();
+    }
+    backend
 }
 
 fn batch(kernel: &mut Kernel, owner: soma::abi::Ref64, values: &[u32]) -> soma::abi::Ref64 {
@@ -71,8 +98,8 @@ fn accelerator_and_cpu_publish_identical_frozen_results() {
     let mut kernel = Kernel::new();
     let owner = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
     let collective = batch(&mut kernel, owner, &[1, 2, 3, 4]);
-    let mut accelerator = ReferenceAccelerator::default();
-    let mut cpu = CpuReferenceBackend;
+    let mut accelerator = reference_accelerator();
+    let mut cpu = cpu_backend();
     let mut stats = PlacementStats::default();
 
     let output = execute_with_spill(
@@ -99,7 +126,7 @@ fn unavailable_or_underfilled_accelerator_work_spills_to_cpu() {
     let unavailable = batch(&mut kernel, owner, &[10, 20, 30, 40]);
     let small = batch(&mut kernel, owner, &[5]);
     let mut accelerator = UnavailableAccelerator;
-    let mut cpu = CpuReferenceBackend;
+    let mut cpu = cpu_backend();
     let mut stats = PlacementStats::default();
 
     let first = execute_with_spill(
@@ -119,7 +146,7 @@ fn unavailable_or_underfilled_accelerator_work_spills_to_cpu() {
         owner,
         small,
         4,
-        &mut ReferenceAccelerator::default(),
+        &mut reference_accelerator(),
         &mut cpu,
         &mut stats,
     )
@@ -135,8 +162,8 @@ fn switching_backend_at_a_collective_boundary_counts_as_migration() {
     let owner = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
     let large = batch(&mut kernel, owner, &[1, 2, 3, 4]);
     let small = batch(&mut kernel, owner, &[5]);
-    let mut accelerator = ReferenceAccelerator::default();
-    let mut cpu = CpuReferenceBackend;
+    let mut accelerator = reference_accelerator();
+    let mut cpu = cpu_backend();
     let mut stats = PlacementStats::default();
 
     execute_with_spill(

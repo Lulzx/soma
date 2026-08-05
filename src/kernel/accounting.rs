@@ -24,6 +24,12 @@ pub struct Accounting {
     pub deferred_lanes: u64,
     /// Continuations deferred by the serial-process invariant (§19).
     pub serial_deferrals: u64,
+    /// Epochs that admitted work and then dispatched nothing.
+    ///
+    /// I21's first half is a statement about a transition, not a state, so it
+    /// cannot be read off the tables afterwards. Counting the stalls as they
+    /// happen turns it into one that can: a legal run has none.
+    pub stalled_epochs: u64,
 }
 
 impl Accounting {

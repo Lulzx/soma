@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 
 use crate::abi::{Ref64, StateAccess};
+use crate::compiler::body::{BodyError, EvaluatorProgram};
 use crate::kernel::{Kernel, RuntimeError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,6 +29,14 @@ pub struct BatchEvaluator {
     pub schema: FrozenArraySchema,
     pub entry: ResumePoint,
     pub completion: ResumePoint,
+    /// What this evaluator computes, when the module declares it.
+    ///
+    /// `None` names an evaluator without describing it, which is all this IR
+    /// could do before v0.3. A module in that form can still be loaded and
+    /// linked — I17 covers identity and stride either way — but no backend can
+    /// realize it, so `execute_with_spill` reports `UnsupportedEvaluator`
+    /// rather than applying whatever it happened to have compiled in.
+    pub body: Option<EvaluatorProgram>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,11 +59,18 @@ pub enum IrError {
     Syntax,
     InvalidAccess,
     Runtime(RuntimeError),
+    Body(BodyError),
 }
 
 impl From<RuntimeError> for IrError {
     fn from(value: RuntimeError) -> Self {
         Self::Runtime(value)
+    }
+}
+
+impl From<BodyError> for IrError {
+    fn from(value: BodyError) -> Self {
+        Self::Body(value)
     }
 }
 
@@ -96,6 +112,16 @@ impl Module {
             if !evaluator_ids.insert(evaluator.id) || !names.insert(evaluator.name.clone()) {
                 return Err(IrError::DuplicateEvaluator);
             }
+            // A body derives its own stride from its declared element layout.
+            // If that disagrees with the stride the evaluator declares, one of
+            // the two is wrong and the module must not load — a backend
+            // striding differently from the collective would read across
+            // element boundaries and produce plausible garbage.
+            if let Some(body) = &evaluator.body {
+                if body.stride() != evaluator.schema.element_stride {
+                    return Err(IrError::Body(BodyError::StrideMismatch));
+                }
+            }
             for resume in [evaluator.entry, evaluator.completion] {
                 if !resume_points.insert(resume.id) {
                     return Err(IrError::DuplicateResumePoint);
@@ -110,8 +136,19 @@ impl Module {
 
     /// Parse the deliberately small textual surface:
     ///
-    /// `module NAME`
-    /// `evaluator ID NAME STRIDE ENTRY_ID ENTRY_CLASS ro|rw DONE_ID DONE_CLASS ro|rw`
+    /// ```text
+    /// module NAME
+    /// evaluator ID NAME STRIDE ENTRY_ID ENTRY_CLASS ro|rw DONE_ID DONE_CLASS ro|rw
+    ///   field u32
+    ///   op 0 load 0
+    ///   op 1 const 2
+    ///   op 2 mul 0 1
+    ///   store 0 2
+    /// ```
+    ///
+    /// The `field`/`op`/`store` lines following an `evaluator` line are its
+    /// body and are optional. Omitting them keeps the pre-v0.3 form, which
+    /// names an evaluator without saying what it computes.
     pub fn parse(source: &str) -> Result<Self, IrError> {
         let mut lines = source
             .lines()
@@ -122,10 +159,25 @@ impl Module {
         if header.len() != 2 || header[0] != "module" {
             return Err(IrError::Syntax);
         }
-        let mut evaluators = Vec::new();
+
+        // Group each `evaluator` line with the body lines that follow it.
+        let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
         for line in lines {
-            let fields = line.split_whitespace().collect::<Vec<_>>();
-            if fields.len() != 10 || fields[0] != "evaluator" {
+            if line.starts_with("evaluator ") {
+                groups.push((line, Vec::new()));
+            } else {
+                match groups.last_mut() {
+                    Some((_, body)) => body.push(line),
+                    // A body line before any evaluator has nothing to attach to.
+                    None => return Err(IrError::Syntax),
+                }
+            }
+        }
+
+        let mut evaluators = Vec::new();
+        for (declaration, body_lines) in groups {
+            let fields = declaration.split_whitespace().collect::<Vec<_>>();
+            if fields.len() != 10 {
                 return Err(IrError::Syntax);
             }
             let number = |index: usize| fields[index].parse::<u32>().map_err(|_| IrError::Syntax);
@@ -134,9 +186,16 @@ impl Module {
                 "rw" => Ok(StateAccess::Mutable),
                 _ => Err(IrError::InvalidAccess),
             };
+            let id = number(1)?;
+            let name = fields[2].to_string();
+            let body = if body_lines.is_empty() {
+                None
+            } else {
+                Some(EvaluatorProgram::parse_lines(id, &name, &body_lines)?)
+            };
             evaluators.push(BatchEvaluator {
-                id: number(1)?,
-                name: fields[2].to_string(),
+                id,
+                name,
                 schema: FrozenArraySchema {
                     element_stride: number(3)?,
                 },
@@ -150,9 +209,25 @@ impl Module {
                     run_class: number(8)?,
                     state_access: access(9)?,
                 },
+                body,
             });
         }
         Self::named(header[1], evaluators)
+    }
+
+    /// Every declared body in this module, in evaluator order.
+    pub fn programs(&self) -> Vec<&EvaluatorProgram> {
+        self.evaluators
+            .iter()
+            .filter_map(|evaluator| evaluator.body.as_ref())
+            .collect()
+    }
+
+    pub fn program(&self, evaluator_id: u32) -> Option<&EvaluatorProgram> {
+        self.evaluators
+            .iter()
+            .find(|evaluator| evaluator.id == evaluator_id)
+            .and_then(|evaluator| evaluator.body.as_ref())
     }
 
     pub fn name(&self) -> &str {

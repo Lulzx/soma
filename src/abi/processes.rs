@@ -92,6 +92,16 @@ pub struct ProcessDescriptor {
 
     pub last_committed_epoch: u32,
     pub failure_count: u32,
+
+    /// Continuations of this process in a live state (`New`, `Runnable`,
+    /// `Waiting`, or `Running`), maintained incrementally.
+    ///
+    /// A process retires when its last continuation does (I3), and the
+    /// reference implementation used to answer "is any left?" by scanning the
+    /// whole continuation table on every completion. That is O(continuations)
+    /// per commit, which a concurrent scheduler cannot afford. The count is
+    /// derived state, so I3 checks it against an actual scan.
+    pub live_continuations: u32,
 }
 
 impl ProcessDescriptor {
@@ -118,6 +128,23 @@ impl ProcessDescriptor {
             deadline_ns: 0,
             last_committed_epoch: 0,
             failure_count: 0,
+            live_continuations: 0,
         }
     }
 }
+
+impl ContinuationState {
+    /// Whether a continuation in this state could still run, and therefore
+    /// keeps its process alive (I3).
+    pub fn is_live(self) -> bool {
+        matches!(
+            self,
+            ContinuationState::New
+                | ContinuationState::Runnable
+                | ContinuationState::Waiting
+                | ContinuationState::Running
+        )
+    }
+}
+
+use super::continuations::ContinuationState;

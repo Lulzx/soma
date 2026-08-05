@@ -5,6 +5,8 @@
 //! points; it is not a general-purpose language. Each resume point becomes a
 //! run class; frames are byte blobs with a per-run-class layout (see `frame`).
 
+pub mod body;
+pub mod examples;
 pub mod frame;
 pub mod ir;
 pub mod state_machine_lowering;

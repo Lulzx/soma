@@ -26,6 +26,8 @@ pub struct GenTable<T> {
     /// Occupied slot count, maintained incrementally so `len` is O(1) — it is
     /// called from per-epoch accounting paths.
     live: usize,
+    /// Slots withdrawn from reuse because their generation was exhausted.
+    retired: usize,
 }
 
 impl<T> GenTable<T> {
@@ -41,6 +43,7 @@ impl<T> GenTable<T> {
             }],
             free: Vec::new(),
             live: 0,
+            retired: 0,
         }
     }
 
@@ -108,15 +111,35 @@ impl<T> GenTable<T> {
             return Err(AbiError::StaleReference);
         }
         let value = slot.value.take().ok_or(AbiError::BadSlot)?;
-        // Increment generation before reuse; skip 0 so a reused slot is never
-        // addressable with a zero generation from a previous occupant.
-        slot.generation = slot.generation.wrapping_add(1);
-        if slot.generation == 0 {
-            slot.generation = 1;
+        // Increment the generation before reuse, so a stale reference to the
+        // previous occupant no longer resolves.
+        //
+        // When the generation would wrap, retire the slot instead of recycling
+        // it. Wrapping is the ABA window the ABI note in `abi/refs.rs` used to
+        // document as unsolved: a reference held across 65,536 recycles of one
+        // slot would match again and silently address a different entity.
+        // Retiring costs one slot per 65,535 recycles and makes staleness
+        // detection guaranteed rather than bounded, which is what a
+        // distributed implementation needs — it persists references across a
+        // network, where "held for a long time" is the normal case rather than
+        // the pathological one.
+        match slot.generation.checked_add(1) {
+            Some(next) => {
+                slot.generation = next;
+                self.free.push(r.slot);
+            }
+            None => self.retired += 1,
         }
-        self.free.push(r.slot);
         self.live -= 1;
         Ok(value)
+    }
+
+    /// Slots permanently withdrawn because their generation was exhausted.
+    ///
+    /// Nonzero here is not an error, but it is the signal that a workload
+    /// churns one slot hard enough to matter.
+    pub fn retired_slots(&self) -> usize {
+        self.retired
     }
 
     /// Number of live entries (occupied slots).

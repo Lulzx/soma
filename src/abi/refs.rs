@@ -64,13 +64,21 @@ impl Kind {
 ///
 /// `Ref64` is not itself an authority; it is merely a table reference.
 ///
-/// The generation field is 16 bits, which bounds staleness detection rather than
-/// guaranteeing it: a slot recycled 65,536 times wraps back to a generation a
-/// long-held stale reference could match (a classic ABA window). This is the
-/// deliberate cost of keeping a reference in 64 bits. It is acceptable while
-/// references are short-lived relative to slot churn; a future phase that
-/// persists references across checkpoints will need a wider generation or an
-/// epoch-scoped reference table.
+/// The generation field is 16 bits. That used to bound staleness detection
+/// rather than guarantee it — a slot recycled 65,536 times wrapped back to a
+/// generation a long-held stale reference could match, a classic ABA window.
+///
+/// `GenTable::delete` now retires a slot rather than wrapping its generation,
+/// so staleness detection is guaranteed at every generation width. The cost
+/// moved from correctness to space: one permanently withdrawn slot per 65,535
+/// recycles, reported by `GenTable::retired_slots`. Keeping the field at 16
+/// bits is therefore a space/churn tradeoff rather than a soundness one, and a
+/// reference still fits in 64 bits.
+///
+/// A distributed implementation needs one more thing this does not provide: a
+/// node identity, so that two nodes allocating slot 7 do not produce colliding
+/// references. That is deliberately deferred — it changes the reference layout,
+/// and nothing before a multi-node implementation can test it.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Ref64 {

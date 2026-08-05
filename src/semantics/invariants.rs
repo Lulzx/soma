@@ -57,6 +57,9 @@ pub enum Invariant {
     DomainContractIntegrity,
     /// I17. Loaded module manifests and linked evaluator uses agree.
     ModuleIntegrity,
+    /// I21. Admitted work is dispatched, and no runnable continuation waits
+    /// longer than the declared deferral bound.
+    BoundedProgress,
 }
 
 /// A specific way in which a state was illegal.
@@ -102,8 +105,59 @@ pub fn check(kernel: &Kernel) -> Vec<Violation> {
     supervision_integrity(kernel, &mut v);
     domain_contract_integrity(kernel, &mut v);
     module_integrity(kernel, &mut v);
+    bounded_progress(kernel, &mut v);
     v.sort();
     v
+}
+
+// ---- I21 -----------------------------------------------------------------
+
+/// **I21. Bounded progress.**
+///
+/// This replaces v0.2's I14, which was the specification's only `[modelled]`
+/// clause — verified by targeted test rather than by a predicate. Two halves:
+///
+/// 1. **No withholding.** An epoch that admitted work dispatched some of it.
+///    The reference interpreter guarantees this by re-planning under
+///    `RunPartial` when a deferral policy would otherwise idle the epoch; the
+///    counter is what makes a future policy unable to break it quietly.
+/// 2. **No starvation.** No runnable continuation has sat in a bin for longer
+///    than the kernel's deferral bound. v0.2 §4 declined to promise this and
+///    allowed one run class to starve another. Under placement policies that
+///    bind classes to territories, starvation stops being a scheduling detail
+///    and becomes a silent correctness surprise, so it gets a bound.
+fn bounded_progress(kernel: &Kernel, out: &mut Vec<Violation>) {
+    if kernel.accounting().stalled_epochs > 0 {
+        out.push(Violation::new(
+            Invariant::BoundedProgress,
+            format!(
+                "{} epoch(s) admitted work and dispatched none",
+                kernel.accounting().stalled_epochs
+            ),
+        ));
+    }
+
+    let bound = kernel.deferral_bound();
+    let epoch = kernel.epoch_number();
+    for (r, c) in kernel.continuations().iter() {
+        if c.status != ContinuationState::Runnable {
+            continue;
+        }
+        // A continuation enqueued this epoch has waited zero epochs. Only the
+        // gap since it last changed state counts, so work created during the
+        // current epoch is never reported.
+        let waiting_since = c.last_run_epoch.max(c.created_epoch);
+        let waited = epoch.saturating_sub(waiting_since);
+        if waited > bound {
+            out.push(Violation::new(
+                Invariant::BoundedProgress,
+                format!(
+                    "continuation {} of run class {} has been runnable for {} epochs, bound is {}",
+                    r.slot, c.run_class, waited, bound
+                ),
+            ));
+        }
+    }
 }
 
 // ---- I17 -----------------------------------------------------------------
@@ -633,6 +687,29 @@ fn process_continuation_consistency(kernel: &Kernel, out: &mut Vec<Violation>) {
                 format!(
                     "continuation {} is {:?} but its process {} is terminal",
                     r.slot, c.status, c.process.slot
+                ),
+            ));
+        }
+    }
+
+    // `live_continuations` replaced a per-completion table scan, so it is
+    // derived state that can silently drift. Recompute it the slow way and
+    // compare: a status write that bypasses `set_continuation_status` is a
+    // bug that would otherwise surface much later as a stranded process.
+    let mut actual: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
+    for (_, c) in kernel.continuations().iter() {
+        if c.status.is_live() {
+            *actual.entry(c.process.slot).or_insert(0) += 1;
+        }
+    }
+    for (r, p) in kernel.processes().iter() {
+        let counted = actual.get(&r.slot).copied().unwrap_or(0);
+        if p.live_continuations != counted {
+            out.push(Violation::new(
+                Invariant::ProcessContinuationConsistency,
+                format!(
+                    "process {} caches {} live continuations but {} are live",
+                    r.slot, p.live_continuations, counted
                 ),
             ));
         }

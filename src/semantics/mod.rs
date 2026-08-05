@@ -5,3 +5,4 @@
 //! document from describing a machine the implementation does not build.
 
 pub mod invariants;
+pub mod order;

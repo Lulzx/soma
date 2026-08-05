@@ -182,6 +182,7 @@ pub struct TraceSnapshotRow {
     pub continuation: u64,
     pub run_class: u32,
     pub auxiliary: u32,
+    pub causal: u64,
 }
 
 /// The whole kernel state: every table, the object payloads, mailboxes, the
@@ -237,6 +238,10 @@ pub struct Kernel {
     cohort_width: u16,
     /// What to do with a run class's final, incompletely filled cohort (§14).
     partial_policy: PartialCohortPolicy,
+    /// Consecutive epochs a runnable continuation may wait before I21 calls it
+    /// starved. Generous by default: the clause exists to catch a policy that
+    /// never runs a class at all, not to police scheduling latency.
+    deferral_bound: u32,
     /// Cumulative counters for the §27 measurements.
     accounting: Accounting,
 }
@@ -280,6 +285,7 @@ impl Kernel {
             scheduler,
             cohort_width: 1,
             partial_policy: PartialCohortPolicy::default(),
+            deferral_bound: 64,
             accounting: Accounting::default(),
         };
         let root = kernel.domains.alloc(DomainDescriptor::new(Ref64::NULL, 0));
@@ -295,6 +301,23 @@ impl Kernel {
     pub fn configure_cohorts(&mut self, width: u16, policy: PartialCohortPolicy) {
         self.cohort_width = width;
         self.partial_policy = policy;
+    }
+
+    /// How many consecutive epochs a runnable continuation may sit in a bin
+    /// before I21 reports starvation.
+    ///
+    /// `docs/SOMA-v0.2.md` §4 declined to guarantee fairness beyond I14 and
+    /// explicitly permitted one run class to starve another. That is
+    /// defensible for a sequential interpreter, where starvation is visible in
+    /// a single trace. Under territory placement and class affinity it becomes
+    /// a policy outcome nobody chose, so v0.3 makes it a bound rather than an
+    /// emergent property.
+    pub fn set_deferral_bound(&mut self, epochs: u32) {
+        self.deferral_bound = epochs;
+    }
+
+    pub fn deferral_bound(&self) -> u32 {
+        self.deferral_bound
     }
 
     pub fn cohort_width(&self) -> u16 {
@@ -447,6 +470,32 @@ impl Kernel {
         run_class: u32,
         auxiliary: u32,
     ) {
+        self.trace_caused(
+            event_kind,
+            process,
+            continuation,
+            run_class,
+            auxiliary,
+            Ref64::NULL,
+        );
+    }
+
+    /// Append a trace event that is causally related to another event through
+    /// `causal` — the future that woke a continuation, the channel or receiver
+    /// a message crossed, the child a notice reports.
+    ///
+    /// Only the events that participate in a cross-entity happens-before edge
+    /// need this. Everything else is ordered by the continuation it belongs to
+    /// and by its epoch, which `trace` already records.
+    fn trace_caused(
+        &mut self,
+        event_kind: EventKind,
+        process: Ref64,
+        continuation: Ref64,
+        run_class: u32,
+        auxiliary: u32,
+        causal: Ref64,
+    ) {
         self.logical_time = self.logical_time.wrapping_add(1);
         self.trace.push(TraceEvent::new(
             self.logical_time,
@@ -458,6 +507,7 @@ impl Kernel {
         ));
         if let Some(last) = self.trace.last_mut() {
             last.auxiliary = auxiliary;
+            last.causal = causal;
         }
     }
 
@@ -479,6 +529,7 @@ impl Kernel {
                 continuation: t.continuation.to_u64(),
                 run_class: t.run_class,
                 auxiliary: t.auxiliary,
+                causal: t.causal.to_u64(),
             })
             .collect()
     }
@@ -1314,10 +1365,10 @@ impl Kernel {
 
         for continuation in &cancelled {
             self.scheduler.remove(*continuation);
-            if let Ok(descriptor) = self.continuations.get_mut(*continuation) {
-                descriptor.status = crate::abi::continuations::ContinuationState::Cancelled;
-                descriptor.last_run_epoch = self.epoch;
-            }
+            self.set_continuation_status(
+                *continuation,
+                crate::abi::continuations::ContinuationState::Cancelled,
+            );
             self.trace(
                 EventKind::ContinuationCancelled,
                 process,
@@ -1504,6 +1555,11 @@ impl Kernel {
             c.status = crate::abi::continuations::ContinuationState::Runnable;
             c.created_epoch = self.epoch;
         }
+        // `New` and `Runnable` are both live, so a fresh continuation is
+        // counted exactly once, here.
+        if let Ok(descriptor) = self.processes.get_mut(process) {
+            descriptor.live_continuations = descriptor.live_continuations.saturating_add(1);
+        }
         self.scheduler.enqueue(spec.run_class, r);
         self.mint_genesis(process, r, 0, 0);
         self.trace(EventKind::ContinuationReady, process, r, spec.run_class, 0);
@@ -1516,6 +1572,47 @@ impl Kernel {
     ) -> Result<crate::abi::continuations::ContinuationState, RuntimeError> {
         let cd = self.continuations.get(c)?;
         Ok(cd.status)
+    }
+
+    /// The single path by which an existing continuation's status changes.
+    ///
+    /// Routing every transition through one function is what lets
+    /// `ProcessDescriptor::live_continuations` stay correct without the
+    /// table scan `retire_process_if_idle` used to perform. A status write
+    /// that bypasses this leaves the count stale, which I3 reports.
+    pub(crate) fn set_continuation_status(
+        &mut self,
+        continuation: Ref64,
+        status: crate::abi::continuations::ContinuationState,
+    ) {
+        let epoch = self.epoch;
+        let Ok(descriptor) = self.continuations.get(continuation) else {
+            return;
+        };
+        let process = descriptor.process;
+        let previous = descriptor.status;
+        if let Ok(descriptor) = self.continuations.get_mut(continuation) {
+            descriptor.status = status;
+            descriptor.last_run_epoch = epoch;
+        }
+        if previous.is_live() == status.is_live() {
+            return;
+        }
+        if let Ok(descriptor) = self.processes.get_mut(process) {
+            descriptor.live_continuations = if status.is_live() {
+                descriptor.live_continuations.saturating_add(1)
+            } else {
+                descriptor.live_continuations.saturating_sub(1)
+            };
+        }
+    }
+
+    /// Whether `process` still has a continuation that could run (I3).
+    pub(crate) fn has_live_continuation(&self, process: Ref64) -> bool {
+        self.processes
+            .get(process)
+            .map(|descriptor| descriptor.live_continuations > 0)
+            .unwrap_or(false)
     }
 
     // ---- execution contracts -------------------------------------------
@@ -1732,9 +1829,20 @@ impl Kernel {
                 c.status = crate::abi::continuations::ContinuationState::Runnable;
             }
             self.scheduler.enqueue(rc, w);
-            self.trace(EventKind::ContinuationReady, process, w, rc, 0);
+            self.trace_caused(EventKind::ContinuationReady, process, w, rc, 0, future);
         }
-        self.trace(EventKind::FutureResolved, owner, Ref64::NULL, 0, value.slot);
+        // §3.3 emits the wakes first and the resolution last, so the semantic
+        // order runs wake ≺ resolution. See `semantics::order` — the edge is an
+        // ordering constraint taken from the transition rule, not a claim about
+        // which event physically caused the other.
+        self.trace_caused(
+            EventKind::FutureResolved,
+            owner,
+            Ref64::NULL,
+            0,
+            value.slot,
+            future,
+        );
         Ok(())
     }
 
@@ -2342,7 +2450,14 @@ impl Kernel {
         };
 
         if trace_send {
-            self.trace(EventKind::MessageSent, sender, sender_cont, 0, seq as u32);
+            self.trace_caused(
+                EventKind::MessageSent,
+                sender,
+                sender_cont,
+                0,
+                seq as u32,
+                receiver,
+            );
         }
 
         if let Some(waiter) = waiter {
@@ -2352,7 +2467,14 @@ impl Kernel {
                 let c = self.continuations.get_mut(waiter).unwrap();
                 c.status = crate::abi::continuations::ContinuationState::Runnable;
             }
-            self.trace(EventKind::MessageReceived, receiver, waiter, rc, 0);
+            self.trace_caused(
+                EventKind::MessageReceived,
+                receiver,
+                waiter,
+                rc,
+                seq as u32,
+                sender,
+            );
         }
         Ok(())
     }
@@ -2393,12 +2515,13 @@ impl Kernel {
                 }
                 self.trace(EventKind::ContinuationReady, process, w, rc, 0);
             }
-            self.trace(
+            self.trace_caused(
                 EventKind::MessageReceived,
                 process,
                 cont,
                 0,
                 msg.sender_sequence as u32,
+                msg.sender,
             );
             return Ok(Some(msg));
         }

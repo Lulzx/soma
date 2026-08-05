@@ -55,9 +55,12 @@ slot's current generation. Deleting an entity increments its slot generation
 before the slot is reused, so a reference retained across a delete fails to
 resolve rather than silently addressing a new entity.
 
-*Note.* The generation field is finite (16 bits in the reference ABI), so
-staleness detection is bounded, not guaranteed: a slot recycled 2^16 times wraps.
-This is an ABA window, documented rather than solved.
+*Note.* The generation field is finite (16 bits in the reference ABI). This used
+to make staleness detection bounded rather than guaranteed — a slot recycled
+2^16 times wrapped, an ABA window documented rather than solved. **Solved in
+v0.3 §1.2:** a slot whose generation is exhausted is retired instead of
+recycled, so detection is guaranteed at every generation width, at a cost of one
+withdrawn slot per 65,535 recycles.
 
 ### 1.1 Entities
 
@@ -140,6 +143,16 @@ Two runs are **equivalent** when their traces are equal. The model defines no
 other equivalence. Internal state absent from the trace is
 not observable, and an implementation may represent it however it likes.
 
+> **Superseded by v0.3 §2.** Trace equality is defined over a total order on
+> logical time, and this interpreter's total order is an artifact of running one
+> continuation at a time. Under this clause as written, every parallel
+> implementation of SOMA is non-conforming by construction. `docs/SOMA-v0.3.md`
+> replaces it with I18: a trace conforms when it contains the same events per
+> epoch and is a linear extension of the semantic order ≺. Equality is the
+> special case where ≺ happens to be total. Placement reporting
+> (`CohortCreated`, `ContinuationPlaced`) is excluded from observable behaviour,
+> without which §4's "cohorting is not part of the semantics" would be false.
+
 ---
 
 ## 2. Invariants
@@ -216,10 +229,15 @@ continuation declaring `Mutable` access to a process's canonical state starts in
 an epoch. Read-only continuations may share the epoch. State mutation also
 requires the declared continuation to be the process's active continuation.
 
-**I14. Progress [modelled].** If any continuation is runnable, an epoch executes
-at least one step. Deferral policies may delay work but may not withhold it
-indefinitely. The reference interpreter forces a partial cohort when an epoch
-would otherwise do nothing.
+**I14. Progress [superseded by I21].** If any continuation is runnable, an epoch
+executes at least one step. Deferral policies may delay work but may not
+withhold it indefinitely. The reference interpreter forces a partial cohort when
+an epoch would otherwise do nothing.
+
+> This was the specification's only `[modelled]` clause. v0.3's I21 checks it —
+> the withholding half as a counter, since it describes a transition rather than
+> a state — and adds a starvation bound, which §4 below explicitly declined to
+> give.
 
 **I15. Supervision integrity [checked].** A process cannot supervise itself.
 Every non-null supervisor and every child named by a queued notice resolves.
@@ -487,7 +505,10 @@ continuations within an epoch provided it preserves I1–I13, I15–I17, and det
 - **Time.** There is no wall clock. Legacy `deadline_ns` fields remain inert,
   and a current execution contract with a nonzero deadline is invalid.
 - **Fairness.** Beyond I14, no fairness guarantee is made. A run class may
-  starve another.
+  starve another. *(v0.3's I21 adds a bound: no runnable continuation waits
+  longer than a declared number of consecutive epochs. Starvation is defensible
+  when it is visible in a single sequential trace and much less so under
+  territory placement, where it becomes a policy outcome nobody chose.)*
 
 ---
 
@@ -510,7 +531,7 @@ continuations within an epoch provided it preserves I1–I13, I15–I17, and det
 | I11 trace monotonicity | checked | |
 | I12 accounting consistency | checked | |
 | I13 process-state serialisation | checked | trace-level, with fault injection |
-| I14 progress | modelled | by test |
+| I14 progress | superseded | checked as I21 in v0.3, with a starvation bound |
 | I15 supervision integrity | checked | notices, escalation, bounded restart, replacement lineage |
 | I16 domain/contract integrity | checked | membership, quotas, contract bounds |
 | I17 module integrity | checked | manifests and collective evaluator links |
