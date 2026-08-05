@@ -70,8 +70,9 @@ I10a/I10b checks exist. Every right used by a reachable operation is enforced
 at use, including expiry, object-version, range, and parent-chain checks.
 Authority decisions and governed effects are traced, and I10c rejects any
 effect without an adjacent matching grant. Failure containment and cooperative
-cancellation settle sibling work, futures, mailboxes, and waiters. Channels,
-collectives, domains, and supervision are still absent.
+cancellation settle sibling work, futures, mailboxes, channels, collectives,
+and waiters. First-class bounded channels and the `BatchEvaluate` collective
+are implemented; domains, execution contracts, and supervision remain absent.
 
 The specification has already caught a lifetime bug. `Complete` once retired a
 process when one continuation finished. A second live continuation could then
@@ -161,17 +162,20 @@ Implemented now:
   scheduling
 - Contained process failure and cooperative cancellation with terminal futures
   and waiter wakeup
+- First-class bounded channels with capability-checked send, receive, close,
+  back-pressure, and kernel-held payload authority
+- A generic `BatchEvaluate` collective over frozen input/output arrays with a
+  single-assignment completion future
 - A domain-neutral dynamic constraint-search validation workload
 
 Not implemented:
 
-- Channels and collectives
-- Cancellation and supervision
+- Domains, execution contracts, and supervision
 - GPU execution, CPU/GPU migration, and spill
 
 The current job is to finish the machine semantics before adding a surface
-language or GPU backend. The largest remaining semantic gaps are channels,
-collectives, and supervision.
+language or GPU backend. The largest remaining semantic gap is supervision;
+the next validation work should exercise the new channel and collective paths.
 
 ## License
 

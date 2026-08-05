@@ -7,7 +7,10 @@ use std::collections::HashMap;
 
 use crate::abi::capabilities::CapabilityEntry;
 use crate::abi::continuations::ContinuationDescriptor;
-use crate::abi::{FutureDescriptor, ObjectDescriptor, ProcessDescriptor, Ref64, TraceEvent};
+use crate::abi::{
+    ChannelDescriptor, CollectiveDescriptor, FutureDescriptor, ObjectDescriptor, ProcessDescriptor,
+    Ref64, TraceEvent,
+};
 use crate::kernel::accounting::Accounting;
 use crate::kernel::{Kernel, Mailbox};
 use crate::scheduler::runnable_bins::Scheduler;
@@ -22,6 +25,8 @@ pub struct State<'a> {
     pub capability_spaces: &'a mut HashMap<u32, GenTable<CapabilityEntry>>,
     pub continuations: &'a mut GenTable<ContinuationDescriptor>,
     pub futures: &'a mut GenTable<FutureDescriptor>,
+    pub channels: &'a mut GenTable<ChannelDescriptor>,
+    pub collectives: &'a mut GenTable<CollectiveDescriptor>,
     pub mailboxes: &'a mut HashMap<u32, Mailbox>,
     pub future_waiters: &'a mut HashMap<u32, Vec<Ref64>>,
     pub scheduler: &'a mut Scheduler,
@@ -44,6 +49,8 @@ pub unsafe fn state(kernel: &mut Kernel) -> State<'_> {
         capability_spaces: &mut kernel.capability_spaces,
         continuations: &mut kernel.continuations,
         futures: &mut kernel.futures,
+        channels: &mut kernel.channels,
+        collectives: &mut kernel.collectives,
         mailboxes: &mut kernel.mailboxes,
         future_waiters: &mut kernel.future_waiters,
         scheduler: &mut kernel.scheduler,

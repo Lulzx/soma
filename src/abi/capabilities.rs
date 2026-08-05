@@ -19,7 +19,8 @@ pub mod Rights {
     pub const DESTROY: u32 = 1 << 8;
 
     /// All Phase-1 rights.
-    pub const ALL: u32 = READ | WRITE | FREEZE | TRANSFER | SEND | RECEIVE | RESOLVE | AWAIT | DESTROY;
+    pub const ALL: u32 =
+        READ | WRITE | FREEZE | TRANSFER | SEND | RECEIVE | RESOLVE | AWAIT | DESTROY;
 
     /// Rights meaningful for each implemented target kind.
     pub const fn for_target(kind: Kind) -> u32 {
@@ -30,6 +31,7 @@ pub mod Rights {
             Kind::Future => RESOLVE | AWAIT | TRANSFER | DESTROY,
             Kind::Capability => TRANSFER | DESTROY,
             Kind::Channel => SEND | RECEIVE | TRANSFER | DESTROY,
+            Kind::Collective => READ | WRITE | TRANSFER | DESTROY,
             _ => DESTROY,
         }
     }

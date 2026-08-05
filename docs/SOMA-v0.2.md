@@ -39,10 +39,10 @@ A SOMA machine state Σ is:
 E  epoch counter
 τ  logical clock and event trace
 T  entity tables, one per kind: processes, objects, continuations,
-   futures, capabilities
+   futures, channels, collectives, capabilities
 Q  runnable bins: a mapping from bin key to a queue of continuations
-M  mailboxes: one bounded ordered queue per process
-W  wait sets: for each future, the continuations registered on it
+M  mailboxes and channel queues: bounded ordered message stores
+W  wait sets: future, mailbox, and channel continuations awaiting readiness
 S  scheduler configuration: binning mode, cohort width, partial policy
 A  accounting counters
 ```
@@ -95,8 +95,15 @@ spaces, genesis, attenuation, and enforcement for every reachable operation
 right are implemented. Authority decisions and governed effects are observable,
 making I10c trace-checkable.
 
-**Channel**, **Collective**, **Domain**, named by the model, not implemented.
-**[absent]**
+**Channel**, a first-class bounded FIFO message queue. Send, receive, and close
+are separate capability-governed operations. A committed message holds payload
+read authority in kernel escrow until delivery. **[checked]**
+
+**Collective**, a coordinated operation with an owner and completion future.
+The implemented `BatchEvaluate` form consumes a frozen input array and
+publishes a frozen output array. **[checked]**
+
+**Domain**, named by the model, not implemented. **[absent]**
 
 ### 1.2 Observable behaviour
 
@@ -118,6 +125,8 @@ violation, not the first.
 **I1. Reference integrity [checked].** Every reference held by a live entity
 resolves, or is null. A continuation's process, frame, and dependency. A
 process's state object. A resolved future's value. A queued message's payload.
+A channel's escrow target and waiters. A collective's owner, arrays, and
+completion future.
 
 **I2. No continuation left running [checked].** Between transitions no
 continuation is in the `Running` state. `Running` exists only *within* a step.
@@ -133,14 +142,15 @@ live, and a terminated process has no continuation that is still schedulable.
 **I4. Future single assignment [checked].** A pending future carries no value. A
 settled future was settled no later than the current epoch and has an empty
 wait set. Resolution drains the wait set exactly once. A continuation
-registered after resolution would never wake.
+registered after resolution would never wake. A collective's state and output
+must agree with the state and value of its completion future.
 
-**I5. Mailbox bound [checked].** No mailbox holds more messages than its
-capacity. Send into a full mailbox fails and registers the sender for wakeup. It
-does not block, spin, or drop.
+**I5. Mailbox bound [checked].** No process mailbox or first-class channel holds
+more messages than its capacity. Send into a full queue fails and registers the
+sender for wakeup. It does not block, spin, or drop.
 
-**I6. Message ordering [checked].** Messages from one sender to one receiver are
-delivered in send order. No ordering is defined between different senders.
+**I6. Message ordering [checked].** Process-mailbox messages from one sender to
+one receiver are delivered in send order. A channel is FIFO across all senders.
 
 **I7. Scheduler well-formedness [checked].** Every continuation in a bin is
 live, is in the `Runnable` state, and is stored in the bin its run class maps to
@@ -233,6 +243,31 @@ Send is non-blocking and lossless: a full mailbox is back-pressure, reported to
 the sender, never a dropped message. Every blocked sender is registered, not
 just the first (I5).
 
+First-class channels use the analogous rules:
+
+```text
+CREATE-CHANNEL(owner, capacity) -> ch
+  effect  fresh open channel with an empty bounded FIFO
+
+CHANNEL-SEND(sender, ch, payload, from)
+  pre     sender has SEND on ch and READ|TRANSFER on payload; ch is open
+  effect  if full: register from and fail with MailboxFull
+          otherwise escrow a payload READ root and append in FIFO order
+  trace   ChannelSent
+
+CHANNEL-RECEIVE(receiver, ch, c) -> message?
+  pre     receiver has RECEIVE on ch
+  effect  pop the oldest entry, install its escrowed READ root in receiver's
+          capability space, and wake one capacity waiter; if open and empty,
+          register c; if closed and empty, fail with ChannelClosed
+  trace   ChannelReceived on delivery
+
+CLOSE-CHANNEL(actor, ch)
+  pre     actor has DESTROY on ch
+  effect  reject future sends, wake all waiters, preserve queued entries for drain
+  trace   ChannelClosed
+```
+
 ### 3.3 Dataflow readiness
 
 ```text
@@ -254,6 +289,26 @@ The `AlreadySettled` outcome is not an optimisation. Resolution, failure, and
 cancellation drain the wait set once and never revisit it, so registering on a
 settled future is a permanent stall (I4). The returned state lets the caller
 distinguish a value from failure or cancellation.
+
+`BatchEvaluate` is the first collective:
+
+```text
+CREATE-BATCH-EVALUATE(owner, inputs, count, stride) -> (op, done)
+  pre     inputs is a frozen array of at least count * stride bytes
+  effect  fresh Pending collective and Pending completion future
+  trace   CollectiveCreated
+
+COMPLETE-BATCH-EVALUATE(owner, op, outputs)
+  pre     owner has WRITE on op and RESOLVE on done;
+          op and done are Pending; outputs is a sufficiently large frozen array
+  effect  op.outputs := outputs; op.state := Completed;
+          resolve done to outputs
+  trace   CollectiveCompleted
+```
+
+The collective specifies lifecycle and publication, not evaluator code or
+parallel execution strategy. Owner failure or cancellation settles the pending
+collective and its completion future together.
 
 ### 3.4 Execution and commit
 
@@ -348,11 +403,10 @@ continuations within an epoch provided it preserves I1–I13 and determinism.
 | I13 process-state serialisation | checked | trace-level, with fault injection |
 | I14 progress | modelled | by test |
 
-Entities named but not implemented: **Channel**, **Collective**, **Domain**,
-execution contracts, and supervision. Messaging is per-process
-mailboxes rather than first-class channels. There is no collective construct at
-all, so the model's claim to cover cooperative execution shapes is currently
-unsupported by any implementation.
+Entities named but not implemented: **Domain**, execution contracts, and
+supervision. Channels and the `BatchEvaluate` collective are implemented and
+covered by reference-integrity, boundedness, ordering, capability-integrity,
+and future-consistency checks plus targeted lifecycle tests.
 
 `tests/semantics.rs::i10c_records_grants_denials_and_authorized_effects` exercises
 grants, denials, and an authorized write. The adjacent fault-injection test
@@ -410,13 +464,15 @@ ending in `Cancelled`. Cancellation does not preempt a continuation mid-step.
 
 ## 7. Remaining work
 
-1. **Channels and collectives.** Currently vocabulary, not machinery.
-2. **Validation workloads** beyond the existing domain-neutral dynamic
+1. **Validation workloads** beyond the existing domain-neutral dynamic
    constraint search: streaming pipelines, actor systems, and irregular
    dataflow, chosen to stress ordering, back-pressure, and failure rather than
    throughput.
-3. **A minimal IR.** The ownership and failure blockers are settled; keep the
-   first IR small while channels and collectives remain absent.
+2. **A minimal IR.** Ownership, failure, channel, and collective semantics are
+   settled. Keep the first IR small: evaluator identity, frozen-array schema,
+   and continuation resume points.
+3. **Domains, execution contracts, and supervision.** Still vocabulary rather
+   than machinery.
 
 Performance work belongs after all of this, and the performance results already
 in this repository (`docs/SOMA-P1.md`, and the cohorting studies) should be read

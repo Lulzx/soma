@@ -27,6 +27,13 @@ pub enum EventKind {
     ContinuationCancelled = 17,
     FutureFailed = 18,
     FutureCancelled = 19,
+    ChannelSent = 20,
+    ChannelReceived = 21,
+    ChannelClosed = 22,
+    CollectiveCreated = 23,
+    CollectiveCompleted = 24,
+    CollectiveFailed = 25,
+    CollectiveCancelled = 26,
 }
 
 /// Compact trace record (§21).

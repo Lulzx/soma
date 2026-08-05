@@ -16,7 +16,7 @@
 //! not immediately paired with the matching successful authority decision.
 
 use crate::abi::continuations::ContinuationState;
-use crate::abi::{FutureState, Kind, ProcessState, Ref64, StateAccess};
+use crate::abi::{CollectiveState, FutureState, Kind, ProcessState, Ref64, StateAccess};
 use crate::kernel::Kernel;
 
 /// Which clause of the specification a violation belongs to.
@@ -123,8 +123,10 @@ fn live(kernel: &Kernel, r: Ref64) -> bool {
         // Capability references are actor-relative and are checked by I10b in
         // the space that owns them; there is no meaningful global lookup.
         Kind::Capability => true,
-        // Domains, channels, contracts, collectives and modules have no table
-        // in the reference model; a reference to one cannot be validated.
+        Kind::Channel => kernel.channels().get(r).is_ok(),
+        Kind::Collective => kernel.collectives().get(r).is_ok(),
+        // Domains, contracts and modules have no table in the reference model;
+        // a reference to one cannot yet be validated.
         _ => true,
     }
 }
@@ -189,6 +191,54 @@ fn reference_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
                     format!("mailbox {slot} holds a message with a dead payload"),
                 ));
             }
+        }
+    }
+
+    for (r, channel) in kernel.channels().iter() {
+        if channel.id != r || channel.closed > 1 {
+            out.push(Violation::new(
+                Invariant::ReferenceIntegrity,
+                format!("channel {} contains an invalid id or closed state", r.slot),
+            ));
+        }
+    }
+
+    for queue in kernel.channel_queue_snapshots() {
+        for (payload, _, escrow_target) in queue.entries {
+            if !live(kernel, payload) || escrow_target != payload {
+                out.push(Violation::new(
+                    Invariant::ReferenceIntegrity,
+                    format!(
+                        "channel {} holds an invalid escrowed payload",
+                        queue.channel.slot
+                    ),
+                ));
+            }
+        }
+        for waiter in queue.send_waiters.into_iter().chain(queue.receive_waiters) {
+            if !live(kernel, waiter) {
+                out.push(Violation::new(
+                    Invariant::ReferenceIntegrity,
+                    format!("channel {} holds a dead waiter", queue.channel.slot),
+                ));
+            }
+        }
+    }
+
+    for (r, collective) in kernel.collectives().iter() {
+        if collective.id != r
+            || (!collective.owner_process.is_null() && !live(kernel, collective.owner_process))
+            || !live(kernel, collective.inputs)
+            || !live(kernel, collective.completion_future)
+            || (!collective.outputs.is_null() && !live(kernel, collective.outputs))
+        {
+            out.push(Violation::new(
+                Invariant::ReferenceIntegrity,
+                format!(
+                    "collective {} contains a dangling or inconsistent reference",
+                    r.slot
+                ),
+            ));
         }
     }
 }
@@ -271,6 +321,30 @@ fn future_single_assignment(kernel: &Kernel, out: &mut Vec<Violation>) {
             }
         }
     }
+
+    for (r, collective) in kernel.collectives().iter() {
+        let Ok(completion) = kernel.futures().get(collective.completion_future) else {
+            continue;
+        };
+        let consistent = match collective.state {
+            CollectiveState::Pending => {
+                completion.state == FutureState::Pending && collective.outputs.is_null()
+            }
+            CollectiveState::Completed => {
+                completion.state == FutureState::Resolved
+                    && !collective.outputs.is_null()
+                    && completion.value == collective.outputs
+            }
+            CollectiveState::Failed => completion.state == FutureState::Failed,
+            CollectiveState::Cancelled => completion.state == FutureState::Cancelled,
+        };
+        if !consistent {
+            out.push(Violation::new(
+                Invariant::FutureSingleAssignment,
+                format!("collective {} disagrees with its completion future", r.slot),
+            ));
+        }
+    }
 }
 
 // ---- I5 ------------------------------------------------------------------
@@ -284,6 +358,22 @@ fn mailbox_bound(kernel: &Kernel, out: &mut Vec<Violation>) {
                     "mailbox {slot} holds {} messages over a capacity of {}",
                     mailbox.entries.len(),
                     mailbox.capacity
+                ),
+            ));
+        }
+    }
+    for queue in kernel.channel_queue_snapshots() {
+        let Ok(descriptor) = kernel.channels().get(queue.channel) else {
+            continue;
+        };
+        if queue.entries.len() > descriptor.capacity as usize {
+            out.push(Violation::new(
+                Invariant::MailboxBound,
+                format!(
+                    "channel {} holds {} messages over a capacity of {}",
+                    queue.channel.slot,
+                    queue.entries.len(),
+                    descriptor.capacity
                 ),
             ));
         }
@@ -308,6 +398,19 @@ fn message_ordering(kernel: &Kernel, out: &mut Vec<Violation>) {
                 }
             }
             last.insert(m.sender.slot, m.sender_sequence);
+        }
+    }
+    for queue in kernel.channel_queue_snapshots() {
+        for pair in queue.entries.windows(2) {
+            if pair[1].1 <= pair[0].1 {
+                out.push(Violation::new(
+                    Invariant::MessageOrdering,
+                    format!(
+                        "channel {} sequence {} follows {}",
+                        queue.channel.slot, pair[1].1, pair[0].1
+                    ),
+                ));
+            }
         }
     }
 }
@@ -410,6 +513,8 @@ fn capability_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
                 Kind::Object => kernel.objects().get(cap.target).is_ok(),
                 Kind::Continuation => kernel.continuations().get(cap.target).is_ok(),
                 Kind::Future => kernel.futures().get(cap.target).is_ok(),
+                Kind::Channel => kernel.channels().get(cap.target).is_ok(),
+                Kind::Collective => kernel.collectives().get(cap.target).is_ok(),
                 Kind::Capability => space.get(cap.target).is_ok(),
                 _ => false,
             };
@@ -434,10 +539,7 @@ fn capability_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
             if !cap.parent_capability.is_null() && space.get(cap.parent_capability).is_err() {
                 out.push(Violation::new(
                     Invariant::CapabilityIntegrity,
-                    format!(
-                        "capability {} in space {holder} has a dead parent",
-                        r.slot
-                    ),
+                    format!("capability {} in space {holder} has a dead parent", r.slot),
                 ));
             }
         }
@@ -448,7 +550,10 @@ fn capability_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
         if writers > 1 {
             out.push(Violation::new(
                 Invariant::CapabilityIntegrity,
-                format!("object {} has {writers} mutable authority holders", object.slot),
+                format!(
+                    "object {} has {writers} mutable authority holders",
+                    object.slot
+                ),
             ));
         }
     }

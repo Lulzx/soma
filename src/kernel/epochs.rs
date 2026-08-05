@@ -13,8 +13,8 @@ use std::collections::HashSet;
 
 use crate::abi::cohorts::PartialCohortPolicy;
 use crate::abi::continuations::ContinuationState;
-use crate::abi::StateAccess;
 use crate::abi::Ref64;
+use crate::abi::StateAccess;
 use crate::executives::cpu_scalar;
 use crate::kernel::commit;
 use crate::kernel::Kernel;
@@ -53,7 +53,8 @@ impl Kernel {
         for bin in bins {
             let mut lanes: Vec<(Ref64, u32)> = Vec::new();
             for cont in self.scheduler.drain(bin) {
-                let (process, run_class, state_access, status) = match self.continuations.get(cont) {
+                let (process, run_class, state_access, status) = match self.continuations.get(cont)
+                {
                     Ok(c) => (c.process, c.run_class, c.state_access, c.status),
                     Err(_) => continue,
                 };
@@ -125,7 +126,11 @@ impl Kernel {
             }
             // Deferred lanes return to their bins for a later epoch.
             for cont in &plan.deferred {
-                let run_class = self.continuations.get(*cont).map(|c| c.run_class).unwrap_or(0);
+                let run_class = self
+                    .continuations
+                    .get(*cont)
+                    .map(|c| c.run_class)
+                    .unwrap_or(0);
                 self.scheduler.enqueue(run_class, *cont);
                 self.accounting.deferred_lanes += 1;
             }

@@ -44,7 +44,12 @@ fn retire_process_if_idle(kernel: &mut Kernel, process: Ref64) {
 }
 
 /// Apply `result` for `cont` (owned by `process`). Returns steps consumed.
-pub fn apply_step_result(kernel: &mut Kernel, cont: Ref64, process: Ref64, result: StepResult) -> usize {
+pub fn apply_step_result(
+    kernel: &mut Kernel,
+    cont: Ref64,
+    process: Ref64,
+    result: StepResult,
+) -> usize {
     match result.kind {
         StepKind::Complete => {
             if let Ok(c) = kernel.continuations.get_mut(cont) {
@@ -52,7 +57,13 @@ pub fn apply_step_result(kernel: &mut Kernel, cont: Ref64, process: Ref64, resul
                 c.last_run_epoch = kernel.epoch;
             }
             retire_process_if_idle(kernel, process);
-            kernel.trace(EventKind::ContinuationCompleted, process, cont, result.next_run_class, 0);
+            kernel.trace(
+                EventKind::ContinuationCompleted,
+                process,
+                cont,
+                result.next_run_class,
+                0,
+            );
         }
         StepKind::Yield => {
             let rc = result.next_run_class;
@@ -117,7 +128,13 @@ pub fn apply_step_result(kernel: &mut Kernel, cont: Ref64, process: Ref64, resul
                 p.failure_count = p.failure_count.wrapping_add(1);
             }
             kernel.contain_process_failure(process, cont);
-            kernel.trace(EventKind::ProcessFailed, process, cont, result.next_run_class, 0);
+            kernel.trace(
+                EventKind::ProcessFailed,
+                process,
+                cont,
+                result.next_run_class,
+                0,
+            );
         }
     }
     if result.kind != StepKind::Fault

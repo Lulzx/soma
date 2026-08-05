@@ -12,11 +12,12 @@ pub mod raw;
 use std::collections::{HashMap, VecDeque};
 
 use crate::abi::capabilities::CapabilityEntry;
-use crate::abi::{
-    AbiError, EventKind, FutureDescriptor, FutureState, Kind, MessageDescriptor, ObjectDescriptor,
-    ObjectKind, ProcessDescriptor, ProcessMode, ProcessState, Ref64, TraceEvent,
-};
 use crate::abi::cohorts::PartialCohortPolicy;
+use crate::abi::{
+    AbiError, ChannelDescriptor, CollectiveDescriptor, CollectiveState, EventKind,
+    FutureDescriptor, FutureState, Kind, MessageDescriptor, ObjectDescriptor, ObjectKind,
+    ProcessDescriptor, ProcessMode, ProcessState, Ref64, TraceEvent,
+};
 use crate::kernel::accounting::Accounting;
 use crate::scheduler::runnable_bins::{Scheduler, SchedulingMode};
 use crate::table::GenTable;
@@ -29,6 +30,8 @@ pub enum RuntimeError {
     MissingMailbox,
     MailboxFull,
     ProcessUnavailable,
+    ChannelClosed,
+    InvalidCollective,
     InvalidStateAccess,
     AlreadyResolved,
     NotResolved,
@@ -69,6 +72,38 @@ impl Mailbox {
             capacity,
             recv_waiters: VecDeque::new(),
             full_waiters: VecDeque::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct EscrowMessage {
+    descriptor: MessageDescriptor,
+    payload_authority: CapabilityEntry,
+}
+
+#[derive(Debug)]
+struct ChannelQueue {
+    entries: VecDeque<EscrowMessage>,
+    send_waiters: VecDeque<Ref64>,
+    receive_waiters: VecDeque<Ref64>,
+    next_sequence: u64,
+}
+
+pub(crate) struct ChannelQueueSnapshot {
+    pub channel: Ref64,
+    pub entries: Vec<(Ref64, u64, Ref64)>,
+    pub send_waiters: Vec<Ref64>,
+    pub receive_waiters: Vec<Ref64>,
+}
+
+impl ChannelQueue {
+    fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            send_waiters: VecDeque::new(),
+            receive_waiters: VecDeque::new(),
+            next_sequence: 0,
         }
     }
 }
@@ -155,6 +190,8 @@ pub struct Kernel {
     capability_spaces: HashMap<u32, GenTable<CapabilityEntry>>,
     continuations: crate::table::GenTable<crate::abi::continuations::ContinuationDescriptor>,
     futures: GenTable<FutureDescriptor>,
+    channels: GenTable<ChannelDescriptor>,
+    collectives: GenTable<CollectiveDescriptor>,
 
     /// Object payload bytes, keyed by object slot. Kernel-private (§6: user
     /// programs cannot inspect or construct the physical mapping).
@@ -163,6 +200,7 @@ pub struct Kernel {
     mailboxes: HashMap<u32, Mailbox>,
     /// Future waiters keyed by future slot.
     future_waiters: HashMap<u32, Vec<Ref64>>,
+    channel_queues: HashMap<u32, ChannelQueue>,
     /// Per (sender, receiver) pair, the next `sender_sequence` value (§11).
     send_sequences: HashMap<(u32, u32), u64>,
 
@@ -199,9 +237,12 @@ impl Kernel {
             capability_spaces: HashMap::from([(0, GenTable::new(Kind::Capability))]),
             continuations: GenTable::new(Kind::Continuation),
             futures: GenTable::new(Kind::Future),
+            channels: GenTable::new(Kind::Channel),
+            collectives: GenTable::new(Kind::Collective),
             object_payloads: HashMap::new(),
             mailboxes: HashMap::new(),
             future_waiters: HashMap::new(),
+            channel_queues: HashMap::new(),
             send_sequences: HashMap::new(),
             scheduler,
             cohort_width: 1,
@@ -243,7 +284,9 @@ impl Kernel {
     }
 
     pub fn mailbox_entries(&self, process: Ref64) -> Option<&VecDeque<MessageDescriptor>> {
-        self.mailboxes.get(&process.slot).map(|mailbox| &mailbox.entries)
+        self.mailboxes
+            .get(&process.slot)
+            .map(|mailbox| &mailbox.entries)
     }
 
     pub fn mailbox_full_waiter_count(&self, process: Ref64) -> usize {
@@ -287,6 +330,40 @@ impl Kernel {
 
     pub(crate) fn futures(&self) -> &GenTable<FutureDescriptor> {
         &self.futures
+    }
+
+    pub(crate) fn channels(&self) -> &GenTable<ChannelDescriptor> {
+        &self.channels
+    }
+
+    pub(crate) fn collectives(&self) -> &GenTable<CollectiveDescriptor> {
+        &self.collectives
+    }
+
+    pub(crate) fn channel_queue_snapshots(&self) -> Vec<ChannelQueueSnapshot> {
+        self.channels
+            .iter()
+            .filter_map(|(channel, _)| {
+                self.channel_queues
+                    .get(&channel.slot)
+                    .map(|queue| ChannelQueueSnapshot {
+                        channel,
+                        entries: queue
+                            .entries
+                            .iter()
+                            .map(|entry| {
+                                (
+                                    entry.descriptor.payload,
+                                    entry.descriptor.sender_sequence,
+                                    entry.payload_authority.target,
+                                )
+                            })
+                            .collect(),
+                        send_waiters: queue.send_waiters.iter().copied().collect(),
+                        receive_waiters: queue.receive_waiters.iter().copied().collect(),
+                    })
+            })
+            .collect()
     }
 
     pub(crate) fn mailboxes(&self) -> &HashMap<u32, Mailbox> {
@@ -355,7 +432,9 @@ impl Kernel {
     }
 
     fn create_object_for(&mut self, actor: Ref64, kind: ObjectKind, bytes: Vec<u8>) -> Ref64 {
-        let r = self.objects.alloc(ObjectDescriptor::new(kind, bytes.len() as u64));
+        let r = self
+            .objects
+            .alloc(ObjectDescriptor::new(kind, bytes.len() as u64));
         let byte_length = bytes.len() as u64;
         self.object_payloads.insert(r.slot, bytes);
         {
@@ -422,9 +501,12 @@ impl Kernel {
 
     /// Find a capability in an actor-relative space by target and required rights.
     pub fn find_capability(&self, actor: Ref64, target: Ref64, rights: u32) -> Option<Ref64> {
-        self.capability_spaces.get(&actor.slot)?.iter().find_map(|(r, cap)| {
-            (cap.target == target && cap.rights & rights == rights).then_some(r)
-        })
+        self.capability_spaces
+            .get(&actor.slot)?
+            .iter()
+            .find_map(|(r, cap)| {
+                (cap.target == target && cap.rights & rights == rights).then_some(r)
+            })
     }
 
     pub fn capability_entry(
@@ -519,12 +601,7 @@ impl Kernel {
         self.trace(EventKind::AuthorityEffect, actor, target, right, 0);
     }
 
-    fn find_authorized_capability(
-        &self,
-        actor: Ref64,
-        right: u32,
-        target: Ref64,
-    ) -> Option<Ref64> {
+    fn find_authorized_capability(&self, actor: Ref64, right: u32, target: Ref64) -> Option<Ref64> {
         let space = self.capability_spaces.get(&actor.slot)?;
         let object_metadata = if target.kind == Kind::Object {
             self.objects
@@ -536,13 +613,10 @@ impl Kernel {
         };
         space.iter().find_map(|(capability_ref, capability)| {
             let full_object_access = object_metadata
-                .map(|(_, byte_length)| {
-                    capability.offset == 0 && capability.length >= byte_length
-                })
+                .map(|(_, byte_length)| capability.offset == 0 && capability.length >= byte_length)
                 .unwrap_or(true);
-            let object_access_rights = crate::abi::Rights::READ
-                | crate::abi::Rights::WRITE
-                | crate::abi::Rights::FREEZE;
+            let object_access_rights =
+                crate::abi::Rights::READ | crate::abi::Rights::WRITE | crate::abi::Rights::FREEZE;
             let range_is_sufficient = right & object_access_rights == 0 || full_object_access;
             (capability.target == target
                 && capability.rights & right == right
@@ -556,10 +630,7 @@ impl Kernel {
         })
     }
 
-    fn capability_chain_is_live(
-        space: &GenTable<CapabilityEntry>,
-        capability: Ref64,
-    ) -> bool {
+    fn capability_chain_is_live(space: &GenTable<CapabilityEntry>, capability: Ref64) -> bool {
         let mut current = capability;
         // More parent edges than live entries implies a cycle. The bound also
         // makes corrupted raw-test states terminate deterministically.
@@ -599,8 +670,7 @@ impl Kernel {
             let roots: Vec<Ref64> = space
                 .iter()
                 .filter_map(|(capability, entry)| {
-                    (entry.target == target && entry.rights & right == right)
-                        .then_some(capability)
+                    (entry.target == target && entry.rights & right == right).then_some(capability)
                 })
                 .collect();
             for root in roots {
@@ -758,7 +828,8 @@ impl Kernel {
 
     pub fn create_process(&mut self, actor: Ref64, mode: ProcessMode) -> Ref64 {
         let r = self.processes.alloc(ProcessDescriptor::new(mode));
-        self.capability_spaces.insert(r.slot, GenTable::new(Kind::Capability));
+        self.capability_spaces
+            .insert(r.slot, GenTable::new(Kind::Capability));
         self.mint_genesis(r, r, 0, 0);
         let state_obj = self.create_object_for(r, ObjectKind::ProcessState, Vec::new());
         if actor != r {
@@ -816,6 +887,7 @@ impl Kernel {
     pub(super) fn contain_process_failure(&mut self, process: Ref64, faulted: Ref64) {
         self.cancel_process_continuations(process, Some(faulted));
         self.settle_owned_futures(process, FutureState::Failed);
+        self.settle_owned_collectives(process, CollectiveState::Failed);
         self.drain_terminal_mailbox(process);
         self.capability_spaces.remove(&process.slot);
     }
@@ -823,6 +895,7 @@ impl Kernel {
     pub(super) fn finalize_process_cancellation(&mut self, process: Ref64) {
         self.cancel_process_continuations(process, None);
         self.settle_owned_futures(process, FutureState::Cancelled);
+        self.settle_owned_collectives(process, CollectiveState::Cancelled);
         self.drain_terminal_mailbox(process);
         self.capability_spaces.remove(&process.slot);
         if let Ok(descriptor) = self.processes.get_mut(process) {
@@ -876,6 +949,14 @@ impl Kernel {
                 .full_waiters
                 .retain(|waiter| !cancelled.contains(waiter));
         }
+        for channel in self.channel_queues.values_mut() {
+            channel
+                .send_waiters
+                .retain(|waiter| !cancelled.contains(waiter));
+            channel
+                .receive_waiters
+                .retain(|waiter| !cancelled.contains(waiter));
+        }
     }
 
     fn settle_owned_futures(&mut self, process: Ref64, terminal: FutureState) {
@@ -898,11 +979,8 @@ impl Kernel {
             }
             let waiters = self.future_waiters.remove(&future.slot).unwrap_or_default();
             for waiter in waiters {
-                let Some((waiter_process, run_class, status)) = self
-                    .continuations
-                    .get(waiter)
-                    .ok()
-                    .map(|descriptor| {
+                let Some((waiter_process, run_class, status)) =
+                    self.continuations.get(waiter).ok().map(|descriptor| {
                         (descriptor.process, descriptor.run_class, descriptor.status)
                     })
                 else {
@@ -934,6 +1012,29 @@ impl Kernel {
         }
     }
 
+    fn settle_owned_collectives(&mut self, process: Ref64, terminal: CollectiveState) {
+        let collectives: Vec<Ref64> = self
+            .collectives
+            .iter()
+            .filter_map(|(collective, descriptor)| {
+                (descriptor.owner_process == process
+                    && descriptor.state == CollectiveState::Pending)
+                    .then_some(collective)
+            })
+            .collect();
+        let event = if terminal == CollectiveState::Failed {
+            EventKind::CollectiveFailed
+        } else {
+            EventKind::CollectiveCancelled
+        };
+        for collective in collectives {
+            if let Ok(descriptor) = self.collectives.get_mut(collective) {
+                descriptor.state = terminal;
+            }
+            self.trace(event, process, collective, 0, 0);
+        }
+    }
+
     fn drain_terminal_mailbox(&mut self, process: Ref64) {
         let full_waiters = if let Some(mailbox) = self.mailboxes.get_mut(&process.slot) {
             mailbox.entries.clear();
@@ -944,11 +1045,8 @@ impl Kernel {
         };
 
         for waiter in full_waiters {
-            let Some((waiter_process, run_class, status)) = self
-                .continuations
-                .get(waiter)
-                .ok()
-                .map(|descriptor| {
+            let Some((waiter_process, run_class, status)) =
+                self.continuations.get(waiter).ok().map(|descriptor| {
                     (descriptor.process, descriptor.run_class, descriptor.status)
                 })
             else {
@@ -996,19 +1094,16 @@ impl Kernel {
             return Err(RuntimeError::InvalidStateAccess);
         }
         self.authority_effect(actor, crate::abi::Rights::WRITE, process);
-        let frame_obj = self.create_object_for(
-            process,
-            ObjectKind::ContinuationFrame,
-            spec.frame_bytes,
-        );
-        let r = self.continuations.alloc(
-            crate::abi::continuations::ContinuationDescriptor::new(
+        let frame_obj =
+            self.create_object_for(process, ObjectKind::ContinuationFrame, spec.frame_bytes);
+        let r = self
+            .continuations
+            .alloc(crate::abi::continuations::ContinuationDescriptor::new(
                 process,
                 spec.state_access,
                 spec.run_class,
                 spec.resume_point,
-            ),
-        );
+            ));
         {
             let c = self.continuations.get_mut(r).expect("fresh continuation");
             c.id = r;
@@ -1074,7 +1169,10 @@ impl Kernel {
         if settled {
             return Ok(AwaitOutcome::AlreadySettled(future_state));
         }
-        self.future_waiters.entry(future.slot).or_default().push(cont);
+        self.future_waiters
+            .entry(future.slot)
+            .or_default()
+            .push(cont);
         // The `ContinuationWaiting` trace is emitted once, by the commit phase
         // (§18 Phase G), so every await path produces exactly one event.
         Ok(AwaitOutcome::Registered)
@@ -1132,6 +1230,312 @@ impl Kernel {
         Ok(self.futures.get(future)?.state)
     }
 
+    // ---- channels --------------------------------------------------------
+
+    pub fn create_channel(&mut self, actor: Ref64, capacity: u32) -> Ref64 {
+        let channel = self.channels.alloc(ChannelDescriptor::new(capacity.max(1)));
+        self.channels.get_mut(channel).expect("fresh channel").id = channel;
+        self.channel_queues
+            .insert(channel.slot, ChannelQueue::new());
+        self.mint_genesis(actor, channel, 0, 0);
+        channel
+    }
+
+    pub fn send_channel(
+        &mut self,
+        actor: Ref64,
+        channel: Ref64,
+        payload: Ref64,
+        sender_continuation: Ref64,
+    ) -> Result<(), RuntimeError> {
+        self.authorize(actor, crate::abi::Rights::SEND, channel)?;
+        let descriptor = self.channels.get(channel)?;
+        if descriptor.closed != 0 {
+            return Err(RuntimeError::ChannelClosed);
+        }
+        let full = self
+            .channel_queues
+            .get(&channel.slot)
+            .ok_or(RuntimeError::MissingMailbox)?
+            .entries
+            .len()
+            >= descriptor.capacity as usize;
+        if full {
+            self.authority_effect(actor, crate::abi::Rights::SEND, channel);
+            let queue = self
+                .channel_queues
+                .get_mut(&channel.slot)
+                .ok_or(RuntimeError::MissingMailbox)?;
+            if !sender_continuation.is_null() && !queue.send_waiters.contains(&sender_continuation)
+            {
+                queue.send_waiters.push_back(sender_continuation);
+            }
+            return Err(RuntimeError::MailboxFull);
+        }
+
+        let payload_authority = self.escrow_payload_read(actor, payload)?;
+        self.authorize(actor, crate::abi::Rights::SEND, channel)?;
+        self.authority_effect(actor, crate::abi::Rights::SEND, channel);
+        let (sequence, receiver_waiter) = {
+            let queue = self
+                .channel_queues
+                .get_mut(&channel.slot)
+                .ok_or(RuntimeError::MissingMailbox)?;
+            let sequence = queue.next_sequence;
+            queue.next_sequence = queue.next_sequence.wrapping_add(1);
+            let mut message = MessageDescriptor::new(actor, channel, payload);
+            message.sender_sequence = sequence;
+            message.logical_timestamp = self.logical_time;
+            queue.entries.push_back(EscrowMessage {
+                descriptor: message,
+                payload_authority,
+            });
+            (sequence, queue.receive_waiters.pop_front())
+        };
+        if let Some(waiter) = receiver_waiter {
+            self.wake_waiting_continuation(waiter);
+        }
+        self.trace(EventKind::ChannelSent, actor, channel, 0, sequence as u32);
+        Ok(())
+    }
+
+    pub fn receive_channel(
+        &mut self,
+        actor: Ref64,
+        channel: Ref64,
+        continuation: Ref64,
+    ) -> Result<Option<MessageDescriptor>, RuntimeError> {
+        self.authorize(actor, crate::abi::Rights::RECEIVE, channel)?;
+        if actor != SYSTEM_PRINCIPAL
+            && !continuation.is_null()
+            && self.continuations.get(continuation)?.process != actor
+        {
+            return Err(RuntimeError::InvalidStateAccess);
+        }
+        let closed = self.channels.get(channel)?.closed != 0;
+        let empty = self
+            .channel_queues
+            .get(&channel.slot)
+            .ok_or(RuntimeError::MissingMailbox)?
+            .entries
+            .is_empty();
+        if closed && empty {
+            return Err(RuntimeError::ChannelClosed);
+        }
+        self.authority_effect(actor, crate::abi::Rights::RECEIVE, channel);
+        let (entry, sender_waiter) = {
+            let queue = self
+                .channel_queues
+                .get_mut(&channel.slot)
+                .ok_or(RuntimeError::MissingMailbox)?;
+            match queue.entries.pop_front() {
+                Some(entry) => (Some(entry), queue.send_waiters.pop_front()),
+                None => {
+                    if !continuation.is_null() && !queue.receive_waiters.contains(&continuation) {
+                        queue.receive_waiters.push_back(continuation);
+                    }
+                    (None, None)
+                }
+            }
+        };
+        if let Some(waiter) = sender_waiter {
+            self.wake_waiting_continuation(waiter);
+        }
+        let Some(mut entry) = entry else {
+            return Ok(None);
+        };
+        let transferred = self
+            .capability_spaces
+            .get_mut(&actor.slot)
+            .ok_or(RuntimeError::MissingCapabilitySpace)?
+            .alloc(entry.payload_authority);
+        entry.descriptor.transferred_capability = transferred;
+        self.trace(
+            EventKind::ChannelReceived,
+            actor,
+            channel,
+            0,
+            entry.descriptor.sender_sequence as u32,
+        );
+        Ok(Some(entry.descriptor))
+    }
+
+    pub fn close_channel(&mut self, actor: Ref64, channel: Ref64) -> Result<(), RuntimeError> {
+        self.authorize(actor, crate::abi::Rights::DESTROY, channel)?;
+        if self.channels.get(channel)?.closed != 0 {
+            return Ok(());
+        }
+        self.authority_effect(actor, crate::abi::Rights::DESTROY, channel);
+        self.channels.get_mut(channel)?.closed = 1;
+        let waiters = {
+            let queue = self
+                .channel_queues
+                .get_mut(&channel.slot)
+                .ok_or(RuntimeError::MissingMailbox)?;
+            queue
+                .send_waiters
+                .drain(..)
+                .chain(queue.receive_waiters.drain(..))
+                .collect::<Vec<_>>()
+        };
+        for waiter in waiters {
+            self.wake_waiting_continuation(waiter);
+        }
+        self.trace(EventKind::ChannelClosed, actor, channel, 0, 0);
+        Ok(())
+    }
+
+    pub fn channel_len(&self, channel: Ref64) -> Result<usize, RuntimeError> {
+        let _ = self.channels.get(channel)?;
+        Ok(self
+            .channel_queues
+            .get(&channel.slot)
+            .ok_or(RuntimeError::MissingMailbox)?
+            .entries
+            .len())
+    }
+
+    fn escrow_payload_read(
+        &mut self,
+        actor: Ref64,
+        payload: Ref64,
+    ) -> Result<CapabilityEntry, RuntimeError> {
+        self.authorize(actor, crate::abi::Rights::TRANSFER, payload)?;
+        let capability = self
+            .find_authorized_capability(
+                actor,
+                crate::abi::Rights::READ | crate::abi::Rights::TRANSFER,
+                payload,
+            )
+            .ok_or(RuntimeError::AuthorityDenied)?;
+        let mut escrowed = self
+            .capability_spaces
+            .get(&actor.slot)
+            .ok_or(RuntimeError::MissingCapabilitySpace)?
+            .get(capability)?
+            .clone();
+        escrowed.rights = crate::abi::Rights::READ;
+        escrowed.parent_capability = Ref64::NULL;
+        self.authority_effect(actor, crate::abi::Rights::TRANSFER, payload);
+        Ok(escrowed)
+    }
+
+    fn wake_waiting_continuation(&mut self, continuation: Ref64) {
+        let Some((process, run_class, status)) = self
+            .continuations
+            .get(continuation)
+            .ok()
+            .map(|entry| (entry.process, entry.run_class, entry.status))
+        else {
+            return;
+        };
+        if status != crate::abi::continuations::ContinuationState::Waiting {
+            return;
+        }
+        if let Ok(entry) = self.continuations.get_mut(continuation) {
+            entry.status = crate::abi::continuations::ContinuationState::Runnable;
+        }
+        self.scheduler.enqueue(run_class, continuation);
+        self.trace(
+            EventKind::ContinuationReady,
+            process,
+            continuation,
+            run_class,
+            0,
+        );
+    }
+
+    // ---- collectives -----------------------------------------------------
+
+    pub fn create_batch_evaluate(
+        &mut self,
+        actor: Ref64,
+        inputs: Ref64,
+        element_count: u32,
+        element_stride: u32,
+    ) -> Result<(Ref64, Ref64), RuntimeError> {
+        self.authorize(actor, crate::abi::Rights::READ, inputs)?;
+        self.validate_frozen_array(inputs, element_count, element_stride)?;
+        let completion = self.create_future(actor);
+        let collective = self.collectives.alloc(CollectiveDescriptor::batch_evaluate(
+            actor,
+            inputs,
+            element_count,
+            element_stride,
+            completion,
+        ));
+        self.collectives.get_mut(collective)?.id = collective;
+        self.mint_genesis(actor, collective, 0, 0);
+        self.trace(
+            EventKind::CollectiveCreated,
+            actor,
+            collective,
+            0,
+            element_count,
+        );
+        Ok((collective, completion))
+    }
+
+    pub fn complete_batch_evaluate(
+        &mut self,
+        actor: Ref64,
+        collective: Ref64,
+        outputs: Ref64,
+    ) -> Result<(), RuntimeError> {
+        self.authorize(actor, crate::abi::Rights::WRITE, collective)?;
+        let (state, count, stride, completion) = {
+            let descriptor = self.collectives.get(collective)?;
+            (
+                descriptor.state,
+                descriptor.element_count,
+                descriptor.element_stride,
+                descriptor.completion_future,
+            )
+        };
+        if state != CollectiveState::Pending
+            || self.future_state(completion)? != FutureState::Pending
+        {
+            return Err(RuntimeError::InvalidCollective);
+        }
+        self.authorize(actor, crate::abi::Rights::RESOLVE, completion)?;
+        self.authorize(actor, crate::abi::Rights::READ, outputs)?;
+        self.validate_frozen_array(outputs, count, stride)?;
+        self.authorize(actor, crate::abi::Rights::WRITE, collective)?;
+        self.authority_effect(actor, crate::abi::Rights::WRITE, collective);
+        {
+            let descriptor = self.collectives.get_mut(collective)?;
+            descriptor.outputs = outputs;
+            descriptor.state = CollectiveState::Completed;
+        }
+        self.resolve_future(actor, completion, outputs)?;
+        self.trace(EventKind::CollectiveCompleted, actor, collective, 0, count);
+        Ok(())
+    }
+
+    pub fn collective_state(&self, collective: Ref64) -> Result<CollectiveState, RuntimeError> {
+        Ok(self.collectives.get(collective)?.state)
+    }
+
+    fn validate_frozen_array(
+        &self,
+        object: Ref64,
+        element_count: u32,
+        element_stride: u32,
+    ) -> Result<(), RuntimeError> {
+        let descriptor = self.objects.get(object)?;
+        let required = u64::from(element_count)
+            .checked_mul(u64::from(element_stride))
+            .ok_or(RuntimeError::InvalidCollective)?;
+        if descriptor.object_kind != ObjectKind::FrozenArray
+            || descriptor.byte_length < required
+            || crate::kernel::ownership::ownership_state(self, object)?
+                != crate::abi::OwnershipState::FrozenShared
+        {
+            return Err(RuntimeError::InvalidCollective);
+        }
+        Ok(())
+    }
+
     // ---- messages --------------------------------------------------------
 
     /// Send a message from a continuation into `receiver`'s mailbox with
@@ -1154,14 +1558,7 @@ impl Kernel {
         }
         if self.mailbox_is_full(receiver)? {
             self.authority_effect(actor, crate::abi::Rights::SEND, receiver);
-            return self.push_message(
-                actor,
-                receiver,
-                payload,
-                Ref64::NULL,
-                sender_cont,
-                true,
-            );
+            return self.push_message(actor, receiver, payload, Ref64::NULL, sender_cont, true);
         }
         let byte_length = self.objects.get(payload)?.byte_length;
         let transferred = self.grant_capability(
@@ -1199,14 +1596,7 @@ impl Kernel {
             return Err(RuntimeError::ProcessUnavailable);
         }
         if self.mailbox_is_full(receiver)? {
-            return self.push_message(
-                sender,
-                receiver,
-                payload,
-                Ref64::NULL,
-                sender_cont,
-                false,
-            );
+            return self.push_message(sender, receiver, payload, Ref64::NULL, sender_cont, false);
         }
         let object = self.objects.get(payload)?;
         let byte_length = object.byte_length;

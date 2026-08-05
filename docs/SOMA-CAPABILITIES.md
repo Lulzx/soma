@@ -345,6 +345,11 @@ when adding an operation.
 | `enqueue_message` | `SEND` | receiver process | Plus `TRANSFER` on any attached capability. |
 | `receive_message` | `RECEIVE` | own mailbox | Trivially held today. It becomes meaningful with channels. |
 | `ingest_message` | system | receiver | External input from the system principal. |
+| `send_channel` | `SEND` | channel | Also requires `READ|TRANSFER` on the payload; escrow retains a root `READ` capability until delivery. |
+| `receive_channel` | `RECEIVE` | channel | Installs escrowed payload `READ` authority in the receiver's space. |
+| `close_channel` | `DESTROY` | channel | Rejects new sends while allowing the existing FIFO to drain. |
+| `create_batch_evaluate` | `READ` | frozen input array | Creation mints the collective and completion future. |
+| `complete_batch_evaluate` | `WRITE`, `RESOLVE`, `READ` | collective, future, frozen output array | Publishes outputs exactly once through the completion future. |
 | `run_epoch` and scheduling | system | none | The machine acting as itself. |
 
 ### 10.1 Introspection, deliberately left ungated

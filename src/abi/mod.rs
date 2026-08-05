@@ -6,7 +6,9 @@
 //! `soma/abi/*` in §24 of the contract.
 
 pub mod capabilities;
+pub mod channels;
 pub mod cohorts;
+pub mod collectives;
 pub mod contracts;
 pub mod continuations;
 pub mod futures;
@@ -17,7 +19,9 @@ pub mod refs;
 pub mod traces;
 
 pub use capabilities::{CapabilityEntry, Rights};
+pub use channels::ChannelDescriptor;
 pub use cohorts::{CohortDescriptor, PartialCohortPolicy, MAX_COHORT_WIDTH};
+pub use collectives::{CollectiveDescriptor, CollectiveKind, CollectiveState};
 pub use contracts::{
     ContractFlags, DeterminismPolicy, ExecutionContract, PlacementPolicy, PrecisionPolicy, Shape,
 };

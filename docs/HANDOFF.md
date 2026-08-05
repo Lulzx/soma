@@ -3,8 +3,8 @@
 Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
-Repository: https://github.com/Lulzx/soma. About 7,200 lines of Rust, no
-dependencies, 106 tests, and no Clippy warnings.
+Repository: https://github.com/Lulzx/soma. About 7,500 lines of Rust, no
+dependencies, 112 integration tests, one doc test, and no Clippy warnings.
 
 ```sh
 cargo test
@@ -49,7 +49,8 @@ the mismatch.
 src/
   abi/         Fixed-width ABI structs. Ref64 = slot+generation+kind+flags.
                Descriptors for objects, processes, continuations, cohorts,
-               futures, messages, capabilities, contracts, traces.
+               futures, messages, channels, collectives, capabilities,
+               contracts, traces.
   table.rs     Generational slot table. Slot 0 is NULL. Delete bumps generation.
                Stale references fail.
   kernel/      The machine. mod.rs holds all state. epochs.rs runs epochs.
@@ -96,14 +97,16 @@ register state, so another executor can resume the continuation.
   state, with active-continuation enforcement and trace-checked I13 admission.
 - Contained process failure and cancellation: sibling continuations terminate,
   owned futures settle, mailboxes drain, and external waiters/senders wake.
+- First-class bounded channels with capability-gated send/receive/close,
+  back-pressure, FIFO delivery, and kernel escrow of payload `READ` authority.
+- A `BatchEvaluate` collective lifecycle over frozen arrays, publishing one
+  frozen output array through a completion future.
 
 ### Named by the model and NOT implemented
 
 Treat these as absent, not nearly-done:
 
-- **Channels.** Messaging is per-process mailboxes. `Kind::Channel` is a
-  discriminant with no implementation.
-- **Collectives, domains, execution contracts, supervision.** Vocabulary only.
+- **Domains, execution contracts, supervision.** Vocabulary only.
 
 ---
 
@@ -184,8 +187,17 @@ Exported authority roots remain valid.
 
 ### 5.4 Channels and collectives
 
-Currently vocabulary. Collectives matter most: the model claims to cover
-cooperative execution shapes and there is no implementation at all.
+Settled at the semantic-core level. Channels are first-class bounded entities.
+`SEND`, `RECEIVE`, and `DESTROY` gate send, receive, and close; committed
+messages carry an escrowed `READ` root so sender failure cannot revoke an
+in-flight payload. Close rejects new sends, wakes waiters, and permits queued
+messages to drain. I1, I5, I6, and I10b cover channel state.
+
+`BatchEvaluate` accepts a frozen input array plus count and stride and creates a
+completion future. Completion requires a frozen output array, resolves the
+future exactly once, and failure or cancellation of the owner settles both
+entities consistently. This is orchestration and publication semantics only;
+the evaluator body belongs to the future module/IR layer.
 
 ### 5.5 Validation workloads
 
@@ -198,8 +210,9 @@ workloads exercise none of those hard.
 
 ### 5.6 Minimal IR, deliberately deferred
 
-The ownership/failure blockers are settled. Keep the first IR deliberately
-small and avoid encoding channels or collectives before their semantics exist.
+The ownership, failure, channel, and collective blockers are settled. Keep the
+first IR deliberately small: enough to name an evaluator and its frozen-array
+schema without embedding a hardware execution model.
 
 ### 5.7 Later: GPU OS as an implementation
 
@@ -233,8 +246,8 @@ exactly once. Any occupancy figure from a policy that silently drops or double-c
 meaningless.
 
 Mark absent things absent. Do not write a vacuous check to make a table look
-complete. The I10 gap is recorded as a hole with a test proving it, which is
-more useful than a green tick.
+complete. Each newly implemented entity needs both behavioral tests and a
+fault-injection case proving its invariant can reject illegal state.
 
 Every measurement depends on comparable runs. Sort before any scheduling
 decision that would otherwise depend on `HashMap` iteration order.
@@ -273,5 +286,6 @@ decision that would otherwise depend on `HashMap` iteration order.
 3. Break something on purpose. Flip a condition in `commit.rs` and confirm the
    invariant checker catches it. That tells you the safety net is real before
    you rely on it.
-4. Continue the remaining rights in step 5 of
-   `docs/SOMA-CAPABILITIES.md`, one operation at a time.
+4. Build the first channel-heavy validation workload: a generic bounded
+   streaming graph with deterministic stages, back-pressure, and injected
+   producer failure.
