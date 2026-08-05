@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SOMA — ant colony</title>
+<style>
+  :root {
+    --bg: #0a0c10;
+    --panel: #11141b;
+    --line: #1e242f;
+    --ink: #d7dee9;
+    --dim: #6b7688;
+    --accent: #7fd6c1;
+    --warn: #e0864f;
+    --food: #f2c14e;
+  }
+  * { box-sizing: border-box; }
+  /* The whole demo is one screen. Nothing here scrolls the page: the world
+     scales to whatever height is left over, and the panel is sized to fit
+     beside it. */
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    height: 100vh; display: flex; flex-direction: column; overflow: hidden;
+  }
+  header {
+    padding: 10px 20px; border-bottom: 1px solid var(--line); flex: none;
+    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+  }
+  h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .02em; }
+  header .sub { color: var(--dim); font-size: 12px; }
+  main {
+    flex: 1; min-height: 0;
+    display: grid; grid-template-columns: minmax(0,1fr) 370px; gap: 1px; background: var(--line);
+  }
+  section { background: var(--bg); padding: 12px 18px; min-width: 0; min-height: 0; }
+  section.stage { display: flex; flex-direction: column; }
+  section.panel { overflow: auto; }
+  #stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; }
+  #world {
+    /* Drawn oversized and scaled down to the stage, so the world is as large as
+       the screen allows at any window size. `pixelated` keeps the cells crisp
+       through the downscale. */
+    max-width: 100%; max-height: 100%; width: auto; height: auto;
+    image-rendering: pixelated; border: 1px solid var(--line); border-radius: 3px; background: #05070a;
+  }
+  .controls { display: flex; gap: 10px; align-items: center; margin: 10px 0 4px; flex-wrap: wrap; flex: none; }
+  button, select {
+    background: var(--panel); color: var(--ink); border: 1px solid var(--line);
+    padding: 5px 11px; border-radius: 3px; font: inherit; cursor: pointer;
+  }
+  button:hover, select:hover { border-color: var(--dim); }
+  input[type=range] { flex: 1; min-width: 120px; accent-color: var(--accent); }
+  .modes { display: flex; flex-direction: column; gap: 4px; }
+  .modes label {
+    display: flex; align-items: baseline; gap: 8px; padding: 5px 9px; cursor: pointer;
+    border: 1px solid var(--line); border-radius: 3px; background: var(--panel);
+  }
+  .modes label.on { border-color: var(--accent); }
+  .modes .note { color: var(--dim); font-size: 11px; margin-left: auto; }
+  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .12em; color: var(--dim);
+       margin: 14px 0 6px; font-weight: 600; }
+  h2:first-of-type { margin-top: 0; }
+  .bar { display: grid; grid-template-columns: 104px 1fr 40px; gap: 8px; align-items: center;
+         height: 16px; }
+  .bar .track { display: block; height: 10px; background: #161b24; border-radius: 2px; overflow: hidden; }
+  .bar .fill { display: block; height: 100%; min-width: 2px; transition: width .12s linear; }
+  .bar .n { text-align: right; color: var(--dim); font-variant-numeric: tabular-nums; }
+  #lanes { display: flex; flex-direction: column; gap: 1px; }
+  #more { height: 16px; }
+  .cohort { display: flex; gap: 1px; align-items: center; height: 10px; }
+  .cohort .tag { width: 104px; font-size: 10px; color: var(--dim); flex: none;
+                 overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .lane { width: 6px; height: 9px; border-radius: 1px; flex: none; }
+  .lane.idle { background: #1b2029; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  td { padding: 1px 0; }
+  td.k { color: var(--dim); }
+  td.v { text-align: right; }
+  .flag { color: var(--warn); }
+  footer { padding: 8px 20px; border-top: 1px solid var(--line); color: var(--dim);
+           font-size: 11px; flex: none; line-height: 1.45; }
+  #legend { flex: none; font-size: 11px; }
+  #loading { padding: 40px 20px; color: var(--dim); }
+</style>
+</head>
+<body>
+<header>
+  <h1>50,000 Independent Minds, One SIMD Machine</h1>
+  <span class="sub">Every ant behaves independently. SOMA discovers how they should execute together.</span>
+</header>
+
+<div id="loading">Loading traces… (serve this directory over HTTP — <code>python3 -m http.server</code> — <code>file://</code> cannot fetch.)</div>
+
+<main hidden>
+  <section class="stage">
+    <div id="stage"><canvas id="world"></canvas></div>
+    <div class="controls">
+      <button id="play">Pause</button>
+      <input type="range" id="scrub" min="0" value="0">
+      <span id="epoch" class="sub"></span>
+      <select id="speed">
+        <option value="1">1x</option>
+        <option value="2" selected>2x</option>
+        <option value="4">4x</option>
+        <option value="8">8x</option>
+      </select>
+    </div>
+    <div class="sub" id="legend"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Scheduler</h2>
+    <div class="modes" id="modes"></div>
+
+    <h2>Ready continuations</h2>
+    <div id="bins"></div>
+
+    <h2>Physical lane groups</h2>
+    <div id="lanes"></div>
+    <div id="more" class="sub"></div>
+
+    <h2>This epoch</h2>
+    <table id="metrics"></table>
+  </section>
+</main>
+
+<footer>
+  Lane occupancy is a <strong>structural</strong> quantity, computed from how continuations group — a lane
+  group spanning <em>k</em> run classes is charged <em>k</em> masked dispatches because a uniform-dispatch
+  executive cannot do better. The reference executive runs a cohort's lanes one after another, so nothing
+  here is a wall-clock measurement.
+</footer>
+
+<script>
+const FILES = {
+  'run-class':       { path: 'data/run-class.jsonl',       note: 'SOMA run-class cohorting' },
+  'persistent-fifo': { path: 'data/persistent-fifo.jsonl', note: 'one bin, arrival order' },
+  'predator':        { path: 'data/predator.jsonl',        note: 'run-class + failure injection' },
+};
+
+// Behaviour colours. Assigned by run class so the world and the histogram agree.
+const COLOURS = {
+  20: '#6aa9f5', // Explore
+  21: '#7fd6c1', // FollowTrail
+  22: '#f2c14e', // CarryFood
+  23: '#e0864f', // AvoidObstacle
+  24: '#b48ee8', // ReturnHome
+  25: '#5d6675', // Wait
+  26: '#3f7d6e', // ColonyAggregate
+  27: '#8a94a6', // WorldStep
+};
+
+const CELL = 12;
+let runs = {}, current = null, playing = true, frame = 0, speed = 2, tick = 0;
+
+function b64(s) {
+  const bin = atob(s), out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+async function load(name, spec) {
+  const text = await (await fetch(spec.path)).text();
+  const run = { note: spec.note, epochs: [], fields: new Map(), header: null, summary: null };
+  for (const line of text.split('\n')) {
+    if (!line) continue;
+    const r = JSON.parse(line);
+    if (r.kind === 'header') run.header = r;
+    else if (r.kind === 'epoch') run.epochs.push(r);
+    else if (r.kind === 'field') run.fields.set(r.epoch, { food: b64(r.food), home: b64(r.home) });
+    else if (r.kind === 'summary') run.summary = r;
+  }
+  // Fields are emitted on a stride; carry each forward so every epoch can draw.
+  run.fieldAt = [];
+  let last = null;
+  for (let e = 0; e < run.epochs.length; e++) {
+    if (run.fields.has(e)) last = run.fields.get(e);
+    run.fieldAt.push(last);
+  }
+  runs[name] = run;
+}
+
+function obstacleMask(header) {
+  const bits = b64(header.obstacles), n = header.width * header.height;
+  const mask = new Uint8Array(n);
+  for (let i = 0; i < n; i++) mask[i] = (bits[i >> 3] >> (i & 7)) & 1;
+  return mask;
+}
+
+let scratch, scratchCtx;
+function drawWorld(run, epoch) {
+  const h = run.header, W = h.width, H = h.height;
+  const canvas = document.getElementById('world');
+  canvas.width = W * CELL; canvas.height = H * CELL;
+  const ctx = canvas.getContext('2d');
+
+  if (!scratch || scratch.width !== W) {
+    scratch = document.createElement('canvas');
+    scratch.width = W; scratch.height = H;
+    scratchCtx = scratch.getContext('2d');
+  }
+
+  // Terrain and pheromone, drawn at grid resolution then scaled up.
+  const img = scratchCtx.createImageData(W, H);
+  const field = run.fieldAt[epoch];
+  for (let i = 0; i < W * H; i++) {
+    let r = 8, g = 10, b = 14;
+    if (field) {
+      // The field is normalised against its own maximum, and that maximum sits
+      // on a handful of saturated cells near the nests. Linear mapping would
+      // therefore render the entire trail network as near-black. The gamma lift
+      // is a display choice on already-quantised data — it changes what is
+      // legible, not what was simulated.
+      const food = Math.pow(field.food[i] / 255, 0.42);
+      const home = Math.pow(field.home[i] / 255, 0.42);
+      // Home trail reads cool, food trail warm, so the two gradients stay
+      // distinguishable where they overlap.
+      r += home * 30 + food * 200;
+      g += home * 70 + food * 150;
+      b += home * 125 + food * 40;
+    }
+    if (run.mask[i]) { r = 34; g = 38; b = 46; }
+    const p = i * 4;
+    img.data[p] = r; img.data[p+1] = g; img.data[p+2] = b; img.data[p+3] = 255;
+  }
+  scratchCtx.putImageData(img, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(scratch, 0, 0, canvas.width, canvas.height);
+
+  // Food sources.
+  for (const [x, y, rad] of h.food) {
+    ctx.beginPath();
+    ctx.arc((x + .5) * CELL, (y + .5) * CELL, rad * CELL, 0, 7);
+    ctx.strokeStyle = 'rgba(242,193,78,.55)'; ctx.lineWidth = 1.5; ctx.stroke();
+  }
+  // Nests.
+  for (const [x, y] of h.nests) {
+    ctx.beginPath();
+    ctx.arc((x + .5) * CELL, (y + .5) * CELL, CELL * 1.7, 0, 7);
+    ctx.fillStyle = 'rgba(215,222,233,.16)'; ctx.fill();
+    ctx.strokeStyle = 'rgba(215,222,233,.7)'; ctx.lineWidth = 1.2; ctx.stroke();
+  }
+  // Ants, coloured by the behaviour they are about to run.
+  for (const [, x, y, carrying, rc] of run.epochs[epoch].ants) {
+    ctx.fillStyle = COLOURS[rc] || '#fff';
+    ctx.fillRect(x * CELL, y * CELL, CELL, CELL);
+    if (carrying) {
+      ctx.fillStyle = '#fff6d8';
+      ctx.fillRect(x * CELL + CELL/3, y * CELL + CELL/3, CELL/3, CELL/3);
+    }
+  }
+}
+
+// Every list below renders a constant number of rows, padding with spacers.
+// The counts genuinely vary epoch to epoch — a FIFO epoch issues two to three
+// times the dispatches a cohorted one does — and letting the row count drive the
+// layout made the whole panel jump on every frame. Reserving the space costs a
+// little blank area and makes the numbers readable while they change.
+const BIN_ROWS = 8, LANE_ROWS = 13;
+
+function drawBins(run, epoch) {
+  const names = run.header.run_classes;
+  const bins = run.epochs[epoch].bins;
+  const total = Math.max(1, ...bins.map(([, n]) => n));
+  // Under the FIFO baseline there is one bin holding every class, and its key
+  // is a bin index rather than a run class. Say so, rather than printing "0".
+  const label = rc => names[rc] || (rc === 0 ? 'all classes' : rc);
+  const rows = bins.map(([rc, n]) => `
+    <div class="bar">
+      <span>${label(rc)}</span>
+      <span class="track"><span class="fill" style="width:${(n / total * 100).toFixed(1)}%;background:${COLOURS[rc] || '#888'}"></span></span>
+      <span class="n">${n}</span>
+    </div>`);
+  while (rows.length < BIN_ROWS) rows.push('<div class="bar"></div>');
+  document.getElementById('bins').innerHTML = rows.join('');
+}
+
+function drawLanes(run, epoch) {
+  const names = run.header.run_classes;
+  const width = run.header.lane_width;
+  const cohorts = run.epochs[epoch].cohorts;
+  const shown = cohorts.slice(0, LANE_ROWS);
+  const rows = shown.map(([rc, active]) => {
+    const lanes = Array.from({ length: width }, (_, i) =>
+      `<span class="lane${i < active ? '' : ' idle'}" ${i < active ? `style="background:${COLOURS[rc] || '#888'}"` : ''}></span>`
+    ).join('');
+    return `<div class="cohort"><span class="tag">${names[rc] || rc}</span>${lanes}</div>`;
+  });
+  while (rows.length < LANE_ROWS) rows.push('<div class="cohort"></div>');
+  document.getElementById('lanes').innerHTML = rows.join('');
+  document.getElementById('more').textContent = cohorts.length > shown.length
+    ? `+ ${cohorts.length - shown.length} more dispatches this epoch` : '';
+}
+
+function drawMetrics(run, epoch) {
+  const m = run.epochs[epoch].metrics;
+  const e = run.epochs[epoch];
+  const occ = m.lane_slots ? m.useful_lane_slots / m.lane_slots : 0;
+  const waiting = e.bins.reduce((a, [, n]) => a + n, 0);
+  // Always the same rows, including the failure ones. They are zero for most of
+  // a run, and appearing only when non-zero would move everything below them.
+  const flag = n => n ? 'flag' : 'k';
+  const rows = [
+    ['Useful lane occupancy', (occ * 100).toFixed(1) + '%', 'k'],
+    ['Dispatches this epoch', m.dispatches, 'k'],
+    ['Full cohorts', m.full_cohorts, 'k'],
+    ['Continuations waiting', waiting, 'k'],
+    ['Processes alive', e.ants_alive, 'k'],
+    ['Host launches', m.host_launches, 'k'],
+    ['Processes failed', m.failures, flag(m.failures)],
+    ['Terminal notices', m.notices, flag(m.notices)],
+    ['Restarts', m.restarts, flag(m.restarts)],
+  ];
+  document.getElementById('metrics').innerHTML =
+    rows.map(([k, v, cls]) => `<tr><td class="${cls}">${k}</td><td class="v">${v}</td></tr>`).join('');
+}
+
+function render() {
+  const run = runs[current];
+  const epoch = Math.min(frame, run.epochs.length - 1);
+  drawWorld(run, epoch);
+  drawBins(run, epoch);
+  drawLanes(run, epoch);
+  drawMetrics(run, epoch);
+  document.getElementById('epoch').textContent =
+    `epoch ${epoch} / ${run.epochs.length - 1}`;
+  document.getElementById('scrub').value = epoch;
+}
+
+function selectRun(name) {
+  current = name;
+  const run = runs[name];
+  if (!run.mask) run.mask = obstacleMask(run.header);
+  document.getElementById('scrub').max = run.epochs.length - 1;
+  frame = Math.min(frame, run.epochs.length - 1);
+  for (const el of document.querySelectorAll('.modes label'))
+    el.classList.toggle('on', el.dataset.name === name);
+  render();
+}
+
+function loop() {
+  if (playing && current) {
+    tick++;
+    if (tick % Math.max(1, 5 - speed) === 0) {
+      frame = (frame + 1) % runs[current].epochs.length;
+      render();
+    }
+  }
+  requestAnimationFrame(loop);
+}
+
+(async function () {
+  try {
+    await Promise.all(Object.entries(FILES).map(([n, s]) => load(n, s)));
+  } catch (err) {
+    document.getElementById('loading').textContent =
+      'Could not load traces: ' + err + '. Run `cargo run --release --example ant_colony_trace` first, then serve this directory over HTTP.';
+    return;
+  }
+  document.getElementById('loading').hidden = true;
+  document.querySelector('main').hidden = false;
+
+  document.getElementById('modes').innerHTML = Object.entries(FILES).map(([name, spec]) => `
+    <label data-name="${name}">
+      <input type="radio" name="mode" value="${name}" ${name === 'run-class' ? 'checked' : ''}>
+      <span>${name}</span><span class="note">${spec.note}</span>
+    </label>`).join('');
+  for (const input of document.querySelectorAll('input[name=mode]'))
+    input.addEventListener('change', e => selectRun(e.target.value));
+
+  document.getElementById('legend').innerHTML = Object.entries(runs['run-class'].header.run_classes)
+    .map(([rc, name]) => `<span style="color:${COLOURS[rc] || '#888'}">■</span> ${name}`).join('  ');
+
+  document.getElementById('play').addEventListener('click', e => {
+    playing = !playing; e.target.textContent = playing ? 'Pause' : 'Play';
+  });
+  document.getElementById('scrub').addEventListener('input', e => {
+    frame = +e.target.value; render();
+  });
+  document.getElementById('speed').addEventListener('change', e => { speed = +e.target.value; });
+
+  selectRun('run-class');
+  loop();
+})();
+</script>
+</body>
+</html>
