@@ -14,6 +14,12 @@
     --accent: #7fd6c1;
     --warn: #e0864f;
     --food: #f2c14e;
+    /* Three steps, not five. A dense instrument panel carries hierarchy in
+       colour, weight and letter-spacing more than in size, but 11/11.5/12 was
+       noise rather than density. */
+    --f-meta: 11px;
+    --f-base: 13px;
+    --f-title: 16px;
   }
   * { box-sizing: border-box; }
   /* The whole demo is one screen. Nothing here scrolls the page: the world
@@ -21,15 +27,15 @@
      beside it. */
   body {
     margin: 0; background: var(--bg); color: var(--ink);
-    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    font: var(--f-base)/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
     height: 100vh; display: flex; flex-direction: column; overflow: hidden;
   }
   header {
     padding: 10px 20px; border-bottom: 1px solid var(--line); flex: none;
     display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
   }
-  h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .02em; }
-  header .sub { color: var(--dim); font-size: 12px; }
+  h1 { font-size: var(--f-title); margin: 0; font-weight: 600; letter-spacing: .02em; }
+  header .sub { color: var(--dim); font-size: var(--f-meta); }
   main {
     flex: 1; min-height: 0;
     display: grid; grid-template-columns: minmax(0,1fr) 370px; gap: 1px; background: var(--line);
@@ -58,15 +64,15 @@
     border: 1px solid var(--line); border-radius: 3px; background: var(--panel);
   }
   .modes label.on { border-color: var(--accent); }
-  .modes .note { color: var(--dim); font-size: 11px; margin-left: auto; }
-  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .12em; color: var(--dim);
+  .modes .note { color: var(--dim); font-size: var(--f-meta); margin-left: auto; }
+  h2 { font-size: var(--f-meta); text-transform: uppercase; letter-spacing: .12em; color: var(--dim);
        margin: 14px 0 2px; font-weight: 600; }
-  .cap { color: var(--dim); font-size: 11px; margin-bottom: 6px; line-height: 1.35; }
+  .cap { color: var(--dim); font-size: var(--f-meta); margin-bottom: 6px; line-height: 1.35; }
   .cap em { color: var(--ink); font-style: normal; }
   #intro { border-left: 2px solid var(--accent); padding-left: 10px; margin-bottom: 6px;
-           font-size: 11.5px; line-height: 1.5; color: var(--dim); }
+           font-size: var(--f-meta); line-height: 1.5; color: var(--dim); }
   #intro strong { color: var(--ink); font-weight: 600; }
-  #metrics th { font-size: 10px; text-transform: uppercase; letter-spacing: .08em;
+  #metrics th { font-size: var(--f-meta); text-transform: uppercase; letter-spacing: .08em;
                 color: var(--dim); font-weight: 600; text-align: right; padding-bottom: 3px; }
   #metrics th.l { text-align: left; }
   td.other { text-align: right; color: var(--dim); }
@@ -74,8 +80,12 @@
   h2:first-of-type { margin-top: 0; }
   .bar { display: grid; grid-template-columns: 118px 1fr 40px; gap: 8px; align-items: center;
          height: 16px; }
+  .bar > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .bar .track { display: block; height: 10px; background: #161b24; border-radius: 2px; overflow: hidden; }
-  .bar .fill { display: block; height: 100%; min-width: 2px; transition: width .12s linear; }
+  /* Scaled rather than resized: the fills update every frame, and animating
+     width relayouts the panel on each one. */
+  .bar .fill { display: block; height: 100%; width: 100%; transform-origin: left center;
+               transition: transform .12s linear; }
   .bar .n { text-align: right; color: var(--dim); font-variant-numeric: tabular-nums; }
   #lanes { display: flex; flex-direction: column; gap: 1px;
            flex: 1 1 auto; min-height: 0; overflow: hidden; }
@@ -83,19 +93,57 @@
   .panel > h2, .panel > .cap, .panel > .modes, .panel > #bins,
   .panel > #intro, .panel > table { flex: none; }
   .cohort { display: flex; gap: 1px; align-items: center; height: 10px; }
-  .cohort .tag { width: 118px; font-size: 10px; color: var(--dim); flex: none;
+  .cohort .tag { width: 118px; font-size: var(--f-meta); color: var(--dim); flex: none;
                  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .lane { width: 6px; height: 9px; border-radius: 1px; flex: none; }
   .lane.idle { background: #1b2029; }
   table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-  td { padding: 0; font-size: 12px; line-height: 1.4; }
+  td { padding: 0; line-height: 1.4; }
   td.k { color: var(--dim); }
   td.v { text-align: right; }
   .flag { color: var(--warn); }
   footer { padding: 8px 20px; border-top: 1px solid var(--line); color: var(--dim);
-           font-size: 11px; flex: none; line-height: 1.45; }
-  #legend { flex: none; font-size: 11px; }
+           font-size: var(--f-meta); flex: none; line-height: 1.45; }
+  #legend { flex: none; font-size: var(--f-meta); }
   #loading { padding: 40px 20px; color: var(--dim); }
+
+  /* Narrow screens stack. The desktop layout's promise is one screen with no
+     scrolling; keeping that on a phone would mean a world too small to read a
+     trail in and lane groups too small to count. So the page scrolls here, and
+     each part gets the width it needs instead. */
+  @media (max-width: 860px) {
+    body { height: auto; overflow: visible; }
+    main { grid-template-columns: 1fr; }
+    section { padding: 12px 14px; }
+    header, footer { padding: 10px 14px; }
+    header { gap: 4px; }
+    header .sub { flex-basis: 100%; }
+    #stage { min-height: 0; }
+    #world { max-height: 70vh; }
+    /* Natural height: nothing needs to absorb slack when the page can grow. */
+    section.panel { display: block; overflow: visible; }
+    #lanes { flex: none; overflow: visible; }
+    .cohort .tag, .bar { }
+    .cohort .tag { width: 88px; }
+    .bar { grid-template-columns: 88px 1fr 36px; }
+    .lane { width: 5px; }
+    /* Comfortable touch targets. */
+    .modes label { padding: 9px 10px; }
+    button, select { padding: 8px 12px; }
+    input[type=range] { height: 28px; }
+  }
+
+  /* Phone portrait: the 32-lane rows are the thing most likely to overflow. */
+  @media (max-width: 460px) {
+    .cohort .tag { width: 84px; }
+    .bar { grid-template-columns: 84px 1fr 34px; }
+    .lane { width: 4px; }
+    #metrics th, #metrics td { font-size: var(--f-meta); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .bar .fill { transition: none; }
+  }
 </style>
 </head>
 <body>
@@ -281,7 +329,12 @@ function drawWorld(run, epoch) {
 // times the dispatches a cohorted one does — and letting the row count drive the
 // layout made the whole panel jump on every frame. Reserving the space costs a
 // little blank area and makes the numbers readable while they change.
-const BIN_ROWS = 8, LANE_ROWS = 26;
+const BIN_ROWS = 8;
+// Reserved rows keep the panel from resizing every epoch. On desktop `#lanes`
+// clips whatever does not fit; stacked on a phone there is nothing to clip
+// against, so fewer rows are reserved and the overflow count carries the rest.
+const isNarrow = () => window.matchMedia('(max-width: 860px)').matches;
+const laneRows = () => (isNarrow() ? 16 : 26);
 
 function drawBins(run, epoch) {
   const names = run.header.run_classes;
@@ -293,7 +346,7 @@ function drawBins(run, epoch) {
   const rows = bins.map(([rc, n]) => `
     <div class="bar">
       <span>${label(rc)}</span>
-      <span class="track"><span class="fill" style="width:${(n / total * 100).toFixed(1)}%;background:${COLOURS[rc] || '#888'}"></span></span>
+      <span class="track"><span class="fill" style="transform:scaleX(${Math.max(n / total, n > 0 ? 0.01 : 0).toFixed(4)});background:${COLOURS[rc] || '#888'}"></span></span>
       <span class="n">${n}</span>
     </div>`);
   while (rows.length < BIN_ROWS) rows.push('<div class="bar"></div>');
@@ -304,14 +357,15 @@ function drawLanes(run, epoch) {
   const names = run.header.run_classes;
   const width = run.header.lane_width;
   const cohorts = run.epochs[epoch].cohorts;
-  const shown = cohorts.slice(0, LANE_ROWS);
+  const rowCount = laneRows();
+  const shown = cohorts.slice(0, rowCount);
   const rows = shown.map(([rc, active]) => {
     const lanes = Array.from({ length: width }, (_, i) =>
       `<span class="lane${i < active ? '' : ' idle'}" ${i < active ? `style="background:${COLOURS[rc] || '#888'}"` : ''}></span>`
     ).join('');
     return `<div class="cohort"><span class="tag">${names[rc] || rc}</span>${lanes}</div>`;
   });
-  while (rows.length < LANE_ROWS) rows.push('<div class="cohort"></div>');
+  while (rows.length < rowCount) rows.push('<div class="cohort"></div>');
   document.getElementById('lanes').innerHTML = rows.join('');
   document.getElementById('more').textContent = cohorts.length > shown.length
     ? `+ ${cohorts.length - shown.length} more dispatches this epoch` : '';
@@ -435,6 +489,11 @@ function loop() {
     frame = +e.target.value; render();
   });
   document.getElementById('speed').addEventListener('change', e => { speed = +e.target.value; });
+  let resizeTimer;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => { if (current) render(); }, 120);
+  });
 
   selectRun('run-class');
   loop();
