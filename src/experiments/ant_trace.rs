@@ -49,7 +49,25 @@ pub struct ExportOptions {
     pub ant_sample: u32,
     /// Optional predator strike, and the epoch it lands on.
     pub predator: Option<(u32, PredatorStrike)>,
+    /// Emit the field at 1/`field_scale` resolution in each axis.
+    ///
+    /// The field dominates the stream at any interesting grid size, and a
+    /// pheromone gradient survives halving. Cells are combined by *maximum*
+    /// rather than mean: a trail is one cell wide, and averaging it against its
+    /// empty neighbours is how you make a colony's roads disappear.
+    pub field_scale: u32,
 }
+
+/// Bytes per packed ant: `x: u16, y: u16, flags: u8`.
+///
+/// Ten thousand ants as `[id,x,y,carrying,class]` JSON is about 190 kB an epoch
+/// before the commas, which is tens of megabytes across a run and megabytes of
+/// parsing in the viewer. The viewer draws dots; it needs a position, whether
+/// the ant is laden, and which behaviour to colour it. That is five bytes.
+pub const ANT_RECORD: usize = 5;
+
+/// `carrying` occupies the top bit, the behaviour index the low three.
+const CARRYING_BIT: u8 = 0x80;
 
 impl Default for ExportOptions {
     fn default() -> Self {
@@ -59,6 +77,7 @@ impl Default for ExportOptions {
             field_stride: 4,
             ant_sample: 0,
             predator: None,
+            field_scale: 1,
         }
     }
 }
@@ -238,7 +257,8 @@ impl<W: Write> Exporter<W> {
             self.sink,
             "{{\"kind\":\"header\",\"width\":{},\"height\":{},\"colonies\":{},\
              \"ants\":{},\"epochs\":{},\"seed\":{},\"mode\":\"{}\",\"lane_width\":{},\
-             \"field_stride\":{},\"ant_sample\":{}",
+             \"field_stride\":{},\"ant_sample\":{},\"ant_record\":{},\"field_scale\":{},\
+             \"field_w\":{},\"field_h\":{}",
             knobs.width,
             knobs.height,
             knobs.colonies,
@@ -249,6 +269,10 @@ impl<W: Write> Exporter<W> {
             self.options.cohort_width,
             self.options.field_stride,
             self.options.ant_sample,
+            ANT_RECORD,
+            self.options.field_scale.max(1),
+            knobs.width as u32 / self.options.field_scale.max(1),
+            knobs.height as u32 / self.options.field_scale.max(1),
         )?;
 
         write!(self.sink, ",\"nests\":[")?;
@@ -310,24 +334,24 @@ impl<W: Write> Exporter<W> {
         } else {
             (ants.len() as u32).div_ceil(self.options.ant_sample).max(1) as usize
         };
-        write!(self.sink, ",\"ants\":[")?;
+        let mut packed = Vec::with_capacity(ants.len() * ANT_RECORD);
         let mut written = 0usize;
         for ant in ants.iter().step_by(stride) {
             if !ant.alive {
                 continue;
             }
-            if written > 0 {
-                write!(self.sink, ",")?;
-            }
-            write!(
-                self.sink,
-                "[{},{},{},{},{}]",
-                ant.id, ant.x, ant.y, ant.carrying as u8, ant.run_class
-            )?;
+            packed.extend_from_slice(&ant.x.to_le_bytes());
+            packed.extend_from_slice(&ant.y.to_le_bytes());
+            let behaviour = ant.run_class.saturating_sub(crate::compiler::run_classes::ANT_BASE);
+            packed.push((behaviour as u8 & 0x07) | if ant.carrying { CARRYING_BIT } else { 0 });
             written += 1;
         }
-        write!(self.sink, "],\"ants_shown\":{written},\"ants_alive\":{}",
-            ants.iter().filter(|a| a.alive).count())?;
+        write!(
+            self.sink,
+            ",\"ants\":\"{}\",\"ants_shown\":{written},\"ants_alive\":{}",
+            base64(&packed),
+            ants.iter().filter(|a| a.alive).count()
+        )?;
 
         // Ready continuations per run class — the bin histogram.
         write!(self.sink, ",\"bins\":[")?;
@@ -403,19 +427,36 @@ impl<W: Write> Exporter<W> {
             return Ok(());
         };
 
-        let mut food = vec![0u8; cells];
-        let mut home = vec![0u8; cells];
+        let scale = self.options.field_scale.max(1) as usize;
+        let (width, height) = (colony.knobs.width as usize, colony.knobs.height as usize);
+        let (out_w, out_h) = (width / scale, height / scale);
+
         let mut food_max = 1u16;
         let mut home_max = 1u16;
         for cell in 0..cells {
             food_max = food_max.max(read_trail(bytes, cells, TRAIL_FOOD, cell));
             home_max = home_max.max(read_trail(bytes, cells, TRAIL_HOME, cell));
         }
-        for cell in 0..cells {
-            food[cell] =
-                ((read_trail(bytes, cells, TRAIL_FOOD, cell) as u32 * 255) / food_max as u32) as u8;
-            home[cell] =
-                ((read_trail(bytes, cells, TRAIL_HOME, cell) as u32 * 255) / home_max as u32) as u8;
+
+        let mut food = vec![0u8; out_w * out_h];
+        let mut home = vec![0u8; out_w * out_h];
+        for oy in 0..out_h {
+            for ox in 0..out_w {
+                let (mut f, mut h) = (0u16, 0u16);
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        let (x, y) = (ox * scale + dx, oy * scale + dy);
+                        if x >= width || y >= height {
+                            continue;
+                        }
+                        let cell = y * width + x;
+                        f = f.max(read_trail(bytes, cells, TRAIL_FOOD, cell));
+                        h = h.max(read_trail(bytes, cells, TRAIL_HOME, cell));
+                    }
+                }
+                food[oy * out_w + ox] = ((f as u32 * 255) / food_max as u32) as u8;
+                home[oy * out_w + ox] = ((h as u32 * 255) / home_max as u32) as u8;
+            }
         }
 
         writeln!(

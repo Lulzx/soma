@@ -17,11 +17,27 @@ fn main() -> std::io::Result<()> {
     let out = std::env::args().nth(1).unwrap_or_else(|| "viz/data".into());
     create_dir_all(&out)?;
 
+    // Ten thousand ants across a hundred colonies. The colony size is what keeps
+    // every capability space bounded, so the population scales by adding
+    // colonies rather than by making them bigger.
     let knobs = ColonyKnobs {
-        colonies: 4,
-        ants_per_colony: 96,
-        epochs: 400,
+        colonies: 100,
+        ants_per_colony: 100,
+        width: 320,
+        height: 320,
+        food_sources: 40,
+        epochs: 260,
         ..ColonyKnobs::default()
+    };
+
+    // The whole population is simulated; the stream carries a sample of it. Ten
+    // thousand ants a frame is tens of megabytes that a viewer drawing dots does
+    // not need, and the header records the sampling so the page can say so.
+    let sampling = ExportOptions {
+        ant_sample: 2500,
+        field_stride: 6,
+        field_scale: 2,
+        ..ExportOptions::default()
     };
 
     let runs = [
@@ -29,22 +45,24 @@ fn main() -> std::io::Result<()> {
             "run-class.jsonl",
             ExportOptions {
                 mode: SchedulingMode::RunClassBins,
-                ..ExportOptions::default()
+                ..sampling
             },
         ),
         (
             "persistent-fifo.jsonl",
             ExportOptions {
                 mode: SchedulingMode::PersistentFifo,
-                ..ExportOptions::default()
+                ..sampling
             },
         ),
         (
             "predator.jsonl",
             ExportOptions {
                 mode: SchedulingMode::RunClassBins,
-                predator: Some((200, PredatorStrike { colony: 1, victims: 48 })),
-                ..ExportOptions::default()
+                // A whole colony, so the containment is visible against
+                // ninety-nine that carry on.
+                predator: Some((150, PredatorStrike { colony: 42, victims: 100 })),
+                ..sampling
             },
         ),
     ];

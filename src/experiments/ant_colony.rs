@@ -621,13 +621,26 @@ fn layout(knobs: &ColonyKnobs) -> (Vec<Nest>, Vec<FoodSource>) {
     let span_x = (knobs.width as i32 - 2 * margin).max(1);
     let span_y = (knobs.height as i32 - 2 * margin).max(1);
 
+    // Nests sit on a lattice rather than a line. A row of colonies works for
+    // four and puts a hundred of them two cells apart, which is one nest as far
+    // as any ant is concerned.
+    let count = knobs.colonies.max(1) as i32;
+    let columns = (count as f64).sqrt().ceil() as i32;
+    let rows = count.div_euclid(columns) + i32::from(count % columns != 0);
+    let step_x = span_x / columns.max(1);
+    let step_y = span_y / rows.max(1);
+
     let nests = (0..knobs.colonies)
         .map(|i| {
-            // Colonies sit on a ring so they do not overlap, whatever the count.
-            let slots = knobs.colonies.max(1) as i32;
-            let step = span_x / slots.max(1);
-            let x = margin + step * (i as i32) + step / 2;
-            let y = margin + span_y / 2 + ((i as i32 % 2) * 2 - 1) * (span_y / 6);
+            let index = i as i32;
+            let (column, row) = (index % columns, index / columns);
+            // A deterministic jitter inside the cell, so a large lattice does
+            // not read as wallpaper.
+            let mut cell_rng = knobs.seed ^ ((index as u64) << 17) ^ 0x4E57_0000u64;
+            let jx = (split_mix(&mut cell_rng) % (step_x.max(2) as u64 / 2)) as i32;
+            let jy = (split_mix(&mut cell_rng) % (step_y.max(2) as u64 / 2)) as i32;
+            let x = margin + column * step_x + step_x / 4 + jx;
+            let y = margin + row * step_y + step_y / 4 + jy;
             (
                 x.clamp(0, knobs.width as i32 - 1) as u16,
                 y.clamp(0, knobs.height as i32 - 1) as u16,

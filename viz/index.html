@@ -57,7 +57,14 @@
     padding: 5px 11px; border-radius: 3px; font: inherit; cursor: pointer;
   }
   button:hover, select:hover { border-color: var(--dim); }
-  input[type=range] { flex: 1; min-width: 120px; accent-color: var(--accent); }
+  #track { flex: 1; min-width: 120px; position: relative; display: flex; }
+  input[type=range] { flex: 1; min-width: 0; accent-color: var(--accent); }
+  /* The strike lasts one epoch in two hundred and sixty. Without a mark on the
+     timeline it is essentially unfindable by scrubbing. */
+  #mark { position: absolute; top: 50%; width: 2px; height: 15px; margin-top: -7px;
+          background: var(--warn); pointer-events: none; border-radius: 1px; }
+  #mark::after { content: 'predator'; position: absolute; left: 5px; top: -3px;
+                 font-size: var(--f-meta); color: var(--warn); white-space: nowrap; }
   .modes { display: flex; flex-direction: column; gap: 4px; }
   .modes label {
     display: flex; align-items: baseline; gap: 8px; padding: 4px 9px; cursor: pointer;
@@ -89,7 +96,8 @@
   .bar .n { text-align: right; color: var(--dim); font-variant-numeric: tabular-nums; }
   #lanes { display: flex; flex-direction: column; gap: 1px;
            flex: 1 1 auto; min-height: 0; overflow: hidden; }
-  #more { height: 15px; flex: none; }
+  #more { height: 15px; flex: none; white-space: nowrap; overflow: hidden;
+          text-overflow: ellipsis; }
   .panel > h2, .panel > .cap, .panel > .modes, .panel > #bins,
   .panel > #intro, .panel > table { flex: none; }
   .cohort { display: flex; gap: 1px; align-items: center; height: 10px; }
@@ -98,7 +106,7 @@
   .lane { width: 6px; height: 9px; border-radius: 1px; flex: none; }
   .lane.idle { background: #1b2029; }
   table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-  td { padding: 0; line-height: 1.4; }
+  td { padding: 0; line-height: 1.4; white-space: nowrap; }
   td.k { color: var(--dim); }
   td.v { text-align: right; }
   .flag { color: var(--warn); }
@@ -159,7 +167,7 @@
     <div id="stage"><canvas id="world"></canvas></div>
     <div class="controls">
       <button id="play">Pause</button>
-      <input type="range" id="scrub" min="0" value="0">
+      <span id="track"><input type="range" id="scrub" min="0" value="0"><span id="mark" hidden></span></span>
       <span id="epoch" class="sub"></span>
       <select id="speed">
         <option value="1">1x</option>
@@ -195,8 +203,8 @@
     Every ant is its own process, choosing its own next <strong>behaviour</strong> and knowing about no
     other ant. SOMA packs the ants about to run the <strong>same</strong> behaviour into one SIMD dispatch.
     Switching scheduler reruns the <strong>identical colony</strong> — the world never changes by a single
-    ant, only how the machine packs it. <strong>predator</strong> kills 48 ants of one colony at epoch 200:
-    the failure is contained to that colony and the rest keep foraging.
+    ant, only how the machine packs it. <strong>predator</strong> takes an entire colony at epoch 150:
+    the failure stays there and the other ninety-nine keep foraging.
   </div>
   Lane occupancy is a <strong>structural</strong> quantity, computed from how continuations group — a lane
   group spanning <em>k</em> run classes is charged <em>k</em> masked dispatches because a uniform-dispatch
@@ -223,8 +231,11 @@ const COLOURS = {
   27: '#8a94a6', // WorldStep
 };
 
-const CELL = 12;
 let runs = {}, current = null, playing = true, frame = 0, speed = 2, tick = 0;
+
+// Cells are sized so the world lands near 1200px whatever the grid, then the
+// canvas is scaled down to the stage. A fixed cell size works for one grid.
+const cellSize = W => Math.max(2, Math.round(1200 / W));
 
 function b64(s) {
   const bin = atob(s), out = new Uint8Array(bin.length);
@@ -239,11 +250,14 @@ async function load(name, spec) {
     if (!line) continue;
     const r = JSON.parse(line);
     if (r.kind === 'header') run.header = r;
-    else if (r.kind === 'epoch') run.epochs.push(r);
+    else if (r.kind === 'epoch') { r.ants = b64(r.ants); run.epochs.push(r); }
     else if (r.kind === 'field') run.fields.set(r.epoch, { food: b64(r.food), home: b64(r.home) });
+    // Ants arrive as packed 5-byte records rather than JSON arrays.
     else if (r.kind === 'summary') run.summary = r;
   }
   // Fields are emitted on a stride; carry each forward so every epoch can draw.
+  // The epoch the failure lands on, so the timeline can point at it.
+  run.strike = run.epochs.findIndex(e => e.metrics.failures > 0);
   run.fieldAt = [];
   let last = null;
   for (let e = 0; e < run.epochs.length; e++) {
@@ -263,6 +277,7 @@ function obstacleMask(header) {
 let scratch, scratchCtx;
 function drawWorld(run, epoch) {
   const h = run.header, W = h.width, H = h.height;
+  const CELL = cellSize(W);
   const canvas = document.getElementById('world');
   canvas.width = W * CELL; canvas.height = H * CELL;
   const ctx = canvas.getContext('2d');
@@ -273,24 +288,28 @@ function drawWorld(run, epoch) {
     scratchCtx = scratch.getContext('2d');
   }
 
-  // Terrain and pheromone, drawn at grid resolution then scaled up.
+  // Terrain and pheromone, drawn at grid resolution then scaled up. The field
+  // may be at a coarser resolution than the terrain, so it is sampled rather
+  // than indexed.
   const img = scratchCtx.createImageData(W, H);
   const field = run.fieldAt[epoch];
+  const fs = h.field_scale || 1, fw = h.field_w || W;
   for (let i = 0; i < W * H; i++) {
     let r = 8, g = 10, b = 14;
     if (field) {
+      const fi = Math.floor((i / W | 0) / fs) * fw + Math.floor((i % W) / fs);
       // The field is normalised against its own maximum, and that maximum sits
       // on a handful of saturated cells near the nests. Linear mapping would
       // therefore render the entire trail network as near-black. The gamma lift
       // is a display choice on already-quantised data — it changes what is
       // legible, not what was simulated.
-      const food = Math.pow(field.food[i] / 255, 0.42);
-      const home = Math.pow(field.home[i] / 255, 0.42);
+      const food = Math.pow((field.food[fi] || 0) / 255, 0.42);
+      const home = Math.pow((field.home[fi] || 0) / 255, 0.85);
       // Home trail reads cool, food trail warm, so the two gradients stay
       // distinguishable where they overlap.
-      r += home * 30 + food * 200;
-      g += home * 70 + food * 150;
-      b += home * 125 + food * 40;
+      r += home * 18 + food * 200;
+      g += home * 42 + food * 150;
+      b += home * 78 + food * 40;
     }
     if (run.mask[i]) { r = 34; g = 38; b = 46; }
     const p = i * 4;
@@ -313,15 +332,30 @@ function drawWorld(run, epoch) {
     ctx.fillStyle = 'rgba(215,222,233,.16)'; ctx.fill();
     ctx.strokeStyle = 'rgba(215,222,233,.7)'; ctx.lineWidth = 1.2; ctx.stroke();
   }
-  // Ants, coloured by the behaviour they are about to run.
-  for (const [, x, y, carrying, rc] of run.epochs[epoch].ants) {
-    ctx.fillStyle = COLOURS[rc] || '#fff';
-    ctx.fillRect(x * CELL, y * CELL, CELL, CELL);
-    if (carrying) {
-      ctx.fillStyle = '#fff6d8';
-      ctx.fillRect(x * CELL + CELL/3, y * CELL + CELL/3, CELL/3, CELL/3);
-    }
+  // Ants, coloured by the behaviour they are about to run. Batched by colour:
+  // at ten thousand dots, setting fillStyle per ant is most of the frame.
+  const packed = run.epochs[epoch].ants;
+  const base = +Object.keys(run.header.run_classes)[0];
+  const byClass = new Map();
+  for (let i = 0; i + 4 < packed.length; i += 5) {
+    const flags = packed[i + 4];
+    const rc = base + (flags & 7);
+    let list = byClass.get(rc);
+    if (!list) byClass.set(rc, (list = []));
+    list.push(packed[i] | (packed[i + 1] << 8), packed[i + 2] | (packed[i + 3] << 8),
+              flags & 0x80);
   }
+  const dot = Math.max(CELL, 2);
+  for (const [rc, list] of byClass) {
+    ctx.fillStyle = COLOURS[rc] || '#fff';
+    for (let i = 0; i < list.length; i += 3) ctx.fillRect(list[i] * CELL, list[i+1] * CELL, dot, dot);
+  }
+  // Laden ants get a pale core so the food economy is visible at a glance.
+  ctx.fillStyle = '#fff6d8';
+  const core = Math.max(1, Math.round(CELL / 3));
+  for (const list of byClass.values())
+    for (let i = 0; i < list.length; i += 3)
+      if (list[i+2]) ctx.fillRect(list[i] * CELL + core, list[i+1] * CELL + core, core, core);
 }
 
 // Every list below renders a constant number of rows, padding with spacers.
@@ -358,7 +392,11 @@ function drawLanes(run, epoch) {
   const width = run.header.lane_width;
   const cohorts = run.epochs[epoch].cohorts;
   const rowCount = laneRows();
-  const shown = cohorts.slice(0, rowCount);
+  // Cohorts arrive grouped by run class, so slicing the first N shows N rows of
+  // whichever behaviour happens to sort first. Sampling across the epoch shows
+  // what the epoch actually dispatched.
+  const step = Math.max(1, Math.ceil(cohorts.length / rowCount));
+  const shown = cohorts.filter((_, i) => i % step === 0).slice(0, rowCount);
   const rows = shown.map(([rc, active]) => {
     const lanes = Array.from({ length: width }, (_, i) =>
       `<span class="lane${i < active ? '' : ' idle'}" ${i < active ? `style="background:${COLOURS[rc] || '#888'}"` : ''}></span>`
@@ -368,7 +406,7 @@ function drawLanes(run, epoch) {
   while (rows.length < rowCount) rows.push('<div class="cohort"></div>');
   document.getElementById('lanes').innerHTML = rows.join('');
   document.getElementById('more').textContent = cohorts.length > shown.length
-    ? `+ ${cohorts.length - shown.length} more dispatches this epoch` : '';
+    ? `sampled ${shown.length} of ${cohorts.length.toLocaleString()} dispatches` : '';
 }
 
 // The comparison is the point, and asking someone to toggle back and forth and
@@ -399,11 +437,11 @@ function drawMetrics(run, epoch) {
   // a run, and appearing only when non-zero would move everything below them.
   const flag = n => n ? 'flag' : 'k';
   const rows = [
-    ['Useful lane occupancy', (occ * 100).toFixed(1) + '%', 'k'],
-    ['Dispatches this epoch', m.dispatches, 'k'],
-    ['Full cohorts', m.full_cohorts, 'k'],
-    ['Continuations waiting', waiting, 'k'],
-    ['Processes alive', e.ants_alive, 'k'],
+    ['Lane occupancy', (occ * 100).toFixed(1) + '%', 'k'],
+    ['Dispatches', m.dispatches.toLocaleString(), 'k'],
+    ['Full cohorts', m.full_cohorts.toLocaleString(), 'k'],
+    ['Waiting', waiting.toLocaleString(), 'k'],
+    ['Processes alive', e.ants_alive.toLocaleString(), 'k'],
     ['Host launches', m.host_launches, 'k'],
     // One row rather than three: they are zero for most of a run, and three
     // rows that only matter together cost three rows of height always.
@@ -413,13 +451,15 @@ function drawMetrics(run, epoch) {
   const other = runs[otherName] ? epochStats(runs[otherName], epoch) : null;
   const pct = n => (n * 100).toFixed(1) + '%';
   const otherCol = other ? [
-    pct(other.occ), other.dispatches, other.full, other.waiting,
-    other.alive, other.launches, `${other.failures} / ${other.notices}`,
+    pct(other.occ), other.dispatches.toLocaleString(), other.full.toLocaleString(),
+    other.waiting.toLocaleString(), other.alive.toLocaleString(), other.launches,
+    `${other.failures} / ${other.notices}`,
   ] : rows.map(() => '');
 
   // Highlight the two numbers that carry the claim.
   const highlight = new Set([0, 1, 2]);
-  const head = `<tr><th class="l"></th><th>${current}</th><th>${otherName || ''}</th></tr>`;
+  const short = n => n === 'persistent-fifo' ? 'fifo' : n === 'run-class' ? 'run-class' : n;
+  const head = `<tr><th class="l"></th><th>${short(current)}</th><th>${short(otherName) || ''}</th></tr>`;
   document.getElementById('metrics').innerHTML = head + rows.map(([k, v, cls], i) =>
     `<tr><td class="${cls}">${k}</td>` +
     `<td class="v${highlight.has(i) ? ' win' : ''}">${v}</td>` +
@@ -446,6 +486,13 @@ function selectRun(name) {
   frame = Math.min(frame, run.epochs.length - 1);
   for (const el of document.querySelectorAll('.modes label'))
     el.classList.toggle('on', el.dataset.name === name);
+  const mark = document.getElementById('mark');
+  if (run.strike >= 0) {
+    mark.hidden = false;
+    mark.style.left = `calc(${(run.strike / (run.epochs.length - 1) * 100).toFixed(2)}% - 1px)`;
+  } else {
+    mark.hidden = true;
+  }
   render();
 }
 
@@ -479,8 +526,13 @@ function loop() {
   for (const input of document.querySelectorAll('input[name=mode]'))
     input.addEventListener('change', e => selectRun(e.target.value));
 
-  document.getElementById('legend').innerHTML = Object.entries(runs['run-class'].header.run_classes)
-    .map(([rc, name]) => `<span style="color:${COLOURS[rc] || '#888'}">■</span> ${name}`).join('  ');
+  const h0 = runs['run-class'].header;
+  const shown = runs['run-class'].epochs[0].ants.length / 5;
+  const sampled = shown < h0.ants
+    ? ` &nbsp;·&nbsp; drawing ${shown.toLocaleString()} of ${h0.ants.toLocaleString()} ants; all ${h0.ants.toLocaleString()} are simulated`
+    : '';
+  document.getElementById('legend').innerHTML = Object.entries(h0.run_classes)
+    .map(([rc, name]) => `<span style="color:${COLOURS[rc] || '#888'}">■</span> ${name}`).join('  ') + sampled;
 
   document.getElementById('play').addEventListener('click', e => {
     playing = !playing; e.target.textContent = playing ? 'Pause' : 'Play';
