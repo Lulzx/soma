@@ -99,16 +99,27 @@ pub struct SearchFrame {
     pub branching: u32,
     /// Bounded arithmetic iterations per node (the "state duration" knob).
     pub work_iters: u32,
+    /// How many distinct run classes this search spreads across (§25.1). Each
+    /// node derives its own class from its value, so children scatter across
+    /// classes and a mixed-arrival queue becomes genuinely divergent.
+    pub class_count: u32,
 }
 
 impl SearchFrame {
+    /// A single node with no children, confined to one run class.
     pub fn leaf(value: u64, work_iters: u32) -> SearchFrame {
         SearchFrame {
             value,
             depth: 0,
             branching: 0,
             work_iters,
+            class_count: 1,
         }
+    }
+
+    /// The run class this node belongs to.
+    pub fn run_class(&self) -> u32 {
+        crate::compiler::run_classes::search_class(self.value, self.class_count)
     }
 }
 
@@ -118,6 +129,7 @@ impl Frame for SearchFrame {
         crate::compiler::frame::put_u32(out, self.depth);
         crate::compiler::frame::put_u32(out, self.branching);
         crate::compiler::frame::put_u32(out, self.work_iters);
+        crate::compiler::frame::put_u32(out, self.class_count);
     }
 
     fn decode(c: &mut ByteCursor) -> Result<Self, FrameError> {
@@ -126,6 +138,7 @@ impl Frame for SearchFrame {
             depth: c.u32()?,
             branching: c.u32()?,
             work_iters: c.u32()?,
+            class_count: c.u32()?,
         })
     }
 }

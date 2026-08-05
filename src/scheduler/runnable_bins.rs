@@ -56,14 +56,53 @@ impl DoubleBin {
     }
 }
 
+/// How runnable continuations are assigned to bins — the single variable the
+/// cohorting experiment turns (§26).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SchedulingMode {
+    /// One bin per run class, so a bin's contents are uniform by construction.
+    /// This is the mechanism under test.
+    #[default]
+    RunClassBins,
+    /// A single persistent queue in arrival order, ignoring run class. The
+    /// baseline that isolates launch elimination from cohorting: work is still
+    /// resident and still dispatched in lane groups, but those groups mix run
+    /// classes exactly as they arrive.
+    PersistentFifo,
+}
+
+/// The bin every continuation lands in under `PersistentFifo`.
+pub const FIFO_BIN: u32 = 0;
+
 /// All runnable bins, keyed by run-class id. Run-class grouping is implicit:
 /// each bin belongs to exactly one run class.
 #[derive(Debug, Default)]
 pub struct Scheduler {
     bins: std::collections::HashMap<u32, DoubleBin>,
+    mode: SchedulingMode,
 }
 
 impl Scheduler {
+    /// A scheduler that bins by the given mode.
+    pub fn with_mode(mode: SchedulingMode) -> Scheduler {
+        Scheduler {
+            bins: std::collections::HashMap::new(),
+            mode,
+        }
+    }
+
+    pub fn mode(&self) -> SchedulingMode {
+        self.mode
+    }
+
+    /// The bin a continuation of `run_class` belongs to under the current mode.
+    pub fn bin_of(&self, run_class: u32) -> u32 {
+        match self.mode {
+            SchedulingMode::RunClassBins => run_class,
+            SchedulingMode::PersistentFifo => FIFO_BIN,
+        }
+    }
+
     /// Register a run class with a bin capacity.
     pub fn register_run_class(&mut self, run_class: u32, capacity: u32) {
         self.bins
@@ -71,10 +110,13 @@ impl Scheduler {
             .or_insert_with(|| DoubleBin::new(capacity));
     }
 
-    /// Append a runnable continuation to the given run class's next-epoch bin.
+    /// Append a runnable continuation to the next-epoch bin its run class maps
+    /// to. Under `PersistentFifo` every run class maps to the same bin, which is
+    /// what makes lane groups divergent downstream.
     pub fn enqueue(&mut self, run_class: u32, cont: Ref64) {
+        let bin = self.bin_of(run_class);
         self.bins
-            .entry(run_class)
+            .entry(bin)
             .or_insert_with(|| DoubleBin::new(u32::MAX))
             .enqueue(cont);
     }
@@ -106,8 +148,9 @@ impl Scheduler {
         v
     }
 
-    /// Snapshot of current-epoch runnable counts per run class, for tracing /
-    /// cohorting statistics.
+    /// Snapshot of current-epoch runnable counts per bin, for tracing /
+    /// cohorting statistics. Sorted, so iteration order is deterministic
+    /// regardless of the underlying map.
     pub fn runnable_counts(&self) -> Vec<(u32, usize)> {
         let mut v: Vec<(u32, usize)> = self
             .bins

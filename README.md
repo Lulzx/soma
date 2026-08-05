@@ -1,111 +1,119 @@
 # SOMA
 
-**Small-scale SIMD OS for Many-Agent systems** — Phase 1 kernel prototype.
+**S**mall-scale SI**M**D **O**S for **m**any-**a**gent systems — a kernel prototype.
 
 > Persistent independent processes can execute efficiently on heterogeneous SIMD
 > hardware when their ready continuations are dynamically regrouped into coherent
 > physical execution cohorts.
 
-SOMA is a minimal executable kernel contract that tests that hypothesis. It models
-a population of long-lived, engine-independent processes as a set of bounded,
-resumable continuations, and dynamically regroups those continuations by run class
-so they can be executed as coherent SIMD cohorts. This repository is the Phase-1
-prototype: a deterministic, dependency-free Rust implementation of the ABI, the
-CPU scalar continuation interpreter, and the process/message/future runtime that
-drives them.
+SOMA is an executable kernel contract built to test that sentence. A population of
+long-lived, engine-independent processes is modelled as bounded resumable
+continuations, and those continuations are regrouped by run class so they can be
+dispatched as coherent SIMD cohorts. This repo is the Phase-1 prototype:
+deterministic, dependency-free Rust, no GPU yet.
 
-## The idea in one picture
+## The mechanism
+
+Every resume point of every state machine is a **run class**, and a run class is
+simultaneously three things: the queue a ready continuation belongs to, the key
+the interpreter dispatches on, and the unit a SIMD cohort is cut from. They are
+the same integer. That identity is the whole idea — the scheduler never inspects
+continuation metadata to decide what can run together, because a continuation
+that yields already names its next bin.
 
 ```text
-processes (persistent, serial)          continuations (schedulable units)
-        │                                       │
-        ▼                       resumed by messages / futures ▼
-   bounded state machine   ────►   grouped by run class (cohorting)
-        │                                       │
-        ▼                                       ▼
-   durable frame (byte blob)            CPU scalar / GPU SIMD lane executive
+process (persistent, serial)
+   │  message / future wakes it
+   ▼
+continuation ──► run-class bin ──► cohort of W lanes ──► uniform dispatch
+   │                                                          │
+   └──────────── durable frame (little-endian bytes) ◄─────────┘
 ```
 
-Every *resume point* of every state machine becomes a **run class** — the exact
-queue a continuation belongs to. The scheduler never inspects arbitrary
-continuation metadata; a yielded continuation already knows its next bin. That
-grouping is the seed of cohorting: continuations in one run class can be packed
-into a SIMD cohort and executed through one uniform dispatch.
+The frame is a byte blob in shared memory, not register state, so a continuation
+can move between executives at any continuation boundary.
 
-## What Phase 1 implements
+## What the prototype shows so far
 
-This slice covers the first three steps of the evidence-producing path in the
-[contract](docs/SOMA-P1.md) (§30):
+Binning by run class instead of arrival order raises useful SIMD-lane occupancy
+by **1.85–3.27×** on divergent work, eliminating 46–69% of dispatches.
+Reproduce with `cargo run --example cohort_report`:
 
-1. **Fixed ABI references and generational tables.** `Ref64`
-   (slot / generation / kind / flags), `AbiHeader`, and every descriptor struct
-   (objects, processes, continuations, run classes, execution contracts,
-   messages, futures, capabilities, traces). Deleting an entity bumps its slot
-   generation before reuse, so stale references are always rejected.
-2. **A deterministic CPU scalar continuation interpreter.** Uniform
-   `dispatch(run_class)` execution with step budgets. Frames are little-endian
-   byte blobs that live in shared memory, so a continuation can later move
-   between executives without migrating register state.
-3. **Processes, messages, futures, and double-buffered runnable bins.** Bounded,
-   ordered mailboxes; single-assignment futures that awaken waiters; a
-   serial-process invariant (at most one mutating continuation per process
-   running at a time); and an epoch lifecycle that commits every side effect and
-   emits a full `TraceEvent` stream for deterministic replay.
+| run classes | width | FIFO occupancy | run-class occupancy | ratio |
+| ----------- | ----- | -------------- | ------------------- | ----- |
+| 1           | 32    | 0.910          | 0.910               | 1.00× |
+| 2           | 32    | 0.455          | 0.843               | 1.85× |
+| 4           | 32    | 0.246          | 0.758               | 3.08× |
+| 8           | 32    | 0.202          | 0.615               | 3.04× |
 
-**Deferred to later slices:** the GPU SIMD-lane executive, real cohort
-construction, CPU/GPU migration and spill, the FIFO / bulk-frontier baselines,
-and the Sokoban-style workload.
+The single-class row is the control: with nothing to diverge, cohorting buys
+exactly nothing, as it must.
+
+**This is a structural bound, not a hardware measurement.** A lane group holding
+`k` run classes is counted as `k` masked dispatches because a uniform-dispatch
+executive cannot do better; real hardware can only do worse. It settles the
+occupancy limb of the go/no-go criterion (§28.1) and says nothing about the
+throughput limb or scheduler overhead — both need the GPU executive and
+wall-clock timing that Phase 1 does not have.
+
+## What is implemented
+
+Steps 1–3 and 6 of the contract's evidence-producing path ([§30](docs/SOMA-P1.md)):
+
+- **ABI and generational tables.** `Ref64` (slot / generation / kind / flags) and
+  every descriptor: objects, processes, continuations, run classes, cohorts,
+  execution contracts, messages, futures, capabilities, traces. Deleting an
+  entity bumps its slot generation, so stale references are always rejected.
+- **A deterministic CPU continuation interpreter.** Uniform `dispatch(run_class)`
+  under step budgets, over durable byte-blob frames.
+- **The runtime.** Bounded ordered mailboxes with back-pressure,
+  single-assignment futures, the serial-process invariant, double-buffered
+  runnable bins, and an eight-phase epoch lifecycle that commits every side
+  effect and emits a full trace for replay.
+- **Cohorting and its baseline.** Cohort construction with all four
+  partial-cohort policies, plus a persistent-FIFO scheduling mode that changes
+  binning and nothing else — which is what makes the comparison above honest.
+
+Not yet built: the GPU SIMD executive, CPU/GPU migration and spill, the bulk
+frontier baseline, and the Sokoban workload.
 
 ## Quick start
 
 ```sh
-cargo build          # clean, no warnings
-cargo test           # 27 tests
-cargo clippy --all-targets   # zero lints
+cargo test                    # 37 tests
+cargo run --example cohort_report
+cargo clippy --all-targets    # zero lints
 ```
 
-Requires a stable Rust toolchain. No external dependencies.
-
-## The `Expand` example (§22)
-
-The source model lowers into three resume points, each its own run class:
-
-```text
-Expand.resume_0  Receive request; store in frame; spawn heuristic; await.
-Expand.resume_1  Load heuristic result; generate a bounded group of moves.
-Expand.resume_2  Finish child creation; send reply; complete.
-```
-
-The interpreter test drives a process through the full lifecycle — receive a
-message, await a future across an epoch boundary, yield to the next resume point,
-spawn children, and reply — then asserts the run is deterministic by comparing the
-trace of two identical runs.
+Stable Rust, no dependencies.
 
 ## Layout
 
 ```text
 src/
-  abi/        ABI structs: refs, objects, processes, continuations,
-              contracts, messages, futures, capabilities, traces
-  table.rs    Generational slot table (one per kind, generation-bump on delete)
-  kernel/     Tables + epoch lifecycle + commit + ownership transitions
-  executives/ cpu_scalar: the run-class dispatch interpreter
-  scheduler/  Double-buffered runnable bins per run class
-  compiler/   Frame byte-blob encoding; the Expand state-machine lowering
-  replay/     Trace reader / determinism comparison
-  experiments/ Synthetic branching-search workload with control knobs
-tests/        ABI, Expand end-to-end, dynamic-search determinism
+  abi/         refs, objects, processes, continuations, cohorts,
+               contracts, messages, futures, capabilities, traces
+  table.rs     generational slot table (generation bump on delete)
+  kernel/      tables, epoch lifecycle, commit, ownership, accounting
+  executives/  cpu_scalar: the run-class dispatch interpreter
+  scheduler/   double-buffered run-class bins; cohort construction
+  compiler/    frame encoding; the Expand state-machine lowering
+  replay/      trace reader and determinism comparison
+  experiments/ branching search; the FIFO-vs-cohorting study
 ```
 
 ## Status
 
-Working prototype, `v0.1.0`. Tests cover ABI reference validity, the full Expand
-lifecycle, branching-search termination + determinism, and the kernel's
-negative paths — mailbox back-pressure, step-budget exhaustion, the
-serial-process invariant, re-entry after blocking, and ownership transitions.
-It proves, on one CPU executive, that resumable continuations regrouped by run
-class run deterministically — the mechanism cohorting depends on. The GPU
-executive and the go/no-go measurements (§28) are the next slices.
+Working prototype, `v0.1.0`. The kernel is exercised on its negative paths as
+well as its happy ones — mailbox back-pressure, step-budget exhaustion, the
+serial-process invariant, re-entry after blocking — because that is where an
+epoch lifecycle loses or duplicates work.
+
+What is established: resumable continuations regrouped by run class run
+deterministically, and that regrouping is worth a large occupancy factor on
+divergent work. What is not: that the factor survives contact with a GPU. The
+[contract](docs/SOMA-P1.md) is explicit that SOMA remains a strong but unproven
+abstract machine until it does.
 
 ## License
 

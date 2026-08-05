@@ -8,7 +8,7 @@
 
 use crate::abi::ProcessMode;
 use crate::compiler::frame::Frame;
-use crate::compiler::run_classes::{DEFAULT_MAX_STEPS, SEARCH_BRANCH};
+use crate::compiler::run_classes::DEFAULT_MAX_STEPS;
 use crate::compiler::state_machine_lowering::SearchFrame;
 use crate::kernel::Kernel;
 
@@ -64,7 +64,12 @@ impl ControlKnobs {
 
 /// Spawn the branching-search roots into a fresh kernel. Returns the kernel.
 pub fn build(knobs: &ControlKnobs) -> Kernel {
-    let mut kernel = Kernel::new();
+    build_in(Kernel::new(), knobs)
+}
+
+/// Spawn the roots into an already-configured kernel — used to vary scheduling
+/// mode, cohort width, or partial policy without duplicating workload setup.
+pub fn build_in(mut kernel: Kernel, knobs: &ControlKnobs) -> Kernel {
     for root in 0..knobs.process_count {
         let p = kernel.create_process(ProcessMode::Serial);
         let frame = SearchFrame {
@@ -72,10 +77,12 @@ pub fn build(knobs: &ControlKnobs) -> Kernel {
             depth: knobs.depth,
             branching: knobs.branching_factor,
             work_iters: knobs.arithmetic_ops,
+            class_count: knobs.class_count,
         };
+        let run_class = frame.run_class();
         let mut bytes = Vec::new();
         frame.encode(&mut bytes);
-        kernel.create_continuation(p, SEARCH_BRANCH, 0, bytes, DEFAULT_MAX_STEPS);
+        kernel.create_continuation(p, run_class, 0, bytes, DEFAULT_MAX_STEPS);
     }
     kernel
 }

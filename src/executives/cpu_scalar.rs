@@ -14,8 +14,8 @@ use crate::abi::Ref64;
 use crate::abi::{MessageDescriptor, StepResult};
 use crate::compiler::frame::{ByteCursor, Frame};
 use crate::compiler::run_classes::{
-    DEFAULT_MAX_STEPS, EXPAND_RESUME_0, EXPAND_RESUME_1, EXPAND_RESUME_2, SEARCH_BRANCH,
-    SEARCH_HEURISTIC,
+    search_class_index, DEFAULT_MAX_STEPS, EXPAND_RESUME_0, EXPAND_RESUME_1, EXPAND_RESUME_2,
+    SEARCH_BRANCH, SEARCH_HEURISTIC,
 };
 use crate::compiler::state_machine_lowering::{
     ExpandFrame, HeuristicFrame, SearchFrame,
@@ -41,8 +41,12 @@ pub fn dispatch(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResult 
         EXPAND_RESUME_1 => expand_resume_1(kernel, cont, process),
         EXPAND_RESUME_2 => expand_resume_2(kernel, cont, process),
         SEARCH_HEURISTIC => heuristic(kernel, cont, process),
-        SEARCH_BRANCH => search_branch(kernel, cont, process),
-        _ => StepResult::fault(process, rc),
+        // The search classes occupy a contiguous block; each is a distinct
+        // case of this switch with its own arithmetic (§25.1).
+        rc => match search_class_index(rc) {
+            Some(index) => search_branch(kernel, cont, process, index),
+            None => StepResult::fault(process, rc),
+        },
     }
 }
 
@@ -183,11 +187,15 @@ fn heuristic(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResult {
     }
 }
 
-/// `SEARCH_BRANCH`: one synthetic branching-search node (§25.1). Reads the
+/// One synthetic branching-search node of class `index` (§25.1). Reads the
 /// frame, does a bounded amount of deterministic arithmetic ("state duration"),
 /// then either spawns `branching` child processes (internal node) or completes
-/// (leaf). Every resume point is a run class, so all siblings share this class.
-fn search_branch(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResult {
+/// (leaf).
+///
+/// `index` selects the arithmetic, so the search classes are distinct code
+/// paths rather than aliases of one handler — a cohort really can only contain
+/// one of them.
+fn search_branch(kernel: &mut Kernel, cont: Ref64, process: Ref64, index: u32) -> StepResult {
     let mut sf: SearchFrame = load_frame(
         kernel,
         cont,
@@ -196,11 +204,15 @@ fn search_branch(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResult
             depth: 0,
             branching: 0,
             work_iters: 0,
+            class_count: 1,
         },
     );
+
+    let multiplier = 31u64.wrapping_add(index as u64 * 2);
+    let addend = 7u64.wrapping_add(index as u64);
     let mut acc = sf.value;
     for _ in 0..sf.work_iters {
-        acc = acc.wrapping_mul(31).wrapping_add(7);
+        acc = acc.wrapping_mul(multiplier).wrapping_add(addend);
     }
     sf.value = acc;
 
@@ -212,10 +224,12 @@ fn search_branch(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResult
                 depth: sf.depth - 1,
                 branching: sf.branching,
                 work_iters: sf.work_iters,
+                class_count: sf.class_count,
             };
+            let run_class = cframe.run_class();
             let mut cb = Vec::new();
             cframe.encode(&mut cb);
-            kernel.create_continuation(child, SEARCH_BRANCH, 0, cb, DEFAULT_MAX_STEPS);
+            kernel.create_continuation(child, run_class, 0, cb, DEFAULT_MAX_STEPS);
         }
         // Spawn with no continuation: the commit phase terminates this node.
         StepResult::spawn(process, 0)

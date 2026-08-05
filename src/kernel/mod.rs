@@ -2,6 +2,7 @@
 //! messages, and futures real (§7, §8, §11, §12). Phase 1 is single-threaded and
 //! deterministic; every table is generation-checked (§4).
 
+pub mod accounting;
 pub mod commit;
 pub mod epochs;
 pub mod ownership;
@@ -13,7 +14,9 @@ use crate::abi::{
     AbiError, EventKind, FutureDescriptor, FutureState, Kind, MessageDescriptor, ObjectDescriptor,
     ObjectKind, ProcessDescriptor, ProcessMode, ProcessState, Ref64, TraceEvent,
 };
-use crate::scheduler::runnable_bins::Scheduler;
+use crate::abi::cohorts::PartialCohortPolicy;
+use crate::kernel::accounting::Accounting;
+use crate::scheduler::runnable_bins::{Scheduler, SchedulingMode};
 use crate::table::GenTable;
 
 /// Runtime errors raised by kernel operations.
@@ -114,10 +117,28 @@ pub struct Kernel {
     pub send_sequences: HashMap<(u32, u32), u64>,
 
     pub scheduler: Scheduler,
+
+    /// SIMD lanes per dispatch (§14). The default of 1 makes every cohort a
+    /// single lane, which is exactly scalar execution.
+    pub cohort_width: u16,
+    /// What to do with a run class's final, incompletely filled cohort (§14).
+    pub partial_policy: PartialCohortPolicy,
+    /// Cumulative counters for the §27 measurements.
+    pub accounting: Accounting,
 }
 
 impl Kernel {
     pub fn new() -> Kernel {
+        Kernel::with_scheduler(Scheduler::default())
+    }
+
+    /// A kernel that bins runnable continuations by `mode` — the knob that
+    /// selects between run-class cohorting and the persistent-FIFO baseline.
+    pub fn with_mode(mode: SchedulingMode) -> Kernel {
+        Kernel::with_scheduler(Scheduler::with_mode(mode))
+    }
+
+    fn with_scheduler(scheduler: Scheduler) -> Kernel {
         Kernel {
             epoch: 0,
             logical_time: 0,
@@ -132,7 +153,10 @@ impl Kernel {
             mailboxes: HashMap::new(),
             future_waiters: HashMap::new(),
             send_sequences: HashMap::new(),
-            scheduler: Scheduler::default(),
+            scheduler,
+            cohort_width: 1,
+            partial_policy: PartialCohortPolicy::default(),
+            accounting: Accounting::default(),
         }
     }
 

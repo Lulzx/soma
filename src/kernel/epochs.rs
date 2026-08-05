@@ -1,20 +1,24 @@
-//! The epoch lifecycle (§18). Phase 1 runs on a single CPU scalar executive, so
-//! the phases reduce to: Ingest (nothing external yet) → Validate/Admit (light,
-//! per-process serial guard) → Execute → Commit → Account, then swap the
-//! runnable-bin buffers and advance the epoch.
+//! The epoch lifecycle (§18): Ingest (nothing external yet) → Validate/Admit
+//! (per-process serial guard) → Cohort → Execute → Commit → Account, then swap
+//! the runnable-bin buffers and advance the epoch.
 //!
-//! Phase E (Cohort) is a stub here: everything is scalar, `cohort_width = 1`.
-//! The run-class grouping already performed by `Scheduler::enqueue` is the seed
-//! of cohorting (§9); real SIMD cohort construction is a later slice.
+//! Phase E (Cohort) partitions each bin's admitted continuations into width-`W`
+//! SIMD dispatches (§14). Execution itself is still the CPU scalar executive, so
+//! a cohort's lanes run one after another rather than simultaneously — but the
+//! cohorts are real, and the lane-occupancy they imply is what §28.1 measures.
+//! With the default `cohort_width` of 1 every dispatch is a single lane, which
+//! reduces exactly to the pre-cohorting behaviour.
 
 use std::collections::HashSet;
 
+use crate::abi::cohorts::PartialCohortPolicy;
 use crate::abi::continuations::ContinuationState;
 use crate::abi::ProcessMode;
 use crate::abi::Ref64;
 use crate::executives::cpu_scalar;
 use crate::kernel::commit;
 use crate::kernel::Kernel;
+use crate::scheduler::cohorts::{build_cohorts, CohortPlan};
 
 impl Kernel {
     /// Run one epoch. Returns the number of continuation steps executed.
@@ -26,47 +30,116 @@ impl Kernel {
         // Epoch boundary: promote `next` → `current` (§18 Phase H → next epoch).
         self.scheduler.swap_all();
 
-        // Phase F: Execute (CPU scalar).
-        let mut steps = 0;
-
+        // Phases B/C: Validate and Admit. Everything admitted this epoch is
+        // collected per bin before any of it runs, so cohort construction sees
+        // the whole epoch's eligible work rather than a prefix of it.
+        //
         // Serial-process invariant (§19): at most one mutating continuation of a
         // serial process runs per epoch. Sequential execution cannot overlap two
         // continuations *within* a step, but a parallel executive would run a
-        // whole epoch's cohort concurrently — so the invariant must hold at
+        // whole epoch's cohorts concurrently — so the invariant must hold at
         // epoch granularity, and a slot claimed here is held for the rest of the
         // epoch. Later continuations of the same process defer to the next epoch.
         let mut claimed_procs: HashSet<u32> = HashSet::new();
+        let mut admitted: Vec<(u32, Vec<(Ref64, u32)>)> = Vec::new();
 
-        let classes: Vec<u32> = self.scheduler.runnable_counts().iter().map(|(c, _)| *c).collect();
-        for rc in classes {
-            let batch = self.scheduler.drain(rc);
-            for cont in batch {
-                let (process, mode, status) = match self.continuations.get(cont) {
-                    Ok(c) => (c.process, self.process_mode(c.process), c.status),
+        let bins: Vec<u32> = self
+            .scheduler
+            .runnable_counts()
+            .iter()
+            .map(|(b, _)| *b)
+            .collect();
+        for bin in bins {
+            let mut lanes: Vec<(Ref64, u32)> = Vec::new();
+            for cont in self.scheduler.drain(bin) {
+                let (process, run_class, mode, status) = match self.continuations.get(cont) {
+                    Ok(c) => (
+                        c.process,
+                        c.run_class,
+                        self.process_mode(c.process),
+                        c.status,
+                    ),
                     Err(_) => continue,
                 };
                 // Only runnable continuations execute. Nothing in the current
                 // single-threaded path enqueues a non-runnable continuation —
-                // the budget check below faults before any commit can requeue —
-                // so this is a guard for the executives to come, where a cohort
-                // can be cancelled or faulted after its bin was filled.
+                // the budget check faults before any commit can requeue — so
+                // this is a guard for the executives to come, where a cohort can
+                // be cancelled or faulted after its bin was filled.
                 if status != ContinuationState::Runnable {
                     continue;
                 }
                 let mutating = mode == ProcessMode::Serial || mode == ProcessMode::System;
                 if mutating && !claimed_procs.insert(process.slot) {
-                    // Another continuation of this serial process already ran
-                    // this epoch; defer to the next-epoch buffer.
-                    self.scheduler.enqueue(rc, cont);
+                    self.scheduler.enqueue(run_class, cont);
+                    self.accounting.serial_deferrals += 1;
                     continue;
                 }
-                steps += self.execute_cont(cont, process);
+                lanes.push((cont, run_class));
+            }
+            if !lanes.is_empty() {
+                admitted.push((bin, lanes));
+            }
+        }
+
+        // Phase E: Cohort (§14).
+        let mut plans: Vec<CohortPlan> = admitted
+            .iter()
+            .map(|(_, lanes)| build_cohorts(lanes, self.cohort_width, self.partial_policy))
+            .collect();
+
+        // Forward-progress guard for `Defer`: if the policy held everything back
+        // this epoch, nothing would run and the next epoch would face the same
+        // choice forever. Re-plan under `RunPartial` so the epoch does work.
+        if plans.iter().all(|p| p.is_empty()) && !admitted.is_empty() {
+            plans = admitted
+                .iter()
+                .map(|(_, lanes)| {
+                    build_cohorts(lanes, self.cohort_width, PartialCohortPolicy::RunPartial)
+                })
+                .collect();
+        }
+
+        // Phase F: Execute (CPU scalar — a cohort's lanes run in lane order).
+        let mut steps = 0;
+        for plan in &plans {
+            for cohort in &plan.cohorts {
+                self.accounting.cohorts += 1;
+                self.accounting.lane_slots += cohort.width as u64;
+                self.accounting.useful_lane_slots += cohort.active_lanes as u64;
+                self.accounting.idle_lane_slots += cohort.idle_lanes() as u64;
+                if cohort.is_full() {
+                    self.accounting.full_cohorts += 1;
+                }
+                self.trace(
+                    crate::abi::EventKind::CohortCreated,
+                    Ref64::NULL,
+                    *cohort.lanes().first().unwrap_or(&Ref64::NULL),
+                    cohort.run_class,
+                    cohort.active_lanes as u32,
+                );
+
+                for cont in cohort.lanes() {
+                    let process = match self.continuations.get(*cont) {
+                        Ok(c) => c.process,
+                        Err(_) => continue,
+                    };
+                    steps += self.execute_cont(*cont, process);
+                }
+            }
+            // Deferred lanes return to their bins for a later epoch.
+            for cont in &plan.deferred {
+                let run_class = self.continuations.get(*cont).map(|c| c.run_class).unwrap_or(0);
+                self.scheduler.enqueue(run_class, *cont);
+                self.accounting.deferred_lanes += 1;
             }
         }
 
         // Phase H: Account.
         let total = self.scheduler.total_pending();
         self.epoch_runnable.push(total);
+        self.accounting.epochs += 1;
+        self.accounting.steps += steps as u64;
 
         self.epoch = self.epoch.wrapping_add(1);
 
