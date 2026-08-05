@@ -25,6 +25,13 @@ impl Kernel {
     /// buffer) is promoted to `current`, executed, and any work it produces
     /// lands in `next` for the following epoch (§13, §18).
     pub fn run_epoch(&mut self) -> usize {
+        // Under a bounded retention policy the logs carry only the epoch that
+        // just ran, so this is where last epoch's records stop being the
+        // caller's to drain. Under the default `Retain` it does nothing. A
+        // dropped record is counted (`kernel::retention`), so a run that meant
+        // to stream its whole trace can tell that it did not.
+        self.release_epoch_logs();
+
         // Epoch boundary: promote `next` → `current` (§18 Phase H → next epoch).
         self.scheduler.swap_all();
 
@@ -75,6 +82,7 @@ impl Kernel {
         // by race (v0.3 §4). I22 checks that the decision survives permutation
         // of the candidates.
         let decision = admit(&candidates);
+        self.admission_counters.emit();
         self.admission_log.push(AdmissionRecord {
             candidates,
             decision: decision.clone(),

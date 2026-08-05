@@ -8,6 +8,7 @@ pub mod commit;
 pub mod effects;
 pub mod epochs;
 pub mod ownership;
+pub mod retention;
 #[doc(hidden)]
 pub mod raw;
 
@@ -288,6 +289,13 @@ pub struct Kernel {
     deferral_bound: u32,
     /// Cumulative counters for the §27 measurements.
     accounting: Accounting,
+
+    /// How long the append-only logs are kept. `Retain` by default, which is
+    /// what every whole-run invariant check needs; see `kernel::retention`.
+    retention: retention::LogRetention,
+    trace_counters: retention::LogCounters,
+    effect_counters: retention::LogCounters,
+    admission_counters: retention::LogCounters,
 }
 
 impl Kernel {
@@ -342,6 +350,10 @@ impl Kernel {
             partial_policy: PartialCohortPolicy::default(),
             deferral_bound: 64,
             accounting: Accounting::default(),
+            retention: retention::LogRetention::default(),
+            trace_counters: retention::LogCounters::default(),
+            effect_counters: retention::LogCounters::default(),
+            admission_counters: retention::LogCounters::default(),
         };
         let root = kernel.domains.alloc(DomainDescriptor::new(Ref64::NULL, 0));
         kernel.domains.get_mut(root).expect("fresh root domain").id = root;
@@ -437,6 +449,16 @@ impl Kernel {
         self.continuations.len()
     }
 
+    /// An object's declared byte length.
+    ///
+    /// A delegated `READ`/`WRITE` capability only authorises object access when
+    /// it spans the whole object (`find_authorized_capability`), so a caller
+    /// delegating authority needs this to ask for a grant that will actually
+    /// authorise anything.
+    pub fn object_byte_length(&self, object: Ref64) -> Result<u64, RuntimeError> {
+        Ok(self.objects.get(object)?.byte_length)
+    }
+
     pub fn capability_count(&self) -> usize {
         self.capability_spaces.values().map(GenTable::len).sum()
     }
@@ -466,6 +488,70 @@ impl Kernel {
 
     pub fn trace_events(&self) -> &[TraceEvent] {
         &self.trace
+    }
+
+    // ---- log retention (see `kernel::retention`) -------------------------
+
+    /// Choose how long the append-only logs are kept.
+    ///
+    /// `Retain` is the default and is what every whole-run check requires. Set
+    /// `PerEpoch` only for a run whose logs are drained between epochs; the
+    /// records it discards are counted, not forgotten.
+    pub fn set_log_retention(&mut self, retention: retention::LogRetention) {
+        self.retention = retention;
+    }
+
+    pub fn log_retention(&self) -> retention::LogRetention {
+        self.retention
+    }
+
+    /// Drain the trace, transferring the records to the caller.
+    ///
+    /// Draining is what makes `PerEpoch` lossless: a taken record is the
+    /// consumer's responsibility and is counted as taken rather than dropped.
+    pub fn take_trace_events(&mut self) -> Vec<TraceEvent> {
+        let taken = std::mem::take(&mut self.trace);
+        self.trace_counters.take(taken.len());
+        taken
+    }
+
+    pub fn take_effect_log(&mut self) -> Vec<crate::kernel::effects::EffectRecord> {
+        let taken = std::mem::take(&mut self.effect_log);
+        self.effect_counters.take(taken.len());
+        taken
+    }
+
+    pub fn take_admission_log(&mut self) -> Vec<crate::scheduler::admission::AdmissionRecord> {
+        let taken = std::mem::take(&mut self.admission_log);
+        self.admission_counters.take(taken.len());
+        taken
+    }
+
+    /// What became of every record each log produced.
+    ///
+    /// `emitted == retained + taken + dropped` holds for each log. A run that
+    /// means to have seen everything should assert `is_complete()` rather than
+    /// assume its draining kept up.
+    pub fn log_accounting(&self) -> retention::LogAccounting {
+        retention::LogAccounting {
+            trace: self.trace_counters.census(self.trace.len()),
+            effects: self.effect_counters.census(self.effect_log.len()),
+            admissions: self.admission_counters.census(self.admission_log.len()),
+        }
+    }
+
+    /// Discard whatever the logs still hold, counting it as dropped. Called at
+    /// the epoch boundary under `PerEpoch`; a no-op under `Retain`.
+    pub(crate) fn release_epoch_logs(&mut self) {
+        if !self.retention.is_bounded() {
+            return;
+        }
+        self.trace_counters.drop_all(self.trace.len());
+        self.trace.clear();
+        self.effect_counters.drop_all(self.effect_log.len());
+        self.effect_log.clear();
+        self.admission_counters.drop_all(self.admission_log.len());
+        self.admission_log.clear();
     }
 
     /// Every epoch's admission, in epoch order: the candidates offered and the
@@ -658,6 +744,7 @@ impl Kernel {
     ) {
         self.logical_time = self.logical_time.wrapping_add(1);
         let (lane, lane_sequence) = self.next_position();
+        self.trace_counters.emit();
         self.trace.push(TraceEvent::new(
             self.logical_time,
             self.epoch,

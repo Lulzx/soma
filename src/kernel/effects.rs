@@ -196,6 +196,7 @@ impl Kernel {
     fn apply_effect(&mut self, position: (u32, u32, u32), effect: Effect) {
         let (epoch, lane, sequence) = position;
         let applied = self.effect_log.len() as u64;
+        self.effect_counters.emit();
         self.effect_log.push(EffectRecord {
             epoch,
             lane,
