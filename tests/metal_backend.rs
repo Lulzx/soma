@@ -93,14 +93,12 @@ fn every_example_body_agrees_between_metal_and_the_cpu_interpreter() {
         examples::BITMIX,
     ] {
         // Batch large enough to reach the accelerator.
-        let (gpu_bytes, gpu_trace, gpu_stats) =
-            run(evaluator, 8, 1, &mut metal, &mut cpu);
+        let (gpu_bytes, gpu_trace, gpu_stats) = run(evaluator, 8, 1, &mut metal, &mut cpu);
         assert_eq!(gpu_stats.accelerator_executions, 1);
         assert_eq!(gpu_stats.cpu_executions, 0);
 
         // Batch too small for the accelerator, so the same work spills to CPU.
-        let (cpu_bytes, cpu_trace, cpu_stats) =
-            run(evaluator, 8, u32::MAX, &mut metal, &mut cpu);
+        let (cpu_bytes, cpu_trace, cpu_stats) = run(evaluator, 8, u32::MAX, &mut metal, &mut cpu);
         assert_eq!(cpu_stats.cpu_executions, 1);
 
         assert_eq!(
@@ -146,4 +144,51 @@ fn metal_rejects_an_evaluator_it_was_never_given() {
         ),
         "an uninstalled evaluator was silently evaluated: {result:?}"
     );
+}
+
+#[test]
+fn a_reused_buffer_does_not_leak_the_previous_batch_into_a_smaller_one() {
+    // The backend grows one input/output pair to the largest batch it has
+    // seen and reuses it. That makes batch order observable in a way it was
+    // not when every call allocated: a short batch runs against buffers still
+    // holding a long batch's bytes, and reading one element too many would
+    // publish the previous collective's results as this one's.
+    let module = examples::module();
+    let programs = module.programs();
+    let mut metal = MetalBatchBackend::with(&programs).unwrap();
+    let mut cpu = CpuReferenceBackend::with(&programs);
+
+    let stride = 8u32;
+    let long: Vec<u8> = (0..64u32)
+        .flat_map(|value| {
+            let mut element = value.to_le_bytes().to_vec();
+            element.extend_from_slice(&(value ^ 0xFFFF).to_le_bytes());
+            element
+        })
+        .collect();
+    let short = long[..(3 * stride as usize)].to_vec();
+
+    for evaluator in [
+        examples::DOUBLE_PLUS_ONE_TAGGED,
+        examples::MIN_AND_XOR,
+        examples::BITMIX,
+    ] {
+        metal
+            .evaluate(evaluator, &long, 64, stride)
+            .expect("long batch runs");
+        let after_long = metal
+            .evaluate(evaluator, &short, 3, stride)
+            .expect("short batch runs");
+
+        let expected = cpu.evaluate(evaluator, &short, 3, stride).unwrap();
+        assert_eq!(
+            after_long.len(),
+            expected.len(),
+            "evaluator {evaluator} returned the reused buffer's capacity, not its batch"
+        );
+        assert_eq!(
+            after_long, expected,
+            "evaluator {evaluator} leaked the previous batch through a reused buffer"
+        );
+    }
 }
