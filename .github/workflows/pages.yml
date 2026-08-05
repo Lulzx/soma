@@ -1,0 +1,54 @@
+# Build the ant-colony traces and publish the viewer to GitHub Pages.
+#
+# The traces are generated here rather than committed. They are ~15 MB of
+# derived data, and generating them in CI means the page can never show numbers
+# that disagree with the code that produced them.
+name: pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; don't cancel a run that is mid-publish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The demo's claims are tested claims; a failing suite must not publish.
+      - name: Test
+        run: cargo test --release
+
+      - name: Generate traces
+        run: cargo run --release --example ant_colony_trace viz/data
+
+      - name: Report what was published
+        run: ls -lh viz/data
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: viz
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

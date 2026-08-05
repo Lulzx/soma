@@ -28,7 +28,46 @@ cargo run --example regime_map
 cargo run --example streaming_report
 cargo run --example supervision_report
 cargo run --example multi_input_report
+cargo run --example ant_colony_report      # cohorting on a population of agents
 ```
+
+## The ant colony
+
+`experiments/ant_colony.rs` is a population of persistent processes rather than a
+computation: ten thousand ants, each holding its own state, each deciding its own
+next behaviour, none of them synchronised with any other. An ant that finds food
+yields to `ANT_CARRY_FOOD`; an ant that walks into a rock yields to
+`ANT_AVOID_OBSTACLE`. Neither knows the other exists, and the scheduler groups
+them anyway — because the run class an ant names *is* the bin it lands in.
+
+```sh
+cargo run --release --example ant_colony_report   # the measurement
+cargo run --release --example ant_colony_trace    # write viz/data/*.jsonl
+cd viz && python3 -m http.server                  # then open localhost:8000
+```
+
+The same population, the same seed, the same world, binned two ways:
+
+| | dispatches | useful lane occupancy | full cohorts |
+| --- | --- | --- | --- |
+| persistent FIFO | 19,260 | 0.252 | ~0 |
+| run-class bins | 6,765 | 0.719 | most |
+
+2.85x occupancy at 65% fewer dispatches. The control that makes it mean anything
+is `simulated_identical_world`: both runs deliver the same food, lay the same
+trails, and leave every ant in the same place. Only the binning differs. The
+width-1 null control reports 1.00x, because at one lane per dispatch binning
+cannot matter.
+
+Occupancy is a **structural** quantity here, as everywhere else in this
+repository — computed from how continuations group, not measured on silicon.
+
+Clicking *predator* fails a subtree of one colony. The failure is contained, the
+supervisor is notified, the other colonies are untouched, and the survivors keep
+foraging. `experiments/ant_scoring.rs` lifts the movement-scoring decision into a
+batch evaluator that runs on real Metal hardware under `--features metal`; the
+neighbourhood *gather* stays on the CPU, because the body language has no
+indexed read of another element and so cannot express one.
 
 Read [docs/SOMA-v0.2.md](docs/SOMA-v0.2.md) for the current machine. The older
 [Phase-1 contract](docs/SOMA-P1.md) records the broader GPU-oriented design that
