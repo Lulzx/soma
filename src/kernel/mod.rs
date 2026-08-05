@@ -42,8 +42,11 @@ pub struct Mailbox {
     pub capacity: usize,
     /// Continuations waiting for a message to arrive (FIFO).
     pub recv_waiters: VecDeque<Ref64>,
-    /// A continuation waiting for capacity (a full mailbox); woken on receive.
-    pub full_waiter: Option<Ref64>,
+    /// Continuations waiting for capacity (a full mailbox), oldest first. One is
+    /// woken per message received, since a receive frees exactly one slot.
+    /// This must be a queue, not a single slot: with `Option`, a second blocked
+    /// sender would never be registered and would park forever (§11).
+    pub full_waiters: VecDeque<Ref64>,
 }
 
 impl Mailbox {
@@ -52,9 +55,36 @@ impl Mailbox {
             entries: VecDeque::new(),
             capacity,
             recv_waiters: VecDeque::new(),
-            full_waiter: None,
+            full_waiters: VecDeque::new(),
         }
     }
+}
+
+/// Outcome of registering a continuation on a future (§12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AwaitOutcome {
+    /// The future was pending; the continuation is now a waiter and will be
+    /// woken by `resolve_future`. The caller should return `StepResult::await_on`.
+    Registered,
+    /// The future was already resolved, so there is nothing left to wait for.
+    /// The caller should return `StepResult::yield_next` instead — registering
+    /// would park the continuation forever, since `resolve_future` drains its
+    /// waiter list exactly once.
+    AlreadyResolved,
+}
+
+/// One comparable row of a trace snapshot (§21). Two runs are identical exactly
+/// when their snapshot vectors are equal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TraceSnapshotRow {
+    pub logical_time: u64,
+    pub epoch: u32,
+    pub event_kind: EventKind,
+    pub engine: u16,
+    pub process: u64,
+    pub continuation: u64,
+    pub run_class: u32,
+    pub auxiliary: u32,
 }
 
 /// The whole kernel state: every table, the object payloads, mailboxes, the
@@ -132,17 +162,23 @@ impl Kernel {
     }
 
     /// Compact, comparable snapshot of the trace for determinism tests.
-    pub fn trace_snapshot(&self) -> Vec<(u64, EventKind, u32, u32, u32)> {
+    ///
+    /// Every field that can diverge between two runs is included — notably
+    /// `epoch` and `auxiliary`, so a run that produces the same events in the
+    /// same order but on different epoch boundaries is still detected as
+    /// divergent (§21).
+    pub fn trace_snapshot(&self) -> Vec<TraceSnapshotRow> {
         self.trace
             .iter()
-            .map(|t| {
-                (
-                    t.logical_time,
-                    t.event_kind,
-                    t.process.slot,
-                    t.continuation.slot,
-                    t.run_class,
-                )
+            .map(|t| TraceSnapshotRow {
+                logical_time: t.logical_time,
+                epoch: t.epoch,
+                event_kind: t.event_kind,
+                engine: t.engine,
+                process: t.process.to_u64(),
+                continuation: t.continuation.to_u64(),
+                run_class: t.run_class,
+                auxiliary: t.auxiliary,
             })
             .collect()
     }
@@ -267,22 +303,33 @@ impl Kernel {
 
     /// Register `cont` as a waiter on `future`, moving it to run class
     /// `next_run_class` and the WAITING state. It is woken by `resolve_future`.
+    ///
+    /// If the future is *already* resolved, nothing is registered and
+    /// `AlreadyResolved` is returned: the caller must yield rather than await,
+    /// because `resolve_future` has already drained the waiter list and will
+    /// never revisit it.
     pub fn await_future(
         &mut self,
         cont: Ref64,
         future: Ref64,
         next_run_class: u32,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<AwaitOutcome, RuntimeError> {
+        let resolved = self.futures.get(future)?.state != FutureState::Pending;
         {
             let c = self.continuations.get_mut(cont)?;
             c.run_class = next_run_class;
-            c.status = crate::abi::continuations::ContinuationState::Waiting;
             c.dependency = future;
+            if !resolved {
+                c.status = crate::abi::continuations::ContinuationState::Waiting;
+            }
         }
-        let process = self.continuations.get(cont)?.process;
+        if resolved {
+            return Ok(AwaitOutcome::AlreadyResolved);
+        }
         self.future_waiters.entry(future.slot).or_default().push(cont);
-        self.trace(EventKind::ContinuationWaiting, process, cont, next_run_class, future.slot);
-        Ok(())
+        // The `ContinuationWaiting` trace is emitted once, by the commit phase
+        // (§18 Phase G), so every await path produces exactly one event.
+        Ok(AwaitOutcome::Registered)
     }
 
     /// Single-assignment resolution of a future: publish the value, then wake
@@ -381,8 +428,11 @@ impl Kernel {
                 .get_mut(&receiver.slot)
                 .ok_or(RuntimeError::MissingMailbox)?;
             if mailbox.entries.len() >= mailbox.capacity {
-                if mailbox.full_waiter.is_none() {
-                    mailbox.full_waiter = Some(sender_cont);
+                // Every blocked sender is registered, not just the first, so no
+                // sender can park on a full mailbox and never be woken (§11).
+                // A retrying sender is registered only once.
+                if !sender_cont.is_null() && !mailbox.full_waiters.contains(&sender_cont) {
+                    mailbox.full_waiters.push_back(sender_cont);
                 }
                 return Err(RuntimeError::MailboxFull);
             }
@@ -416,7 +466,8 @@ impl Kernel {
             .get_mut(&process.slot)
             .ok_or(RuntimeError::MissingMailbox)?;
         if let Some(msg) = mailbox.entries.pop_front() {
-            if let Some(w) = mailbox.full_waiter.take() {
+            // One receive frees exactly one slot, so wake exactly one sender.
+            if let Some(w) = mailbox.full_waiters.pop_front() {
                 let rc = self.continuations.get(w)?.run_class;
                 self.scheduler.enqueue(rc, w);
                 {

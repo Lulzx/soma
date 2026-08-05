@@ -42,8 +42,16 @@ pub fn apply_step_result(kernel: &mut Kernel, cont: Ref64, process: Ref64, resul
                 c.last_run_epoch = kernel.epoch;
             }
             // No immediate re-enqueue: the waiter is woken later by
-            // `resolve_future` / `enqueue_message`.
-            kernel.trace(EventKind::ContinuationWaiting, process, cont, rc, 0);
+            // `resolve_future` / `enqueue_message`. This is the single
+            // `ContinuationWaiting` emission for every await path; `auxiliary`
+            // carries the slot of whatever is being awaited.
+            kernel.trace(
+                EventKind::ContinuationWaiting,
+                process,
+                cont,
+                rc,
+                result.target.slot,
+            );
         }
         StepKind::Send | StepKind::Spawn => {
             let kind = if result.kind == StepKind::Send {

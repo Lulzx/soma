@@ -23,6 +23,9 @@ pub struct GenTable<T> {
     kind: Kind,
     slots: Vec<Slot<T>>,
     free: Vec<u32>,
+    /// Occupied slot count, maintained incrementally so `len` is O(1) — it is
+    /// called from per-epoch accounting paths.
+    live: usize,
 }
 
 impl<T> GenTable<T> {
@@ -37,6 +40,7 @@ impl<T> GenTable<T> {
                 value: None,
             }],
             free: Vec::new(),
+            live: 0,
         }
     }
 
@@ -57,6 +61,7 @@ impl<T> GenTable<T> {
                 value: Some(value),
             });
         }
+        self.live += 1;
         Ref64::new(slot, generation, self.kind)
     }
 
@@ -110,12 +115,13 @@ impl<T> GenTable<T> {
             slot.generation = 1;
         }
         self.free.push(r.slot);
+        self.live -= 1;
         Ok(value)
     }
 
     /// Number of live entries (occupied slots).
     pub fn len(&self) -> usize {
-        self.slots.iter().filter(|s| s.value.is_some()).count()
+        self.live
     }
 
     pub fn is_empty(&self) -> bool {

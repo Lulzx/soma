@@ -35,7 +35,13 @@ pub struct ExpandFrame {
     pub heuristic_result: u64,
     pub reply_receiver: Ref64,
     pub moves: Vec<u64>,
+    /// How many of `moves` have already had their child spawned. A resume point
+    /// may re-enter after blocking, so this is what makes child creation
+    /// idempotent across re-entries.
     pub move_index: u32,
+    /// The reply payload object, allocated once and remembered so a re-entry
+    /// reuses it instead of leaking a fresh object per attempt.
+    pub reply_payload: Ref64,
 }
 
 impl ExpandFrame {
@@ -47,6 +53,7 @@ impl ExpandFrame {
             reply_receiver,
             moves: Vec::new(),
             move_index: 0,
+            reply_payload: Ref64::NULL,
         }
     }
 }
@@ -59,6 +66,7 @@ impl Frame for ExpandFrame {
         put_ref64(out, self.reply_receiver);
         put_vec_u64(out, &self.moves);
         crate::compiler::frame::put_u32(out, self.move_index);
+        put_ref64(out, self.reply_payload);
     }
 
     fn decode(c: &mut ByteCursor) -> Result<Self, FrameError> {
@@ -69,6 +77,7 @@ impl Frame for ExpandFrame {
             reply_receiver: c.ref64()?,
             moves: c.vec_u64()?,
             move_index: c.u32()?,
+            reply_payload: c.ref64()?,
         })
     }
 }

@@ -20,7 +20,7 @@ use crate::compiler::run_classes::{
 use crate::compiler::state_machine_lowering::{
     ExpandFrame, HeuristicFrame, SearchFrame,
 };
-use crate::kernel::{Kernel, RuntimeError};
+use crate::kernel::{AwaitOutcome, Kernel, RuntimeError};
 
 /// Run-class identifiers recognized by this executive (mirrors §15's switch).
 pub mod run_classes {
@@ -99,8 +99,13 @@ fn expand_resume_0(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResu
             kernel.create_continuation(process, SEARCH_HEURISTIC, 0, hb, DEFAULT_MAX_STEPS);
 
             store_frame(kernel, cont, &frame);
-            let _ = kernel.await_future(cont, fut, EXPAND_RESUME_1);
-            StepResult::await_on(fut, EXPAND_RESUME_1)
+            match kernel.await_future(cont, fut, EXPAND_RESUME_1) {
+                Ok(AwaitOutcome::Registered) => StepResult::await_on(fut, EXPAND_RESUME_1),
+                // The heuristic already resolved, so there is nothing to wait
+                // for; go straight to the next resume point.
+                Ok(AwaitOutcome::AlreadyResolved) => StepResult::yield_next(EXPAND_RESUME_1),
+                Err(_) => StepResult::fault(process, EXPAND_RESUME_0),
+            }
         }
         // No message yet: `receive_message` registered us as a receiver waiter.
         Ok(None) => StepResult::await_on(process, EXPAND_RESUME_0),
@@ -124,22 +129,32 @@ fn expand_resume_1(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResu
 }
 
 /// `Expand.resume_2`: spawn a child process per move, send the reply, complete.
+/// This resume point can be re-entered: a full reply mailbox parks it and it
+/// runs again once capacity frees. Child creation and payload allocation are
+/// therefore recorded in the frame as they happen, so re-entry resumes where it
+/// left off rather than repeating side effects (§8).
 fn expand_resume_2(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResult {
-    let frame: ExpandFrame = load_frame(kernel, cont, ExpandFrame::initial(0, process));
+    let mut frame: ExpandFrame = load_frame(kernel, cont, ExpandFrame::initial(0, process));
 
-    for m in &frame.moves {
+    while (frame.move_index as usize) < frame.moves.len() {
+        let m = frame.moves[frame.move_index as usize];
         let child = kernel.create_process(crate::abi::ProcessMode::Serial);
-        let cframe = SearchFrame::leaf(*m, 0);
+        let cframe = SearchFrame::leaf(m, 0);
         let mut cb = Vec::new();
         cframe.encode(&mut cb);
         kernel.create_continuation(child, SEARCH_BRANCH, 0, cb, DEFAULT_MAX_STEPS);
+        frame.move_index += 1;
     }
 
-    let reply_payload = kernel.create_object(
-        crate::abi::ObjectKind::MessagePayload,
-        frame.heuristic_result.to_le_bytes().to_vec(),
-    );
-    match kernel.enqueue_message(process, frame.reply_receiver, reply_payload, cont) {
+    if frame.reply_payload.is_null() {
+        frame.reply_payload = kernel.create_object(
+            crate::abi::ObjectKind::MessagePayload,
+            frame.heuristic_result.to_le_bytes().to_vec(),
+        );
+    }
+    store_frame(kernel, cont, &frame);
+
+    match kernel.enqueue_message(process, frame.reply_receiver, frame.reply_payload, cont) {
         Ok(()) => StepResult::complete(),
         Err(RuntimeError::MailboxFull) => StepResult::await_on(frame.reply_receiver, EXPAND_RESUME_2),
         Err(_) => StepResult::fault(process, EXPAND_RESUME_2),

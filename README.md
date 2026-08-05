@@ -60,7 +60,7 @@ and the Sokoban-style workload.
 
 ```sh
 cargo build          # clean, no warnings
-cargo test           # 19 tests
+cargo test           # 27 tests
 cargo clippy --all-targets   # zero lints
 ```
 
@@ -100,10 +100,12 @@ tests/        ABI, Expand end-to-end, dynamic-search determinism
 ## Status
 
 Working prototype, `v0.1.0`. Tests cover ABI reference validity, the full Expand
-lifecycle, and branching-search termination + determinism. It proves, on one CPU
-executive, that resumable continuations regrouped by run class run
-deterministically — the mechanism cohorting depends on. The GPU executive and the
-go/no-go measurements (§28) are the next slices.
+lifecycle, branching-search termination + determinism, and the kernel's
+negative paths — mailbox back-pressure, step-budget exhaustion, the
+serial-process invariant, re-entry after blocking, and ownership transitions.
+It proves, on one CPU executive, that resumable continuations regrouped by run
+class run deterministically — the mechanism cohorting depends on. The GPU
+executive and the go/no-go measurements (§28) are the next slices.
 
 ## License
 

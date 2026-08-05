@@ -63,6 +63,14 @@ impl Kind {
 /// - the requesting domain has authority to use it (deferred in Phase 1).
 ///
 /// `Ref64` is not itself an authority; it is merely a table reference.
+///
+/// The generation field is 16 bits, which bounds staleness detection rather than
+/// guaranteeing it: a slot recycled 65,536 times wraps back to a generation a
+/// long-held stale reference could match (a classic ABA window). This is the
+/// deliberate cost of keeping a reference in 64 bits. It is acceptable while
+/// references are short-lived relative to slot churn; a future phase that
+/// persists references across checkpoints will need a wider generation or an
+/// epoch-scoped reference table.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Ref64 {

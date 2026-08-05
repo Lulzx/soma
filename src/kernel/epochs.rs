@@ -9,6 +9,7 @@
 
 use std::collections::HashSet;
 
+use crate::abi::continuations::ContinuationState;
 use crate::abi::ProcessMode;
 use crate::abi::Ref64;
 use crate::executives::cpu_scalar;
@@ -29,30 +30,37 @@ impl Kernel {
         let mut steps = 0;
 
         // Serial-process invariant (§19): at most one mutating continuation of a
-        // serial process RUNNING at a time. Sequential execution can't overlap,
-        // but we still encode the check so a later parallel executive must obey
-        // it. A continuation of an already-running serial process is deferred.
-        let mut running_procs: HashSet<u32> = HashSet::new();
+        // serial process runs per epoch. Sequential execution cannot overlap two
+        // continuations *within* a step, but a parallel executive would run a
+        // whole epoch's cohort concurrently — so the invariant must hold at
+        // epoch granularity, and a slot claimed here is held for the rest of the
+        // epoch. Later continuations of the same process defer to the next epoch.
+        let mut claimed_procs: HashSet<u32> = HashSet::new();
 
         let classes: Vec<u32> = self.scheduler.runnable_counts().iter().map(|(c, _)| *c).collect();
         for rc in classes {
             let batch = self.scheduler.drain(rc);
             for cont in batch {
-                let (process, mode) = match self.continuations.get(cont) {
-                    Ok(c) => (c.process, self.process_mode(c.process)),
+                let (process, mode, status) = match self.continuations.get(cont) {
+                    Ok(c) => (c.process, self.process_mode(c.process), c.status),
                     Err(_) => continue,
                 };
+                // Only runnable continuations execute. Nothing in the current
+                // single-threaded path enqueues a non-runnable continuation —
+                // the budget check below faults before any commit can requeue —
+                // so this is a guard for the executives to come, where a cohort
+                // can be cancelled or faulted after its bin was filled.
+                if status != ContinuationState::Runnable {
+                    continue;
+                }
                 let mutating = mode == ProcessMode::Serial || mode == ProcessMode::System;
-                if mutating && !running_procs.insert(process.slot) {
-                    // Another continuation of this serial process is running
+                if mutating && !claimed_procs.insert(process.slot) {
+                    // Another continuation of this serial process already ran
                     // this epoch; defer to the next-epoch buffer.
                     self.scheduler.enqueue(rc, cont);
                     continue;
                 }
                 steps += self.execute_cont(cont, process);
-                if mutating {
-                    running_procs.remove(&process.slot);
-                }
             }
         }
 
@@ -103,14 +111,26 @@ impl Kernel {
             .unwrap_or(ProcessMode::System)
     }
 
-    /// Execute a single continuation: dispatch to the interpreter, enforce the
-    /// step budget, and commit the result.
+    /// Execute a single continuation: enforce the step budget, dispatch to the
+    /// interpreter, and commit the result.
     fn execute_cont(&mut self, cont: Ref64, process: Ref64) -> usize {
-        let run_class = self
+        let (run_class, remaining) = self
             .continuations
             .get(cont)
-            .map(|c| c.run_class)
-            .unwrap_or(0);
+            .map(|c| (c.run_class, c.remaining_steps))
+            .unwrap_or((0, 0));
+
+        // Step budget (§8): a continuation must not exceed its declared maximum.
+        // The check happens *before* dispatch, so an exhausted continuation is
+        // faulted without running and — crucially — without having first been
+        // re-enqueued by a commit. Faulting after the commit would leave a
+        // faulted continuation sitting live in a runnable bin.
+        if remaining == 0 {
+            let over = crate::abi::StepResult::fault(process, run_class);
+            let _ = commit::apply_step_result(self, cont, process, over);
+            return 0;
+        }
+
         self.trace(
             crate::abi::EventKind::ContinuationStarted,
             process,
@@ -121,23 +141,7 @@ impl Kernel {
         let result = cpu_scalar::dispatch(self, cont, process);
         let consumed = commit::apply_step_result(self, cont, process, result);
 
-        // Step budget (§8): a continuation must not exceed its declared maximum.
-        // If a hand-written handler ever overruns, fault it.
-        let remaining = self
-            .continuations
-            .get(cont)
-            .map(|c| c.remaining_steps)
-            .unwrap_or(0);
-        if remaining <= consumed as u32 {
-            if let Ok(c) = self.continuations.get_mut(cont) {
-                if c.status != crate::abi::continuations::ContinuationState::Completed
-                    && c.status != crate::abi::continuations::ContinuationState::Faulted
-                {
-                    let fake = crate::abi::StepResult::fault(process, run_class);
-                    let _ = commit::apply_step_result(self, cont, process, fake);
-                }
-            }
-        } else if let Ok(c) = self.continuations.get_mut(cont) {
+        if let Ok(c) = self.continuations.get_mut(cont) {
             c.remaining_steps = c.remaining_steps.saturating_sub(consumed as u32);
         }
 
