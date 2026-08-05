@@ -592,6 +592,11 @@ Future work extends rather than completes this specification:
 3. A persistent device scheduler or distributed implementation proven
    trace-equivalent to this machine.
 
+These are scoped in `docs/SOMA-v0.3.md`. Item 3 cannot be attempted under this
+specification as written: §1.2 defines equivalence as trace equality over a
+total order, which no concurrent implementation can satisfy. Weakening that
+relation is v0.3's only specification deliverable.
+
 Performance work belongs after all of this, and the performance results already
 in this repository (`docs/SOMA-P1.md`, and the cohorting studies) should be read
 as measurements of *one implementation strategy*, not as properties of the

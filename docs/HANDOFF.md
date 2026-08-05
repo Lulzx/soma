@@ -43,6 +43,7 @@ Two documents, and they are not equals:
 | Doc | Status |
 | --- | --- |
 | `docs/SOMA-v0.2.md` | **Current.** The semantic specification. Start here. |
+| `docs/SOMA-v0.3.md` | Scope for the next version. Nothing in it is implemented. Read after v0.2 if you are picking up new work. |
 | `docs/SOMA-P1.md` | Historical. The original broad Phase-1 contract, still referenced by `§n` markers in code comments. Useful context, but it describes a wider system than the one being built, and its framing is what the refocus moved away from. |
 
 The directory is still named `gpu-os` and the crate `soma`. Harmless, but expect
@@ -361,6 +362,9 @@ decision that would otherwise depend on `HashMap` iteration order.
 3. Break something on purpose. Flip a condition in `commit.rs` and confirm the
    invariant checker catches it. That tells you the safety net is real before
    you rely on it.
-4. Read the supervision-tree and multi-input reports, then choose an extension:
-   a general evaluator compiler, persistent device scheduling, or a
-   trace-equivalent distributed implementation.
+4. Read the supervision-tree and multi-input reports, then read
+   `docs/SOMA-v0.3.md`. It scopes the four extensions — a general evaluator
+   compiler, persistent device scheduling, a trace-equivalent distributed
+   implementation, and hardware performance work — and identifies the one
+   specification change that blocks three of them. Two carried debts from §7
+   above are on its critical path and neither needs the spec settled first.
