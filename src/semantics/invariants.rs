@@ -39,8 +39,6 @@ pub enum Invariant {
     SchedulerWellFormed,
     /// I8. No two continuations share a frame object.
     FrameExclusivity,
-    /// I9. A frozen object never returns to mutable state.
-    OwnershipMonotonicity,
     /// I10a. Derived capabilities never amplify rights or byte range.
     CapabilityAttenuation,
     /// I10b. Capability targets and parent links resolve with valid rights.
@@ -87,7 +85,6 @@ pub fn check(kernel: &Kernel) -> Vec<Violation> {
     message_ordering(kernel, &mut v);
     scheduler_well_formed(kernel, &mut v);
     frame_exclusivity(kernel, &mut v);
-    ownership_monotonicity(kernel, &mut v);
     capability_attenuation(kernel, &mut v);
     capability_integrity(kernel, &mut v);
     no_unauthorized_effect(kernel, &mut v);
@@ -359,33 +356,6 @@ fn frame_exclusivity(kernel: &Kernel, out: &mut Vec<Violation>) {
     }
 }
 
-// ---- I9 ------------------------------------------------------------------
-
-fn ownership_monotonicity(kernel: &Kernel, out: &mut Vec<Violation>) {
-    use crate::abi::objects::OwnershipState;
-    for (r, o) in kernel.objects().iter() {
-        // A frozen object is readable by many, so it must have been published.
-        if o.ownership_state == OwnershipState::FrozenShared && o.reader_count == 0 {
-            out.push(Violation::new(
-                Invariant::OwnershipMonotonicity,
-                format!("object {} is frozen but was never published", r.slot),
-            ));
-        }
-        if o.ownership_state == OwnershipState::FrozenShared && !o.unique_owner.is_null() {
-            // Freezing surrenders unique authority; retaining an owner would
-            // let a writer believe it still holds it.
-            if !live(kernel, o.unique_owner) {
-                out.push(Violation::new(
-                    Invariant::OwnershipMonotonicity,
-                    format!("frozen object {} names a dead unique owner", r.slot),
-                ));
-            }
-        }
-    }
-}
-
-// ---- I11 -----------------------------------------------------------------
-
 // ---- I10 -----------------------------------------------------------------
 
 fn capability_attenuation(kernel: &Kernel, out: &mut Vec<Violation>) {
@@ -458,6 +428,16 @@ fn capability_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
                     ),
                 ));
             }
+        }
+    }
+
+    for (object, _) in kernel.objects().iter() {
+        let writers = kernel.authority_holder_count(object, Rights::WRITE);
+        if writers > 1 {
+            out.push(Violation::new(
+                Invariant::CapabilityIntegrity,
+                format!("object {} has {writers} mutable authority holders", object.slot),
+            ));
         }
     }
 }

@@ -243,23 +243,21 @@ proves the checker rejects a forged effect.
 
 These are the parts worth arguing about before writing code.
 
-### 7.1 Ownership and capabilities are currently two mechanisms for one thing
+### 7.1 Ownership is capability-derived
 
-`ObjectDescriptor.unique_owner` and a `WRITE` capability both claim to govern
-mutation. Two mechanisms for one property is how models acquire contradictions:
-nothing says what happens when they disagree.
+The former `ObjectDescriptor.unique_owner`, stored ownership state/reader count,
+and capability ownership mode all duplicated live authority and could disagree.
+They have been removed.
 
-**Recommendation: eliminate `unique_owner` and define ownership in terms of
-capabilities.** An object is *uniquely owned* exactly when one live `WRITE`
-capability for it exists. It is *frozen* when no `WRITE` capability for it
-exists and at least one `READ` capability does. Freezing is then not a flag to
-be set but the act of destroying the write capability, which makes the model's
-one-way rule structural rather than enforced by a check.
+An object is *uniquely owned* when exactly one process capability space holds
+live full-object `WRITE` authority. Multiple derived entries in that same space
+do not create another principal. It is *frozen* when no process holds `WRITE`
+and at least one holds `READ`. `WRITE` cannot be copied through a grant;
+`transfer_unique` moves the sole writer, and freezing eagerly revokes every
+write-bearing capability tree before publishing a version-pinned `READ` root.
 
-This collapses I9 into I10, deletes `ownership.rs`'s advisory transfer, and
-makes "mutation of a frozen object requires allocating a new object" true by
-construction. It is a real simplification, and it is the reason to settle
-capabilities before ownership (spec §6.2) rather than after.
+I10b rejects more than one mutable holder. This subsumes I9 and makes "mutation
+of a frozen object requires allocating a new object" true by construction.
 
 ### 7.2 Failure containment needs an answer for authority
 
@@ -320,7 +318,9 @@ Each step should land green.
 6. **Trace events and I10c. Complete.** Granted and denied decisions are
    observable, governed mutations emit adjacent effect markers, and the I10c
    checker has positive and fault-injection coverage.
-7. **Unify ownership (§7.1)**, delete `unique_owner`, collapse I9.
+7. **Unify ownership (§7.1). Complete.** Ownership is derived from live holder
+   spaces; advisory owner/mode/count fields are deleted, `WRITE` is linear
+   across processes, freeze revokes it, and I9 is subsumed by I10b.
 8. **Settle failure (§7.2)** and update the spec.
 
 ---

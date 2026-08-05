@@ -16,7 +16,7 @@ pub mod processes;
 pub mod refs;
 pub mod traces;
 
-pub use capabilities::{CapabilityEntry, OwnershipMode, Rights};
+pub use capabilities::{CapabilityEntry, Rights};
 pub use cohorts::{CohortDescriptor, PartialCohortPolicy, MAX_COHORT_WIDTH};
 pub use contracts::{
     ContractFlags, DeterminismPolicy, ExecutionContract, PlacementPolicy, PrecisionPolicy, Shape,

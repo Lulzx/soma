@@ -324,6 +324,11 @@ fn freezing_is_idempotent_and_makes_an_object_untransferable() {
         OwnershipState::UniqueMutable
     );
     transfer_unique(&mut kernel, owner, object, other).unwrap();
+    assert!(matches!(
+        kernel.object_bytes_mut(owner, object),
+        Err(RuntimeError::AuthorityDenied)
+    ));
+    kernel.object_bytes_mut(other, object).unwrap()[0] = 2;
 
     let version = freeze(&mut kernel, other, object).unwrap();
     assert_eq!(

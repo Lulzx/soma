@@ -154,15 +154,15 @@ Implemented now:
 - Four partial-cohort policies, a persistent FIFO, and two bulk-frontier
   baselines
 - Trace-driven irregular-arrival and execution-territory experiments
+- Actor-relative capabilities with operation checks and trace-checked effects
+- Capability-derived unique/frozen object ownership
+- A domain-neutral dynamic constraint-search validation workload
 
 Not implemented:
 
-- Capability checks on operations other than `WRITE`
-- Writes guarded by ownership state
 - Channels and collectives
 - Cancellation and supervision
 - GPU execution, CPU/GPU migration, and spill
-- A generic dynamic constraint-search validation workload
 
 The current job is to finish the machine semantics before adding a surface
 language or GPU backend. Open questions include process ownership, the fate of a

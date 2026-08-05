@@ -284,6 +284,11 @@ fn grants_require_transfer_authority_and_must_attenuate() {
         kernel.grant_capability(owner, receiver, object, Rights::READ, 0, 5),
         Err(RuntimeError::InvalidCapabilityDerivation)
     );
+    assert_eq!(
+        kernel.grant_capability(owner, receiver, object, Rights::WRITE, 0, 4),
+        Err(RuntimeError::InvalidCapabilityDerivation),
+        "WRITE is moved by unique transfer, never copied by a grant"
+    );
 
     let granted = kernel
         .grant_capability(owner, receiver, object, Rights::READ, 1, 2)

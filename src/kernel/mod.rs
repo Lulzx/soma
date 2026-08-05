@@ -421,6 +421,11 @@ impl Kernel {
     ) -> Result<Ref64, RuntimeError> {
         let _ = self.processes.get(receiver)?;
         self.authorize(actor, crate::abi::Rights::TRANSFER, target)?;
+        if rights & crate::abi::Rights::WRITE != 0 {
+            // WRITE is linear ownership authority. Copying it would create a
+            // second mutable holder; use `transfer_unique` to move it instead.
+            return Err(RuntimeError::InvalidCapabilityDerivation);
+        }
         let source_ref = self
             .find_authorized_capability(actor, crate::abi::Rights::TRANSFER, target)
             .ok_or(RuntimeError::AuthorityDenied)?;
@@ -503,12 +508,10 @@ impl Kernel {
                     capability.offset == 0 && capability.length >= byte_length
                 })
                 .unwrap_or(true);
-            let range_is_sufficient = !matches!(
-                right,
-                crate::abi::Rights::READ
-                    | crate::abi::Rights::WRITE
-                    | crate::abi::Rights::FREEZE
-            ) || full_object_access;
+            let object_access_rights = crate::abi::Rights::READ
+                | crate::abi::Rights::WRITE
+                | crate::abi::Rights::FREEZE;
+            let range_is_sufficient = right & object_access_rights == 0 || full_object_access;
             (capability.target == target
                 && capability.rights & right == right
                 && capability.valid_until_epoch >= self.epoch
@@ -540,6 +543,42 @@ impl Kernel {
         false
     }
 
+    pub(crate) fn authority_holder_count(&self, target: Ref64, right: u32) -> usize {
+        self.capability_spaces
+            .keys()
+            .filter(|holder| {
+                self.find_authorized_capability(
+                    Ref64 {
+                        slot: **holder,
+                        generation: 0,
+                        kind: Kind::Process,
+                        flags: 0,
+                    },
+                    right,
+                    target,
+                )
+                .is_some()
+            })
+            .count()
+    }
+
+    pub(super) fn revoke_target_right(&mut self, target: Ref64, right: u32) {
+        for space in self.capability_spaces.values_mut() {
+            let roots: Vec<Ref64> = space
+                .iter()
+                .filter_map(|(capability, entry)| {
+                    (entry.target == target && entry.rights & right == right)
+                        .then_some(capability)
+                })
+                .collect();
+            for root in roots {
+                if space.get(root).is_ok() {
+                    Self::revoke_capability_tree(space, root);
+                }
+            }
+        }
+    }
+
     pub(super) fn mint_object_read(
         &mut self,
         actor: Ref64,
@@ -562,8 +601,20 @@ impl Kernel {
         receiver: Ref64,
         target: Ref64,
     ) -> Result<(), RuntimeError> {
+        let write_holders = self.authority_holder_count(target, crate::abi::Rights::WRITE);
+        if write_holders != 1
+            || self
+                .find_authorized_capability(actor, crate::abi::Rights::WRITE, target)
+                .is_none()
+        {
+            return Err(RuntimeError::AuthorityDenied);
+        }
         let source_ref = self
-            .find_authorized_capability(actor, crate::abi::Rights::TRANSFER, target)
+            .find_authorized_capability(
+                actor,
+                crate::abi::Rights::WRITE | crate::abi::Rights::TRANSFER,
+                target,
+            )
             .ok_or(RuntimeError::AuthorityDenied)?;
         let mut exported = self
             .capability_spaces
@@ -574,6 +625,7 @@ impl Kernel {
         exported.parent_capability = Ref64::NULL;
 
         if actor != receiver {
+            self.authority_effect(actor, crate::abi::Rights::TRANSFER, target);
             self.capability_spaces
                 .get_mut(&receiver.slot)
                 .ok_or(RuntimeError::MissingCapabilitySpace)?

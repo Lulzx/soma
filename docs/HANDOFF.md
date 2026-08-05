@@ -53,7 +53,8 @@ src/
   table.rs     Generational slot table. Slot 0 is NULL. Delete bumps generation.
                Stale references fail.
   kernel/      The machine. mod.rs holds all state. epochs.rs runs epochs.
-               commit.rs publishes effects. ownership.rs handles object state.
+               commit.rs publishes effects. ownership.rs derives object state
+               from live capabilities.
                accounting.rs records counters.
   executives/  cpu_scalar.rs is the interpreter. One switch on run_class.
   scheduler/   runnable_bins.rs contains double-buffered run-class bins.
@@ -89,15 +90,13 @@ register state, so another executor can resume the continuation.
   contract), plus a persistent-FIFO scheduling mode as a baseline.
 - The semantic specification, with 11 original invariants plus capability
   attenuation, integrity, and effect authorization machine-checked.
+- Capability-derived object ownership: one mutable holder, linear `WRITE`
+  transfer, and freeze by revoking write-bearing capability trees.
 
 ### Named by the model and NOT implemented
 
 Treat these as absent, not nearly-done:
 
-- **Unified ownership.** `freeze` invalidates the old mutable version and
-  `transfer_unique` moves authority, but `ObjectDescriptor.unique_owner` still
-  duplicates what capabilities should define. Capability design step 7 removes
-  that second mechanism and collapses I9 into I10.
 - **Channels.** Messaging is per-process mailboxes. `Kind::Channel` is a
   discriminant with no implementation.
 - **Collectives, domains, execution contracts, cancellation, supervision.**
@@ -149,16 +148,16 @@ interpreter. It constrains the remaining work.
 Authority is checked at operation, not at reference resolution, and the
 operation set is closed by making kernel state private so a bypass is a compile
 error. That note carries the full check surface, a staged implementation order
-where every step passes tests, and the two consequences worth settling
-before coding: ownership should be redefined in terms of capabilities (deleting
-`unique_owner` and collapsing I9), and failure needs a position on whether
-authority survives a faulted holder.
+where every step passes tests, and the two consequences it forced: object
+ownership is now defined entirely by capabilities, while failure still needs a
+recorded position on whether exported authority survives a faulted holder.
 
-Steps 1 through 6 are complete. Every right used by a reachable operation is
+Steps 1 through 7 are complete. Every right used by a reachable operation is
 enforced, message sends delegate payload `READ` authority, parked `AWAIT`
 authority is rechecked on resume, and authority decisions/effects make I10c
-trace-checkable. Step 7 is next: remove `unique_owner`, define unique/frozen
-ownership entirely through live capabilities, and collapse I9 into I10.
+trace-checkable. Object ownership is derived from live capability holders; the
+advisory owner/mode/count fields are gone and I9 is subsumed by I10b. Step 8 is
+next: settle authority lifetime across process failure and update the spec.
 
 ### 5.2 What does a process own? (spec §6.2)
 

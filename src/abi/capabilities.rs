@@ -35,15 +35,6 @@ pub mod Rights {
     }
 }
 
-/// Phase-1 ownership modes (§5).
-#[repr(u16)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OwnershipMode {
-    UniqueMutable = 1,
-    FrozenShared = 2,
-    KernelOwned = 3,
-}
-
 /// Capability entry (§5). Application code receives a `CapRef` which resolves
 /// through the calling domain's capability table. Capability derivation can
 /// only reduce authority — it can never amplify it.
@@ -57,7 +48,6 @@ pub struct CapabilityEntry {
     pub length: u64,
 
     pub rights: u32,
-    pub ownership_mode: OwnershipMode,
     pub transfer_policy: u16,
 
     pub object_version: u32,
@@ -74,7 +64,6 @@ impl CapabilityEntry {
             offset: 0,
             length: 0,
             rights,
-            ownership_mode: OwnershipMode::UniqueMutable,
             transfer_policy: 0,
             object_version: 0,
             valid_until_epoch: u32::MAX,

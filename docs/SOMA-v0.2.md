@@ -66,9 +66,10 @@ identity, private state, an inbox, a mode, and a lifecycle status. A process is
 *not* a unit of execution. It does not "run". It becomes ready, and its
 continuations run.
 
-**Object**, a byte payload with an ownership state, a version, and a kind. The
-physical representation is private to the implementation. The program API does
-not construct or expose a mapping.
+**Object**, a byte payload with a version and a kind. Its unique-mutable or
+frozen-shared state is derived from live capability holders rather than stored
+in its descriptor. The physical representation is private to the
+implementation. The program API does not construct or expose a mapping.
 
 **Continuation**, a *bounded resumable segment* of a process's execution: the
 schedulable unit. It names its process, its run class, its durable frame, what
@@ -147,22 +148,19 @@ under the current binning mode.
 **I8. Frame exclusivity [checked].** No two continuations share a frame object.
 A frame is the private mutable state of exactly one continuation.
 
-**I9. Ownership monotonicity [checked, partial].** A frozen object has been
-published to at least one reader, and any owner it names is live. Freezing is
-one-way: mutation of a frozen object requires allocating a new object.
-
-> Only the structural half is checked. That a frozen object is never *written*
-> is now enforced by version-pinned capabilities, but the descriptor's
-> `unique_owner` field still duplicates capability authority. Step 7 of the
-> capability design removes that second mechanism and folds this clause into
-> I10.
+**I9. Ownership monotonicity [subsumed by I10b].** Ownership is not an
+independent flag. Exactly one process may hold live full-object `WRITE`
+authority; no writer plus at least one reader is frozen-shared. `WRITE` cannot
+be copied across processes, transfer moves the sole writer, and freeze revokes
+write-bearing capability trees. Returning to mutable state therefore requires
+allocating a new object.
 
 **I10a. Capability attenuation [checked].** A derived capability's rights are a
 subset of its parent's rights and its byte range lies within its parent's.
 
 **I10b. Capability integrity [checked].** Every capability target resolves, its
-rights apply to the target kind, and its parent is live in the same actor's
-capability space.
+rights apply to the target kind, its parent is live in the same actor's
+capability space, and no object has more than one mutable authority holder.
 
 **I10c. No unauthorised effect [checked].** No process may apply a governed
 effect without holding a capability conferring that right. Every reachable
@@ -326,7 +324,7 @@ continuations within an epoch provided it preserves I1–I12 and determinism.
 | I6 message ordering | checked | per sender/receiver pair only |
 | I7 scheduler well-formed | checked | |
 | I8 frame exclusivity | checked | |
-| I9 ownership monotonicity | checked, partial | structural half only |
+| I9 ownership monotonicity | subsumed by I10b | ownership derived from capabilities |
 | I10a attenuation | checked | rights and ranges only shrink |
 | I10b capability integrity | checked | actor-relative spaces and live links |
 | I10c no unauthorised effect | checked | adjacent decision/effect trace proof |
@@ -389,17 +387,15 @@ them.
 
 ## 7. Remaining work
 
-1. **Capabilities (I10).** The largest gap between what the model claims and
-   what it does. Settled in design by
-   [docs/SOMA-CAPABILITIES.md](SOMA-CAPABILITIES.md): checked at operation, with
-   the operation set closed by making kernel state private. That note also
-   proposes collapsing I9 into I10 by defining ownership in terms of
-   capabilities, which is why capabilities come before §6.2 rather than after.
+1. **Capability failure lifetime.** I10 and capability-derived object ownership
+   are implemented. The remaining capability decision is whether exported
+   authority survives when the exporting process faults; see
+   [docs/SOMA-CAPABILITIES.md](SOMA-CAPABILITIES.md) §7.2.
 2. **Failure and cancellation (§6.3, §6.4).** Both need the answer to §6.2
    first.
 3. **Channels and collectives.** Currently vocabulary, not machinery.
-4. **Validation workloads** beyond dynamic search: a domain-neutral dynamic
-   constraint search, streaming pipelines, actor systems, and irregular
+4. **Validation workloads** beyond the existing domain-neutral dynamic
+   constraint search: streaming pipelines, actor systems, and irregular
    dataflow, chosen to stress ordering, back-pressure, and failure rather than
    throughput.
 5. **A minimal IR**, after §6.2 and §6.3 are settled. A surface syntax for a

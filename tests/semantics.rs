@@ -229,14 +229,22 @@ fn i8_catches_two_continuations_sharing_a_frame() {
 }
 
 #[test]
-fn i9_catches_an_unpublished_frozen_object() {
+fn i10b_catches_multiple_mutable_authority_holders() {
     let mut kernel = Kernel::new();
-    let object = kernel.create_object(SYSTEM_PRINCIPAL, ObjectKind::RawBytes, vec![1, 2, 3]);
-    soma::kernel::ownership::freeze(&mut kernel, SYSTEM_PRINCIPAL, object).unwrap();
-    assert!(!violated(&kernel, Invariant::OwnershipMonotonicity));
+    let owner = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let other = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let object = kernel.create_object(owner, ObjectKind::RawBytes, vec![0]);
+    let capability = kernel.find_capability(owner, object, Rights::WRITE).unwrap();
+    let duplicate = kernel.capability_entry(owner, capability).unwrap().clone();
+    assert!(!violated(&kernel, Invariant::CapabilityIntegrity));
 
-    unsafe { raw::state(&mut kernel) }.objects.get_mut(object).unwrap().reader_count = 0;
-    assert!(violated(&kernel, Invariant::OwnershipMonotonicity));
+    unsafe { raw::state(&mut kernel) }
+        .capability_spaces
+        .get_mut(&other.slot)
+        .unwrap()
+        .alloc(duplicate);
+
+    assert!(violated(&kernel, Invariant::CapabilityIntegrity));
 }
 
 #[test]

@@ -16,14 +16,14 @@ pub enum ObjectKind {
     TraceBuffer = 7,
 }
 
-/// Phase-1 ownership states. A frozen object cannot return to mutable state in
-/// Phase 1; mutation requires allocating a new object (§6.2).
+/// Ownership states derived from live capability holders. They are observations,
+/// not stored descriptor flags. A frozen object cannot return to mutable state;
+/// mutation requires allocating a new object (§6.2).
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OwnershipState {
     UniqueMutable = 1,
     FrozenShared = 2,
-    KernelOwned = 3,
 }
 
 /// Object descriptor (§6). `physical_mapping_token` is private to the kernel
@@ -40,10 +40,6 @@ pub struct ObjectDescriptor {
 
     pub version: u32,
     pub object_kind: ObjectKind,
-    pub ownership_state: OwnershipState,
-
-    pub unique_owner: Ref64,
-    pub reader_count: u32,
     pub flags: u32,
 }
 
@@ -57,9 +53,6 @@ impl ObjectDescriptor {
             physical_mapping_token: 0,
             version: 0,
             object_kind,
-            ownership_state: OwnershipState::UniqueMutable,
-            unique_owner: Ref64::NULL,
-            reader_count: 0,
             flags: 0,
         }
     }
