@@ -162,6 +162,21 @@ impl Scheduler {
         v
     }
 
+    /// Every queued continuation with the bin it sits in, current buffer first,
+    /// in deterministic bin order. Used by the semantic invariant checker to
+    /// verify that nothing unrunnable is sitting in a runnable bin.
+    pub fn pending_entries(&self) -> Vec<(u32, Ref64)> {
+        let mut bins: Vec<(&u32, &DoubleBin)> = self.bins.iter().collect();
+        bins.sort_by_key(|(k, _)| **k);
+        let mut out = Vec::new();
+        for (bin, b) in bins {
+            for c in b.current.iter().chain(b.next.iter()) {
+                out.push((*bin, *c));
+            }
+        }
+        out
+    }
+
     /// Drain one run class's current-epoch bin for execution.
     pub fn drain(&mut self, run_class: u32) -> Vec<Ref64> {
         match self.bins.get_mut(&run_class) {

@@ -21,4 +21,5 @@ pub mod experiments;
 pub mod kernel;
 pub mod replay;
 pub mod scheduler;
+pub mod semantics;
 pub mod table;

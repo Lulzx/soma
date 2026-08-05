@@ -1,0 +1,447 @@
+//! Executable well-formedness invariants for the SOMA abstract machine.
+//!
+//! These are the machine-checked half of the semantic specification in
+//! `docs/SOMA-v0.2.md`. Every invariant here has an identifier (`I1`, `I2`, …)
+//! that matches a numbered clause in that document, so the prose and the code
+//! cannot drift apart without a test failing.
+//!
+//! The checker is a predicate over a whole machine state, not over a
+//! transition. It answers "is this a legal state", which is what makes it
+//! usable as a postcondition after *any* transition: run it after every epoch
+//! and any rule that can produce an illegal state gets caught, without having
+//! to anticipate which rule.
+//!
+//! # What is deliberately not checked
+//!
+//! Capability safety (§I10 in the spec) is absent, not passing. The reference
+//! implementation allocates a capability table and never consults it, so there
+//! is no authority to verify and a check here would report success for a
+//! property the machine does not have. An invariant that cannot fail is worse
+//! than a missing one, because it reads as evidence. See the conformance table
+//! in the specification.
+
+use crate::abi::continuations::ContinuationState;
+use crate::abi::{FutureState, Kind, ProcessMode, ProcessState, Ref64};
+use crate::kernel::Kernel;
+
+/// Which clause of the specification a violation belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Invariant {
+    /// I1. Every reference held in a live descriptor resolves.
+    ReferenceIntegrity,
+    /// I2. No continuation is left mid-execution at a quiescent state.
+    NoContinuationLeftRunning,
+    /// I3. A continuation's process is live; a terminated process has no
+    /// schedulable continuations.
+    ProcessContinuationConsistency,
+    /// I4. Futures are single-assignment, and nothing waits on a settled one.
+    FutureSingleAssignment,
+    /// I5. Mailboxes respect their declared bound.
+    MailboxBound,
+    /// I6. Messages from one sender to one receiver stay in send order.
+    MessageOrdering,
+    /// I7. Everything in a runnable bin is live, runnable, and correctly binned.
+    SchedulerWellFormed,
+    /// I8. No two continuations share a frame object.
+    FrameExclusivity,
+    /// I9. A frozen object never returns to mutable state.
+    OwnershipMonotonicity,
+    /// I11. The trace is a strictly increasing logical clock.
+    TraceMonotonicity,
+    /// I12. Accounting counters are mutually consistent.
+    AccountingConsistency,
+}
+
+/// A specific way in which a state was illegal.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Violation {
+    pub invariant: Invariant,
+    pub detail: String,
+}
+
+impl Violation {
+    fn new(invariant: Invariant, detail: impl Into<String>) -> Violation {
+        Violation {
+            invariant,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for Violation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}: {}", self.invariant, self.detail)
+    }
+}
+
+/// Check every invariant, returning all violations rather than the first, so a
+/// broken transition reports its full damage in one pass.
+pub fn check(kernel: &Kernel) -> Vec<Violation> {
+    let mut v = Vec::new();
+    reference_integrity(kernel, &mut v);
+    no_continuation_left_running(kernel, &mut v);
+    process_continuation_consistency(kernel, &mut v);
+    future_single_assignment(kernel, &mut v);
+    mailbox_bound(kernel, &mut v);
+    message_ordering(kernel, &mut v);
+    scheduler_well_formed(kernel, &mut v);
+    frame_exclusivity(kernel, &mut v);
+    ownership_monotonicity(kernel, &mut v);
+    trace_monotonicity(kernel, &mut v);
+    accounting_consistency(kernel, &mut v);
+    v.sort();
+    v
+}
+
+/// Panic with every violation, for use as a test postcondition.
+pub fn assert_legal(kernel: &Kernel) {
+    let violations = check(kernel);
+    assert!(
+        violations.is_empty(),
+        "illegal machine state at epoch {}:\n{}",
+        kernel.epoch,
+        violations
+            .iter()
+            .map(|v| format!("  {v}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+// ---- I1 ------------------------------------------------------------------
+
+fn live(kernel: &Kernel, r: Ref64) -> bool {
+    match r.kind {
+        Kind::Process => kernel.processes.get(r).is_ok(),
+        Kind::Object => kernel.objects.get(r).is_ok(),
+        Kind::Continuation => kernel.continuations.get(r).is_ok(),
+        Kind::Future => kernel.futures.get(r).is_ok(),
+        Kind::Capability => kernel.capabilities.get(r).is_ok(),
+        // Domains, channels, contracts, collectives and modules have no table
+        // in the reference model; a reference to one cannot be validated.
+        _ => true,
+    }
+}
+
+fn reference_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
+    for (r, p) in kernel.processes.iter() {
+        if !p.id.is_null() && p.id != r {
+            out.push(Violation::new(
+                Invariant::ReferenceIntegrity,
+                format!("process {} carries id {}", r.slot, p.id.slot),
+            ));
+        }
+        if !p.state.is_null() && !live(kernel, p.state) {
+            out.push(Violation::new(
+                Invariant::ReferenceIntegrity,
+                format!("process {} has a dangling state object", r.slot),
+            ));
+        }
+    }
+
+    for (r, c) in kernel.continuations.iter() {
+        if !live(kernel, c.process) {
+            out.push(Violation::new(
+                Invariant::ReferenceIntegrity,
+                format!("continuation {} references a dead process", r.slot),
+            ));
+        }
+        if !c.frame.is_null() && !live(kernel, c.frame) {
+            out.push(Violation::new(
+                Invariant::ReferenceIntegrity,
+                format!("continuation {} has a dangling frame", r.slot),
+            ));
+        }
+        if !c.dependency.is_null() && !live(kernel, c.dependency) {
+            out.push(Violation::new(
+                Invariant::ReferenceIntegrity,
+                format!("continuation {} depends on a dead entity", r.slot),
+            ));
+        }
+    }
+
+    for (r, f) in kernel.futures.iter() {
+        if f.state == FutureState::Resolved && !f.value.is_null() && !live(kernel, f.value) {
+            out.push(Violation::new(
+                Invariant::ReferenceIntegrity,
+                format!("future {} resolved to a dead object", r.slot),
+            ));
+        }
+    }
+
+    for (slot, mailbox) in &kernel.mailboxes {
+        for m in &mailbox.entries {
+            if !m.payload.is_null() && !live(kernel, m.payload) {
+                out.push(Violation::new(
+                    Invariant::ReferenceIntegrity,
+                    format!("mailbox {slot} holds a message with a dead payload"),
+                ));
+            }
+        }
+    }
+}
+
+// ---- I2 ------------------------------------------------------------------
+
+fn no_continuation_left_running(kernel: &Kernel, out: &mut Vec<Violation>) {
+    for (r, c) in kernel.continuations.iter() {
+        if c.status == ContinuationState::Running {
+            out.push(Violation::new(
+                Invariant::NoContinuationLeftRunning,
+                format!("continuation {} is still RUNNING between epochs", r.slot),
+            ));
+        }
+    }
+}
+
+// ---- I3 ------------------------------------------------------------------
+
+fn process_continuation_consistency(kernel: &Kernel, out: &mut Vec<Violation>) {
+    for (r, c) in kernel.continuations.iter() {
+        let process = match kernel.processes.get(c.process) {
+            Ok(p) => p,
+            // Already reported by I1.
+            Err(_) => continue,
+        };
+        let schedulable = matches!(
+            c.status,
+            ContinuationState::Runnable | ContinuationState::Waiting
+        );
+        if schedulable && process.status == ProcessState::Terminated as u32 {
+            out.push(Violation::new(
+                Invariant::ProcessContinuationConsistency,
+                format!(
+                    "continuation {} is {:?} but its process {} has terminated",
+                    r.slot, c.status, c.process.slot
+                ),
+            ));
+        }
+    }
+}
+
+// ---- I4 ------------------------------------------------------------------
+
+fn future_single_assignment(kernel: &Kernel, out: &mut Vec<Violation>) {
+    for (r, f) in kernel.futures.iter() {
+        match f.state {
+            FutureState::Pending => {
+                if !f.value.is_null() {
+                    out.push(Violation::new(
+                        Invariant::FutureSingleAssignment,
+                        format!("future {} is pending but carries a value", r.slot),
+                    ));
+                }
+            }
+            FutureState::Resolved | FutureState::Failed | FutureState::Cancelled => {
+                if f.resolved_epoch > kernel.epoch {
+                    out.push(Violation::new(
+                        Invariant::FutureSingleAssignment,
+                        format!("future {} resolved in a future epoch", r.slot),
+                    ));
+                }
+                // A settled future's waiter list has already been drained, so a
+                // continuation registered on it would never wake.
+                if let Some(waiters) = kernel.future_waiters.get(&r.slot) {
+                    if !waiters.is_empty() {
+                        out.push(Violation::new(
+                            Invariant::FutureSingleAssignment,
+                            format!(
+                                "{} continuations wait on already-settled future {}",
+                                waiters.len(),
+                                r.slot
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---- I5 ------------------------------------------------------------------
+
+fn mailbox_bound(kernel: &Kernel, out: &mut Vec<Violation>) {
+    for (slot, mailbox) in &kernel.mailboxes {
+        if mailbox.entries.len() > mailbox.capacity {
+            out.push(Violation::new(
+                Invariant::MailboxBound,
+                format!(
+                    "mailbox {slot} holds {} messages over a capacity of {}",
+                    mailbox.entries.len(),
+                    mailbox.capacity
+                ),
+            ));
+        }
+    }
+}
+
+// ---- I6 ------------------------------------------------------------------
+
+fn message_ordering(kernel: &Kernel, out: &mut Vec<Violation>) {
+    for (slot, mailbox) in &kernel.mailboxes {
+        let mut last: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        for m in &mailbox.entries {
+            if let Some(previous) = last.get(&m.sender.slot) {
+                if m.sender_sequence <= *previous {
+                    out.push(Violation::new(
+                        Invariant::MessageOrdering,
+                        format!(
+                            "mailbox {slot}: sender {} delivered sequence {} after {}",
+                            m.sender.slot, m.sender_sequence, previous
+                        ),
+                    ));
+                }
+            }
+            last.insert(m.sender.slot, m.sender_sequence);
+        }
+    }
+}
+
+// ---- I7 ------------------------------------------------------------------
+
+fn scheduler_well_formed(kernel: &Kernel, out: &mut Vec<Violation>) {
+    for (bin, cont) in kernel.scheduler.pending_entries() {
+        let c = match kernel.continuations.get(cont) {
+            Ok(c) => c,
+            Err(_) => {
+                out.push(Violation::new(
+                    Invariant::SchedulerWellFormed,
+                    format!("bin {bin} holds dead continuation {}", cont.slot),
+                ));
+                continue;
+            }
+        };
+        if c.status != ContinuationState::Runnable {
+            out.push(Violation::new(
+                Invariant::SchedulerWellFormed,
+                format!(
+                    "bin {bin} holds continuation {} in state {:?}",
+                    cont.slot, c.status
+                ),
+            ));
+        }
+        let expected = kernel.scheduler.bin_of(c.run_class);
+        if expected != bin {
+            out.push(Violation::new(
+                Invariant::SchedulerWellFormed,
+                format!(
+                    "continuation {} of run class {} sits in bin {bin}, not {expected}",
+                    cont.slot, c.run_class
+                ),
+            ));
+        }
+    }
+}
+
+// ---- I8 ------------------------------------------------------------------
+
+fn frame_exclusivity(kernel: &Kernel, out: &mut Vec<Violation>) {
+    let mut owner: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    for (r, c) in kernel.continuations.iter() {
+        if c.frame.is_null() {
+            continue;
+        }
+        if let Some(previous) = owner.insert(c.frame.slot, r.slot) {
+            out.push(Violation::new(
+                Invariant::FrameExclusivity,
+                format!(
+                    "frame {} is shared by continuations {} and {}",
+                    c.frame.slot, previous, r.slot
+                ),
+            ));
+        }
+    }
+}
+
+// ---- I9 ------------------------------------------------------------------
+
+fn ownership_monotonicity(kernel: &Kernel, out: &mut Vec<Violation>) {
+    use crate::abi::objects::OwnershipState;
+    for (r, o) in kernel.objects.iter() {
+        // A frozen object is readable by many, so it must have been published.
+        if o.ownership_state == OwnershipState::FrozenShared && o.reader_count == 0 {
+            out.push(Violation::new(
+                Invariant::OwnershipMonotonicity,
+                format!("object {} is frozen but was never published", r.slot),
+            ));
+        }
+        if o.ownership_state == OwnershipState::FrozenShared && !o.unique_owner.is_null() {
+            // Freezing surrenders unique authority; retaining an owner would
+            // let a writer believe it still holds it.
+            if !live(kernel, o.unique_owner) {
+                out.push(Violation::new(
+                    Invariant::OwnershipMonotonicity,
+                    format!("frozen object {} names a dead unique owner", r.slot),
+                ));
+            }
+        }
+    }
+}
+
+// ---- I11 -----------------------------------------------------------------
+
+fn trace_monotonicity(kernel: &Kernel, out: &mut Vec<Violation>) {
+    let mut previous_time = 0u64;
+    let mut previous_epoch = 0u32;
+    for (i, e) in kernel.trace.iter().enumerate() {
+        if e.logical_time <= previous_time && i > 0 {
+            out.push(Violation::new(
+                Invariant::TraceMonotonicity,
+                format!(
+                    "trace event {i} has logical time {} after {}",
+                    e.logical_time, previous_time
+                ),
+            ));
+        }
+        if e.epoch < previous_epoch {
+            out.push(Violation::new(
+                Invariant::TraceMonotonicity,
+                format!("trace event {i} moves backward to epoch {}", e.epoch),
+            ));
+        }
+        previous_time = e.logical_time;
+        previous_epoch = e.epoch;
+    }
+}
+
+// ---- I12 -----------------------------------------------------------------
+
+fn accounting_consistency(kernel: &Kernel, out: &mut Vec<Violation>) {
+    let a = &kernel.accounting;
+    if a.useful_lane_slots > a.lane_slots {
+        out.push(Violation::new(
+            Invariant::AccountingConsistency,
+            format!(
+                "useful lane slots {} exceed issued lane slots {}",
+                a.useful_lane_slots, a.lane_slots
+            ),
+        ));
+    }
+    if a.full_cohorts > a.cohorts {
+        out.push(Violation::new(
+            Invariant::AccountingConsistency,
+            format!(
+                "full cohorts {} exceed total cohorts {}",
+                a.full_cohorts, a.cohorts
+            ),
+        ));
+    }
+    if a.lane_slots != a.useful_lane_slots + a.idle_lane_slots {
+        out.push(Violation::new(
+            Invariant::AccountingConsistency,
+            format!(
+                "lane slots {} do not split into {} useful and {} idle",
+                a.lane_slots, a.useful_lane_slots, a.idle_lane_slots
+            ),
+        ));
+    }
+}
+
+/// Whether a process is serial, i.e. bound by the one-mutator rule.
+pub fn is_serial(kernel: &Kernel, process: Ref64) -> bool {
+    kernel
+        .processes
+        .get(process)
+        .map(|p| matches!(p.process_mode, ProcessMode::Serial | ProcessMode::System))
+        .unwrap_or(false)
+}

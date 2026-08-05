@@ -1,16 +1,48 @@
 # SOMA
 
-**S**mall-scale SI**M**D **O**S for **m**any-**a**gent systems — a kernel prototype.
+An abstract machine for irregular concurrent computation, with an executable
+specification.
 
-> Persistent independent processes can execute efficiently on heterogeneous SIMD
-> hardware when their ready continuations are dynamically regrouped into coherent
-> physical execution cohorts.
+> Can persistent processes, object capabilities, continuations, dataflow
+> readiness, and collectives provide a coherent general programming model for
+> heterogeneous computation?
 
-SOMA is an executable kernel contract built to test that sentence. A population of
-long-lived, engine-independent processes is modelled as bounded resumable
-continuations, and those continuations are regrouped by run class so they can be
-dispatched as coherent SIMD cohorts. This repo is the Phase-1 prototype:
-deterministic, dependency-free Rust, no GPU yet.
+SOMA is defined without reference to hardware: no SIMD width, no device, no
+host, no placement. Those belong to *implementations*, of which the CPU
+reference interpreter here is one. The machine is specified in
+**[docs/SOMA-v0.2.md](docs/SOMA-v0.2.md)**, and most of that specification is
+executable — its invariants are checked against the interpreter after every
+transition, so the document cannot drift from the machine without a test
+failing.
+
+Deterministic, dependency-free Rust.
+
+## The specification
+
+Fourteen invariants, each marked with what it actually is:
+
+- **checked** — machine-verified by `soma::semantics::invariants` after every
+  transition. Eleven of the fourteen.
+- **modelled** — implemented and tested, but a property of a transition rather
+  than of a state, so not expressible as a predicate.
+- **absent** — named by the model and *not implemented*. The machine does not
+  have this property.
+
+`tests/semantics.rs` asserts both directions for every checked clause: the
+reference model satisfies it, **and** the checker catches a state that violates
+it. A checker that cannot fail is not evidence.
+
+The largest honest gap is capability safety (I10). The capability table is
+allocated and never consulted, so any process can mutate any object it can name.
+There is deliberately no checker for it — a check that cannot fail would
+misrepresent the machine as safe — and a test demonstrates the hole concretely.
+Channels, collectives, domains, cancellation, and supervision are vocabulary,
+not machinery.
+
+Writing the specification immediately broke something real: `Complete` had
+conflated "this continuation finished" with "this process is done", so a process
+with two live continuations retired when the first completed and the second went
+on running against a dead process. See §6.1 of the spec.
 
 ## The mechanism
 
@@ -33,7 +65,12 @@ continuation ──► run-class bin ──► cohort of W lanes ──► unifo
 The frame is a byte blob in shared memory, not register state, so a continuation
 can move between executives at any continuation boundary.
 
-## What the prototype shows so far
+## Implementation results
+
+Everything below measures **one implementation strategy** — grouping
+continuations by run class so they can be dispatched together — not a property
+of the model. The specification neither requires nor mentions it. Read these as
+evidence about a scheduler, not about SOMA.
 
 Binning by run class instead of arrival order raises useful SIMD-lane occupancy
 by **1.85–3.27×** over a persistent FIFO, eliminating 46–69% of dispatches.
@@ -140,7 +177,7 @@ Sokoban workload.
 ## Quick start
 
 ```sh
-cargo test                    # 59 tests
+cargo test                    # 83 tests
 cargo run --example cohort_report
 cargo run --example baseline_report
 cargo run --example irregular_report
@@ -162,13 +199,14 @@ src/
   scheduler/   double-buffered run-class bins; cohort construction
   compiler/    frame encoding; the Expand state-machine lowering
   replay/      trace reader and determinism comparison
+  semantics/   executable invariants from the specification
   experiments/ branching search; cohorting study; bulk frontier;
-               irregular arrival
+               irregular arrival; execution territories
 ```
 
 ## Status
 
-Working prototype, `v0.1.0`. The kernel is exercised on its negative paths as
+Reference interpreter plus a draft specification, `v0.1.0`. The kernel is exercised on its negative paths as
 well as its happy ones — mailbox back-pressure, step-budget exhaustion, the
 serial-process invariant, re-entry after blocking — because that is where an
 epoch lifecycle loses or duplicates work.
@@ -185,9 +223,18 @@ bound computed from how continuations group, and the irregular result is a polic
 model rather than the kernel executing. The throughput limb of §28.1 and the
 overhead budget of §28.2 remain untouched, and both need the GPU executive.
 
-The [contract](docs/SOMA-P1.md) is explicit that SOMA must permit results that
-falsify it (§29) — its purpose is not to protect its original thesis. So far it
-has survived one honest attempt, on one synthetic workload family.
+The [Phase-1 contract](docs/SOMA-P1.md) is explicit that SOMA must permit
+results that falsify it (§29) — its purpose is not to protect its original
+thesis. So far the cohorting strategy has survived one honest attempt, on one
+synthetic workload family.
+
+The current work is not that, though. It is
+[the specification](docs/SOMA-v0.2.md): pinning down what the machine *is*
+before optimising how it runs. Section 6 of that document lists the ambiguities
+the executable model has already exposed and has not yet resolved — what a
+process owns, what happens to a failed process's futures and waiters, and what
+cancellation means. A surface syntax written before those are settled would
+encode the ambiguity rather than remove it.
 
 ## License
 
