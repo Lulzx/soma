@@ -290,6 +290,18 @@ Added in v0.3:
   can say no" to "operations whose result another lane can decide". It is also
   the first workload clause 1 can see, and it sees only the order in which the
   awaiter parked: the reference order reports nothing from it.
+- The sixth decision, and the first the comparison missed (v0.3 §4.16).
+  `POLL_FUTURE` reads a future without awaiting it (`tests/future_poll.rs`).
+  Before this section nothing reported the race at all -- not clause 1, not
+  clause 2, and not `conforms_traces`, because what the poll saw went into a
+  frame. `POLL_ACT` makes it undeniable by sending a message in a later epoch if
+  the poll saw a value: the runs then disagree in epoch 1 while epoch 0, which
+  decided it, is clean by every clause. The fix makes the read governed like the
+  view's other reads -- `AWAIT`, an authority pair, and `FutureStateObserved`
+  recording what it saw. Unlike the five before it, this event fires in existing
+  workloads: fourteen test files reach it, all pass, and the example reports are
+  byte-identical, which says no existing workload polls a future its own epoch
+  is resolving.
 - A lane-local trace buffer (v0.3 §4.11). A lane produces trace events into
   `lane_trace` and `leave_lane` appends them, which is §4.4's move applied to
   the trace. `logical_time` is handed out at the drain rather than at emission,
@@ -626,6 +638,28 @@ decision that would otherwise depend on `HashMap` iteration order.
   `apply_step_result` writes a continuation's status inside the lane that
   produced it. No handler reads another's, so it is unreachable in the §4.14
   sense — a fact about the handlers, with the same expiry.
+- **A read can be a race, and the reordering discipline does not always catch
+  it.** §4.16 is the one case where running the workload again in another order
+  and comparing reported *nothing*: a poll of a future put what it saw in a
+  frame, and a frame is not observable behaviour, so two I18-equivalent runs
+  left different state. Clause 1 had no edge (nothing parked, so nothing was
+  woken) and clause 2 had no event. When the divergence finally reached the
+  trace it was an epoch later, in an epoch that had not raced anything, while
+  the epoch that decided it passed every clause. If a step reads state, ask what
+  records the read — "the comparison will catch it" is not always true.
+- **`future_value` is a governed read, and `Kernel::future_value` is not.**
+  `LaneView::future_value` takes `&mut` and an actor, authorizes `AWAIT`, and
+  emits `FutureStateObserved`; the kernel's plain `future_value` stays the
+  host's ungoverned read, for tests and the epoch machinery. Do not reach for
+  the second from a step — the point of the split is that a lane's look at a
+  future is recorded. The event carries *both* outcomes (`auxiliary` is 1 for
+  resolved, 0 for pending) because a poll that saw nothing was decided by the
+  lane that had not yet run, exactly as much as one that saw the value.
+- **A denial, a pending future, and a null reference are three answers.** The
+  ungoverned read collapsed all three into `None`. A handler now faults on a
+  denial, treats pending as pending, and skips the read entirely when the frame
+  names no future — that last one is what keeps `EXPAND_RESUME_1` working for
+  the tests that run it over an empty frame, and it is why the arm exists.
 - **`Bounded` has an entry that is not a bounded resource.** `FutureSettlement`
   dispenses nothing; it is a future's state, written by a resolver and read by
   an awaiter. It is in clause 2 because the clause's subject was never

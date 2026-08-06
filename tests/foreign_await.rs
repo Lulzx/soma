@@ -240,7 +240,11 @@ fn clause_2_sees_the_order_in_which_the_resolver_went_first() {
     let plan = workload(LaneOrder::Plan, Setup::Contested);
     let reported = violations(&plan);
     assert_eq!(reported.len(), 1, "{reported:?}");
-    assert!(reported[0].contains("whether that await parks"), "{}", reported[0]);
+    assert!(
+        reported[0].contains("read whether it had been resolved"),
+        "{}",
+        reported[0]
+    );
 }
 
 /// Between them, every order reports. That is the property the workload owes:

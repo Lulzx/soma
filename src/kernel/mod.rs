@@ -2393,6 +2393,16 @@ impl Kernel {
         Ok(continuation)
     }
 
+    /// The object a continuation's frame lives in.
+    ///
+    /// A host read. It is the only way to see the part of a run's state the
+    /// trace does not carry, which is what v0.3 §4.16 needs: two runs can be
+    /// I18-equivalent and still leave different frames behind, and showing that
+    /// means looking at one.
+    pub fn continuation_frame(&self, continuation: Ref64) -> Result<Ref64, RuntimeError> {
+        Ok(self.continuations.get(continuation)?.frame)
+    }
+
     pub fn continuation_contract(&self, continuation: Ref64) -> Result<Ref64, RuntimeError> {
         Ok(self.continuations.get(continuation)?.execution_contract)
     }
@@ -2594,7 +2604,49 @@ impl Kernel {
         Ok(())
     }
 
+    /// Observe a future's state from inside a lane: its value if it has one,
+    /// `None` if it is still pending.
+    ///
+    /// The governed form of `future_value`, and the reason it exists is that the
+    /// ungoverned one is what a step used to call (v0.3 §4.16). Reading whether
+    /// a future has been resolved is a decision another lane of the same epoch
+    /// can make, exactly as `await_future`'s two outcomes are, and it was the
+    /// one read on `LaneView` that needed no authority and left no record — so
+    /// nothing could report the epoch in which the reading lane and the
+    /// resolving lane raced.
+    ///
+    /// It authorizes `AWAIT`, which is the right that already means "may
+    /// observe this future": a poll is the non-blocking form of the same
+    /// observation, and the two should not differ in what they demand.
+    pub fn observe_future(
+        &mut self,
+        actor: Ref64,
+        future: Ref64,
+    ) -> Result<Option<Ref64>, RuntimeError> {
+        self.authorize(actor, crate::abi::Rights::AWAIT, future)?;
+        let descriptor = self.futures.get(future)?;
+        let (state, value) = (descriptor.state, descriptor.value);
+        let resolved = state == FutureState::Resolved;
+        self.authority_effect(actor, crate::abi::Rights::AWAIT, future);
+        self.trace_full(
+            EventKind::FutureStateObserved,
+            actor,
+            Ref64::NULL,
+            0,
+            u32::from(resolved),
+            future,
+            if resolved { value } else { Ref64::NULL },
+        );
+        Ok(if resolved { Some(value) } else { None })
+    }
+
     /// Read a resolved future's value (an object ref), or `None` if unresolved.
+    ///
+    /// The host's read: ungoverned, untraced, and not reachable from a step —
+    /// `LaneView` offers `observe_future` instead. Tests, examples and the
+    /// epoch machinery use this one, and the distinction is the same one
+    /// `object_bytes` draws between what the host may look at and what a lane
+    /// may.
     pub fn future_value(&self, future: Ref64) -> Option<Ref64> {
         match self.futures.get(future) {
             Ok(f) if f.state == FutureState::Resolved => Some(f.value),

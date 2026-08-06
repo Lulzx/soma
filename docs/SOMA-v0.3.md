@@ -1248,7 +1248,10 @@ the handlers, not about the machine:
   step it awaits, so the resolver cannot have run yet. A handler that awaited a
   future it did not create would reach it immediately.
 - `future_value` reads a resolution with no event at all, and the same argument
-  applies for the same reason.
+  applies for the same reason. (§4.15 reaches it and §4.16 finds that reaching
+  it was not the same as racing it: the read there follows an await, so the
+  resolution is already in the past. A poll is the case that races, and it is
+  the one nothing could report.)
 
 So the blind spot is a property of the handler set, and it moves the moment the
 handler set does. That is a different kind of "not reachable" from §4.12's, which
@@ -1355,6 +1358,85 @@ descriptor rather than the table — and it is not done here because narrowing
 `continuations()` is a change to the fifteen and belongs with the concurrent
 executive that will need it.
 
+### 4.16 A future looked at, and the epoch that did not report it
+
+Re-walking the fifteen under §4.15's wider question — which operations have a
+result another lane can decide — turns up one the narrow question had no reason
+to stop at. `future_value` cannot fail and does not block. It was also the only
+read on `LaneView` that took no capability and left no record.
+
+§4.15 did reach it: `JOIN_RESUME` reads a future it did not create. It never
+*raced* it, because that read comes after an await, and an await that parks or
+returns settled has already put the resolution in the past. Take the await away
+and the read is a poll, which is a perfectly ordinary thing for a program to do
+— check whether a result is ready, carry on either way — and now the resolving
+lane of the same epoch decides what it returns.
+
+**Everything this project built to catch that was blind.** One resolver lane,
+one polling lane, one future, one epoch:
+
+- clause 1 has no edge to find: nothing parked, so nothing was woken, so no
+  event names another lane's continuation. Unlike §4.15, this is not a
+  limitation of what the trace records — there genuinely is no interaction
+  between the two lanes beyond the read.
+- clause 2 had no event to key on.
+- and **the run comparison was blind too**, which is new. What the poll saw went
+  into its frame, and a frame is not observable behaviour. `conforms_traces`
+  reported nothing. Two runs, I18-equivalent, leaving different state.
+
+That last one matters more than the clause. §4.6's discipline — run the workload
+again in another order and compare — is what found all five earlier races, and
+it is the fallback whenever a clause is blind. Here the fallback fails as well,
+so the run that was decided by lane order has no detector of any kind.
+
+**Making it undeniable.** `POLL_ACT` is a second resume point that sends a
+message if the poll saw a value. Now the runs do disagree — and they disagree in
+epoch 1, while the epoch that decided everything is epoch 0, which every clause
+declares clean under both orders. An epoch passing I25 is supposed to mean its
+lanes could have run in any order. Here it says so and is wrong, and the
+evidence arrives an epoch later, attached to a lane that did nothing wrong.
+
+**The fix is the one the machine already applies to its other reads.**
+`object_bytes` and `read_u64_object` are governed: they authorize, they trace
+the decision, and `LaneView` takes them by `&mut` for exactly that reason.
+`future_value` now joins them. It authorizes `AWAIT` — the right that already
+means "may observe this future", since a poll is the non-blocking form of the
+same observation — and emits `FutureStateObserved`.
+
+Two details of that event are load-bearing:
+
+- **It records what the poll saw**, in `auxiliary` and `subject`. A poll that
+  found the future still *pending* was decided by the resolving lane exactly as
+  much as one that found the value — it would have seen the value under the
+  other order — so recording only the resolved case would leave half the runs
+  unreportable. That is the same mistake in miniature as the one this section
+  exists to fix.
+- **A denied read faults**, rather than reading as "not resolved yet". The
+  ungoverned read collapsed those two answers into `None`, and they are
+  different answers. A null future reference is a third thing again — the frame
+  names nothing to look at — and skips the read entirely, which is what keeps
+  handlers holding an empty frame behaving as they did.
+
+Clause 2 keys the event under `FutureSettlement`, beside §4.15's settled await:
+same resource, same question, two operations that read it. Both orders of the
+poll workload now report, in epoch 0.
+
+**The nulls** are §4.15's three, with the same readings — published before the
+epoch (nobody won it), nobody resolving at all, and the two lanes on different
+futures — plus one this section needs of its own: a poller holding no `AWAIT` is
+denied and faults, which is what says the read is governed rather than merely
+traced.
+
+**What is not unchanged, for the first time in five rounds.** The four refusals
+and the settled await were emitted by no existing workload, and each round could
+say so with a probe. This one is emitted by fourteen of the suite's test files —
+`future_value` is what `expand_resume_1` calls to collect its heuristic result,
+so the Expand workload's trace grows by three events per read (the grant, the
+effect, the observation). Nothing failed and the ten example reports are still
+byte-identical, which is the useful part of the result: fourteen files' worth of
+workloads look at futures, and not one of them looks at a future its own epoch
+is resolving. The clause fires nowhere except where it was built to.
+
 ---
 
 ## 5. C — distributed, trace-equivalent
@@ -1428,7 +1510,7 @@ cannot reach means the model is charging for the wrong thing.
 | I22 admission determinism | checked | the decision is a function of the candidate set (§4.1) |
 | I23 position-derived emission | checked | the trace's order needs no shared clock (§4.2) |
 | I24 effect-mediated commit | checked | bins are written by an applier, in plan order (§4.4) |
-| I25 lane independence | checked | two clauses: no ≺ edge joins two lanes of one epoch (§4.5), and no lane's outcome is decided by another through one resource — a domain quota, a mailbox's capacity, a mailbox's occupancy, a future's one assignment, or a future's settled state (§4.12–§4.15) |
+| I25 lane independence | checked | two clauses: no ≺ edge joins two lanes of one epoch (§4.5), and no lane's outcome is decided by another through one resource — a domain quota, a mailbox's capacity, a mailbox's occupancy, a future's one assignment, or a future's settled state, whether awaited or merely looked at (§4.12–§4.16) |
 
 **I21** has two halves. The first — an epoch that admitted work dispatched some
 of it — is a statement about a transition rather than a state, so it is counted

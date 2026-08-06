@@ -30,7 +30,10 @@
 //! * *Reads* — `continuations`, `epoch_number`, `future_value`, `object_bytes`,
 //!   `read_u64_object`.
 //!   These need a shared borrow and nothing else once the lane stops holding
-//!   `&mut`.
+//!   `&mut` — except that three of them are *governed* reads, which trace the
+//!   authority decision and so write one place each. §4.11's per-lane trace
+//!   buffer is that place. `future_value` joined them in §4.16, for the reason
+//!   given on it.
 //! * *Allocation* — `create_process`, `create_continuation`, `create_future`,
 //!   `create_object`. §4.8's shards are the lane-local form; wiring them is
 //!   mechanical.
@@ -77,8 +80,8 @@ use crate::kernel::{ContinuationSpec, Kernel, RuntimeError};
 /// fail for the wrong reason and pass vacuously.
 ///
 /// ```
-/// fn f(lane: &soma::executives::lane::LaneView<'_>) -> Option<soma::abi::Ref64> {
-///     lane.future_value(soma::abi::Ref64::NULL)
+/// fn f(lane: &mut soma::executives::lane::LaneView<'_>) {
+///     let _ = lane.future_value(soma::abi::Ref64::NULL, soma::abi::Ref64::NULL);
 /// }
 /// ```
 ///
@@ -110,8 +113,17 @@ impl<'a> LaneView<'a> {
         self.kernel.epoch_number()
     }
 
-    pub fn future_value(&self, future: Ref64) -> Option<Ref64> {
-        self.kernel.future_value(future)
+    /// Takes `&mut` and an actor for `object_bytes`'s reason, and it did not
+    /// used to: looking at a future is a governed effect and the authority
+    /// decision is traced. It was the one read here that was neither, which is
+    /// what let a lane read a decision another lane of its epoch had made and
+    /// leave nothing for I25 to report (v0.3 §4.16).
+    pub fn future_value(
+        &mut self,
+        actor: Ref64,
+        future: Ref64,
+    ) -> Result<Option<Ref64>, RuntimeError> {
+        self.kernel.observe_future(actor, future)
     }
 
     /// Takes `&mut` because reading is a governed effect and the authority

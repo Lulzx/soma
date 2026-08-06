@@ -120,6 +120,24 @@ pub enum EventKind {
     /// `causal` is the future, as it is for `FutureResolved`, and `subject` is
     /// the value the await found published.
     FutureAwaitSettled = 38,
+    /// A lane looked at a future's state without awaiting it.
+    ///
+    /// `future_value` was the one read on `LaneView` that was neither
+    /// authorized nor recorded, which made it the only way a lane could learn
+    /// something about another lane's epoch and leave nothing behind. What it
+    /// returns is decided by whether a resolver of the same epoch ran first,
+    /// and a poll that acts on what it saw turns that into behaviour an epoch
+    /// or two later — so the run that was decided by lane order is not the run
+    /// that reports it (v0.3 §4.16).
+    ///
+    /// `causal` is the future and `subject` is the value, or `Ref64::NULL` when
+    /// the poll found it still pending. `auxiliary` is 1 when it was resolved
+    /// and 0 when it was not, so the clause can read the outcome without
+    /// inspecting the subject — and so that *both* outcomes are recorded.
+    /// Recording only the resolved one would repeat this section's own mistake:
+    /// a poll that saw nothing was equally decided by the lane that had not yet
+    /// run.
+    FutureStateObserved = 39,
 }
 
 /// The lane an event was emitted from when it was not emitted from one: epoch

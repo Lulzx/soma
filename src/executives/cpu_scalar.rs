@@ -21,8 +21,8 @@ use crate::abi::{MessageDescriptor, StateAccess, StepResult};
 use crate::compiler::frame::{ByteCursor, Frame};
 use crate::compiler::run_classes::{
     ant_class_index, search_class_index, COLONY_AGGREGATE, DEFAULT_MAX_STEPS, EXPAND_RESUME_0,
-    EXPAND_RESUME_1, EXPAND_RESUME_2, JOIN_AWAIT, JOIN_RESUME, SEARCH_BRANCH, SEARCH_HEURISTIC,
-    WORLD_STEP,
+    EXPAND_RESUME_1, EXPAND_RESUME_2, JOIN_AWAIT, JOIN_RESUME, POLL_ACT, POLL_FUTURE, SEARCH_BRANCH,
+    SEARCH_HEURISTIC, WORLD_STEP,
 };
 use crate::compiler::state_machine_lowering::{
     search_step, ExpandFrame, HeuristicFrame, JoinFrame, SearchFrame,
@@ -52,6 +52,8 @@ pub fn dispatch(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepRes
         SEARCH_HEURISTIC => heuristic(lane, cont, process),
         JOIN_AWAIT => join_await(lane, cont, process),
         JOIN_RESUME => join_resume(lane, cont, process),
+        POLL_FUTURE => poll_future(lane, cont, process),
+        POLL_ACT => poll_act(lane, cont, process),
         COLONY_AGGREGATE => ant_colony::colony_aggregate(lane, cont, process),
         WORLD_STEP => ant_colony::world_step(lane, cont, process),
         // The search classes occupy a contiguous block; each is a distinct
@@ -158,8 +160,18 @@ fn expand_resume_0(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> Step
 fn expand_resume_1(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResult {
     let mut frame: ExpandFrame =
         load_frame(lane, process, cont, ExpandFrame::initial(0, process));
-    if let Some(vobj) = lane.future_value(frame.heuristic_future) {
-        frame.heuristic_result = lane.read_u64_object(process, vobj).unwrap_or(0);
+    // A denial faults rather than reading as "not resolved yet": those are
+    // different answers, and collapsing them is what the ungoverned read did.
+    // A *null* future is neither — the frame simply names no future to look at,
+    // so there is nothing to observe and nothing to record.
+    if !frame.heuristic_future.is_null() {
+        match lane.future_value(process, frame.heuristic_future) {
+            Ok(Some(vobj)) => {
+                frame.heuristic_result = lane.read_u64_object(process, vobj).unwrap_or(0);
+            }
+            Ok(None) => {}
+            Err(_) => return StepResult::fault(process, EXPAND_RESUME_1),
+        }
     }
     // Bounded move generation: legal_moves(node) in the §22 sketch.
     frame.moves = (1..=3)
@@ -289,9 +301,66 @@ fn join_resume(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResu
     // `future_value` is the second decision §4.14 could not reach: it reads a
     // resolution with no event of its own. This handler reaches it for the same
     // reason it reaches `AlreadySettled` — the future is somebody else's.
-    frame.observed = lane.future_value(frame.future).unwrap_or(Ref64::NULL);
+    if !frame.future.is_null() {
+        match lane.future_value(process, frame.future) {
+            Ok(observed) => frame.observed = observed.unwrap_or(Ref64::NULL),
+            Err(_) => return StepResult::fault(process, JOIN_RESUME),
+        }
+    }
     store_frame(lane, process, cont, &frame);
     StepResult::complete()
+}
+
+/// `POLL_FUTURE` (v0.3 §4.16): read a future's value without awaiting it.
+fn poll_future(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResult {
+    let mut frame: JoinFrame = load_frame(
+        lane,
+        process,
+        cont,
+        JoinFrame {
+            future: Ref64::NULL,
+            observed: Ref64::NULL,
+        },
+    );
+    if !frame.future.is_null() {
+        match lane.future_value(process, frame.future) {
+            Ok(observed) => frame.observed = observed.unwrap_or(Ref64::NULL),
+            Err(_) => return StepResult::fault(process, POLL_FUTURE),
+        }
+    }
+    store_frame(lane, process, cont, &frame);
+    StepResult::yield_next(POLL_ACT)
+}
+
+/// `POLL_ACT`: act on what the poll saw, in a later epoch.
+///
+/// Without this the divergence a poll causes stays inside a frame, and a frame
+/// is not observable behaviour. With it, what one epoch's lane order decided
+/// becomes a message another epoch either sends or does not.
+fn poll_act(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResult {
+    let frame: JoinFrame = load_frame(
+        lane,
+        process,
+        cont,
+        JoinFrame {
+            future: Ref64::NULL,
+            observed: Ref64::NULL,
+        },
+    );
+    if frame.observed.is_null() {
+        return StepResult::complete();
+    }
+    let payload = lane.create_object(
+        process,
+        crate::abi::ObjectKind::MessagePayload,
+        frame.observed.slot.to_le_bytes().to_vec(),
+    );
+    // To its own mailbox: what matters is that the send is in the trace and
+    // happens in one run and not the other, not who reads it.
+    match lane.enqueue_message(process, process, payload, cont) {
+        Ok(()) => StepResult::complete(),
+        Err(_) => StepResult::fault(process, POLL_ACT),
+    }
 }
 
 /// One synthetic branching-search node of class `index` (§25.1). Reads the

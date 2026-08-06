@@ -434,7 +434,8 @@ impl Bounded {
                 "resolved one future, and it takes one value, so which lane's value it takes"
             }
             Bounded::FutureSettlement => {
-                "touched one future, and one of them awaited it, so whether that await parks"
+                "touched one future, and one of them read whether it had been resolved, so what \
+                 that read returned"
             }
         }
     }
@@ -548,7 +549,15 @@ fn bounded_resource_independence(kernel: &Kernel, out: &mut Vec<Violation>) {
             // is therefore *both* a draw on the assignment and a write to the
             // state, and is counted under both keys, which is why this arm
             // sits after the one above rather than being merged into it.
-            crate::abi::EventKind::FutureAwaitSettled => {
+            // Both ways of reading that state count as having been decided
+            // against, and `FutureStateObserved` is emitted whichever the poll
+            // saw. A poll that found the future *pending* is exactly as decided
+            // by the resolver's lane as one that found it resolved — it would
+            // have seen the value under the other order — and keying only on
+            // the resolved outcome would leave the run that saw nothing
+            // unreportable, which is the hole §4.16 opened this on.
+            crate::abi::EventKind::FutureAwaitSettled
+            | crate::abi::EventKind::FutureStateObserved => {
                 vec![(Bounded::FutureSettlement, event.causal, true)]
             }
             // The same mailbox from the other end, where what is contended is

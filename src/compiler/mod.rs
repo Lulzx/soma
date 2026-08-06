@@ -40,6 +40,15 @@ pub mod run_classes {
     /// Where a `JOIN_AWAIT` continues, by either route.
     pub const JOIN_RESUME: u32 = 6;
 
+    /// `Poll` (v0.3 §4.16): look at a future without awaiting it.
+    ///
+    /// `JOIN_AWAIT` blocks, so the epoch's outcome is at least *recorded* —
+    /// either it parked or it found the value published. This one does not
+    /// block: it reads `future_value` and carries on with whatever it saw.
+    pub const POLL_FUTURE: u32 = 7;
+    /// Where a poll continues, so that what it saw can leave the frame.
+    pub const POLL_ACT: u32 = 8;
+
     /// Synthetic branching-search step (§25.1). This is the *base* of a
     /// contiguous block of run classes: §25.1 exposes the number of distinct
     /// continuation classes as a control variable, so a search node of class
