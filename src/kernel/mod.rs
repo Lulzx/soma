@@ -9,9 +9,9 @@ pub mod effects;
 pub mod epochs;
 pub mod ownership;
 pub mod payload;
-pub mod retention;
 #[doc(hidden)]
 pub mod raw;
+pub mod retention;
 
 use std::collections::{HashMap, VecDeque};
 
@@ -1113,12 +1113,8 @@ impl Kernel {
         self.capability_spaces
             .keys()
             .filter(|holder| {
-                self.find_authorized_capability(
-                    Ref64::process_at(**holder),
-                    right,
-                    target,
-                )
-                .is_some()
+                self.find_authorized_capability(Ref64::process_at(**holder), right, target)
+                    .is_some()
             })
             .count()
     }
@@ -1225,6 +1221,41 @@ impl Kernel {
             .get(&obj.key())
             .map(|v| v.as_slice())
             .ok_or(RuntimeError::MissingPayload)
+    }
+
+    /// The bytes of several objects at once.
+    ///
+    /// `object_bytes` takes `&mut self` — authorization records an effect —
+    /// so its result borrows the kernel mutably and only one such slice can
+    /// be alive at a time. An epoch that wants to hand a backend every ready
+    /// batch in one submission needs all of them alive together. Authorizing
+    /// each in turn and only then reborrowing shared gives that without
+    /// copying: the mutable phase finishes before the first slice exists.
+    ///
+    /// Fails as a whole if any object is unreadable, so a partially
+    /// authorized epoch is not a state a caller can reach.
+    pub fn object_bytes_many(
+        &mut self,
+        actor: Ref64,
+        objects: &[Ref64],
+    ) -> Result<Vec<&[u8]>, RuntimeError> {
+        for object in objects {
+            self.authorize(actor, crate::abi::Rights::READ, *object)?;
+            let _ = self.objects.get(*object)?;
+            if !self.object_payloads.contains_key(&object.key()) {
+                return Err(RuntimeError::MissingPayload);
+            }
+        }
+        let payloads = &self.object_payloads;
+        objects
+            .iter()
+            .map(|object| {
+                payloads
+                    .get(&object.key())
+                    .map(|payload| payload.as_slice())
+                    .ok_or(RuntimeError::MissingPayload)
+            })
+            .collect()
     }
 
     pub fn object_bytes_mut(
@@ -1806,7 +1837,10 @@ impl Kernel {
                     descriptor.failure = process;
                 }
             }
-            let waiters = self.future_waiters.remove(&future.key()).unwrap_or_default();
+            let waiters = self
+                .future_waiters
+                .remove(&future.key())
+                .unwrap_or_default();
             for waiter in waiters {
                 let Some((waiter_process, run_class, status)) =
                     self.continuations.get(waiter).ok().map(|descriptor| {

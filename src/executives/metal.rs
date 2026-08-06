@@ -19,7 +19,7 @@ use metal::{
     MTLResourceOptions, MTLSize,
 };
 
-use super::batch::{BackendError, BackendKind, BatchBackend};
+use super::batch::{BackendError, BackendKind, BatchBackend, BatchRequest};
 use crate::compiler::body::EvaluatorProgram;
 use crate::kernel::payload::{ForeignPayload, Payload};
 
@@ -251,8 +251,13 @@ impl BatchBackend for MetalBatchBackend {
         element_count: u32,
         element_stride: u32,
     ) -> Result<Vec<u8>, BackendError> {
-        let Some((output, required)) =
-            self.run(evaluator_id, inputs, element_count, element_stride, Output::Reused)?
+        let Some((output, required)) = self.run(
+            evaluator_id,
+            inputs,
+            element_count,
+            element_stride,
+            Output::Reused,
+        )?
         else {
             return Ok(Vec::new());
         };
@@ -267,11 +272,157 @@ impl BatchBackend for MetalBatchBackend {
         element_count: u32,
         element_stride: u32,
     ) -> Result<Payload, BackendError> {
-        let Some((buffer, len)) =
-            self.run(evaluator_id, inputs, element_count, element_stride, Output::Owned)?
+        let Some((buffer, len)) = self.run(
+            evaluator_id,
+            inputs,
+            element_count,
+            element_stride,
+            Output::Owned,
+        )?
         else {
             return Ok(Payload::Host(Vec::new()));
         };
         Ok(Payload::Foreign(Box::new(MetalPayload { buffer, len })))
     }
+
+    /// Encode every request in the epoch into one command buffer.
+    ///
+    /// The default implementation would commit and wait once per request, and
+    /// the wait is the expensive half: the GPU finishes a cohort, the CPU
+    /// wakes, encodes the next, and the GPU idles through all of it. Sixty-four
+    /// 8192-element cohorts cost 9897µs that way and 757µs encoded together
+    /// (`examples/metal_overhead`).
+    ///
+    /// Inputs are staged into one reused buffer at aligned offsets, so the
+    /// epoch costs one copy of its total bytes rather than one allocation per
+    /// request. Outputs are separate owned allocations because each becomes a
+    /// published object, and objects cannot share a buffer the backend would
+    /// later reuse.
+    fn evaluate_epoch(
+        &mut self,
+        requests: &[BatchRequest<'_>],
+    ) -> Result<Vec<Payload>, BackendError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Validate everything before touching the GPU, so a bad request in an
+        // epoch is rejected rather than half-executed.
+        let mut plans = Vec::with_capacity(requests.len());
+        let mut staged = 0usize;
+        for request in requests {
+            let (pipeline, declared_stride) = self
+                .pipelines
+                .get(&request.evaluator_id)
+                .cloned()
+                .ok_or(BackendError::UnsupportedEvaluator)?;
+            if declared_stride != request.element_stride {
+                return Err(BackendError::InvalidInput);
+            }
+            let required = (request.element_count as usize)
+                .checked_mul(request.element_stride as usize)
+                .ok_or(BackendError::InvalidInput)?;
+            if request.inputs.len() < required {
+                return Err(BackendError::InvalidInput);
+            }
+            let offset = staged;
+            staged = staged
+                .checked_add(align_up(required))
+                .ok_or(BackendError::InvalidInput)?;
+            plans.push((pipeline, required, offset));
+        }
+        if staged == 0 {
+            return Ok(requests.iter().map(|_| Payload::Host(Vec::new())).collect());
+        }
+
+        let (input, _) = self.scratch_for(staged as u64);
+        for (request, (_, required, offset)) in requests.iter().zip(&plans) {
+            if *required == 0 {
+                continue;
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    request.inputs.as_ptr(),
+                    input.contents().cast::<u8>().add(*offset),
+                    *required,
+                );
+            }
+        }
+
+        let outputs: Vec<Buffer> = plans
+            .iter()
+            .map(|(_, required, _)| {
+                self.device.new_buffer(
+                    (*required).max(1) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            })
+            .collect();
+
+        let command = self.queue.new_command_buffer();
+        let encoder = command.new_compute_command_encoder();
+        for ((request, (pipeline, required, offset)), output) in
+            requests.iter().zip(&plans).zip(&outputs)
+        {
+            if *required == 0 {
+                continue;
+            }
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(0, Some(&input), *offset as u64);
+            encoder.set_buffer(1, Some(output), 0);
+            encoder.set_bytes(
+                2,
+                std::mem::size_of::<u32>() as u64,
+                (&request.element_count as *const u32).cast::<c_void>(),
+            );
+            encoder.set_bytes(
+                3,
+                std::mem::size_of::<u32>() as u64,
+                (&request.element_stride as *const u32).cast::<c_void>(),
+            );
+            encoder.dispatch_threads(
+                MTLSize {
+                    width: request.element_count as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: pipeline
+                        .thread_execution_width()
+                        .min(request.element_count as u64),
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
+        encoder.end_encoding();
+        command.commit();
+        command.wait_until_completed();
+        if command.status() != MTLCommandBufferStatus::Completed {
+            return Err(BackendError::ExecutionFailed);
+        }
+
+        Ok(outputs
+            .into_iter()
+            .zip(&plans)
+            .map(|(buffer, (_, required, _))| {
+                if *required == 0 {
+                    Payload::Host(Vec::new())
+                } else {
+                    Payload::Foreign(Box::new(MetalPayload {
+                        buffer,
+                        len: *required,
+                    }))
+                }
+            })
+            .collect())
+    }
+}
+
+/// Round a staging offset up to a buffer-binding boundary. Metal requires a
+/// bound offset to be aligned, and 256 is the conservative choice across the
+/// families this may run on.
+fn align_up(bytes: usize) -> usize {
+    const ALIGNMENT: usize = 256;
+    bytes.div_ceil(ALIGNMENT) * ALIGNMENT
 }

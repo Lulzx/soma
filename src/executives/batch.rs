@@ -33,6 +33,15 @@ impl From<RuntimeError> for BackendError {
     }
 }
 
+/// One batch a backend has been asked to evaluate.
+#[derive(Clone, Copy, Debug)]
+pub struct BatchRequest<'a> {
+    pub evaluator_id: u32,
+    pub inputs: &'a [u8],
+    pub element_count: u32,
+    pub element_stride: u32,
+}
+
 pub trait BatchBackend {
     fn kind(&self) -> BackendKind;
 
@@ -75,6 +84,35 @@ pub trait BatchBackend {
     ) -> Result<Payload, BackendError> {
         self.evaluate(evaluator_id, inputs, element_count, element_stride)
             .map(Payload::from)
+    }
+
+    /// Evaluate every request in `requests`, which an epoch offers together.
+    ///
+    /// The default runs them one at a time, which is what a backend with no
+    /// notion of submission should do. It matters for the ones that have one:
+    /// `examples/metal_overhead` prices sixty-four cohorts at 9897µs when each
+    /// is committed and waited on separately against 757µs encoded into a
+    /// single command buffer, because a round trip per cohort is a round trip
+    /// the GPU spends idle.
+    ///
+    /// Either every request succeeds or the call fails. A partial epoch would
+    /// leave the caller holding some published outputs and some unstarted
+    /// collectives with no way to say which.
+    fn evaluate_epoch(
+        &mut self,
+        requests: &[BatchRequest<'_>],
+    ) -> Result<Vec<Payload>, BackendError> {
+        requests
+            .iter()
+            .map(|request| {
+                self.evaluate_payload(
+                    request.evaluator_id,
+                    request.inputs,
+                    request.element_count,
+                    request.element_stride,
+                )
+            })
+            .collect()
     }
 }
 
@@ -314,4 +352,99 @@ pub fn execute_with_spill(
     let output = publish(kernel, actor, collective, outputs)?;
     stats.record(evaluator, kind, spilled);
     Ok(output)
+}
+
+/// Execute every ready `BatchEvaluate` collective in one epoch, giving the
+/// accelerator all of them at once.
+///
+/// `execute_with_spill` is this for a single collective, and running it in a
+/// loop is what makes an epoch cost one GPU round trip per collective. Here
+/// the requests are gathered first, handed to the backend together, and only
+/// then published, so a backend that can submit them as one unit gets the
+/// chance to.
+///
+/// Placement is still per-collective: a batch below `minimum_accelerator_batch`
+/// goes to the CPU, and the two groups run separately. Spilling is all or
+/// nothing for the accelerator group, because a backend that reports itself
+/// unavailable partway through an epoch has not told us which requests it
+/// completed.
+///
+/// Publication order follows `collectives`, not the order the backend
+/// finished, so the trace does not depend on how the work was submitted.
+pub fn execute_epoch_with_spill(
+    kernel: &mut Kernel,
+    actor: Ref64,
+    collectives: &[Ref64],
+    minimum_accelerator_batch: u32,
+    accelerator: &mut dyn BatchBackend,
+    cpu: &mut dyn BatchBackend,
+    stats: &mut PlacementStats,
+) -> Result<Vec<Ref64>, BackendError> {
+    if collectives.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut plans = Vec::with_capacity(collectives.len());
+    for collective in collectives {
+        let (evaluator, inputs, count, stride) = kernel.batch_evaluate_request(*collective)?;
+        plans.push((*collective, evaluator, inputs, count, stride));
+    }
+
+    let inputs: Vec<Ref64> = plans.iter().map(|plan| plan.2).collect();
+    let bytes = kernel.object_bytes_many(actor, &inputs)?;
+
+    let mut accelerated = Vec::new();
+    let mut on_cpu = Vec::new();
+    for (index, plan) in plans.iter().enumerate() {
+        let request = BatchRequest {
+            evaluator_id: plan.1,
+            inputs: bytes[index],
+            element_count: plan.3,
+            element_stride: plan.4,
+        };
+        if plan.3 >= minimum_accelerator_batch {
+            accelerated.push((index, request));
+        } else {
+            on_cpu.push((index, request));
+        }
+    }
+
+    let accelerator_requests: Vec<BatchRequest<'_>> =
+        accelerated.iter().map(|(_, request)| *request).collect();
+    let (accelerator_outputs, accelerator_kind, spilled) =
+        match accelerator.evaluate_epoch(&accelerator_requests) {
+            Ok(outputs) => (outputs, accelerator.kind(), false),
+            Err(BackendError::Unavailable) => {
+                (cpu.evaluate_epoch(&accelerator_requests)?, cpu.kind(), true)
+            }
+            Err(error) => return Err(error),
+        };
+
+    let cpu_requests: Vec<BatchRequest<'_>> = on_cpu.iter().map(|(_, request)| *request).collect();
+    let cpu_outputs = cpu.evaluate_epoch(&cpu_requests)?;
+
+    // Reassemble into the caller's order before anything is published, so the
+    // trace records the epoch's collectives in the order it offered them.
+    let mut ordered: Vec<Option<(Payload, BackendKind, bool)>> =
+        (0..plans.len()).map(|_| None).collect();
+    for ((index, _), payload) in accelerated.iter().zip(accelerator_outputs) {
+        ordered[*index] = Some((payload, accelerator_kind, spilled));
+    }
+    for ((index, _), payload) in on_cpu.iter().zip(cpu_outputs) {
+        ordered[*index] = Some((payload, cpu.kind(), true));
+    }
+
+    let mut published = Vec::with_capacity(plans.len());
+    for (plan, slot) in plans.iter().zip(ordered) {
+        let (payload, kind, spilled) = slot.ok_or(BackendError::ExecutionFailed)?;
+        let required = (plan.3 as usize)
+            .checked_mul(plan.4 as usize)
+            .ok_or(BackendError::InvalidInput)?;
+        if payload.len() < required {
+            return Err(BackendError::InvalidInput);
+        }
+        published.push(publish(kernel, actor, plan.0, payload)?);
+        stats.record(plan.1, kind, spilled);
+    }
+    Ok(published)
 }

@@ -12,7 +12,7 @@
 use soma::compiler::body::EvaluatorProgram;
 use soma::executives::batch::{BatchBackend, CpuReferenceBackend};
 use soma::experiments::backend_bench::{
-    crossover, measured_crossover, render, time_evaluate, time_published_path, Sweep,
+    crossover, measured_crossover, render, time_epoch, time_evaluate, time_published_path, Sweep,
 };
 
 /// Fields per element, arithmetic ops per element, and a name for the regime.
@@ -119,6 +119,7 @@ fn main() {
     }
 
     published_path();
+    epochs();
 }
 
 /// What `execute_with_spill` adds on top of the backend: the `to_vec` of the
@@ -175,4 +176,61 @@ fn report_overhead(
         "{count:>10} | {backend:>9} {bare_ms:>10.3}ms {full_ms:>10.3}ms {:>8.1}%",
         (full_ms - bare_ms) / bare_ms * 100.0
     );
+}
+
+/// An epoch of ready cohorts, submitted together or one at a time.
+///
+/// Both arms go through the kernel and pay the same authorization,
+/// publication, and freezing per cohort; the only difference is whether the
+/// backend was handed the requests together and could submit them as one unit.
+fn epochs() {
+    println!("\n=== an epoch of 8192-element cohorts, through the kernel ===");
+    let program = soma::experiments::backend_bench::synthetic_program(801, 2, 32);
+
+    println!(
+        "{:>8} | {:>9} {:>12} {:>12} {:>9}",
+        "cohorts", "backend", "one by one", "as an epoch", "speedup"
+    );
+
+    let run = |name: &str, accelerator: &mut dyn BatchBackend, threshold: u32| {
+        for cohorts in [1u32, 4, 16, 64] {
+            let mut cpu = CpuReferenceBackend::with(&[&program]);
+            let single = time_epoch(
+                &program,
+                cohorts,
+                8_192,
+                threshold,
+                accelerator,
+                &mut cpu,
+                false,
+            )
+            .unwrap();
+            let batched = time_epoch(
+                &program,
+                cohorts,
+                8_192,
+                threshold,
+                accelerator,
+                &mut cpu,
+                true,
+            )
+            .unwrap();
+            let single_ms = single.median().as_secs_f64() * 1e3;
+            let batched_ms = batched.median().as_secs_f64() * 1e3;
+            println!(
+                "{cohorts:>8} | {name:>9} {single_ms:>10.3}ms {batched_ms:>10.3}ms {:>8.2}x",
+                single_ms / batched_ms
+            );
+        }
+    };
+
+    let mut cpu_accelerator = CpuReferenceBackend::with(&[&program]);
+    run("cpu", &mut cpu_accelerator, u32::MAX);
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    {
+        if let Ok(mut metal) = soma::executives::metal::MetalBatchBackend::with(&[&program]) {
+            run("metal", &mut metal, 1);
+        }
+    }
 }

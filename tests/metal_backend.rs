@@ -9,14 +9,15 @@
 //! generated from `compiler::examples::SOURCE`, so agreement is a statement
 //! about the lowering.
 
-use soma::abi::{ObjectKind, ProcessMode, Ref64};
+use soma::abi::{EventKind, ObjectKind, ProcessMode, Ref64};
 use soma::compiler::examples;
 use soma::executives::batch::{
-    execute_with_spill, BatchBackend, CpuReferenceBackend, PlacementStats,
+    execute_epoch_with_spill, execute_with_spill, BatchBackend, CpuReferenceBackend, PlacementStats,
 };
 use soma::executives::metal::MetalBatchBackend;
 use soma::kernel::ownership::freeze;
 use soma::kernel::{Kernel, SYSTEM_PRINCIPAL};
+use soma::replay::trace_reader::events_of;
 
 /// Inputs chosen to reach the edges the body language defines away:
 /// wraparound on multiply, both arms of a `select`, and a shift whose result
@@ -246,5 +247,125 @@ fn a_gpu_batch_is_published_where_the_gpu_wrote_it() {
     assert_eq!(kernel.object_provenance(cpu_output), Some("host"));
     let gpu_bytes = kernel.object_bytes(owner, output).unwrap().to_vec();
     let cpu_bytes = kernel.object_bytes(owner, cpu_output).unwrap().to_vec();
-    assert_eq!(gpu_bytes, cpu_bytes, "placement changed the published bytes");
+    assert_eq!(
+        gpu_bytes, cpu_bytes,
+        "placement changed the published bytes"
+    );
+}
+
+/// Submitting an epoch as one command buffer must not change what it computes,
+/// what it publishes, or the order it publishes in. The whole point of the
+/// change is that it is invisible above the backend boundary, and the way that
+/// goes wrong is a dispatch reading another cohort's staged input: the requests
+/// share one staging buffer now, at offsets this test deliberately makes
+/// unequal and non-round.
+#[test]
+fn an_epoch_publishes_exactly_what_running_its_collectives_one_at_a_time_does() {
+    let module = examples::module();
+    let programs = module.programs();
+
+    let evaluators = [
+        examples::DOUBLE_PLUS_ONE_TAGGED,
+        examples::MIN_AND_XOR,
+        examples::BITMIX,
+        examples::MIN_AND_XOR,
+    ];
+    // Different element counts per cohort, so every request lands at a
+    // different staging offset and a stride mistake cannot cancel out.
+    let counts = [7u32, 3, 5, 1];
+    let stride = 8u32;
+
+    let build = |kernel: &mut Kernel, owner: Ref64| -> Vec<Ref64> {
+        evaluators
+            .iter()
+            .zip(counts)
+            .map(|(evaluator, count)| {
+                let bytes: Vec<u8> =
+                    sample_elements()[..(count as usize * stride as usize)].to_vec();
+                let inputs = frozen_input(kernel, owner, bytes);
+                kernel
+                    .create_batch_evaluate_for(owner, *evaluator, inputs, count, stride)
+                    .unwrap()
+                    .0
+            })
+            .collect()
+    };
+
+    // One at a time, through the single-collective path.
+    let mut one_kernel = Kernel::new();
+    let one_owner = one_kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let mut one_metal = MetalBatchBackend::with(&programs).unwrap();
+    let mut one_cpu = CpuReferenceBackend::with(&programs);
+    let mut one_stats = PlacementStats::default();
+    let mut one_bytes = Vec::new();
+    for collective in build(&mut one_kernel, one_owner) {
+        let output = execute_with_spill(
+            &mut one_kernel,
+            one_owner,
+            collective,
+            1,
+            &mut one_metal,
+            &mut one_cpu,
+            &mut one_stats,
+        )
+        .unwrap();
+        one_bytes.push(one_kernel.object_bytes(one_owner, output).unwrap().to_vec());
+    }
+
+    // All together, through the epoch path.
+    let mut epoch_kernel = Kernel::new();
+    let epoch_owner = epoch_kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let mut epoch_metal = MetalBatchBackend::with(&programs).unwrap();
+    let mut epoch_cpu = CpuReferenceBackend::with(&programs);
+    let mut epoch_stats = PlacementStats::default();
+    let collectives = build(&mut epoch_kernel, epoch_owner);
+    let outputs = execute_epoch_with_spill(
+        &mut epoch_kernel,
+        epoch_owner,
+        &collectives,
+        1,
+        &mut epoch_metal,
+        &mut epoch_cpu,
+        &mut epoch_stats,
+    )
+    .unwrap();
+    let epoch_bytes: Vec<Vec<u8>> = outputs
+        .iter()
+        .map(|output| {
+            epoch_kernel
+                .object_bytes(epoch_owner, *output)
+                .unwrap()
+                .to_vec()
+        })
+        .collect();
+
+    assert_eq!(
+        epoch_bytes, one_bytes,
+        "an epoch computed something different from the same collectives run singly"
+    );
+    assert_eq!(epoch_stats.accelerator_executions, evaluators.len() as u64);
+    assert_eq!(epoch_stats.cpu_executions, 0);
+    soma::semantics::invariants::assert_legal(&epoch_kernel);
+
+    // Not the whole trace: an epoch authorizes every input before it publishes
+    // anything, so the read effects group together where running singly
+    // interleaves them with publication. That reordering is the epoch, and
+    // demanding an identical trace would be demanding that batching not
+    // happen. What must not move is the order collectives complete in, which
+    // is what a reader downstream of publication sees.
+    let completions = |kernel: &Kernel| -> Vec<Ref64> {
+        events_of(kernel, EventKind::CollectiveCompleted)
+            .map(|row| row.continuation)
+            .collect()
+    };
+    assert_eq!(
+        completions(&epoch_kernel).len(),
+        evaluators.len(),
+        "an epoch did not complete every collective it was given"
+    );
+    assert_eq!(
+        completions(&epoch_kernel),
+        completions(&one_kernel),
+        "an epoch completed its collectives in a different order"
+    );
 }

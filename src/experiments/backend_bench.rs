@@ -27,9 +27,11 @@
 
 use std::time::{Duration, Instant};
 
-use crate::abi::{ObjectKind, ProcessMode};
+use crate::abi::{ObjectKind, ProcessMode, Ref64};
 use crate::compiler::body::{ElementLayout, EvaluatorProgram, FieldWidth, Op, Store};
-use crate::executives::batch::{execute_with_spill, BackendError, BatchBackend, PlacementStats};
+use crate::executives::batch::{
+    execute_epoch_with_spill, execute_with_spill, BackendError, BatchBackend, PlacementStats,
+};
 use crate::kernel::ownership::freeze;
 use crate::kernel::{Kernel, SYSTEM_PRINCIPAL};
 
@@ -251,6 +253,100 @@ pub fn time_published_path(
     }
     Ok(Timing {
         element_count,
+        samples,
+    })
+}
+
+/// Time an epoch of `cohorts` collectives, submitted either together or one
+/// at a time.
+///
+/// This is the end-to-end version of what `examples/metal_overhead` measures
+/// at the Metal API: it goes through the kernel, so it pays authorization,
+/// publication, and freezing for every cohort either way, and the only
+/// difference between the two arms is whether the backend was given the
+/// requests together.
+pub fn time_epoch(
+    program: &EvaluatorProgram,
+    cohorts: u32,
+    elements_per_cohort: u32,
+    minimum_accelerator_batch: u32,
+    accelerator: &mut dyn BatchBackend,
+    cpu: &mut dyn BatchBackend,
+    batched: bool,
+) -> Result<Timing, BackendError> {
+    let stride = program.stride();
+    let repetitions = repetitions_for(cohorts * elements_per_cohort).min(30);
+
+    let mut kernel = Kernel::new();
+    let owner = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let bytes = synthetic_inputs(elements_per_cohort, stride);
+    let inputs: Vec<Ref64> = (0..cohorts)
+        .map(|_| {
+            let object = kernel.create_object(owner, ObjectKind::FrozenArray, bytes.clone());
+            freeze(&mut kernel, owner, object).expect("fresh object is freezable");
+            object
+        })
+        .collect();
+
+    let once = |kernel: &mut Kernel,
+                    accelerator: &mut dyn BatchBackend,
+                    cpu: &mut dyn BatchBackend|
+     -> Result<Duration, BackendError> {
+        let collectives: Vec<Ref64> = inputs
+            .iter()
+            .map(|input| {
+                kernel
+                    .create_batch_evaluate_for(
+                        owner,
+                        program.id(),
+                        *input,
+                        elements_per_cohort,
+                        stride,
+                    )
+                    .map(|(collective, _)| collective)
+                    .map_err(BackendError::from)
+            })
+            .collect::<Result<_, _>>()?;
+
+        let mut stats = PlacementStats::default();
+        let start = Instant::now();
+        if batched {
+            let outputs = execute_epoch_with_spill(
+                kernel,
+                owner,
+                &collectives,
+                minimum_accelerator_batch,
+                accelerator,
+                cpu,
+                &mut stats,
+            )?;
+            std::hint::black_box(outputs);
+        } else {
+            for collective in &collectives {
+                let output = execute_with_spill(
+                    kernel,
+                    owner,
+                    *collective,
+                    minimum_accelerator_batch,
+                    accelerator,
+                    cpu,
+                    &mut stats,
+                )?;
+                std::hint::black_box(output);
+            }
+        }
+        Ok(start.elapsed())
+    };
+
+    for _ in 0..2 {
+        once(&mut kernel, accelerator, cpu)?;
+    }
+    let mut samples = Vec::with_capacity(repetitions as usize);
+    for _ in 0..repetitions {
+        samples.push(once(&mut kernel, accelerator, cpu)?);
+    }
+    Ok(Timing {
+        element_count: cohorts * elements_per_cohort,
         samples,
     })
 }
