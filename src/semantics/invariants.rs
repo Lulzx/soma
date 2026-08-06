@@ -328,10 +328,11 @@ fn lane_independence(kernel: &Kernel, out: &mut Vec<Violation>) {
 
 /// Which bounded thing an epoch's lanes were drawing on.
 ///
-/// The three the machine has. A step can exhaust a domain's process quota, it
-/// can fill a receiver's mailbox, and it can take the message another lane was
-/// about to receive. Anything else a lane reads a *decision* off — rather than
-/// merely writes — belongs here as it arrives.
+/// The four the machine has. A step can exhaust a domain's process quota, it
+/// can fill a receiver's mailbox, it can take the message another lane was about
+/// to receive, and it can publish the one value a future accepts. They were
+/// found by walking the operations a step can perform and asking which of them
+/// can say no, which is a finite list because `LaneView` closes it (§4.10).
 ///
 /// The third is the second one read from the other end, and it is a separate
 /// variant because it is contended differently rather than merely elsewhere. A
@@ -350,6 +351,14 @@ enum Bounded {
     DomainQuota,
     MailboxCapacity,
     MailboxOccupancy,
+    /// A future's one assignment (§12). The bound is one, which is why it is
+    /// the case that does not discriminate between the two conditions below:
+    /// with at most one winner ever, "any other lane that drew" and "a lane
+    /// that was refused" are the same set. It is called interchangeable
+    /// because what a resolver gets is the permission to publish and there is
+    /// nothing to tell one such permission from another — not because the run
+    /// could not tell the difference.
+    FutureAssignment,
 }
 
 /// What a resource hands a lane that draws on it successfully.
@@ -368,7 +377,9 @@ enum Dispenses {
 impl Bounded {
     fn dispenses(&self) -> Dispenses {
         match self {
-            Bounded::DomainQuota | Bounded::MailboxCapacity => Dispenses::Interchangeable,
+            Bounded::DomainQuota | Bounded::MailboxCapacity | Bounded::FutureAssignment => {
+                Dispenses::Interchangeable
+            }
             Bounded::MailboxOccupancy => Dispenses::Identified,
         }
     }
@@ -385,6 +396,9 @@ impl Bounded {
             Bounded::MailboxOccupancy => {
                 "received from one mailbox, so which lane gets which message"
             }
+            Bounded::FutureAssignment => {
+                "resolved one future, and it takes one value, so which lane's value it takes"
+            }
         }
     }
 }
@@ -395,7 +409,7 @@ impl Bounded {
 /// correction rather than a complication.
 ///
 /// For a resource dispensing **interchangeable** units — a domain's quota, a
-/// mailbox's capacity — it is that **one lane got the resource and a different
+/// mailbox's capacity, a future's one assignment — it is that **one lane got the resource and a different
 /// lane was refused it**, in the same epoch. Each half is doing work. Two lanes
 /// drawing on a resource with room for both decide nothing — every lane succeeds
 /// under every order, and nothing in the trace says which slot each took. A
@@ -467,6 +481,14 @@ fn bounded_resource_independence(kernel: &Kernel, out: &mut Vec<Violation>) {
                 Bounded::MailboxCapacity,
                 event.causal,
                 event.event_kind == crate::abi::EventKind::MessageSendBlocked,
+            ),
+            // A future takes one value and refuses every later write. Both
+            // events name it in `causal`.
+            crate::abi::EventKind::FutureResolved
+            | crate::abi::EventKind::FutureResolutionRefused => (
+                Bounded::FutureAssignment,
+                event.causal,
+                event.event_kind == crate::abi::EventKind::FutureResolutionRefused,
             ),
             // The same mailbox from the other end, where what is contended is
             // the messages in it rather than the room left. Both events name

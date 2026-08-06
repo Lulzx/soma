@@ -1206,6 +1206,57 @@ in them finds one. Eight example reports are byte-identical, and the probe that
 says so is stronger than the reports — making the emission `panic!` and running
 the whole suite reaches it from exactly one test file, this one.
 
+### 4.14 A future takes one value
+
+§4.13's correction was to the method: enumerate the *operations* that can say
+no, not the resources. `LaneView` offers fifteen and the compiler holds the list
+closed (§4.10), so that enumeration is finite and can be walked. `resolve_future`
+is on it, and single assignment (§12) is precisely an operation that says no.
+
+Four processes hold `RESOLVE` on one future and each publishes a value computed
+from its own input, in one epoch. The future takes the value of whichever lane
+ran first — lane 1 under `Plan`, lane 4 under `Reverse` — and the other three
+fault. Both runs leave a legal state, so only the comparison reports it, and
+clause 1 is blind for the fourth time. This variant of the reason is the
+starkest: what the losing lanes read is that a cell *had already been written*,
+and a write that did not happen is not something an order can draw an edge from.
+
+`FutureResolutionRefused` is the fourth traced refusal, and single assignment is
+the one that was enforcing itself entirely silently — the loser faulted, and
+`ProcessFailed` does not distinguish a program that went wrong from one told the
+value was already published. It carries the future in `causal`, as
+`FutureResolved` does, and the value the lane built and did not publish in
+`subject`.
+
+**This is the resource that does not discriminate.** §4.13 split clause 2's
+condition in two, and a future has exactly one unit, so there is never a second
+winner and the two conditions name the same set. It is registered as dispensing
+interchangeable units — what a resolver wins is a permission to publish, and one
+such permission is like another — but nothing in any run can tell that choice
+from the other one. Recorded because a resource that cannot distinguish the two
+rules is not evidence for either, and a later reader deciding where a fifth
+resource belongs should not cite this one.
+
+**What the enumeration says about the rest of the fifteen.** Walking the list
+the way §4.13 said to leaves two operations that read a decision and are *not*
+reachable in any workload, for a reason worth stating precisely — it is about
+the handlers, not about the machine:
+
+- `await_future` returns `AlreadySettled` rather than registering a waiter, which
+  is a decision read off a future another lane may resolve in the same epoch. No
+  handler can reach it: the only awaiting handler creates the future in the same
+  step it awaits, so the resolver cannot have run yet. A handler that awaited a
+  future it did not create would reach it immediately.
+- `future_value` reads a resolution with no event at all, and the same argument
+  applies for the same reason.
+
+So the blind spot is a property of the handler set, and it moves the moment the
+handler set does. That is a different kind of "not reachable" from §4.12's, which
+was a claim about the machine and was wrong.
+
+The remaining twelve either allocate (partitioned, §4.8), write a frame no other
+lane holds (I8), or send and receive, which §4.12 and §4.13 covered.
+
 ---
 
 ## 5. C — distributed, trace-equivalent
@@ -1279,7 +1330,7 @@ cannot reach means the model is charging for the wrong thing.
 | I22 admission determinism | checked | the decision is a function of the candidate set (§4.1) |
 | I23 position-derived emission | checked | the trace's order needs no shared clock (§4.2) |
 | I24 effect-mediated commit | checked | bins are written by an applier, in plan order (§4.4) |
-| I25 lane independence | checked | two clauses: no ≺ edge joins two lanes of one epoch (§4.5), and no two lanes are decided by one bounded resource — a domain quota, a mailbox's capacity, or a mailbox's occupancy (§4.12, §4.13) |
+| I25 lane independence | checked | two clauses: no ≺ edge joins two lanes of one epoch (§4.5), and no two lanes are decided by one bounded resource — a domain quota, a mailbox's capacity, a mailbox's occupancy, or a future's one assignment (§4.12–§4.14) |
 
 **I21** has two halves. The first — an epoch that admitted work dispatched some
 of it — is a statement about a transition rather than a state, so it is counted

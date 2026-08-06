@@ -2521,6 +2521,19 @@ impl Kernel {
     ) -> Result<(), RuntimeError> {
         self.authorize(actor, crate::abi::Rights::RESOLVE, future)?;
         if self.futures.get(future)?.state != FutureState::Pending {
+            // Traced for the reason the other refusals are: single assignment
+            // said no, and the record showed only a step that faulted. It is
+            // also what I25 clause 2 reads to tell a future two lanes wrote
+            // between them from one that only one lane touched.
+            self.trace_full(
+                EventKind::FutureResolutionRefused,
+                actor,
+                Ref64::NULL,
+                0,
+                0,
+                future,
+                value,
+            );
             return Err(RuntimeError::AlreadyResolved);
         }
         self.authority_effect(actor, crate::abi::Rights::RESOLVE, future);

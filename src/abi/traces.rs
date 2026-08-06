@@ -88,6 +88,18 @@ pub enum EventKind {
     /// it in the trace would make those runs disagree over something no epoch
     /// decided.
     MessageReceiveBlocked = 36,
+    /// A resolve found the future already settled and refused the write.
+    ///
+    /// Single assignment (§12) is the property this enforces, and until now it
+    /// enforced it silently: the loser's step faulted, and `ProcessFailed` alone
+    /// does not say a program was told the value was already published rather
+    /// than having gone wrong on its own.
+    ///
+    /// `causal` is the future, as it is for `FutureResolved`, which is what lets
+    /// I25 clause 2 key the two on one resource. `subject` is the value the
+    /// refused lane had built and did not publish — an entity, so it goes where
+    /// entities go.
+    FutureResolutionRefused = 37,
 }
 
 /// The lane an event was emitted from when it was not emitted from one: epoch

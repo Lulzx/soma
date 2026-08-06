@@ -4,7 +4,7 @@ Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
 Repository: https://github.com/Lulzx/soma. The default semantic core is
-dependency-free. There are 375 tests (seven of which need the `metal` feature),
+dependency-free. There are 382 tests (seven of which need the `metal` feature),
 six compile-fail doc tests, and no Clippy warnings. The optional `metal`
 feature adds the `metal-rs` implementation dependency on macOS.
 
@@ -268,6 +268,17 @@ Added in v0.3:
   per resource kind. It also stopped taking the lowest winner and looking for an
   unequal loser, which missed a lane that both won and lost -- and made the
   report the same text every run.
+- I25 clause 2's fourth resource (v0.3 §4.14). A future takes one value
+  (`tests/future_assignment.rs`): four lanes publish into one future and it
+  takes the one whose lane ran first, `FutureResolutionRefused` being the record
+  single assignment was enforcing itself without. It is the resource that cannot
+  distinguish clause 2's two conditions -- one unit means there is never a
+  second winner -- so do not cite it as evidence for where a fifth resource
+  belongs. Walking §4.10's fifteen operations the way §4.13 said to leaves
+  `await_future`'s `AlreadySettled` and `future_value` as decisions no *handler*
+  can reach, because the only awaiting handler creates the future in the step it
+  awaits. That is a fact about the handler set and it stops being true the
+  moment a handler awaits a future it did not create.
 - A lane-local trace buffer (v0.3 §4.11). A lane produces trace events into
   `lane_trace` and `leave_lane` appends them, which is §4.4's move applied to
   the trace. `logical_time` is handed out at the drain rather than at emission,
