@@ -284,4 +284,106 @@ fn main() {
             median(200, || large_dispatch(size)),
         );
     }
+
+    // What is left of the fixed cost after a persistent queue and reused
+    // buffers is encode, submit, and the round trip. Two proposals attack it
+    // and they cost very different amounts to adopt, so the question is which
+    // half of the floor each one removes.
+    //
+    // An epoch offering several ready cohorts is run three ways:
+    //
+    //   per-cohort wait   what the backend does now: one command buffer per
+    //                     cohort, each committed and waited on before the next
+    //                     is encoded. Every cohort pays a full round trip.
+    //   deferred wait     the same N command buffers, all committed, waited on
+    //                     once at the end. Removes the stalls and keeps the
+    //                     command buffers: this is what asynchronous
+    //                     submission buys, and it reaches into the
+    //                     collective-completion path to get it.
+    //   one command buffer  all N dispatches encoded into a single command
+    //                     buffer, committed once. Removes the per-cohort
+    //                     command buffer as well, and needs only a
+    //                     backend-level entry point that takes several
+    //                     requests.
+    //
+    // Each cohort gets its own slice of one buffer, so the dispatches are
+    // independent work rather than N repetitions overwriting one region.
+    const COHORT: u32 = 8_192;
+    let chunk = COHORT as u64 * stride as u64;
+    let cohort_count = COHORT;
+
+    let encode_into = |encoder: &metal::ComputeCommandEncoderRef, slot: u64| {
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&large_input_buffer), slot * chunk);
+        encoder.set_buffer(1, Some(&large_output_buffer), slot * chunk);
+        encoder.set_bytes(
+            2,
+            std::mem::size_of::<u32>() as u64,
+            (&cohort_count as *const u32).cast::<c_void>(),
+        );
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<u32>() as u64,
+            (&element_stride as *const u32).cast::<c_void>(),
+        );
+        encoder.dispatch_threads(
+            MTLSize {
+                width: COHORT as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: simd,
+                height: 1,
+                depth: 1,
+            },
+        );
+    };
+
+    println!("\nan epoch of {COHORT}-element cohorts, three submission shapes");
+    for cohorts in [1u64, 4, 16, 64] {
+        line(
+            &format!("{cohorts} cohorts: per-cohort wait"),
+            median(30, || {
+                for slot in 0..cohorts {
+                    let command = queue.new_command_buffer();
+                    let encoder = command.new_compute_command_encoder();
+                    encode_into(encoder, slot);
+                    encoder.end_encoding();
+                    command.commit();
+                    command.wait_until_completed();
+                }
+            }),
+        );
+        line(
+            &format!("{cohorts} cohorts: deferred wait"),
+            median(30, || {
+                let mut last = None;
+                for slot in 0..cohorts {
+                    let command = queue.new_command_buffer().to_owned();
+                    let encoder = command.new_compute_command_encoder();
+                    encode_into(encoder, slot);
+                    encoder.end_encoding();
+                    command.commit();
+                    last = Some(command);
+                }
+                if let Some(command) = last {
+                    command.wait_until_completed();
+                }
+            }),
+        );
+        line(
+            &format!("{cohorts} cohorts: one command buffer"),
+            median(30, || {
+                let command = queue.new_command_buffer();
+                let encoder = command.new_compute_command_encoder();
+                for slot in 0..cohorts {
+                    encode_into(encoder, slot);
+                }
+                encoder.end_encoding();
+                command.commit();
+                command.wait_until_completed();
+            }),
+        );
+    }
 }
