@@ -1,7 +1,7 @@
 //! The effect log (`docs/SOMA-v0.3.md` §4.4).
 //!
-//! §4.3 leaves canonical commit as the piece of B that gates a concurrent
-//! executive, and names the obstacle: the executive's handlers take
+//! §4.3 named canonical commit as the piece of B that gates a concurrent
+//! executive, and named the obstacle: the executive's handlers take
 //! `&mut Kernel` and allocate their effects as they run, so execute and commit
 //! are fused. A step that *performs* its effects can only be run one at a time,
 //! because the order two lanes touch shared state in is the order they happened
@@ -38,14 +38,12 @@
 //!
 //! They are not the next slice, though, which is the thing §4.5 settled.
 //! Deferring them would buy lane independence by construction; I25 buys it by
-//! checking, and checking is what the model can actually afford — §4.3 (2)
-//! establishes that allocation has to stay eager, so a step will keep writing
-//! tables as it runs no matter how much of commit moves.
-//!
-//! Allocation stays eager, and that is not an omission either — §4.3 (2)
-//! establishes that a step allocates entities and then stores them in opaque
-//! frame bytes, so a symbolic reference cannot survive the step. Partitioned
-//! allocation is what makes eager allocation safe for concurrent lanes.
+//! checking, and checking is what the model can actually afford. §4.3 (2)
+//! establishes that allocation has to stay eager — a step allocates entities
+//! and stores them in opaque frame bytes, so a symbolic reference cannot
+//! survive the step — and a step that allocates eagerly writes tables as it
+//! runs however much of commit moves out of the lane. Partitioned allocation is
+//! what makes that safe for concurrent lanes.
 //!
 //! ## Why there is a record
 //!
@@ -64,7 +62,7 @@ use crate::kernel::Kernel;
 /// Proof that a runnable bin is being written by the effect applier.
 ///
 /// [`crate::scheduler::runnable_bins::Scheduler::enqueue`] demands one, the
-/// field is private, and [`apply`](Kernel::apply_lane_effects) is the only
+/// field is private, and `Kernel::apply_epoch_effects` is the only
 /// place that constructs it. A step that writes a bin as it runs is therefore a
 /// compile error rather than a test that might notice, which is the technique
 /// `docs/SOMA-CAPABILITIES.md` used to close the operation set and §4.1 used to
@@ -166,9 +164,9 @@ impl EffectRecord {
 impl Kernel {
     /// Produce a scheduling effect.
     ///
-    /// Inside a lane the effect is journalled and applied when the lane ends.
-    /// Outside one — a caller building work between epochs, an epoch phase
-    /// running on the host — there is no lane to order against, so it is
+    /// Inside a lane the effect is journalled and applied when the *epoch*
+    /// ends. Outside one — a caller building work between epochs, an epoch
+    /// phase running on the host — there is no lane to order against, so it is
     /// applied at once. Both paths go through `apply_effect`, so both are
     /// recorded.
     pub(crate) fn emit(&mut self, effect: Effect) {

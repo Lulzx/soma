@@ -84,6 +84,14 @@ fn main() {
             continue;
         };
 
+        // Only the Metal build pushes a second sweep, so without that feature
+        // the binding is never mutated. Scoped to the build where that is true
+        // rather than allowed unconditionally, so a future unused `mut` here
+        // still gets reported.
+        #[cfg_attr(
+            not(all(feature = "metal", target_os = "macos")),
+            allow(unused_mut)
+        )]
         let mut sweeps = vec![cpu_sweep];
 
         #[cfg(all(feature = "metal", target_os = "macos"))]
