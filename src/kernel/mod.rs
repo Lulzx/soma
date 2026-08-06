@@ -250,6 +250,20 @@ pub struct Kernel {
     /// the explicit system principal.
     capability_spaces: HashMap<u64, capability_space::CapabilitySpace>,
     continuations: crate::table::GenTable<crate::abi::continuations::ContinuationDescriptor>,
+    /// Which continuations belong to which process.
+    ///
+    /// `cancel_process_continuations` needs exactly this question and used to
+    /// answer it by walking every continuation the kernel had ever created.
+    /// Containing a process failure runs it, and a process finishing its work
+    /// is contained the same way, so that walk happened on essentially every
+    /// epoch that did anything: `examples/growth_sweep` measured one
+    /// continuation through two epochs at 1.67µs alone and 6.59ms beside a
+    /// million idle processes.
+    ///
+    /// Continuations are never deleted — a finished one keeps its descriptor
+    /// and a terminal status — so this only grows, and an entry never needs
+    /// removing.
+    continuations_by_process: HashMap<u64, Vec<Ref64>>,
     futures: GenTable<FutureDescriptor>,
     channels: GenTable<ChannelDescriptor>,
     collectives: GenTable<CollectiveDescriptor>,
@@ -337,6 +351,7 @@ impl Kernel {
                 capability_space::CapabilitySpace::new(Kind::Capability),
             )]),
             continuations: GenTable::new(Kind::Continuation),
+            continuations_by_process: HashMap::new(),
             futures: GenTable::new(Kind::Future),
             channels: GenTable::new(Kind::Channel),
             collectives: GenTable::new(Kind::Collective),
@@ -1787,22 +1802,38 @@ impl Kernel {
     }
 
     fn cancel_process_continuations(&mut self, process: Ref64, except: Option<Ref64>) {
-        let cancelled: Vec<Ref64> = self
-            .continuations
-            .iter()
-            .filter_map(|(continuation, descriptor)| {
-                (descriptor.process == process
-                    && Some(continuation) != except
+        let owned = self
+            .continuations_by_process
+            .get(&process.key())
+            .cloned()
+            .unwrap_or_default();
+        let cancelled: Vec<Ref64> = owned
+            .into_iter()
+            .filter(|continuation| {
+                let Ok(descriptor) = self.continuations.get(*continuation) else {
+                    return false;
+                };
+                descriptor.process == process
+                    && Some(*continuation) != except
                     && matches!(
                         descriptor.status,
                         crate::abi::continuations::ContinuationState::New
                             | crate::abi::continuations::ContinuationState::Runnable
                             | crate::abi::continuations::ContinuationState::Waiting
                             | crate::abi::continuations::ContinuationState::Running
-                    ))
-                .then_some(continuation)
+                    )
             })
             .collect();
+
+        // Nothing to cancel is the common case — a process that finishes its
+        // work is contained the same way one that fails is — and every sweep
+        // below is a `retain` that would keep every element. They walk the
+        // future waiters, every mailbox, every channel, and every supervision
+        // queue, and there is one mailbox per process, so skipping them here
+        // is what stops a completing process from costing the population.
+        if cancelled.is_empty() {
+            return;
+        }
 
         // Cancellation empties the bins of everything it cancels, so it has to
         // see the whole lane, not the part of it that has landed. Applying the
@@ -1813,8 +1844,9 @@ impl Kernel {
         // executive can currently reach, and so by a path nothing tests.
         self.apply_lane_effects();
 
+        let cancelled_set: std::collections::HashSet<Ref64> = cancelled.iter().copied().collect();
+        self.scheduler.remove_all(&cancelled_set);
         for continuation in &cancelled {
-            self.scheduler.remove(*continuation);
             self.set_continuation_status(
                 *continuation,
                 crate::abi::continuations::ContinuationState::Cancelled,
@@ -2000,6 +2032,10 @@ impl Kernel {
                 spec.run_class,
                 spec.resume_point,
             ));
+        self.continuations_by_process
+            .entry(process.key())
+            .or_default()
+            .push(r);
         {
             let c = self.continuations.get_mut(r).expect("fresh continuation");
             c.id = r;

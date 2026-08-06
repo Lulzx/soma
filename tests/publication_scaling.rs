@@ -117,3 +117,128 @@ fn publishing_a_batch_does_not_get_slower_as_the_kernel_fills_up() {
         aged,
     );
 }
+
+/// An epoch should cost what its runnable work costs, not what the process
+/// table holds.
+///
+/// Containing a process — which happens when one finishes, not only when one
+/// fails — used to find that process's continuations by walking every
+/// continuation the kernel had ever created, and then sweep the future
+/// waiters, every mailbox, every channel, and every supervision queue for the
+/// ones it cancelled. There is a mailbox per process, so a single continuation
+/// through two epochs cost 1.67µs beside no other processes and 6.59ms beside
+/// a million idle ones.
+#[test]
+fn an_epoch_does_not_get_slower_as_idle_processes_accumulate() {
+    use soma::abi::StateAccess;
+    use soma::kernel::ContinuationSpec;
+
+    const IDLE: usize = 20_000;
+
+    let mut kernel = Kernel::new();
+    let step = |kernel: &mut Kernel, count: usize| {
+        let start = Instant::now();
+        for _ in 0..count {
+            // A fresh worker each time: a process whose continuations have all
+            // run is terminated, and a terminated one cannot take another.
+            let worker = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+            kernel
+                .create_continuation(
+                    worker,
+                    worker,
+                    ContinuationSpec::new(StateAccess::ReadOnly, 0, 0, Vec::new(), 4),
+                )
+                .unwrap();
+            kernel.run_epoch();
+            kernel.run_epoch();
+        }
+        start.elapsed()
+    };
+
+    step(&mut kernel, SAMPLE);
+    let fresh = step(&mut kernel, SAMPLE);
+
+    for _ in 0..IDLE {
+        kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    }
+    let crowded = step(&mut kernel, SAMPLE);
+
+    assert!(
+        crowded.as_secs_f64() < fresh.as_secs_f64() * 8.0,
+        "an epoch got {:.1}x slower beside {IDLE} idle processes ({:?} -> {:?}); \
+         something per-epoch is walking the population again",
+        crowded.as_secs_f64() / fresh.as_secs_f64(),
+        fresh,
+        crowded,
+    );
+}
+
+/// Cancelling a process should cost what it cancels, not what else is queued.
+///
+/// `Scheduler::remove` walks both epoch buffers of every bin, and cancellation
+/// called it once per continuation, so cancelling k continuations with q
+/// queued cost k·q. Removing them as a set costs q once.
+#[test]
+fn cancelling_a_process_does_not_get_slower_as_the_scheduler_fills_up() {
+    use soma::abi::StateAccess;
+    use soma::kernel::ContinuationSpec;
+
+    const QUEUED: usize = 60_000;
+    const OWNED: usize = 4;
+
+    fn victim(kernel: &mut Kernel) -> Ref64 {
+        let process = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+        for _ in 0..OWNED {
+            kernel
+                .create_continuation(
+                    process,
+                    process,
+                    ContinuationSpec::new(StateAccess::ReadOnly, 0, 0, Vec::new(), 4),
+                )
+                .unwrap();
+        }
+        process
+    }
+
+    fn cancel_all(kernel: &mut Kernel, victims: Vec<Ref64>) -> Duration {
+        let start = Instant::now();
+        for process in victims {
+            kernel.cancel_process(SYSTEM_PRINCIPAL, process).unwrap();
+        }
+        start.elapsed()
+    }
+
+    let mut kernel = Kernel::new();
+    let warm: Vec<Ref64> = (0..SAMPLE).map(|_| victim(&mut kernel)).collect();
+    cancel_all(&mut kernel, warm);
+    let empty: Vec<Ref64> = (0..SAMPLE).map(|_| victim(&mut kernel)).collect();
+    let fresh = cancel_all(&mut kernel, empty);
+
+    // Continuations nobody is cancelling, sitting in the bins.
+    let bystander = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    for _ in 0..QUEUED {
+        kernel
+            .create_continuation(
+                bystander,
+                bystander,
+                ContinuationSpec::new(StateAccess::ReadOnly, 0, 0, Vec::new(), 4),
+            )
+            .unwrap();
+    }
+    let crowded_victims: Vec<Ref64> = (0..SAMPLE).map(|_| victim(&mut kernel)).collect();
+    let crowded = cancel_all(&mut kernel, crowded_victims);
+
+    assert!(
+        kernel.total_pending() >= QUEUED,
+        "the bystander's continuations did not stay queued, so this test is \
+         not measuring what it claims"
+    );
+    assert!(
+        crowded.as_secs_f64() < fresh.as_secs_f64() * 12.0,
+        "cancelling got {:.1}x slower with {QUEUED} continuations queued \
+         ({:?} -> {:?}); removal is walking the queue per continuation again",
+        crowded.as_secs_f64() / fresh.as_secs_f64(),
+        fresh,
+        crowded,
+    );
+}

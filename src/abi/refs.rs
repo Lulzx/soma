@@ -17,7 +17,7 @@
 /// in a Rust enum only for the ergonomic `Kind::Process` spelling; it still
 /// serializes as its `u8` discriminant.
 #[repr(u8)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum Kind {
     #[default]
     Domain = 1,
@@ -84,7 +84,10 @@ impl Kind {
 /// It occupies the byte that used to be `flags`, which was written as zero
 /// everywhere and read nowhere, so a reference still fits in 64 bits.
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+// `Hash` alongside `Eq`: a reference is a key, and hashing it whole keeps the
+// generation in the comparison. Keying a set on `key()` instead would let a
+// recycled slot match a reference to the entry that used to live there.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct Ref64 {
     pub slot: u32,
     pub generation: u16,

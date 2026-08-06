@@ -10,16 +10,39 @@
 //! yielded continuation already knows the exact queue it belongs to via
 //! `next_run_class`.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::abi::Ref64;
 use crate::kernel::effects::Committing;
 
 /// One double-buffered bin for a single run class.
+///
+/// Entries are `Option<Ref64>` so that a cancelled continuation can be removed
+/// without moving its neighbours. Both buffers are only ever appended to and
+/// then drained whole, so an entry's index is stable for as long as it is
+/// queued, and `placed` can record where each one sits. Removing by scanning
+/// the buffers instead made cancellation cost the depth of the queue:
+/// `examples/growth_sweep` measured cancelling one four-continuation process
+/// at 2.88µs against an empty scheduler and 1.96ms against a million pending.
+///
+/// `placed` stores the swap sequence an entry was enqueued at rather than
+/// which buffer holds it, because the buffers trade places every epoch and
+/// rewriting a tag per entry per swap would cost exactly what this avoids. An
+/// entry enqueued at sequence `s` is in `next` while `seq == s` and in
+/// `current` while `seq == s + 1`; after that it has been drained.
 #[derive(Clone, Debug, Default)]
 pub struct DoubleBin {
     /// Consumed this epoch.
-    current: Vec<Ref64>,
+    current: Vec<Option<Ref64>>,
     /// Appended this epoch; swapped to `current` at the boundary.
-    next: Vec<Ref64>,
+    next: Vec<Option<Ref64>>,
+    /// Where each queued continuation sits: the swap sequence it arrived at,
+    /// and its index in whichever buffer that puts it in.
+    placed: HashMap<Ref64, (u64, usize)>,
+    /// Entries still present, so a length is not a scan for `Some`.
+    live_current: usize,
+    live_next: usize,
+    seq: u64,
     pub capacity: u32,
 }
 
@@ -28,37 +51,76 @@ impl DoubleBin {
         DoubleBin {
             current: Vec::new(),
             next: Vec::new(),
+            placed: HashMap::new(),
+            live_current: 0,
+            live_next: 0,
+            seq: 0,
             capacity,
         }
     }
 
     /// Append a runnable continuation to the next-epoch buffer.
     pub fn enqueue(&mut self, cont: Ref64) {
-        self.next.push(cont);
+        self.next.push(Some(cont));
+        self.placed.insert(cont, (self.seq, self.next.len() - 1));
+        self.live_next += 1;
     }
 
     /// Drain the current-epoch buffer for execution.
     pub fn drain_current(&mut self) -> Vec<Ref64> {
-        std::mem::take(&mut self.current)
+        let drained: Vec<Ref64> = std::mem::take(&mut self.current)
+            .into_iter()
+            .flatten()
+            .collect();
+        for cont in &drained {
+            self.placed.remove(cont);
+        }
+        self.live_current = 0;
+        drained
     }
 
     pub fn current_len(&self) -> usize {
-        self.current.len()
+        self.live_current
     }
 
     pub fn next_len(&self) -> usize {
-        self.next.len()
+        self.live_next
     }
 
-    fn remove(&mut self, continuation: Ref64) {
-        self.current.retain(|entry| *entry != continuation);
-        self.next.retain(|entry| *entry != continuation);
+    /// Remove one continuation, if this bin holds it, without touching the
+    /// entries around it.
+    fn remove_one(&mut self, continuation: Ref64) {
+        let Some((sequence, index)) = self.placed.remove(&continuation) else {
+            return;
+        };
+        let (buffer, live): (&mut Vec<Option<Ref64>>, &mut usize) = if sequence == self.seq {
+            (&mut self.next, &mut self.live_next)
+        } else if sequence + 1 == self.seq {
+            (&mut self.current, &mut self.live_current)
+        } else {
+            // Already drained; `placed` had a stale entry only if a drain
+            // missed it, which it cannot.
+            return;
+        };
+        if let Some(slot) = buffer.get_mut(index) {
+            if slot.take().is_some() {
+                *live -= 1;
+            }
+        }
+    }
+
+    /// Every queued continuation in this bin, current buffer first.
+    fn entries(&self) -> impl Iterator<Item = Ref64> + '_ {
+        self.current.iter().chain(self.next.iter()).flatten().copied()
     }
 
     /// Swap `next` into `current` at the epoch boundary.
     fn swap(&mut self) {
         std::mem::swap(&mut self.current, &mut self.next);
         self.next.clear();
+        self.live_current = self.live_next;
+        self.live_next = 0;
+        self.seq += 1;
     }
 }
 
@@ -153,10 +215,20 @@ impl Scheduler {
         self.admissions
     }
 
-    /// Remove a continuation from both epoch buffers of every bin.
+    /// Remove one continuation from whichever bin holds it.
     pub fn remove(&mut self, continuation: Ref64) {
         for bin in self.bins.values_mut() {
-            bin.remove(continuation);
+            bin.remove_one(continuation);
+        }
+    }
+
+    /// Remove several continuations, which is what cancelling a process does.
+    ///
+    /// Costs the number removed times the number of bins, and nothing in the
+    /// depth of the queues.
+    pub fn remove_all(&mut self, continuations: &HashSet<Ref64>) {
+        for continuation in continuations {
+            self.remove(*continuation);
         }
     }
 
@@ -209,8 +281,8 @@ impl Scheduler {
         bins.sort_by_key(|(k, _)| **k);
         let mut out = Vec::new();
         for (bin, b) in bins {
-            for c in b.current.iter().chain(b.next.iter()) {
-                out.push((*bin, *c));
+            for c in b.entries() {
+                out.push((*bin, c));
             }
         }
         out
