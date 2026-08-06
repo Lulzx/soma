@@ -968,6 +968,59 @@ run, which is the whole evidence offered for it: the same workloads produce the
 same traces and leave legal states. What it changed is that the remaining
 distance is enumerable.
 
+### 4.11 A lane produces its events too
+
+§4.10 sorted a step's fifteen operations into four groups and put the five
+*reads* in the easiest one — "a shared borrow and nothing else". That was true
+of four of them. It was not true of `object_bytes` and `read_u64_object`, which
+take `&mut` because reading is a governed effect whose authority decision is
+traced (I10c). A read is a write, and what it writes is the trace: `logical_time`
+is one counter the whole run draws from, and `trace` is one vector the whole run
+appends to. Two lanes reading two different objects contend on both.
+
+So the trace gets §4.4's treatment, which is the same treatment the effects got
+and for the same reason: a lane **produces** events into `lane_trace` and the
+boundary appends them. `leave_lane` drains, in emission order.
+
+**The clock is handed out at the drain, not at emission.** That is the part
+worth stating, because it is what makes the counter host-side rather than
+something a lane touches. I23 already says `logical_time` carries no information
+beyond `(epoch, lane, lane_sequence)` — a position is assigned locally and
+needs nothing shared. This makes that structural: a lane produces events that do
+not have a `logical_time` yet, and one exists only because the sequential
+interpreter is the reference and replay reads it.
+
+**The drain does not sort.** Appending in emission order is what makes this
+change no run, and sorting by position instead would be a different and worse
+claim. §4.2 wrote I23's clause 2 as a property of the reference and exempted
+implementations whose append order is not their position order — §4.6's
+reordered lanes are exactly such a run. A reference that re-serialised its own
+trace into position order would make clause 2 hold of anything that emits, which
+is the same objection §4.6 raised against folding `in_position_order` into
+`conforms`.
+
+**One shared-clock read survives, and it is not the trace.** A sent message
+carries a `logical_timestamp` (§11 of the P1 ABI), stamped from the counter
+inside the lane that sends. Nothing reads it and nothing orders by it —
+per-pair ordering is `sender_sequence`, which is what I6 checks — so it is
+left reading the count, including what the lane has produced and not yet
+drained, so the value a run stamps is the value it stamped before. Recorded
+here rather than quietly changed: a concurrent executive either drops the field
+or stamps it from a position, and that is an ABI decision rather than an
+implementation one.
+
+**Entering a lane over an undrained buffer is rejected**, not assumed away. It
+would append one lane's events under the next lane's number, and a position is
+the only thing that says which lane did what (I23 clause 3) — so the trace it
+produces reads as legal. One branch per lane, not per event.
+
+**What this does not do.** The buffer lives on the kernel, so `LaneView` still
+borrows the kernel mutably and the reads still take `&mut`; a lane owning its
+own buffer is what would change that, and it is the same move as a lane owning
+its own table shards (§4.8). Five workloads produce byte-identical output, which
+is the whole evidence offered. What changed is that the *read* category of §4.10
+now writes one place, and that place is per-lane.
+
 ---
 
 ## 5. C — distributed, trace-equivalent

@@ -14,6 +14,8 @@ pub mod payload;
 pub mod raw;
 pub mod reclaim;
 pub mod retention;
+#[cfg(test)]
+mod trace_buffer_tests;
 
 use std::collections::{HashMap, VecDeque};
 
@@ -244,6 +246,15 @@ pub struct Kernel {
     epoch: u32,
     logical_time: u64,
     trace: Vec<TraceEvent>,
+    /// What the currently executing lane has emitted and the kernel has not
+    /// appended yet (v0.3 §4.11). Empty outside a lane.
+    ///
+    /// The same move §4.4 made for scheduling effects, applied to the trace: a
+    /// step produces events rather than appending them, and the boundary is
+    /// where they land. It is what the *read* operations of §4.10 were waiting
+    /// on — reading is a governed effect whose authority decision is traced, so
+    /// a read is a write to this and to nothing else shared.
+    lane_trace: Vec<TraceEvent>,
     /// The lane currently executing, or `HOST_LANE` between lanes.
     current_lane: u32,
     /// Emissions so far from `current_lane` this epoch. Reset when a lane is
@@ -364,6 +375,7 @@ impl Kernel {
         let mut kernel = Kernel {
             epoch: 0,
             logical_time: 0,
+            lane_trace: Vec::new(),
             trace: Vec::new(),
             current_lane: crate::abi::traces::HOST_LANE,
             lane_sequence: 0,
@@ -670,7 +682,12 @@ impl Kernel {
     /// assume its draining kept up.
     pub fn log_accounting(&self) -> retention::LogAccounting {
         retention::LogAccounting {
-            trace: self.trace_counters.census(self.trace.len()),
+            // An undrained buffer is retained, not lost: the census compares
+            // emissions against what is still held, and an event a lane has
+            // produced is held by the lane.
+            trace: self
+                .trace_counters
+                .census(self.trace.len() + self.lane_trace.len()),
             effects: self.effect_counters.census(self.effect_log.len()),
             admissions: self.admission_counters.census(self.admission_log.len()),
         }
@@ -878,24 +895,68 @@ impl Kernel {
         causal: Ref64,
         subject: Ref64,
     ) {
-        self.logical_time = self.logical_time.wrapping_add(1);
         let (lane, lane_sequence) = self.next_position();
         self.trace_counters.emit();
-        self.trace.push(TraceEvent::new(
-            self.logical_time,
-            self.epoch,
-            event_kind,
-            process,
-            continuation,
-            run_class,
-        ));
-        if let Some(last) = self.trace.last_mut() {
-            last.auxiliary = auxiliary;
-            last.causal = causal;
-            last.subject = subject;
-            last.lane = lane;
-            last.lane_sequence = lane_sequence;
+        let mut event =
+            TraceEvent::new(0, self.epoch, event_kind, process, continuation, run_class);
+        event.auxiliary = auxiliary;
+        event.causal = causal;
+        event.subject = subject;
+        event.lane = lane;
+        event.lane_sequence = lane_sequence;
+        if lane == crate::abi::traces::HOST_LANE {
+            self.append_traced(event);
+        } else {
+            self.lane_trace.push(event);
         }
+    }
+
+    /// Put one event in the run's trace and give it its `logical_time`.
+    ///
+    /// The clock is assigned here rather than at emission, which is the whole
+    /// content of the buffer: `logical_time` is a number drawn from a counter
+    /// the whole run shares, so a lane that stamped its own events would be
+    /// reading and writing shared state on every event it emits. I23 already
+    /// says the field carries no information beyond `(epoch, lane,
+    /// lane_sequence)` — this is that statement made structural, since a lane
+    /// now produces events that do not have one yet.
+    fn append_traced(&mut self, mut event: TraceEvent) {
+        self.logical_time = self.logical_time.wrapping_add(1);
+        event.logical_time = self.logical_time;
+        self.trace.push(event);
+    }
+
+    /// Move what the lane that just finished emitted into the run's trace.
+    ///
+    /// Appended in emission order, which is what makes this change no run: a
+    /// sequential lane emits into its buffer in the order it would have
+    /// appended, and the clock is handed out here in the same order it was
+    /// handed out before. What is deliberately *not* done is sorting by
+    /// position. §4.2 wrote I23's clause 2 as a property of the reference and
+    /// exempted implementations that append out of order; a reference that
+    /// re-serialised its own trace into position order would make the clause
+    /// hold of anything and would take back the assumption §2 removed.
+    fn drain_lane_trace(&mut self) {
+        if self.lane_trace.is_empty() {
+            return;
+        }
+        for event in std::mem::take(&mut self.lane_trace) {
+            self.append_traced(event);
+        }
+    }
+
+    /// The clock as it stands including what the current lane has emitted and
+    /// not yet drained.
+    ///
+    /// One caller: the `logical_timestamp` a sent message carries (§11). It is
+    /// a residual read of the shared clock from inside a lane — the trace no
+    /// longer needs one (§4.2) and the message ABI still has the field. Nothing
+    /// reads it today, and nothing orders messages by it: per-pair ordering is
+    /// `sender_sequence`. Left as a read of the count rather than quietly
+    /// changed, so the value a run stamps is the value it stamped before, and
+    /// the dependency stays visible instead of being buried in a stale field.
+    fn clock_now(&self) -> u64 {
+        self.logical_time + self.lane_trace.len() as u64
     }
 
     /// Take the next `(lane, lane_sequence)` for an event.
@@ -923,6 +984,17 @@ impl Kernel {
     /// executive assigns it the same way a sequential one does.
     pub(crate) fn enter_lane(&mut self, lane: u32) {
         debug_assert_ne!(lane, crate::abi::traces::HOST_LANE);
+        // A lane that starts on top of an undrained buffer would append the
+        // previous lane's events under its own number, and a position is the
+        // only thing that says which lane did what (I23 clause 3). Checked
+        // rather than assumed: it costs one branch per lane, not per event, and
+        // the failure it catches is a trace that reads as legal.
+        assert!(
+            self.lane_trace.is_empty(),
+            "lane {lane} entered while lane {} still held {} undrained events",
+            self.current_lane,
+            self.lane_trace.len()
+        );
         self.current_lane = lane;
         self.lane_sequence = 0;
         self.lane_effect_sequence = 0;
@@ -933,6 +1005,7 @@ impl Kernel {
     /// Return emission to the host: epoch bookkeeping and anything a caller
     /// does between epochs.
     pub(crate) fn leave_lane(&mut self) {
+        self.drain_lane_trace();
         self.current_lane = crate::abi::traces::HOST_LANE;
         self.set_active_partition(0);
     }
@@ -2494,6 +2567,7 @@ impl Kernel {
         let payload_authority = self.escrow_payload_read(actor, payload)?;
         self.authorize(actor, crate::abi::Rights::SEND, channel)?;
         self.authority_effect(actor, crate::abi::Rights::SEND, channel);
+        let stamp = self.clock_now();
         let (sequence, receiver_waiter) = {
             let queue = self
                 .channel_queues
@@ -2503,7 +2577,7 @@ impl Kernel {
             queue.next_sequence = queue.next_sequence.wrapping_add(1);
             let mut message = MessageDescriptor::new(actor, channel, payload);
             message.sender_sequence = sequence;
-            message.logical_timestamp = self.logical_time;
+            message.logical_timestamp = stamp;
             queue.entries.push_back(EscrowMessage {
                 descriptor: message,
                 payload_authority,
@@ -3068,7 +3142,7 @@ impl Kernel {
         let mut msg = MessageDescriptor::new(sender, receiver, payload);
         msg.transferred_capability = transferred_capability;
         msg.sender_sequence = seq;
-        msg.logical_timestamp = self.logical_time;
+        msg.logical_timestamp = self.clock_now();
 
         // Commit the send inside a scoped block so the mailbox borrow ends
         // before we touch other tables for tracing / waking.

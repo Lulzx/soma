@@ -4,8 +4,8 @@ Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
 Repository: https://github.com/Lulzx/soma. The default semantic core is
-dependency-free. There are 284 tests (six of which need the `metal` feature),
-three compile-fail doc tests, and no Clippy warnings. The optional `metal`
+dependency-free. There are 347 tests (seven of which need the `metal` feature),
+six compile-fail doc tests, and no Clippy warnings. The optional `metal`
 feature adds the `metal-rs` implementation dependency on macOS.
 
 ```sh
@@ -245,6 +245,14 @@ Added in v0.3:
   runs single-threaded. Results stay in request order -- the caller publishes
   result i into collective i -- and one failed request fails the epoch, which is
   the contract the sequential path already had.
+- A lane-local trace buffer (v0.3 §4.11). A lane produces trace events into
+  `lane_trace` and `leave_lane` appends them, which is §4.4's move applied to
+  the trace. `logical_time` is handed out at the drain rather than at emission,
+  so the run's one counter is host-side and a lane touches nothing shared to
+  emit. This is what §4.10's *read* category was waiting on: reading is a
+  governed effect and the authority decision is traced, so a read writes one
+  place and that place is now per-lane. The drain deliberately does not sort --
+  see the trap below. Entering a lane over an undrained buffer panics.
 - A sealed step surface (v0.3 §4.10). A handler takes `executives::lane::LaneView`
   rather than `&mut Kernel`, and the view offers fifteen operations -- measured
   from what `cpu_scalar` and `executives::ant_colony` already called, not
@@ -548,6 +556,21 @@ decision that would otherwise depend on `HashMap` iteration order.
   a single host counter satisfies "sorted by position equals emitted order"
   perfectly — while the trace goes back to needing a shared clock. Clause 3 of
   I23 is the only thing that reports it.
+- **The lane trace buffer drains in emission order, and must not sort.**
+  `drain_lane_trace` appends what the lane produced in the order it produced it,
+  which is why the buffer changed no run. Sorting by position there looks like an
+  improvement — it would make I23's clause 2 hold even of §4.6's reordered runs
+  — and it is the same mistake as folding `order::in_position_order` into
+  `conforms`: a reference that re-serialises its own trace makes the clause hold
+  of anything that emits. §4.2 wrote the exemption on purpose. No test fails if
+  you do this; what breaks is what clause 2 means.
+- **A message's `logical_timestamp` still reads the run's clock.** It is the one
+  shared-clock read left inside a lane (v0.3 §4.11). Nothing reads the field and
+  nothing orders by it — I6 orders per pair by `sender_sequence` — so `clock_now`
+  keeps it reading the count including the lane's undrained events, and the value
+  a run stamps is what it stamped before. A concurrent executive drops the field
+  or stamps it from a position; that is an ABI decision, so it is recorded rather
+  than quietly changed.
 - **A bin entry is written by the applier, not by the step.** `kernel/effects.rs`
   is the only place that can build the `Committing` token `Scheduler::enqueue`
   demands, so a handler that enqueues inline does not compile. If you find
