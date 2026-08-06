@@ -217,6 +217,15 @@ Added in v0.3:
   applier back inside the lane loop fails it. A reordered run gives up I23's
   clause 2 and owes I18 after `order::in_position_order`, which is the exemption
   §4.2 wrote when the clause was written. Still one thread.
+- The first threads (v0.3 §4.7). `CpuReferenceBackend::with_threads` evaluates a
+  batch's elements across OS threads, split by `chunks_mut` so each owns a
+  disjoint run of output elements over a shared immutable input. The safety
+  argument is entirely the body language's: pure, reads the frozen input and
+  never the output, writes only its own element -- rules stated for I19 that
+  turn out to be exactly what threading needs. A knob rather than a default,
+  because I20 makes this backend the definition and a definition should be the
+  plainest reading of a body available. This is *not* the concurrent executive;
+  lanes still run one after another.
 - An effect log (I24). A step no longer writes a runnable bin; it produces the
   entries it wants and the kernel applies them, in the order the plan puts the
   producing lanes in. `Scheduler::enqueue` demands a token only the applier can

@@ -814,6 +814,40 @@ mechanical rather than semantic, and it is large: handlers take `&mut Kernel`,
 so it means lane-local table shards merged at commit, which is the shape
 partitioned allocation was built for.
 
+### 4.7 The first threads
+
+`src/` had no threads at all, which made every claim in §4 a claim about a
+design rather than about a program. The first ones go where parallelism needs no
+argument beyond rules the machine already pays for.
+
+`CpuReferenceBackend::with_threads` evaluates a batch's elements across OS
+threads. The safety argument is entirely §3.2's: a body is pure, reads the
+frozen *input* array and never the output, and writes only its own element. None
+of those were stated for threading — they are what makes I19 true of a gathering
+body, since a body that could observe another element's store would make the
+published result depend on the schedule. Having paid for them, an element's
+output is a function of the frozen input and its own index, so splitting the
+elements across threads cannot move a byte. The split is `chunks_mut`, each
+thread owning a disjoint run of output elements over a shared immutable input,
+with no synchronisation inside the loop and none needed.
+
+Chunking is by element and not by byte: a boundary inside an element would hand
+two threads halves of one element's output, and the interpreter writes an
+element as a unit.
+
+**It is a knob and not a default.** I20 makes this backend the definition every
+other backend is checked against, and a definition should be the plainest
+available reading of a body. A threaded run has to agree with the single-threaded
+one; a default that already threaded would leave nothing to agree with.
+
+**What this is not.** It is not the concurrent *executive*. An epoch's lanes
+still run one after another — reordered (§4.6), but sequential. Parallel element
+evaluation is the part of the machine that was provably safe to thread the
+moment the body language was written; the executive is the part that is not,
+because handlers take `&mut Kernel` and a lane both reads and writes kernel
+tables. Threading that means lane-local table shards merged at commit, which is
+the shape partitioned allocation (§4.3) was built for and which is not done.
+
 ---
 
 ## 5. C — distributed, trace-equivalent

@@ -999,3 +999,119 @@ fn an_aux_gather_past_the_end_clamps_to_the_last_element() {
     );
     assert_eq!(word(&out, 0), 9, "an out-of-range aux index reads the last");
 }
+
+// ---- threaded evaluation --------------------------------------------------
+
+/// Every example body, evaluated on one thread and on several, must produce
+/// identical bytes.
+///
+/// This is I20 with the two backends being one backend at two thread counts,
+/// and it is the clause that says the body language's rules were worth having.
+/// A body reads the frozen input and never the output and writes only its own
+/// element — stated for I19, because a body that could observe another
+/// element's store would make the result depend on the schedule — so an
+/// element's output is a function of the input and its index and chunking
+/// cannot move a byte.
+#[test]
+fn threading_the_elements_does_not_change_a_byte() {
+    let module = examples::module();
+    for program in module.programs() {
+        let stride = program.stride() as usize;
+        // Enough elements that every thread count below splits them unevenly,
+        // so a chunk-boundary defect has somewhere to happen.
+        let count = 37u32;
+        let inputs: Vec<u8> = (0..count)
+            .flat_map(|value| {
+                let mut element = Vec::new();
+                for field in 0..(stride / 4) {
+                    element.extend_from_slice(
+                        &(value.wrapping_mul(2_654_435_761).rotate_left(field as u32 * 7))
+                            .to_le_bytes(),
+                    );
+                }
+                element.resize(stride, 0);
+                element
+            })
+            .collect();
+
+        let expected = CpuReferenceBackend::with(&[program])
+            .evaluate(program.id(), &inputs, count, program.stride())
+            .expect("the single-threaded reference evaluates");
+
+        for threads in [2usize, 3, 8, 64] {
+            let actual = CpuReferenceBackend::with(&[program])
+                .with_threads(threads)
+                .evaluate(program.id(), &inputs, count, program.stride())
+                .expect("the threaded backend evaluates");
+            assert_eq!(
+                actual,
+                expected,
+                "body {} disagreed with itself at {threads} threads",
+                program.name()
+            );
+        }
+    }
+}
+
+#[test]
+fn a_gathering_body_still_reads_the_whole_array_from_every_thread() {
+    // The sharpest case for chunking: `permute` has every element read a field
+    // its neighbours are overwriting. A thread that gathered from its own
+    // chunk's output — or from a chunk-local view of the input — would return
+    // an answer that depends on how the work was split, which is exactly the
+    // I19 failure the "reads the input, never the output" rule exists to stop.
+    let module = examples::module();
+    let program = module.program(examples::PERMUTE).unwrap();
+    let inputs = array(&[(4, 40), (3, 30), (2, 20), (1, 10), (0, 0)]);
+
+    let expected = CpuReferenceBackend::with(&[program])
+        .evaluate(program.id(), &inputs, 5, program.stride())
+        .unwrap();
+    // Field 1 becomes the field 1 of the element field 0 names: a reversal.
+    assert_eq!(
+        (0..5).map(|e| at(&expected, e, 1)).collect::<Vec<_>>(),
+        vec![0, 10, 20, 30, 40]
+    );
+
+    for threads in [2usize, 5] {
+        let actual = CpuReferenceBackend::with(&[program])
+            .with_threads(threads)
+            .evaluate(program.id(), &inputs, 5, program.stride())
+            .unwrap();
+        assert_eq!(actual, expected, "permute differed at {threads} threads");
+    }
+}
+
+#[test]
+fn the_null_is_that_the_thread_count_is_real() {
+    // Without this, everything above passes for a `with_threads` that ignores
+    // its argument. A count above the element count must still cover every
+    // element exactly once, which is where an off-by-one in the chunking shows
+    // up as a short or duplicated output rather than as a wrong value.
+    let module = examples::module();
+    let program = module.program(examples::DOUBLE_PLUS_ONE_TAGGED).unwrap();
+    assert_eq!(
+        CpuReferenceBackend::with(&[program])
+            .with_threads(9)
+            .threads(),
+        9
+    );
+    assert_eq!(
+        CpuReferenceBackend::with(&[program])
+            .with_threads(0)
+            .threads(),
+        1,
+        "a zero thread count must fall back to one rather than doing nothing"
+    );
+
+    let inputs = array(&[(1, 0), (2, 0), (3, 0)]);
+    let out = CpuReferenceBackend::with(&[program])
+        .with_threads(64)
+        .evaluate(program.id(), &inputs, 3, program.stride())
+        .unwrap();
+    assert_eq!(out.len(), inputs.len(), "the threaded run lost elements");
+    assert_eq!(
+        (0..3).map(|e| at(&out, e, 0)).collect::<Vec<_>>(),
+        vec![3, 5, 7]
+    );
+}

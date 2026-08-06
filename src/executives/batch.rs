@@ -211,11 +211,92 @@ pub fn evaluate_elementwise(
     Ok(outputs)
 }
 
+/// The same, across `threads` OS threads.
+///
+/// This is the one place in the machine where parallelism needs no argument
+/// beyond the rules the body language already has. `compiler::body` requires a
+/// body to be pure, to read the frozen *input* array and never the output, and
+/// to write only its own element. Those are not stated for the sake of
+/// threading — they are what makes I19 true of a gathering body, since a body
+/// that could observe another element's store would make the published result
+/// depend on the schedule. Having paid for them, an element's output is a
+/// function of the frozen input and its own index, so splitting the elements
+/// across threads cannot change a byte.
+///
+/// The split is `chunks_mut`, so each thread owns a disjoint run of output
+/// elements and shares an immutable borrow of the input. There is no
+/// synchronisation inside the loop and none is needed; the only ordering is the
+/// scope's join.
+///
+/// Chunking is by element rather than by byte. A chunk boundary inside an
+/// element would hand two threads halves of one element's output, and the
+/// interpreter writes an element as a unit.
+pub fn evaluate_elementwise_threaded(
+    inputs: &[u8],
+    element_count: u32,
+    element_stride: u32,
+    threads: usize,
+    element: impl Fn(u32, &mut [u8]) + Sync,
+) -> Result<Vec<u8>, BackendError> {
+    let stride = element_stride as usize;
+    if stride == 0 {
+        return Err(BackendError::InvalidInput);
+    }
+    let required = (element_count as usize)
+        .checked_mul(stride)
+        .ok_or(BackendError::InvalidInput)?;
+    if inputs.len() < required {
+        return Err(BackendError::InvalidInput);
+    }
+    let mut outputs = inputs[..required].to_vec();
+
+    let threads = threads.max(1);
+    if threads == 1 || element_count < 2 {
+        for index in 0..element_count {
+            let at = index as usize * stride;
+            element(index, &mut outputs[at..at + stride]);
+        }
+        return Ok(outputs);
+    }
+
+    // Ceiling division, so `threads` chunks cover the array and the last is the
+    // short one. A floor would leave a remainder chunk and one more thread than
+    // asked for.
+    let per_thread = (element_count as usize).div_ceil(threads);
+    let element = &element;
+    std::thread::scope(|scope| {
+        for (chunk_index, chunk) in outputs.chunks_mut(per_thread * stride).enumerate() {
+            let first = (chunk_index * per_thread) as u32;
+            scope.spawn(move || {
+                for offset in 0..(chunk.len() / stride) {
+                    let at = offset * stride;
+                    element(first + offset as u32, &mut chunk[at..at + stride]);
+                }
+            });
+        }
+    });
+    Ok(outputs)
+}
+
 /// Dependency-free scalar backend. It interprets whatever body it was given,
 /// and under I20 it is the definition every other backend is checked against.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CpuReferenceBackend {
     programs: HashMap<u32, EvaluatorProgram>,
+    threads: usize,
+}
+
+impl Default for CpuReferenceBackend {
+    fn default() -> Self {
+        Self {
+            programs: HashMap::new(),
+            // One thread by default, so this backend stays what I20 calls the
+            // definition: the simplest possible reading of a body, with no
+            // decisions in it. A threaded run has to agree with *this*, and a
+            // default that already threaded would leave nothing to agree with.
+            threads: 1,
+        }
+    }
 }
 
 impl CpuReferenceBackend {
@@ -225,6 +306,26 @@ impl CpuReferenceBackend {
             let _ = backend.install(program);
         }
         backend
+    }
+
+    /// Evaluate each batch across `threads` OS threads.
+    ///
+    /// Safe for any body the language admits, and not because the
+    /// implementation is careful: `compiler::body` requires a body to read the
+    /// frozen input and never the output and to write only its own element, so
+    /// an element's result is a function of the input and its index. Those
+    /// rules exist for I19, and threading is what they were already paying for.
+    ///
+    /// It is a knob rather than a default because I20 makes this backend the
+    /// definition every other is checked against, and a definition should be
+    /// the plainest reading of a body available.
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads.max(1);
+        self
+    }
+
+    pub fn threads(&self) -> usize {
+        self.threads
     }
 }
 
@@ -287,9 +388,13 @@ impl BatchBackend for CpuReferenceBackend {
             }
         }
         let arrays = Arrays::of(inputs, element_count).with_aux(aux.bytes, aux.element_count);
-        evaluate_elementwise(inputs, element_count, element_stride, |index, target| {
-            program.evaluate_bound(arrays, index, target)
-        })
+        evaluate_elementwise_threaded(
+            inputs,
+            element_count,
+            element_stride,
+            self.threads,
+            |index, target| program.evaluate_bound(arrays, index, target),
+        )
     }
 }
 
