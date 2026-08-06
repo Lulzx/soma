@@ -4,9 +4,9 @@ Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
 Repository: https://github.com/Lulzx/soma. The default semantic core is
-dependency-free. There are 231 integration tests (two of which need the `metal`
-feature), three compile-fail doc tests, and no Clippy warnings. The optional `metal` feature adds the `metal-rs` implementation
-dependency on macOS.
+dependency-free. There are 275 tests (five of which need the `metal` feature),
+three compile-fail doc tests, and no Clippy warnings. The optional `metal`
+feature adds the `metal-rs` implementation dependency on macOS.
 
 ```sh
 cargo test
@@ -23,6 +23,17 @@ cargo run --example supervision_report # notification vs failure escalation
 cargo run --example multi_input_report # atomic join + skew/failure controls
 ```
 
+The measurement examples are separate, want `--release`, and are documented in
+`docs/PERFORMANCE.md`:
+
+```sh
+cargo run --release --features metal --example backend_bench   # CPU vs Metal across batch sizes
+cargo run --release --features metal --example metal_overhead  # where a Metal call's fixed cost goes
+cargo run --release --example kernel_overhead                  # what a published cohort costs off-GPU
+cargo run --release --example growth_sweep                     # cost against accumulated state, to 1M
+cargo run --release --example memory_profile                   # bytes per unit of work
+```
+
 ---
 
 ## 1. What the project currently is
@@ -36,7 +47,12 @@ The project changed shape recently and the git history reads misleadingly if you
 don't know this. It began as a GPU operating system idea ("replace kernel
 launches with persistent device-resident processes"), generalised into SOMA, and
 is now focused on the abstract machine. A GPU OS may implement it later.
-Performance work is paused.
+Performance work was paused and has since restarted, on the implementation
+only. `docs/PERFORMANCE.md` covers it: a wall-clock harness (the repository had
+none), the Metal backend, three accidentally-quadratic paths, and reclamation.
+No invariant changed. Read its §1 before quoting any figure and §7 for what is
+still open, including that the cohorting thesis in §4 below is *still* a
+structural model rather than a hardware measurement.
 
 Two documents, and they are not equals:
 
@@ -400,6 +416,27 @@ decision that would otherwise depend on `HashMap` iteration order.
 
 ## 7. Traps
 
+- **An index narrows a search. It does not decide the answer.** `Ref64::key()`
+  is partition and slot, not kind and not generation, so a process and an object
+  in the same slot share a bucket in `kernel::capability_space`. Every lookup
+  re-checks the whole reference. Skipping that check let `revoke_target_right`
+  revoke a capability over the wrong entity, and `CapabilityIntegrity` reported
+  it only once reclamation started deleting things, several commits later.
+- **Deleting an entity means purging the capabilities that name it**, and
+  reclaiming a process means giving one back to its domain's
+  `processes_created`, which `DomainContractIntegrity` checks against the *live*
+  count despite the name. Miss either and the machine is smaller and illegal.
+- **Releasing authority is not exercising it.** `AuthorityEffect` is what
+  `NoUnauthorizedEffect` demands an adjacent grant for. Letting go needs no
+  permission beyond having held it. That is why `AuthorityReleased` is a
+  separate event kind, and why reusing the first one makes every release
+  illegal.
+- **Benchmarks that start from `Kernel::new()` cannot see the defect that
+  matters.** Three hot paths scanned a structure that only grows, so a run doing
+  n operations did O(n²) work with every test passing — nothing about the
+  *result* changes, only how long it takes. `examples/growth_sweep` is the shape
+  that finds them: fix an operation, grow one structure underneath it, re-time.
+  Point it at anything new. See `docs/PERFORMANCE.md` §4.
 - **Continuation status must change through `set_continuation_status`.**
   `retire_process_if_idle` no longer scans the continuation table; it reads the
   per-process count that helper maintains. A status write that bypasses it
