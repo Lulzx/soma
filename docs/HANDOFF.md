@@ -238,6 +238,13 @@ Added in v0.3:
   mints and nothing about what it does. This is the allocator a threaded
   executive needs. What has no lane-local form yet is mailboxes, futures,
   capability spaces and object payloads.
+- Threaded epochs (v0.3 §4.9). `CpuReferenceBackend::evaluate_epoch` runs an
+  epoch's collectives side by side, which is the axis element threading cannot
+  serve: many small cohorts have too few elements each to fill a thread. The
+  two are alternatives rather than layers, so a request inside a threaded epoch
+  runs single-threaded. Results stay in request order -- the caller publishes
+  result i into collective i -- and one failed request fails the epoch, which is
+  the contract the sequential path already had.
 - An effect log (I24). A step no longer writes a runnable bin; it produces the
   entries it wants and the kernel applies them, in the order the plan puts the
   producing lanes in. `Scheduler::enqueue` demands a token only the applier can

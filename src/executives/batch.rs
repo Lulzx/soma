@@ -363,6 +363,106 @@ impl BatchBackend for CpuReferenceBackend {
         element_stride: u32,
         aux: AuxArray<'_>,
     ) -> Result<Vec<u8>, BackendError> {
+        self.evaluate_shared(
+            evaluator_id,
+            inputs,
+            element_count,
+            element_stride,
+            aux,
+            self.threads,
+        )
+    }
+
+    /// Run every request of an epoch, one thread per group of requests.
+    ///
+    /// The parallelism is across *requests* here rather than across the
+    /// elements of one, and the two are alternatives rather than layers. An
+    /// epoch of sixty-four small cohorts gets nothing from splitting each
+    /// cohort's elements — there are not enough of them to fill a thread — and
+    /// everything from running the cohorts side by side, which is the shape
+    /// `examples/metal_overhead` prices. An epoch holding one large collective
+    /// is the other way round. Nesting both would oversubscribe by the product
+    /// of the two counts, so each request runs single-threaded here.
+    ///
+    /// Requests are independent by construction: each names its own frozen
+    /// input and its own output, and a body writes only its own element. That
+    /// is the same argument element threading makes, applied one level out.
+    fn evaluate_epoch(
+        &mut self,
+        requests: &[BatchRequest<'_>],
+    ) -> Result<Vec<Payload>, BackendError> {
+        if self.threads <= 1 || requests.len() < 2 {
+            return requests
+                .iter()
+                .map(|request| {
+                    self.evaluate_shared(
+                        request.evaluator_id,
+                        request.inputs,
+                        request.element_count,
+                        request.element_stride,
+                        request.aux,
+                        self.threads,
+                    )
+                    .map(Payload::from)
+                })
+                .collect();
+        }
+
+        let per_thread = requests.len().div_ceil(self.threads);
+        let backend = &*self;
+        // Collected as bytes and wrapped afterwards, so nothing about
+        // `Payload`'s foreign variant has to cross a thread boundary. This
+        // backend only ever produces host bytes anyway.
+        let grouped: Vec<Result<Vec<Vec<u8>>, BackendError>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = requests
+                .chunks(per_thread)
+                .map(|group| {
+                    scope.spawn(move || {
+                        group
+                            .iter()
+                            .map(|request| {
+                                backend.evaluate_shared(
+                                    request.evaluator_id,
+                                    request.inputs,
+                                    request.element_count,
+                                    request.element_stride,
+                                    request.aux,
+                                    1,
+                                )
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("an evaluator body cannot panic"))
+                .collect()
+        });
+
+        // Either every request succeeds or the call fails, which is the
+        // contract the sequential path already has: a partial epoch leaves the
+        // caller holding some published outputs and some unstarted collectives
+        // with no way to say which.
+        let mut out = Vec::with_capacity(requests.len());
+        for group in grouped {
+            out.extend(group?.into_iter().map(Payload::from));
+        }
+        Ok(out)
+    }
+}
+
+impl CpuReferenceBackend {
+    /// The evaluation itself, over `&self` so several threads can run it.
+    fn evaluate_shared(
+        &self,
+        evaluator_id: u32,
+        inputs: &[u8],
+        element_count: u32,
+        element_stride: u32,
+        aux: AuxArray<'_>,
+        threads: usize,
+    ) -> Result<Vec<u8>, BackendError> {
         let program = self
             .programs
             .get(&evaluator_id)
@@ -392,7 +492,7 @@ impl BatchBackend for CpuReferenceBackend {
             inputs,
             element_count,
             element_stride,
-            self.threads,
+            threads,
             |index, target| program.evaluate_bound(arrays, index, target),
         )
     }

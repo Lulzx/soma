@@ -886,6 +886,28 @@ partitioned allocation was already in — I18 compares up to a correspondence
 between names (§2.6) rather than by reference. It is tested rather than left as
 a comment, in both directions: inline allocation recycles, a shard does not.
 
+### 4.9 An epoch's collectives run side by side
+
+Element threading (§4.7) splits one collective's elements. That is the wrong
+axis for the shape an epoch usually has: sixty-four small cohorts have too few
+elements each to fill a thread, and `examples/metal_overhead` prices exactly
+that case. The requests themselves are what should run side by side.
+
+`CpuReferenceBackend::evaluate_epoch` does. The independence argument is the
+element argument one level out: each request names its own frozen input and its
+own output, and a body writes only its own element, so two requests share
+nothing. The two axes are alternatives rather than layers — nesting them would
+oversubscribe by the product of the counts — so a request evaluated as part of a
+threaded epoch runs single-threaded.
+
+Two properties are worth stating because getting either wrong produces bytes
+that look right. Results stay in **request order**, since the caller publishes
+result *i* into collective *i* and a completion-ordered return would put every
+output in the wrong object. And **one failed request fails the epoch**, which is
+the contract the sequential path already had: a partial epoch leaves the caller
+holding some published outputs and some unstarted collectives with no way to say
+which.
+
 **What is still missing for a threaded executive.** The shards are the
 allocator. What has no lane-local form yet is the rest of what a step writes —
 mailboxes, futures, capability spaces, object payloads — and the read-through

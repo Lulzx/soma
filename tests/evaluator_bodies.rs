@@ -1115,3 +1115,123 @@ fn the_null_is_that_the_thread_count_is_real() {
         vec![3, 5, 7]
     );
 }
+
+// ---- threading an epoch's collectives -------------------------------------
+
+/// One epoch's worth of independent requests over the same body.
+fn epoch_requests<'a>(
+    program: &EvaluatorProgram,
+    inputs: &'a [Vec<u8>],
+) -> Vec<soma::executives::batch::BatchRequest<'a>> {
+    inputs
+        .iter()
+        .map(|bytes| soma::executives::batch::BatchRequest {
+            evaluator_id: program.id(),
+            inputs: bytes,
+            aux: soma::executives::batch::AuxArray::NONE,
+            element_count: (bytes.len() / program.stride() as usize) as u32,
+            element_stride: program.stride(),
+        })
+        .collect()
+}
+
+#[test]
+fn running_an_epochs_collectives_in_parallel_publishes_the_same_bytes() {
+    // The parallelism that element threading cannot supply. An epoch of many
+    // small cohorts has too few elements per cohort to fill a thread, and the
+    // cohorts are independent — each names its own frozen input and its own
+    // output — so the level worth splitting is the epoch, not the element.
+    let module = examples::module();
+    let program = module.program(examples::MIN_AND_XOR).unwrap();
+
+    // Deliberately uneven: 17 requests across 4 threads leaves a short group,
+    // and each request is small enough that element threading would not help.
+    let inputs: Vec<Vec<u8>> = (0..17u32)
+        .map(|seed| {
+            array(&[
+                (seed, seed.wrapping_mul(7)),
+                (seed + 1, seed.wrapping_mul(13)),
+                (seed + 2, seed.wrapping_mul(29)),
+            ])
+        })
+        .collect();
+    let requests = epoch_requests(program, &inputs);
+
+    let sequential = CpuReferenceBackend::with(&[program])
+        .evaluate_epoch(&requests)
+        .expect("the sequential epoch runs");
+
+    for threads in [2usize, 4, 32] {
+        let parallel = CpuReferenceBackend::with(&[program])
+            .with_threads(threads)
+            .evaluate_epoch(&requests)
+            .expect("the threaded epoch runs");
+        assert_eq!(
+            parallel.len(),
+            sequential.len(),
+            "{threads} threads returned a different number of results"
+        );
+        for (index, (a, b)) in parallel.iter().zip(&sequential).enumerate() {
+            assert_eq!(
+                a.as_slice(),
+                b.as_slice(),
+                "request {index} differed at {threads} threads"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_threaded_epoch_keeps_its_results_in_request_order() {
+    // Results are indexed by request: the caller publishes result `i` into
+    // collective `i`. A grouping that returned results in completion order
+    // would publish every collective's output into the wrong object, and every
+    // byte would still look plausible.
+    let module = examples::module();
+    let program = module.program(examples::DOUBLE_PLUS_ONE_TAGGED).unwrap();
+
+    // Each request has a distinguishable answer, so an order swap is visible.
+    let inputs: Vec<Vec<u8>> = (0..12u32).map(|seed| array(&[(seed, 0)])).collect();
+    let requests = epoch_requests(program, &inputs);
+
+    let results = CpuReferenceBackend::with(&[program])
+        .with_threads(5)
+        .evaluate_epoch(&requests)
+        .unwrap();
+
+    for (seed, payload) in results.iter().enumerate() {
+        assert_eq!(
+            at(payload.as_slice(), 0, 0),
+            (seed as u32) * 2 + 1,
+            "request {seed} came back in the wrong slot"
+        );
+    }
+}
+
+#[test]
+fn one_failed_request_fails_the_whole_threaded_epoch() {
+    // The contract the sequential path already has. A partial epoch leaves the
+    // caller holding some published outputs and some unstarted collectives with
+    // no way to say which, so the threaded path must not weaken it into
+    // per-request results.
+    let module = examples::module();
+    let program = module.program(examples::MIN_AND_XOR).unwrap();
+    let good = array(&[(1, 2)]);
+
+    let mut requests = epoch_requests(program, std::slice::from_ref(&good));
+    requests.extend(epoch_requests(program, std::slice::from_ref(&good)));
+    // An evaluator the backend was never given.
+    requests[1].evaluator_id = 9_999;
+    // Enough requests that the bad one lands in a different group.
+    while requests.len() < 8 {
+        requests.push(requests[0]);
+    }
+
+    assert_eq!(
+        CpuReferenceBackend::with(&[program])
+            .with_threads(4)
+            .evaluate_epoch(&requests)
+            .err(),
+        Some(BackendError::UnsupportedEvaluator)
+    );
+}
