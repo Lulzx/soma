@@ -78,13 +78,15 @@ fn main() {
         Some("batches") => published_batches(),
         Some("processes") => finished_processes(),
         Some("reclaiming") => reclaiming_processes(),
+        Some("released") => released_batches(),
         _ => {
             published_batches();
             finished_processes();
             reclaiming_processes();
+            released_batches();
             println!(
                 "\nrun one section at a time for comparable resident figures: \
-                 `-- batches`, `-- processes`, `-- reclaiming`"
+                 `-- batches`, `-- processes`, `-- reclaiming`, `-- released`"
             );
         }
     }
@@ -208,5 +210,66 @@ fn reclaiming_processes() {
     println!(
         "  {} processes still resident at the end",
         kernel.process_count()
+    );
+}
+
+/// The publishing workload again, with the owner letting go of each round and
+/// a reachability pass collecting what nothing can name.
+///
+/// The logs are drained every round rather than every fifty thousand, because
+/// with the state bounded they are the only thing left growing and leaving
+/// them in would report their size as the kernel's. That is not a dodge: the
+/// logs already have a retention policy (`kernel::retention`), and
+/// `examples/growth_sweep` shows retaining them costs no time — only memory,
+/// which is the caller's to spend.
+fn released_batches() {
+    let program = synthetic_program(841, 2, 8);
+    let stride = program.stride();
+    let mut accelerator = CpuReferenceBackend::with(&[&program]);
+    let mut cpu = CpuReferenceBackend::with(&[&program]);
+
+    let mut kernel = Kernel::new();
+    let owner = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+
+    header("published batches, released", "batches");
+    let base = resident_kilobytes();
+    let mut published = 0usize;
+    for level in LEVELS {
+        while published < level {
+            let bytes = vec![5u8; 8 * stride as usize];
+            let input = kernel.create_object(owner, ObjectKind::FrozenArray, bytes);
+            freeze(&mut kernel, owner, input).unwrap();
+            let (collective, completion) = kernel
+                .create_batch_evaluate_for(owner, program.id(), input, 8, stride)
+                .unwrap();
+            let output = execute_with_spill(
+                &mut kernel,
+                owner,
+                collective,
+                u32::MAX,
+                &mut accelerator,
+                &mut cpu,
+                &mut PlacementStats::default(),
+            )
+            .unwrap();
+            for held in [output, input, collective, completion] {
+                kernel.release_authority(owner, held).unwrap();
+            }
+            kernel.reclaim_unreachable();
+            // Every round, not every fifty thousand: with the state bounded,
+            // whatever is left growing is either the logs or the tables, and
+            // draining here separates them.
+            kernel.take_trace_events();
+            kernel.take_effect_log();
+            published += 1;
+        }
+        kernel.take_trace_events();
+        kernel.take_effect_log();
+        row(level, base, &kernel);
+    }
+    println!(
+        "  {} collectives and {} futures still resident",
+        kernel.collective_count(),
+        kernel.future_count()
     );
 }

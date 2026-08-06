@@ -474,6 +474,19 @@ impl Kernel {
         self.objects.len()
     }
 
+    pub fn collective_count(&self) -> usize {
+        self.collectives.len()
+    }
+
+    pub fn future_count(&self) -> usize {
+        self.futures.len()
+    }
+
+    /// Record that an actor gave up authority over something.
+    pub(crate) fn trace_authority_released(&mut self, actor: Ref64, target: Ref64) {
+        self.trace(EventKind::AuthorityReleased, actor, target, 0, 0);
+    }
+
     /// Processes that have finished and whose state the kernel is still
     /// holding. Reporting only — it exists so a memory probe can say how much
     /// of the population is reclaimable rather than live.
@@ -1263,7 +1276,10 @@ impl Kernel {
         Ok(())
     }
 
-    fn revoke_capability_tree(space: &mut capability_space::CapabilitySpace, root: Ref64) {
+    pub(crate) fn revoke_capability_tree(
+        space: &mut capability_space::CapabilitySpace,
+        root: Ref64,
+    ) {
         let mut revoked = vec![root];
         let mut index = 0;
         while index < revoked.len() {

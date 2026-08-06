@@ -27,8 +27,27 @@
 //! reach differs from reclaiming one somebody still holds a reference to: the
 //! second is caught, not corrupted.
 
-use crate::abi::{ObjectKind, ProcessState, Ref64};
-use crate::kernel::Kernel;
+use crate::abi::{Kind, ObjectKind, ProcessState, Ref64};
+use crate::kernel::{Kernel, RuntimeError};
+
+/// What a reachability pass found, for callers that want to see the shape of
+/// what is being held before deciding to release it.
+#[derive(Clone, Debug, Default)]
+pub struct Unreachable {
+    pub objects: Vec<Ref64>,
+    pub collectives: Vec<Ref64>,
+    pub futures: Vec<Ref64>,
+}
+
+impl Unreachable {
+    pub fn is_empty(&self) -> bool {
+        self.objects.is_empty() && self.collectives.is_empty() && self.futures.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.objects.len() + self.collectives.len() + self.futures.len()
+    }
+}
 
 /// What one reclamation pass gave back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -37,6 +56,8 @@ pub struct Reclaimed {
     pub continuations: usize,
     pub objects: usize,
     pub capabilities: usize,
+    pub collectives: usize,
+    pub futures: usize,
 }
 
 impl Reclaimed {
@@ -243,5 +264,206 @@ impl Kernel {
         let _ = ObjectKind::ProcessState;
         self.object_payloads.remove(&object.key());
         self.objects.delete(object).is_ok()
+    }
+}
+
+/// Reachability, in the sense a capability machine already has one.
+///
+/// A finished process is easy: it is named by its own descriptor and nothing
+/// else needs it. A *published batch* is not. Its object outlives the process
+/// that produced it, its collective and completion future outlive both, and
+/// `examples/memory_profile` prices the three together at about 1.3KB per
+/// batch that nothing ever released — against 32 bytes of payload.
+///
+/// There is no reference counting here and adding one would be a change to the
+/// ABI. But the machine already says what "reachable" means: an entity is
+/// reachable when something can *name* it. So this marks from the roots that
+/// can name anything — every capability's target, every live process,
+/// continuation, queue and waiter list — follows the references those hold,
+/// and reports what nothing arrived at.
+///
+/// The subtlety that makes it a closure rather than a scan: a collective names
+/// its input and output objects, so an object is not garbage merely because no
+/// capability names it. But if the collective *itself* is unreachable, its
+/// objects must not be kept alive by it. Marking therefore starts from the
+/// roots and propagates, rather than treating every descriptor as a root.
+impl Kernel {
+    /// Give up the authority `actor` holds over `target`.
+    ///
+    /// The counterpart to reachability: nothing can become unreachable while
+    /// its owner still holds a capability naming it, so a run that wants its
+    /// finished work collected needs a way to say it is finished with it.
+    /// This is that, and it is the only new *semantic* operation here —
+    /// everything else in this module is bookkeeping over state nothing can
+    /// name.
+    ///
+    /// It drops only this actor's authority. A frozen array several processes
+    /// read stays readable by the others; it becomes unreachable when the last
+    /// of them lets go.
+    pub fn release_authority(&mut self, actor: Ref64, target: Ref64) -> Result<(), RuntimeError> {
+        let space = self
+            .capability_spaces
+            .get_mut(&actor.key())
+            .ok_or(RuntimeError::Abi(crate::abi::AbiError::NoAuthority))?;
+        let held: Vec<Ref64> = space
+            .for_target(target)
+            .into_iter()
+            .map(|(capability, _)| capability)
+            .collect();
+        if held.is_empty() {
+            return Err(RuntimeError::Abi(crate::abi::AbiError::NoAuthority));
+        }
+        for capability in held {
+            Self::revoke_capability_tree(space, capability);
+        }
+        self.trace_authority_released(actor, target);
+        Ok(())
+    }
+
+    /// Everything nothing can name any more.
+    ///
+    /// Pure inspection: it deletes nothing, so a caller can look at what a
+    /// release would take before taking it.
+    pub fn unreachable(&self) -> Unreachable {
+        let mut marked: std::collections::HashSet<Ref64> = std::collections::HashSet::new();
+        let mut worklist: Vec<Ref64> = Vec::new();
+
+        let root = |reference: Ref64,
+                    marked: &mut std::collections::HashSet<Ref64>,
+                    worklist: &mut Vec<Ref64>| {
+            if !reference.is_null() && marked.insert(reference) {
+                worklist.push(reference);
+            }
+        };
+
+        // Anything a capability names can be reached by whoever holds it.
+        for space in self.capability_spaces.values() {
+            for (_, capability) in space.iter() {
+                root(capability.target, &mut marked, &mut worklist);
+            }
+        }
+        // A live process, and everything a live process's descriptor names.
+        for (process, descriptor) in self.processes.iter() {
+            root(process, &mut marked, &mut worklist);
+            root(descriptor.state, &mut marked, &mut worklist);
+            root(descriptor.inbox, &mut marked, &mut worklist);
+            root(descriptor.urgent_inbox, &mut marked, &mut worklist);
+        }
+        // A live continuation, whether or not anyone holds a capability to it.
+        for (continuation, descriptor) in self.continuations.iter() {
+            root(continuation, &mut marked, &mut worklist);
+            root(descriptor.frame, &mut marked, &mut worklist);
+        }
+        // In-flight messages, and everything waiting on something.
+        for mailbox in self.mailboxes.values() {
+            for entry in &mailbox.entries {
+                root(entry.payload, &mut marked, &mut worklist);
+                root(entry.transferred_capability, &mut marked, &mut worklist);
+                root(entry.completion_future, &mut marked, &mut worklist);
+            }
+        }
+        for queue in self.channel_queues.values() {
+            for entry in &queue.entries {
+                root(entry.descriptor.payload, &mut marked, &mut worklist);
+                root(
+                    entry.descriptor.completion_future,
+                    &mut marked,
+                    &mut worklist,
+                );
+                root(entry.payload_authority.target, &mut marked, &mut worklist);
+            }
+        }
+        for queue in self.supervision_queues.values() {
+            for notice in &queue.notices {
+                root(notice.child, &mut marked, &mut worklist);
+                root(notice.replacement, &mut marked, &mut worklist);
+            }
+        }
+
+        // Follow what the marked entities name.
+        while let Some(reference) = worklist.pop() {
+            let named: Vec<Ref64> = match reference.kind {
+                Kind::Collective => self
+                    .collectives
+                    .get(reference)
+                    .map(|descriptor| {
+                        vec![
+                            descriptor.inputs,
+                            descriptor.outputs,
+                            descriptor.completion_future,
+                        ]
+                    })
+                    .unwrap_or_default(),
+                Kind::Future => self
+                    .futures
+                    .get(reference)
+                    .map(|descriptor| vec![descriptor.value, descriptor.failure])
+                    .unwrap_or_default(),
+                Kind::Continuation => self
+                    .continuations
+                    .get(reference)
+                    .map(|descriptor| vec![descriptor.frame])
+                    .unwrap_or_default(),
+                Kind::Process => self
+                    .processes
+                    .get(reference)
+                    .map(|descriptor| vec![descriptor.state])
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            for next in named {
+                if !next.is_null() && marked.insert(next) {
+                    worklist.push(next);
+                }
+            }
+        }
+
+        Unreachable {
+            objects: self
+                .objects
+                .iter()
+                .map(|(object, _)| object)
+                .filter(|object| !marked.contains(object))
+                .collect(),
+            collectives: self
+                .collectives
+                .iter()
+                .map(|(collective, _)| collective)
+                .filter(|collective| !marked.contains(collective))
+                .collect(),
+            futures: self
+                .futures
+                .iter()
+                .map(|(future, _)| future)
+                .filter(|future| !marked.contains(future))
+                .collect(),
+        }
+    }
+
+    /// Release everything nothing can name.
+    ///
+    /// Like `reclaim_finished_processes`, explicit and called from nowhere: a
+    /// run that wants its published history inspectable afterwards is not
+    /// wrong, and this cannot tell the difference between that and a leak.
+    pub fn reclaim_unreachable(&mut self) -> Reclaimed {
+        let unreachable = self.unreachable();
+        let mut reclaimed = Reclaimed::default();
+        for object in unreachable.objects {
+            if self.release_object(object) {
+                reclaimed.objects += 1;
+            }
+        }
+        for collective in unreachable.collectives {
+            if self.collectives.delete(collective).is_ok() {
+                reclaimed.collectives += 1;
+            }
+        }
+        for future in unreachable.futures {
+            self.future_waiters.remove(&future.key());
+            if self.futures.delete(future).is_ok() {
+                reclaimed.futures += 1;
+            }
+        }
+        reclaimed
     }
 }

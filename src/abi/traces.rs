@@ -40,6 +40,12 @@ pub enum EventKind {
     ContractCreated = 30,
     ContractAttached = 31,
     ModuleLoaded = 32,
+    /// A process gave up authority it held. Not an `AuthorityEffect`: that
+    /// records authority being *exercised* and I-checks demand an adjacent
+    /// grant for one, while letting go needs no permission beyond having held
+    /// it. It is traced because it changes what a process may do next, and
+    /// because it is what makes something collectable.
+    AuthorityReleased = 33,
 }
 
 /// The lane an event was emitted from when it was not emitted from one: epoch

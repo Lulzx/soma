@@ -249,3 +249,113 @@ fn a_run_that_reclaims_computes_what_a_run_that_does_not_computes() {
         "reclaiming changed what the run computed"
     );
 }
+
+/// A published batch outlives its producer, so process reclamation cannot
+/// touch it. What decides its lifetime is whether anything can still name it —
+/// which is a question the machine already answers, since a capability is
+/// exactly the ability to name something.
+#[test]
+fn a_batch_nothing_can_name_is_reclaimable_and_one_that_is_named_is_not() {
+    let program = synthetic_program(852, 2, 8);
+    let stride = program.stride();
+    let mut accelerator = CpuReferenceBackend::with(&[&program]);
+    let mut cpu = CpuReferenceBackend::with(&[&program]);
+
+    let mut kernel = Kernel::new();
+    let owner = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let mut publish = |kernel: &mut Kernel, seed: u8| {
+        let bytes = vec![seed; 8 * stride as usize];
+        let input = kernel.create_object(owner, ObjectKind::FrozenArray, bytes);
+        freeze(kernel, owner, input).unwrap();
+        let (collective, _) = kernel
+            .create_batch_evaluate_for(owner, program.id(), input, 8, stride)
+            .unwrap();
+        execute_with_spill(
+            kernel,
+            owner,
+            collective,
+            u32::MAX,
+            &mut accelerator,
+            &mut cpu,
+            &mut PlacementStats::default(),
+        )
+        .unwrap()
+    };
+
+    let kept = publish(&mut kernel, 1);
+    let kept_bytes = kernel.object_bytes(owner, kept).unwrap().to_vec();
+
+    // While the owner holds authority over its batches, none of them are
+    // garbage — the owner can still read every one.
+    let unreachable = kernel.unreachable();
+    assert!(
+        !unreachable.objects.contains(&kept),
+        "a batch its owner can still name was called unreachable"
+    );
+
+    let reclaimed = kernel.reclaim_unreachable();
+    assert_eq!(
+        kernel.object_bytes(owner, kept).unwrap(),
+        kept_bytes,
+        "reclaiming took a batch the owner can still name"
+    );
+    soma::semantics::invariants::assert_legal(&kernel);
+    let _ = reclaimed;
+}
+
+#[test]
+fn a_run_that_releases_its_batches_stays_bounded() {
+    // The publishing workload from `examples/memory_profile`: without a way to
+    // let go, every output object, collective and future accumulates forever.
+    let program = synthetic_program(853, 2, 8);
+    let stride = program.stride();
+    let mut accelerator = CpuReferenceBackend::with(&[&program]);
+    let mut cpu = CpuReferenceBackend::with(&[&program]);
+
+    let mut kernel = Kernel::new();
+    let owner = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+
+    let mut round = |kernel: &mut Kernel, seed: u8| {
+        let bytes = vec![seed; 8 * stride as usize];
+        let input = kernel.create_object(owner, ObjectKind::FrozenArray, bytes);
+        freeze(kernel, owner, input).unwrap();
+        let (collective, completion) = kernel
+            .create_batch_evaluate_for(owner, program.id(), input, 8, stride)
+            .unwrap();
+        let output = execute_with_spill(
+            kernel,
+            owner,
+            collective,
+            u32::MAX,
+            &mut accelerator,
+            &mut cpu,
+            &mut PlacementStats::default(),
+        )
+        .unwrap();
+        // Done with the round: give up everything it was handed. Releasing
+        // only the output would keep all of it, because the collective still
+        // names its input and output and the owner still names the collective.
+        // That is the pass working — reachability is transitive — and it is
+        // why a caller has to let go of what it was given rather than of the
+        // one reference it happens to care about.
+        for held in [output, input, collective, completion] {
+            kernel.release_authority(owner, held).unwrap();
+        }
+        kernel.reclaim_unreachable();
+    };
+
+    for seed in 0..20u8 {
+        round(&mut kernel, seed);
+    }
+    let settled = (kernel.object_count(), kernel.collective_count());
+
+    for seed in 20..200u8 {
+        round(&mut kernel, seed);
+    }
+    assert_eq!(
+        (kernel.object_count(), kernel.collective_count()),
+        settled,
+        "nine times the batches left more behind"
+    );
+    soma::semantics::invariants::assert_legal(&kernel);
+}
