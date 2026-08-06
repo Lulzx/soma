@@ -848,6 +848,52 @@ because handlers take `&mut Kernel` and a lane both reads and writes kernel
 tables. Threading that means lane-local table shards merged at commit, which is
 the shape partitioned allocation (§4.3) was built for and which is not done.
 
+### 4.8 Lane-local allocation
+
+The concurrent executive's obstacle is not ordering any more — §4.5 settled
+that, and §4.6 checked it. It is that a lane both reads and writes kernel state
+through `&mut Kernel`, and a `&mut` cannot be held by several lanes at once.
+
+Writes divide into two kinds, and only one of them is hard. Effects are already
+produced rather than performed (§4.4) and applied at the epoch boundary (§4.5).
+Allocation is the other kind, and §4.3 (2) established that it cannot be
+deferred the same way: a step creates an entity and stores its `Ref64` in opaque
+frame bytes, so it needs a real name before commit and a symbolic one cannot
+survive the byte blob.
+
+`GenTable::shard` is the answer partitioned allocation was always for. A shard
+is an allocator over slot numbers in one partition that nothing else will mint —
+the partition comes from the lane's position in the epoch's plan (§4.3), and no
+two lanes share one. It holds only the slots the lane mints, so opening one
+leaves the table fully readable: a lane reads pre-epoch state from the table and
+its own new entities from its shard, which is exactly the read-back §4.3 (2)
+requires. `GenTable::merge` folds it in, and appending in shard order reproduces
+the slots the shard minted, because it based its numbering on the partition's
+length when it was opened and is that partition's only allocator.
+
+Shards are taken by `&self`, which is the property that makes them usable: an
+epoch opens one per lane from a single shared borrow, and the lanes then own
+them independently. `two_lanes_allocate_into_their_own_partitions_at_the_same_time`
+fills two of them from two threads with nothing shared and no synchronisation.
+
+**A shard does not recycle freed slots**, and that is the one place it differs
+from allocating inline. Reuse means popping the partition's free list, and two
+lanes popping one list is precisely the coordination partitions exist to remove.
+So a shard appends and freed slots become available again after the merge. The
+cost is that an epoch does not reuse slots freed during it; the effect is on
+which slot numbers a run mints and not on what it does, which is the situation
+partitioned allocation was already in — I18 compares up to a correspondence
+between names (§2.6) rather than by reference. It is tested rather than left as
+a comment, in both directions: inline allocation recycles, a shard does not.
+
+**What is still missing for a threaded executive.** The shards are the
+allocator. What has no lane-local form yet is the rest of what a step writes —
+mailboxes, futures, capability spaces, object payloads — and the read-through
+view that would let a handler take a lane rather than `&mut Kernel`. That is
+mechanical work across the handler surface rather than a further semantic
+question, which is the state §4 has been trying to reach: everything left is a
+refactor, and nothing left is an unanswered question about the model.
+
 ---
 
 ## 5. C — distributed, trace-equivalent

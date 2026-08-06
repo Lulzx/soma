@@ -243,4 +243,158 @@ impl<T> GenTable<T> {
     pub fn kind(&self) -> Kind {
         self.kind
     }
+
+    // ---- lane-local allocation (v0.3 §4.8) -------------------------------
+
+    /// Open an empty shard of `partition` that a lane can allocate into alone.
+    ///
+    /// This is the mechanism a threaded executive needs and the reason
+    /// partitions exist at all. A lane cannot hold `&mut GenTable` while other
+    /// lanes are running, but it can hold a shard: an allocator over slot
+    /// numbers no one else will mint, because the partition is decided from the
+    /// lane's position in the epoch's plan (§4.3) and no two lanes share one.
+    ///
+    /// Taken by `&self`, so an epoch opens one shard per lane from a single
+    /// shared borrow of the table and the lanes then own them independently.
+    /// The table itself stays readable throughout, which is what a step needs:
+    /// it allocates into its shard and reads everything that existed before the
+    /// epoch out of the table.
+    ///
+    /// A shard does **not** recycle freed slots. Reuse means popping the
+    /// partition's free list, and two lanes popping one list is precisely the
+    /// coordination partitions exist to remove — so a shard appends, and freed
+    /// slots become available again after the merge. The cost is that an
+    /// epoch's allocations do not reuse slots freed earlier in that epoch. That
+    /// changes which slot numbers a run mints and nothing about what it does,
+    /// which is the situation partitioned allocation was already in: I18
+    /// compares up to a correspondence between names (§2.6), not by reference.
+    pub fn shard(&self, partition: u8) -> PartitionShard<T> {
+        let base = self
+            .partitions
+            .get(partition as usize)
+            .map(|p| p.slots.len() as u32)
+            .unwrap_or(1);
+        PartitionShard {
+            kind: self.kind,
+            partition,
+            base,
+            slots: Vec::new(),
+        }
+    }
+
+    /// Fold a lane's shard back into the table.
+    ///
+    /// Appending in shard order reproduces exactly the slots the shard minted:
+    /// it based its numbering on the partition's length at `shard` time, it is
+    /// the only allocator for that partition, and nothing else appends there
+    /// while it is out. So a reference the lane handed out — and stored in
+    /// opaque frame bytes, which §4.3 (2) says it must be able to do — resolves
+    /// after the merge to the entity the lane allocated.
+    ///
+    /// Merging in plan order is the caller's job, and matters for the same
+    /// reason applying effects in plan order does: two shards of one partition
+    /// would otherwise interleave by arrival. An epoch gives each lane its own
+    /// partition, so in practice each merge touches a different one.
+    pub fn merge(&mut self, shard: PartitionShard<T>) {
+        debug_assert_eq!(shard.kind, self.kind, "a shard belongs to one table");
+        while self.partitions.len() <= shard.partition as usize {
+            self.partitions.push(Partition::new());
+        }
+        let partition = &mut self.partitions[shard.partition as usize];
+        debug_assert_eq!(
+            partition.slots.len() as u32,
+            shard.base,
+            "the partition grew while its shard was out"
+        );
+        for slot in shard.slots {
+            if slot.value.is_some() {
+                self.live += 1;
+            }
+            partition.slots.push(slot);
+        }
+    }
+}
+
+/// An allocator over one partition's unused slot numbers, owned by one lane.
+///
+/// Holds only the slots the lane mints, not the partition's existing ones, so
+/// opening a shard leaves the table fully readable. A lane therefore reads
+/// pre-epoch state from the table and its own new entities from here, which is
+/// what §4.3 (2) requires: a step that creates a future and stores it in its
+/// frame has to be able to read it back before commit.
+#[derive(Debug)]
+pub struct PartitionShard<T> {
+    kind: Kind,
+    partition: u8,
+    /// The partition's slot count when this shard was opened. Slot numbering
+    /// continues from here, which is what makes the merge an append.
+    base: u32,
+    slots: Vec<Slot<T>>,
+}
+
+impl<T> PartitionShard<T> {
+    pub fn alloc(&mut self, value: T) -> Ref64 {
+        let slot = self.base + self.slots.len() as u32;
+        self.slots.push(Slot {
+            generation: 0,
+            value: Some(value),
+        });
+        Ref64::in_partition(slot, 0, self.kind, self.partition)
+    }
+
+    /// Look up an entity this shard minted, with the same validity checks the
+    /// table makes. A reference to anything else is `BadSlot` here — the caller
+    /// falls through to the table, which is where everything else lives.
+    pub fn get(&self, r: Ref64) -> Result<&T, AbiError> {
+        self.slot(r)?.value.as_ref().ok_or(AbiError::BadSlot)
+    }
+
+    pub fn get_mut(&mut self, r: Ref64) -> Result<&mut T, AbiError> {
+        if r.kind != self.kind || r.partition != self.partition || r.slot < self.base {
+            return Err(AbiError::BadSlot);
+        }
+        let index = (r.slot - self.base) as usize;
+        let slot = self.slots.get_mut(index).ok_or(AbiError::BadSlot)?;
+        if slot.generation != r.generation {
+            return Err(AbiError::StaleReference);
+        }
+        slot.value.as_mut().ok_or(AbiError::BadSlot)
+    }
+
+    /// Whether `r` names something this shard minted, so a caller knows which
+    /// of the two places to look without probing both.
+    pub fn holds(&self, r: Ref64) -> bool {
+        r.kind == self.kind
+            && r.partition == self.partition
+            && r.slot >= self.base
+            && ((r.slot - self.base) as usize) < self.slots.len()
+    }
+
+    fn slot(&self, r: Ref64) -> Result<&Slot<T>, AbiError> {
+        if r.kind != self.kind {
+            return Err(AbiError::KindMismatch);
+        }
+        if r.partition != self.partition || r.slot < self.base {
+            return Err(AbiError::BadSlot);
+        }
+        let index = (r.slot - self.base) as usize;
+        let slot = self.slots.get(index).ok_or(AbiError::BadSlot)?;
+        if slot.generation != r.generation {
+            return Err(AbiError::StaleReference);
+        }
+        Ok(slot)
+    }
+
+    pub fn partition(&self) -> u8 {
+        self.partition
+    }
+
+    /// How many entities this lane allocated.
+    pub fn len(&self) -> usize {
+        self.slots.iter().filter(|s| s.value.is_some()).count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
 }

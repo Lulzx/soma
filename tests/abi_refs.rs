@@ -164,3 +164,163 @@ fn ordinary_churn_still_recycles_slots() {
     assert_eq!(table.len(), 1);
     assert!(table.get(first).is_ok());
 }
+
+// ---- lane-local allocation (v0.3 §4.8) ------------------------------------
+
+/// A shard's references resolve after the merge to the entities the lane
+/// allocated.
+///
+/// This is the property §4.3 (2) needs and the reason allocation can stay
+/// eager under a concurrent executive: a step creates an entity, stores its
+/// `Ref64` in opaque frame bytes, and the reference has to still mean that
+/// entity once the epoch commits. A symbolic name resolved later could not
+/// survive the byte blob; a partitioned slot number can.
+#[test]
+fn a_shards_references_survive_the_merge() {
+    let mut table: GenTable<u32> = GenTable::new(Kind::Process);
+    table.set_active_partition(0);
+    let existing = table.alloc(100);
+
+    let mut shard = table.shard(1);
+    let a = shard.alloc(7);
+    let b = shard.alloc(8);
+
+    // Readable from the shard before the merge, which is what lets a step use
+    // what it just allocated.
+    assert_eq!(shard.get(a), Ok(&7));
+    assert_eq!(shard.get(b), Ok(&8));
+    assert!(shard.holds(a) && shard.holds(b));
+    assert!(!shard.holds(existing));
+
+    table.merge(shard);
+
+    assert_eq!(table.get(a), Ok(&7));
+    assert_eq!(table.get(b), Ok(&8));
+    assert_eq!(table.get(existing), Ok(&100), "the merge disturbed the table");
+    assert_eq!(table.len(), 3);
+}
+
+#[test]
+fn two_lanes_allocate_into_their_own_partitions_at_the_same_time() {
+    // The whole point. Two shards are two independent allocators over disjoint
+    // slot spaces, so they can be filled from two threads with nothing shared
+    // and no coordination — which is what `docs/SOMA-v0.3.md` §4.3 says
+    // partitioned allocation is for.
+    let table: GenTable<u64> = GenTable::new(Kind::Process);
+    let mut first = table.shard(1);
+    let mut second = table.shard(2);
+
+    let (a, b) = std::thread::scope(|scope| {
+        let one = scope.spawn(|| (0..64u64).map(|v| first.alloc(v)).collect::<Vec<_>>());
+        let two = scope.spawn(|| (0..64u64).map(|v| second.alloc(v + 1000)).collect::<Vec<_>>());
+        (one.join().unwrap(), two.join().unwrap())
+    });
+
+    // Both minted slot numbers from the same range and meant different
+    // entities, which is exactly what a partition is.
+    assert_eq!(a[0].slot, b[0].slot);
+    assert_ne!(a[0].partition, b[0].partition);
+
+    let mut table = table;
+    table.merge(first);
+    table.merge(second);
+
+    for (index, r) in a.iter().enumerate() {
+        assert_eq!(table.get(*r), Ok(&(index as u64)));
+    }
+    for (index, r) in b.iter().enumerate() {
+        assert_eq!(table.get(*r), Ok(&(index as u64 + 1000)));
+    }
+    assert_eq!(table.len(), 128);
+}
+
+#[test]
+fn merging_a_shard_matches_allocating_inline() {
+    // The shard is an optimisation of where allocation happens, not a change to
+    // what it produces. Against a partition with no freed slots the two are
+    // identical, references included.
+    let mut inline: GenTable<u32> = GenTable::new(Kind::Object);
+    inline.set_active_partition(3);
+    let direct: Vec<_> = (0..5u32).map(|v| inline.alloc(v)).collect();
+
+    let mut sharded: GenTable<u32> = GenTable::new(Kind::Object);
+    sharded.set_active_partition(3);
+    let mut shard = sharded.shard(3);
+    let staged: Vec<_> = (0..5u32).map(|v| shard.alloc(v)).collect();
+    sharded.merge(shard);
+
+    assert_eq!(direct, staged, "a shard minted different references");
+    assert_eq!(inline.len(), sharded.len());
+    for r in &direct {
+        assert_eq!(inline.get(*r), sharded.get(*r));
+    }
+}
+
+#[test]
+fn a_shard_appends_rather_than_recycling_a_freed_slot() {
+    // The one behavioural difference, tested rather than left in a comment.
+    // Reusing a slot means popping the partition's free list, and two lanes
+    // popping one list is the coordination partitions exist to remove. So the
+    // shard appends, the freed slot stays free, and it becomes available again
+    // after the merge.
+    let mut table: GenTable<u32> = GenTable::new(Kind::Object);
+    table.set_active_partition(0);
+    let first = table.alloc(1);
+    let second = table.alloc(2);
+    table.delete(first).unwrap();
+
+    // Inline, the next allocation would recycle `first`'s slot.
+    let mut recycling: GenTable<u32> = GenTable::new(Kind::Object);
+    let r1 = recycling.alloc(1);
+    let _ = recycling.alloc(2);
+    recycling.delete(r1).unwrap();
+    assert_eq!(recycling.alloc(3).slot, r1.slot, "inline allocation recycles");
+
+    let mut shard = table.shard(0);
+    let third = shard.alloc(3);
+    assert_ne!(third.slot, first.slot, "the shard recycled a freed slot");
+    table.merge(shard);
+
+    assert_eq!(table.get(third), Ok(&3));
+    assert_eq!(table.get(second), Ok(&2));
+    assert_eq!(
+        table.get(first),
+        Err(soma::abi::AbiError::StaleReference),
+        "the deleted reference came back to life"
+    );
+    // And the freed slot is reusable again now the shard is folded in.
+    assert_eq!(table.alloc(4).slot, first.slot);
+}
+
+#[test]
+fn a_shard_refuses_a_reference_it_did_not_mint() {
+    // A lane looks in its shard first and falls through to the table. That only
+    // works if the shard is honest about what it holds, rather than resolving a
+    // neighbouring partition's slot number to its own entity.
+    let mut table: GenTable<u32> = GenTable::new(Kind::Process);
+    table.set_active_partition(0);
+    let older = table.alloc(1);
+
+    let mut shard = table.shard(1);
+    let mine = shard.alloc(2);
+
+    assert_eq!(shard.get(older), Err(soma::abi::AbiError::BadSlot));
+    assert!(!shard.holds(older));
+    assert_eq!(shard.get(mine), Ok(&2));
+
+    // A same-partition slot below the base belongs to the table, not the shard.
+    let mut zero_shard = table.shard(0);
+    let _ = zero_shard.alloc(9);
+    assert_eq!(zero_shard.get(older), Err(soma::abi::AbiError::BadSlot));
+    assert!(!zero_shard.holds(older));
+}
+
+#[test]
+fn a_shard_of_the_wrong_kind_does_not_resolve() {
+    // Kind mismatch is structural everywhere else in the ABI and stays so here.
+    let table: GenTable<u32> = GenTable::new(Kind::Process);
+    let mut shard = table.shard(0);
+    let r = shard.alloc(1);
+    let wrong = Ref64::in_partition(r.slot, r.generation, Kind::Object, r.partition);
+    assert_eq!(shard.get(wrong), Err(soma::abi::AbiError::KindMismatch));
+}

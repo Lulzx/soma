@@ -226,6 +226,18 @@ Added in v0.3:
   because I20 makes this backend the definition and a definition should be the
   plainest reading of a body available. This is *not* the concurrent executive;
   lanes still run one after another.
+- Lane-local allocation (v0.3 §4.8). `GenTable::shard` opens an allocator over
+  one partition's unminted slot numbers, taken by `&self` so an epoch can open
+  one per lane from a shared borrow and the lanes own them independently;
+  `merge` folds one back. A shard holds only the slots its lane mints, so the
+  table stays readable and a step reads pre-epoch state from the table and its
+  own new entities from the shard -- which is the read-back §4.3 (2) requires,
+  since a step stores references it allocated into opaque frame bytes. A shard
+  does not recycle freed slots, because popping a shared free list is the
+  coordination partitions exist to remove; that changes which slot numbers a run
+  mints and nothing about what it does. This is the allocator a threaded
+  executive needs. What has no lane-local form yet is mailboxes, futures,
+  capability spaces and object payloads.
 - An effect log (I24). A step no longer writes a runnable bin; it produces the
   entries it wants and the kernel applies them, in the order the plan puts the
   producing lanes in. `Scheduler::enqueue` demands a token only the applier can
