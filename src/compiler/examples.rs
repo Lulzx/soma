@@ -25,6 +25,9 @@ pub const BITMIX: u32 = 10;
 /// `ant_scoring` occupies 11; the gather examples continue from 12.
 pub const NEIGHBOUR_MAX: u32 = 12;
 pub const PERMUTE: u32 = 13;
+/// The loop examples. `WINDOW_SUM` is uniform; `RUN_LENGTH` is not.
+pub const WINDOW_SUM: u32 = 14;
+pub const RUN_LENGTH: u32 = 15;
 
 pub const SOURCE: &str = r#"
 module soma.examples
@@ -118,6 +121,65 @@ evaluator 13 permute 8 130 131 ro 132 133 ro
   op 0 load 0
   op 1 gather 0 1
   store 1 1
+
+# A loop, and the first body whose result is not a fixed-length expression:
+# field 1 becomes the sum of field 0 over this element and the seven after it,
+# clamped at the end of the array. Written straight-line this is eight gathers
+# and seven adds; the point of the loop is that the same body would be written
+# once for a window of eight hundred.
+#
+# Local 0 is the accumulator and local 1 is the cursor, because a value
+# computed inside the loop belongs to its iteration. Op 5 reads the cursor, op
+# 8 writes the accumulator, and op 10 advances the cursor -- nothing crosses an
+# iteration except through those two.
+evaluator 14 window_sum 8 140 141 ro 142 143 ro
+  field u32
+  field u32
+  locals 2
+  op 0 index
+  op 1 set 1 0
+  op 2 const 1
+  op 3 const 0
+  op 4 repeat 8
+  op 5 get 1
+  op 6 gather 5 0
+  op 7 get 0
+  op 8 add 7 6
+  op 9 set 0 8
+  op 10 get 1
+  op 11 add 10 2
+  op 12 set 1 11
+  op 13 endrepeat
+  op 14 get 0
+  store 1 14
+
+# The same shape with an early exit, so two lanes leave on different
+# iterations: field 1 becomes the number of consecutive elements from this one
+# whose field 0 is non-zero, up to eight. This is the first body that is not
+# uniform, and it is here so that `is_uniform` has something to say no about
+# and so I20 has a diverging body to check on hardware.
+evaluator 15 run_length 8 150 151 ro 152 153 ro
+  field u32
+  field u32
+  locals 2
+  op 0 index
+  op 1 set 1 0
+  op 2 const 1
+  op 3 const 0
+  op 4 repeat 8
+  op 5 get 1
+  op 6 gather 5 0
+  op 7 cmpeq 6 3
+  op 8 breakif 7
+  op 9 get 0
+  op 10 add 9 2
+  op 11 set 0 10
+  op 12 get 1
+  op 13 add 12 2
+  op 14 set 1 13
+  op 15 endrepeat
+  op 16 get 0
+  store 1 16
 "#;
 
 /// Parse the example module. Panics only if the source above is malformed,

@@ -11,10 +11,32 @@
 //! A body here is deliberately small, because the point being tested is
 //! placement-independent publication, not language design:
 //!
-//! - **Pure and total.** No allocation, no division (which would be partial),
-//!   no loops. Every program terminates in a fixed number of steps decided at
-//!   validation time. An out-of-range `Gather` clamps rather than faulting, so
-//!   totality survives a computed index.
+//! - **Pure and total.** No allocation and no division (which would be
+//!   partial). Every program terminates in a number of steps decided at
+//!   validation time — `step_bound` multiplies out the loop nesting and
+//!   `MAX_STEPS` is the ceiling. Two rules keep that true in the presence of
+//!   things that usually break it: an out-of-range `Gather` clamps rather than
+//!   faulting, and a loop's trip count is a constant rather than an
+//!   expression. `BreakIf` gives back the useful half of a data-dependent
+//!   loop, since leaving early can only lower the count.
+//!
+//!   Totality is not a preference. `kernel/epochs.rs` checks a continuation's
+//!   step budget before dispatch and a collective evaluation is one step of one
+//!   continuation, so a body that might not terminate makes that check
+//!   meaningless.
+//! - **Loops carry state in locals, not in values.** SSA and back edges need
+//!   phi nodes, which is a large amount of machinery for a language this size,
+//!   and "an instruction names an earlier instruction" stops meaning anything
+//!   once an instruction can run twice. Instead, a value computed inside a loop
+//!   is visible only within the iteration that computed it — validation rejects
+//!   a reference that escapes one — and `Get`/`Set` over declared locals are
+//!   how anything outlives an iteration.
+//! - **Branch-free is a property of a body, not of the language.** It used to
+//!   be both, because `Select` was the only conditional. `BreakIf` can put two
+//!   lanes of a cohort on different iterations, so `is_uniform` is the question
+//!   a scheduler asks about a body rather than an answer the language
+//!   guarantees. Divergence costs occupancy and not correctness: both lowerings
+//!   still agree, which is what I20 checks.
 //! - **One output element per input element.** A reduction is a different
 //!   collective, not a different body. `Gather` widens what a body may *read*
 //!   to any element of the frozen input array, but not what it may write: a
@@ -154,15 +176,68 @@ pub enum Op {
     CmpEq(u32, u32),
     /// 1 when the first operand is strictly less, 0 otherwise.
     CmpLt(u32, u32),
-    /// `cond != 0 ? a : b`. The only control flow the language has, and it is
-    /// branch-free, so a cohort of lanes executing one body never diverges.
+    /// `cond != 0 ? a : b`. Branch-free, so a cohort of lanes evaluating one
+    /// of these never diverges. It is no longer the only control flow the
+    /// language has, but it is still the only one that costs nothing.
     Select(u32, u32, u32),
+
+    /// Read a local. Locals start at zero and are the only values that survive
+    /// an iteration of a loop.
+    ///
+    /// SSA and loops do not mix without phi nodes, and phi nodes are a large
+    /// amount of machinery for a language this size — the operand model here
+    /// is "an instruction names an earlier instruction", and a back edge makes
+    /// "earlier" stop meaning what it says. Mutable locals are the other way
+    /// out: values computed inside a loop body are visible only inside the
+    /// iteration that computed them, and anything that has to outlive an
+    /// iteration is written to a local. That keeps every operand reference
+    /// meaning exactly what it meant before loops existed.
+    Get(u32),
+    /// Write a local, and evaluate to the value written, so a `set` can be
+    /// used where a value is expected rather than needing a separate statement
+    /// category.
+    Set(u32, u32),
+    /// Begin a loop with a trip count fixed at validation time. Matched by
+    /// [`Op::EndRepeat`].
+    ///
+    /// The count is static and that is the whole of why totality survives:
+    /// `EvaluatorProgram::step_bound` multiplies out the nesting and refuses a
+    /// body whose worst case exceeds [`MAX_STEPS`], so every body still
+    /// terminates in a number of steps decided before it runs. A
+    /// data-dependent trip count would move that decision to runtime and take
+    /// the step budget with it; `BreakIf` is what gives back the useful half
+    /// of one, since exiting early can only lower the count.
+    Repeat(u32),
+    /// Close the innermost open [`Op::Repeat`].
+    EndRepeat,
+    /// Leave the innermost enclosing loop when the operand is non-zero.
+    ///
+    /// This is real divergence: two lanes of a cohort can leave on different
+    /// iterations. It costs occupancy on a GPU and costs nothing in
+    /// correctness — the lanes still execute the same instructions in the same
+    /// order, and a lane that has left simply stops contributing. I20 checks
+    /// that both lowerings agree about which iteration each lane left on.
+    BreakIf(u32),
 }
+
+/// The worst-case instruction count a body is allowed to have once its loops
+/// are multiplied out.
+///
+/// Totality is not a style preference here: `kernel/epochs.rs` checks a
+/// continuation's step budget before dispatch, and a collective evaluation is
+/// one step of one continuation. A body that might not terminate makes that
+/// check meaningless. Bounding the unrolled length at validation time keeps the
+/// old guarantee — every program terminates in a fixed number of steps decided
+/// before it runs — while admitting loops, which is the whole trade.
+pub const MAX_STEPS: u64 = 1 << 20;
 
 impl Op {
     fn operands(self) -> Vec<u32> {
         match self {
             Op::Load(_) | Op::Const(_) | Op::Index => Vec::new(),
+            Op::Get(_) | Op::Repeat(_) | Op::EndRepeat => Vec::new(),
+            Op::Set(_, value) => vec![value],
+            Op::BreakIf(cond) => vec![cond],
             Op::Gather(index, _) => vec![index],
             Op::Add(a, b)
             | Op::Sub(a, b)
@@ -192,6 +267,7 @@ pub struct EvaluatorProgram {
     id: u32,
     name: String,
     layout: ElementLayout,
+    locals: u32,
     ops: Vec<Op>,
     stores: Vec<Store>,
 }
@@ -211,6 +287,24 @@ pub enum BodyError {
     /// The layout's derived stride disagrees with the stride the module
     /// declares for this evaluator.
     StrideMismatch,
+    /// A `get` or `set` names a local outside the declared set. Locals are
+    /// declared like fields are, and for the same reason: an out-of-range name
+    /// is a validation error rather than a runtime fault.
+    LocalOutOfRange,
+    /// A `repeat` was never closed, an `endrepeat` closed nothing, or a
+    /// `breakif` sat outside every loop.
+    UnbalancedLoop,
+    /// A `repeat` declared no iterations. Zero is not obviously wrong, but it
+    /// makes the ops it encloses dead, and a body containing instructions that
+    /// provably never run is more likely a mistake than an intention.
+    EmptyLoop,
+    /// An operand names an instruction inside a loop from outside it. Values do
+    /// not escape an iteration; locals are how a loop communicates with what
+    /// follows it.
+    EscapingValue,
+    /// The body's unrolled length exceeds [`MAX_STEPS`], so it is not
+    /// obviously total and the step budget could not bound it.
+    Unbounded,
     Syntax,
 }
 
@@ -222,10 +316,22 @@ impl EvaluatorProgram {
         ops: Vec<Op>,
         stores: Vec<Store>,
     ) -> Result<Self, BodyError> {
+        Self::with_locals(id, name, layout, 0, ops, stores)
+    }
+
+    pub fn with_locals(
+        id: u32,
+        name: impl Into<String>,
+        layout: ElementLayout,
+        locals: u32,
+        ops: Vec<Op>,
+        stores: Vec<Store>,
+    ) -> Result<Self, BodyError> {
         let program = Self {
             id,
             name: name.into(),
             layout,
+            locals,
             ops,
             stores,
         };
@@ -243,6 +349,14 @@ impl EvaluatorProgram {
         if self.stores.is_empty() {
             return Err(BodyError::NoStore);
         }
+
+        // The loop nest each instruction sits in, as the stack of enclosing
+        // `Repeat` indices. Computing it once gives both remaining checks: the
+        // structure is balanced exactly when this can be built, and a value
+        // escapes exactly when an operand's stack is not a prefix of the
+        // consumer's.
+        let regions = self.regions()?;
+
         let field_count = self.layout.fields().len() as u32;
         for (index, op) in self.ops.iter().enumerate() {
             // The gathered *field* is static and checked here exactly as a
@@ -252,12 +366,26 @@ impl EvaluatorProgram {
                     return Err(BodyError::FieldOutOfRange);
                 }
             }
+            if let Op::Get(local) | Op::Set(local, _) = op {
+                if *local >= self.locals {
+                    return Err(BodyError::LocalOutOfRange);
+                }
+            }
+            if let Op::Repeat(trips) = op {
+                if *trips == 0 {
+                    return Err(BodyError::EmptyLoop);
+                }
+            }
             for operand in op.operands() {
                 if operand as usize >= index {
                     return Err(BodyError::ForwardReference);
                 }
+                if !is_prefix(&regions[operand as usize], &regions[index]) {
+                    return Err(BodyError::EscapingValue);
+                }
             }
         }
+
         for store in &self.stores {
             if store.field >= field_count {
                 return Err(BodyError::FieldOutOfRange);
@@ -265,8 +393,105 @@ impl EvaluatorProgram {
             if store.value as usize >= self.ops.len() {
                 return Err(BodyError::ForwardReference);
             }
+            // A store happens after the body, so it is outside every loop. It
+            // may therefore only name a value computed outside every loop —
+            // the same escape rule the operands above obey, at the one place
+            // where the consumer is not an instruction.
+            if !regions[store.value as usize].is_empty() {
+                return Err(BodyError::EscapingValue);
+            }
+        }
+
+        if self.step_bound() > MAX_STEPS {
+            return Err(BodyError::Unbounded);
         }
         Ok(())
+    }
+
+    /// The stack of enclosing `Repeat` indices for each instruction, and the
+    /// balance check that produces it.
+    ///
+    /// A `BreakIf` outside every loop is rejected here rather than at runtime:
+    /// there is nothing for it to leave, so it is either a typo or a `return`,
+    /// and the language does not have a `return`.
+    fn regions(&self) -> Result<Vec<Vec<usize>>, BodyError> {
+        let mut open: Vec<usize> = Vec::new();
+        let mut regions = Vec::with_capacity(self.ops.len());
+        for (index, op) in self.ops.iter().enumerate() {
+            match op {
+                Op::Repeat(_) => {
+                    // The `repeat` itself belongs to the region outside the
+                    // loop it opens; its body does not.
+                    regions.push(open.clone());
+                    open.push(index);
+                }
+                Op::EndRepeat => {
+                    if open.pop().is_none() {
+                        return Err(BodyError::UnbalancedLoop);
+                    }
+                    regions.push(open.clone());
+                }
+                Op::BreakIf(_) => {
+                    if open.is_empty() {
+                        return Err(BodyError::UnbalancedLoop);
+                    }
+                    regions.push(open.clone());
+                }
+                _ => regions.push(open.clone()),
+            }
+        }
+        if !open.is_empty() {
+            return Err(BodyError::UnbalancedLoop);
+        }
+        Ok(regions)
+    }
+
+    /// The worst-case number of instructions this body executes, with every
+    /// loop taken the full number of times.
+    ///
+    /// `BreakIf` is ignored, which is the conservative direction: leaving a
+    /// loop early can only lower the count, so a body inside the bound stays
+    /// inside it. Saturating arithmetic keeps a deeply nested body from
+    /// wrapping around into a small number and passing.
+    pub fn step_bound(&self) -> u64 {
+        let mut total: u64 = 0;
+        let mut multiplier: u64 = 1;
+        let mut stack: Vec<u64> = Vec::new();
+        for op in &self.ops {
+            total = total.saturating_add(multiplier);
+            match op {
+                Op::Repeat(trips) => {
+                    stack.push(multiplier);
+                    multiplier = multiplier.saturating_mul(u64::from(*trips));
+                }
+                Op::EndRepeat => {
+                    multiplier = stack.pop().unwrap_or(1);
+                }
+                _ => {}
+            }
+        }
+        total
+    }
+
+    /// Whether this body is branch-free, and so evaluates in lockstep across
+    /// the lanes of a cohort.
+    ///
+    /// Every body was in this set before loops existed, which is why nothing
+    /// asked. It is a placement question rather than a correctness one — a
+    /// diverging body computes the same answer on both backends, and I20
+    /// checks that it does — so nothing in the machine refuses a body for
+    /// failing it. It is what a scheduler would consult to decide whether a
+    /// cohort's lanes are worth grouping.
+    ///
+    /// A `repeat` alone does not break uniformity: its trip count is static, so
+    /// every lane runs the same iterations. Only `breakif` can put two lanes on
+    /// different iterations, so only `breakif` is asked about.
+    pub fn is_uniform(&self) -> bool {
+        !self.ops.iter().any(|op| matches!(op, Op::BreakIf(_)))
+    }
+
+    pub fn locals(&self) -> u32 {
+        self.locals
     }
 
     pub fn id(&self) -> u32 {
@@ -332,9 +557,21 @@ impl EvaluatorProgram {
         let stride = self.stride() as usize;
         let own = (index as usize).saturating_mul(stride);
         let input = inputs.get(own..own + stride).unwrap_or(&[]);
-        let mut values: Vec<u64> = Vec::with_capacity(self.ops.len());
-        for op in &self.ops {
-            let value = match *op {
+
+        // Values are a fixed array indexed by instruction rather than a stack
+        // that grows as the walk proceeds, because a loop re-executes an
+        // instruction and would otherwise push a second slot for it. Slots for
+        // instructions inside a loop hold the current iteration's value; the
+        // escape rule checked at validation is what makes that the only value
+        // anything can read.
+        let mut values: Vec<u64> = vec![0; self.ops.len()];
+        let mut locals: Vec<u64> = vec![0; self.locals as usize];
+        // (index of the `Repeat`, iterations still to run after this one).
+        let mut loops: Vec<(usize, u32)> = Vec::new();
+
+        let mut pc = 0usize;
+        while pc < self.ops.len() {
+            let value = match self.ops[pc] {
                 Op::Load(field) => self.read_field(input, field),
                 Op::Index => u64::from(index),
                 Op::Gather(at, field) => {
@@ -360,12 +597,70 @@ impl EvaluatorProgram {
                         values[b as usize]
                     }
                 }
+                Op::Get(local) => locals[local as usize],
+                Op::Set(local, value) => {
+                    let value = values[value as usize];
+                    locals[local as usize] = value;
+                    value
+                }
+                Op::Repeat(trips) => {
+                    // `trips` is at least 1 (validation rejects zero), so the
+                    // body always runs once and the count recorded is what is
+                    // left after this iteration.
+                    loops.push((pc, trips - 1));
+                    0
+                }
+                Op::EndRepeat => {
+                    if let Some((start, remaining)) = loops.pop() {
+                        if remaining > 0 {
+                            loops.push((start, remaining - 1));
+                            values[pc] = 0;
+                            pc = start + 1;
+                            continue;
+                        }
+                    }
+                    0
+                }
+                Op::BreakIf(cond) => {
+                    if values[cond as usize] != 0 {
+                        if let Some((start, _)) = loops.pop() {
+                            values[pc] = 0;
+                            pc = self.end_of_loop(start) + 1;
+                            continue;
+                        }
+                    }
+                    0
+                }
             };
-            values.push(value);
+            values[pc] = value;
+            pc += 1;
         }
+
         for store in &self.stores {
             self.write_field(output, store.field, values[store.value as usize]);
         }
+    }
+
+    /// The index of the `EndRepeat` closing the `Repeat` at `start`.
+    ///
+    /// Validation has already established the structure is balanced, so this
+    /// always finds one; the fallback is the end of the body, which makes a
+    /// hypothetical unbalanced program stop rather than run off.
+    fn end_of_loop(&self, start: usize) -> usize {
+        let mut depth = 0usize;
+        for (index, op) in self.ops.iter().enumerate().skip(start) {
+            match op {
+                Op::Repeat(_) => depth += 1,
+                Op::EndRepeat => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return index;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.ops.len()
     }
 
     /// Read `field` of the element at `at`, clamping `at` to the last element.
@@ -432,6 +727,7 @@ impl EvaluatorProgram {
         let mut fields = Vec::new();
         let mut ops = Vec::new();
         let mut stores = Vec::new();
+        let mut locals = 0u32;
 
         for line in lines {
             let parts: Vec<&str> = line.split_whitespace().collect();
@@ -441,6 +737,12 @@ impl EvaluatorProgram {
                         return Err(BodyError::Syntax);
                     }
                     fields.push(FieldWidth::parse(parts[1]).ok_or(BodyError::Syntax)?);
+                }
+                Some("locals") => {
+                    if parts.len() != 2 {
+                        return Err(BodyError::Syntax);
+                    }
+                    locals = parts[1].parse().map_err(|_| BodyError::Syntax)?;
                 }
                 Some("op") => {
                     if parts.len() < 3 {
@@ -465,7 +767,7 @@ impl EvaluatorProgram {
             }
         }
 
-        EvaluatorProgram::new(id, name, ElementLayout::new(fields), ops, stores)
+        EvaluatorProgram::with_locals(id, name, ElementLayout::new(fields), locals, ops, stores)
     }
 
     /// Generate a Metal Shading Language kernel for this body.
@@ -490,43 +792,93 @@ impl EvaluatorProgram {
             "    for (uint b = 0; b < stride; ++b) output[base + b] = input[base + b];"
         );
 
+        // Every value and local is declared up front rather than at the point
+        // it is computed. A loop body is a C scope, so a `ulong v7` declared
+        // inside one stops existing at the closing brace — and the whole reason
+        // locals exist is for a value to outlive an iteration. Hoisting also
+        // makes the emitted code's shape independent of the control flow around
+        // an instruction, which is what keeps this lowering readable against
+        // the interpreter's `values` array.
+        for index in 0..self.ops.len() {
+            let _ = writeln!(body, "    ulong v{index} = 0ul;");
+        }
+        for local in 0..self.locals {
+            let _ = writeln!(body, "    ulong l{local} = 0ul;");
+        }
+        // A gather needs two scratch values per instruction for the same reason
+        // it did before: the clamped index is used by every byte term of the
+        // read, and recomputing it per byte would emit a kernel quadratic in
+        // the field width.
         for (index, op) in self.ops.iter().enumerate() {
-            // A gather is the one instruction that is not a single expression:
-            // the clamped index is needed by every byte term of the read, and
-            // recomputing it per byte would emit a kernel quadratic in the
-            // field width. It gets its own statements instead.
-            if let Op::Gather(at, field) = *op {
-                let _ = writeln!(
-                    body,
-                    "    uint g{index} = (v{at} >= (ulong)count) ? (count - 1u) : uint(v{at});"
-                );
-                let _ = writeln!(body, "    uint gb{index} = g{index} * stride;");
-                let _ = writeln!(
-                    body,
-                    "    ulong v{index} = {};",
-                    self.metal_read(&format!("gb{index}"), field)
-                );
-                continue;
+            if matches!(op, Op::Gather(_, _)) {
+                let _ = writeln!(body, "    uint g{index} = 0u;");
+                let _ = writeln!(body, "    uint gb{index} = 0u;");
             }
-            let expression = match *op {
-                Op::Load(field) => self.metal_read("base", field),
-                Op::Index => "ulong(gid)".to_string(),
-                // Emitted above.
-                Op::Gather(_, _) => continue,
-                Op::Const(value) => format!("{value}ul"),
-                Op::Add(a, b) => format!("v{a} + v{b}"),
-                Op::Sub(a, b) => format!("v{a} - v{b}"),
-                Op::Mul(a, b) => format!("v{a} * v{b}"),
-                Op::And(a, b) => format!("v{a} & v{b}"),
-                Op::Or(a, b) => format!("v{a} | v{b}"),
-                Op::Xor(a, b) => format!("v{a} ^ v{b}"),
-                Op::Shl(a, b) => format!("v{a} << (v{b} & 63ul)"),
-                Op::Shr(a, b) => format!("v{a} >> (v{b} & 63ul)"),
-                Op::CmpEq(a, b) => format!("(v{a} == v{b}) ? 1ul : 0ul"),
-                Op::CmpLt(a, b) => format!("(v{a} < v{b}) ? 1ul : 0ul"),
-                Op::Select(c, a, b) => format!("(v{c} != 0ul) ? v{a} : v{b}"),
-            };
-            let _ = writeln!(body, "    ulong v{index} = {expression};");
+        }
+
+        let mut indent = 1usize;
+        for (index, op) in self.ops.iter().enumerate() {
+            let pad = "    ".repeat(indent);
+            match *op {
+                Op::Gather(at, field) => {
+                    let _ = writeln!(
+                        body,
+                        "{pad}g{index} = (v{at} >= (ulong)count) ? (count - 1u) : uint(v{at});"
+                    );
+                    let _ = writeln!(body, "{pad}gb{index} = g{index} * stride;");
+                    let _ = writeln!(
+                        body,
+                        "{pad}v{index} = {};",
+                        self.metal_read(&format!("gb{index}"), field)
+                    );
+                }
+                Op::Set(local, value) => {
+                    let _ = writeln!(body, "{pad}l{local} = v{value};");
+                    let _ = writeln!(body, "{pad}v{index} = v{value};");
+                }
+                Op::Repeat(trips) => {
+                    let _ = writeln!(
+                        body,
+                        "{pad}for (uint t{index} = 0u; t{index} < {trips}u; ++t{index}) {{"
+                    );
+                    indent += 1;
+                }
+                Op::EndRepeat => {
+                    // The closing brace belongs to the enclosing level, so the
+                    // indent drops before it is written rather than after.
+                    indent = indent.saturating_sub(1);
+                    let _ = writeln!(body, "{}}}", "    ".repeat(indent));
+                }
+                Op::BreakIf(cond) => {
+                    let _ = writeln!(body, "{pad}if (v{cond} != 0ul) break;");
+                }
+                _ => {
+                    let expression = match *op {
+                        Op::Load(field) => self.metal_read("base", field),
+                        Op::Index => "ulong(gid)".to_string(),
+                        Op::Const(value) => format!("{value}ul"),
+                        Op::Add(a, b) => format!("v{a} + v{b}"),
+                        Op::Sub(a, b) => format!("v{a} - v{b}"),
+                        Op::Mul(a, b) => format!("v{a} * v{b}"),
+                        Op::And(a, b) => format!("v{a} & v{b}"),
+                        Op::Or(a, b) => format!("v{a} | v{b}"),
+                        Op::Xor(a, b) => format!("v{a} ^ v{b}"),
+                        Op::Shl(a, b) => format!("v{a} << (v{b} & 63ul)"),
+                        Op::Shr(a, b) => format!("v{a} >> (v{b} & 63ul)"),
+                        Op::CmpEq(a, b) => format!("(v{a} == v{b}) ? 1ul : 0ul"),
+                        Op::CmpLt(a, b) => format!("(v{a} < v{b}) ? 1ul : 0ul"),
+                        Op::Select(c, a, b) => format!("(v{c} != 0ul) ? v{a} : v{b}"),
+                        Op::Get(local) => format!("l{local}"),
+                        // Handled above.
+                        Op::Gather(_, _)
+                        | Op::Set(_, _)
+                        | Op::Repeat(_)
+                        | Op::EndRepeat
+                        | Op::BreakIf(_) => unreachable!(),
+                    };
+                    let _ = writeln!(body, "{pad}v{index} = {expression};");
+                }
+            }
         }
 
         for store in &self.stores {
@@ -614,6 +966,24 @@ fn parse_op(parts: &[&str]) -> Result<Op, BodyError> {
         "cmpeq" => binary(Op::CmpEq),
         "cmplt" => binary(Op::CmpLt),
         "select" => Ok(Op::Select(number(1)?, number(2)?, number(3)?)),
+        "get" => Ok(Op::Get(number(1)?)),
+        "set" => binary(Op::Set),
+        "repeat" => Ok(Op::Repeat(number(1)?)),
+        "endrepeat" => Ok(Op::EndRepeat),
+        "breakif" => Ok(Op::BreakIf(number(1)?)),
         _ => Err(BodyError::Syntax),
     }
+}
+
+/// Whether `outer` is a prefix of `inner`, over loop-nesting stacks.
+///
+/// This is the escape rule. A stack is the chain of loops an instruction sits
+/// inside, outermost first, so one instruction can read another exactly when
+/// every loop enclosing the producer also encloses the consumer — otherwise the
+/// producer's loop has ended and its value belongs to an iteration that is
+/// over. Prefix rather than equality, because reading *out* of an enclosing
+/// scope into a loop body is fine: that value does not change while the loop
+/// runs.
+fn is_prefix(outer: &[usize], inner: &[usize]) -> bool {
+    outer.len() <= inner.len() && outer.iter().zip(inner).all(|(a, b)| a == b)
 }

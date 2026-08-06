@@ -63,7 +63,7 @@ fn word(bytes: &[u8], index: usize) -> u32 {
 #[test]
 fn the_example_module_parses_and_derives_its_strides() {
     let module = examples::module();
-    assert_eq!(module.programs().len(), 6);
+    assert_eq!(module.programs().len(), 8);
     assert_eq!(
         module.program(examples::DOUBLE_PLUS_ONE).unwrap().stride(),
         4
@@ -564,4 +564,350 @@ fn a_collective_whose_evaluator_no_backend_installed_is_refused() {
         &mut PlacementStats::default(),
     );
     assert!(matches!(result, Err(BackendError::UnsupportedEvaluator)));
+}
+
+// ---- loops ----------------------------------------------------------------
+
+/// A body's declared and evaluated results, for the loop examples.
+fn loop_program(id: u32) -> EvaluatorProgram {
+    examples::module()
+        .program(id)
+        .expect("the example module declares the loop bodies")
+        .clone()
+}
+
+#[test]
+fn a_loop_accumulates_across_iterations() {
+    let program = loop_program(examples::WINDOW_SUM);
+    // Ten elements, field 0 counting up. The window is eight wide and clamps
+    // at the end, so the last elements sum a run that repeats the final value
+    // — which is the same clamp rule a gather already had, now visible eight
+    // times in one body.
+    let inputs = array(&[
+        (1, 0),
+        (2, 0),
+        (3, 0),
+        (4, 0),
+        (5, 0),
+        (6, 0),
+        (7, 0),
+        (8, 0),
+        (9, 0),
+        (10, 0),
+    ]);
+    let out = evaluate_array(&program, &inputs);
+
+    let values: Vec<u32> = (1..=10).collect();
+    for element in 0..10usize {
+        let expected: u32 = (0..8)
+            .map(|step| values[(element + step).min(values.len() - 1)])
+            .sum();
+        assert_eq!(
+            at(&out, element, 1),
+            expected,
+            "element {element} summed its window wrongly"
+        );
+    }
+    // The null: without it, a body that returned its own field eight times
+    // would pass the loop above for the first element by coincidence.
+    assert_ne!(at(&out, 0, 1), at(&out, 1, 1));
+}
+
+#[test]
+fn a_loop_carries_nothing_but_its_locals() {
+    // Field 0 is untouched by the body, so the loop wrote only through its
+    // locals and the store. A body that leaked an iteration's value into the
+    // element would show up here.
+    let program = loop_program(examples::WINDOW_SUM);
+    let inputs = array(&[(3, 77), (4, 88)]);
+    let out = evaluate_array(&program, &inputs);
+    assert_eq!(at(&out, 0, 0), 3);
+    assert_eq!(at(&out, 1, 0), 4);
+}
+
+#[test]
+fn an_early_exit_leaves_on_a_different_iteration_per_element() {
+    let program = loop_program(examples::RUN_LENGTH);
+    // Runs of non-zero values of length 3, then 0, then 2, then 0.
+    let inputs = array(&[
+        (5, 0),
+        (6, 0),
+        (7, 0),
+        (0, 0),
+        (9, 0),
+        (8, 0),
+        (0, 0),
+        (0, 0),
+    ]);
+    let out = evaluate_array(&program, &inputs);
+
+    assert_eq!(at(&out, 0, 1), 3, "element 0 counts its own run");
+    assert_eq!(at(&out, 1, 1), 2);
+    assert_eq!(at(&out, 2, 1), 1);
+    assert_eq!(at(&out, 3, 1), 0, "an element that is itself zero counts none");
+    assert_eq!(at(&out, 4, 1), 2);
+    assert_eq!(at(&out, 5, 1), 1);
+    assert_eq!(at(&out, 6, 1), 0);
+
+    // This is the property the body exists to demonstrate: the elements did
+    // not all run the same number of iterations. Without it the body is just
+    // an expensive constant.
+    let counts: std::collections::BTreeSet<u32> =
+        (0..7).map(|element| at(&out, element, 1)).collect();
+    assert!(
+        counts.len() > 2,
+        "every element left on the same iteration, so nothing diverged: {counts:?}"
+    );
+}
+
+#[test]
+fn divergence_is_a_property_of_a_body_and_the_examples_disagree_about_it() {
+    let module = examples::module();
+    // The pre-loop bodies and the counted loop are lockstep across a cohort.
+    for id in [
+        examples::DOUBLE_PLUS_ONE,
+        examples::MIN_AND_XOR,
+        examples::NEIGHBOUR_MAX,
+        examples::WINDOW_SUM,
+    ] {
+        assert!(
+            module.program(id).unwrap().is_uniform(),
+            "{id} should be uniform"
+        );
+    }
+    // A static trip count is not divergence; leaving early is.
+    assert!(!module.program(examples::RUN_LENGTH).unwrap().is_uniform());
+}
+
+#[test]
+fn a_loops_worst_case_length_is_known_before_it_runs() {
+    let module = examples::module();
+    let straight = module.program(examples::MIN_AND_XOR).unwrap();
+    assert_eq!(straight.step_bound(), straight.ops().len() as u64);
+
+    // Eight iterations of a nine-instruction body plus the four instructions
+    // outside it: the bound multiplies rather than counts.
+    let looping = module.program(examples::WINDOW_SUM).unwrap();
+    assert!(
+        looping.step_bound() > looping.ops().len() as u64,
+        "the bound did not multiply out the loop"
+    );
+    assert!(looping.step_bound() <= soma::compiler::body::MAX_STEPS);
+}
+
+// ---- what the loop rules reject ------------------------------------------
+
+fn build(locals: u32, ops: Vec<Op>, stores: Vec<Store>) -> Result<EvaluatorProgram, BodyError> {
+    EvaluatorProgram::with_locals(
+        1,
+        "candidate",
+        ElementLayout::new(vec![FieldWidth::U32]),
+        locals,
+        ops,
+        stores,
+    )
+}
+
+#[test]
+fn a_loop_that_is_never_closed_is_rejected() {
+    assert_eq!(
+        build(
+            0,
+            vec![Op::Const(1), Op::Repeat(2), Op::Const(3)],
+            vec![Store { field: 0, value: 0 }],
+        ),
+        Err(BodyError::UnbalancedLoop)
+    );
+}
+
+#[test]
+fn closing_a_loop_that_was_never_opened_is_rejected() {
+    assert_eq!(
+        build(
+            0,
+            vec![Op::Const(1), Op::EndRepeat],
+            vec![Store { field: 0, value: 0 }],
+        ),
+        Err(BodyError::UnbalancedLoop)
+    );
+}
+
+#[test]
+fn leaving_a_loop_from_outside_every_loop_is_rejected() {
+    // There is nothing for it to leave. The language has no `return`, so this
+    // is a typo rather than a shorter way to write one.
+    assert_eq!(
+        build(
+            0,
+            vec![Op::Const(1), Op::BreakIf(0)],
+            vec![Store { field: 0, value: 0 }],
+        ),
+        Err(BodyError::UnbalancedLoop)
+    );
+}
+
+#[test]
+fn a_value_computed_inside_a_loop_cannot_be_read_after_it() {
+    // This is the rule that replaces phi nodes. Op 2's value belongs to
+    // whichever iteration produced it, so op 4 must not be able to name it —
+    // and neither may a store.
+    assert_eq!(
+        build(
+            0,
+            vec![
+                Op::Const(1),
+                Op::Repeat(3),
+                Op::Const(7),
+                Op::EndRepeat,
+                Op::Add(0, 2),
+            ],
+            vec![Store { field: 0, value: 4 }],
+        ),
+        Err(BodyError::EscapingValue)
+    );
+    assert_eq!(
+        build(
+            0,
+            vec![Op::Const(1), Op::Repeat(3), Op::Const(7), Op::EndRepeat],
+            vec![Store { field: 0, value: 2 }],
+        ),
+        Err(BodyError::EscapingValue)
+    );
+}
+
+#[test]
+fn the_null_is_that_a_local_carries_the_same_value_out_legally() {
+    // Otherwise the rejection above would read as "a loop cannot produce
+    // anything", which is not what it says.
+    let program = build(
+        1,
+        vec![
+            Op::Const(7),
+            Op::Repeat(3),
+            Op::Const(7),
+            Op::Set(0, 2),
+            Op::EndRepeat,
+            Op::Get(0),
+        ],
+        vec![Store { field: 0, value: 5 }],
+    )
+    .expect("a local may carry a value out of a loop");
+    let out = evaluate(&program, &7u32.to_le_bytes());
+    assert_eq!(word(&out, 0), 7);
+}
+
+#[test]
+fn reading_an_enclosing_scopes_value_from_inside_a_loop_is_allowed() {
+    // The escape rule is a prefix test, not an equality test: a value computed
+    // before the loop does not change while the loop runs, so reading it in is
+    // fine. Equality would have made loops nearly useless.
+    let program = build(
+        1,
+        vec![
+            Op::Const(5),
+            Op::Repeat(3),
+            Op::Get(0),
+            Op::Add(2, 0),
+            Op::Set(0, 3),
+            Op::EndRepeat,
+            Op::Get(0),
+        ],
+        vec![Store { field: 0, value: 6 }],
+    )
+    .expect("a loop body may read a value from outside the loop");
+    let out = evaluate(&program, &0u32.to_le_bytes());
+    assert_eq!(word(&out, 0), 15);
+}
+
+#[test]
+fn a_local_outside_the_declared_set_is_rejected() {
+    assert_eq!(
+        build(
+            1,
+            vec![Op::Const(1), Op::Set(4, 0)],
+            vec![Store { field: 0, value: 0 }],
+        ),
+        Err(BodyError::LocalOutOfRange)
+    );
+}
+
+#[test]
+fn a_loop_with_no_iterations_is_rejected() {
+    assert_eq!(
+        build(
+            0,
+            vec![Op::Const(1), Op::Repeat(0), Op::Const(2), Op::EndRepeat],
+            vec![Store { field: 0, value: 0 }],
+        ),
+        Err(BodyError::EmptyLoop)
+    );
+}
+
+#[test]
+fn a_body_whose_unrolled_length_exceeds_the_bound_is_rejected() {
+    // Totality is the reason the trip count is static, so the check that it
+    // buys something has to exist. Three nested loops of 2048 multiply past
+    // MAX_STEPS; the same body with one fewer level is accepted, which is the
+    // null showing the rejection is about the bound and not about nesting.
+    let ops = |levels: usize| {
+        let mut ops = vec![Op::Const(1)];
+        for _ in 0..levels {
+            ops.push(Op::Repeat(2048));
+        }
+        ops.push(Op::Const(2));
+        for _ in 0..levels {
+            ops.push(Op::EndRepeat);
+        }
+        ops
+    };
+    assert_eq!(
+        build(0, ops(3), vec![Store { field: 0, value: 0 }]),
+        Err(BodyError::Unbounded)
+    );
+    assert!(build(0, ops(1), vec![Store { field: 0, value: 0 }]).is_ok());
+}
+
+#[test]
+fn a_nested_loop_runs_the_product_of_its_trip_counts() {
+    let program = build(
+        1,
+        vec![
+            Op::Const(1),
+            Op::Repeat(3),
+            Op::Repeat(4),
+            Op::Get(0),
+            Op::Add(3, 0),
+            Op::Set(0, 4),
+            Op::EndRepeat,
+            Op::EndRepeat,
+            Op::Get(0),
+        ],
+        vec![Store { field: 0, value: 8 }],
+    )
+    .expect("nested loops validate");
+    let out = evaluate(&program, &0u32.to_le_bytes());
+    assert_eq!(word(&out, 0), 12);
+}
+
+#[test]
+fn the_generated_metal_declares_its_values_before_its_loops() {
+    // A `ulong v7` declared inside a C loop body stops existing at the closing
+    // brace, which would make a local's whole purpose unreachable. The check
+    // is textual because the alternative is a GPU, and the GPU check exists in
+    // `tests/metal_backend.rs` behind a feature.
+    let source = examples::module()
+        .program(examples::WINDOW_SUM)
+        .unwrap()
+        .metal_source();
+    let first_declaration = source.find("ulong v0").expect("values are declared");
+    let first_loop = source.find("for (uint t").expect("the loop is emitted");
+    assert!(
+        first_declaration < first_loop,
+        "a value was declared inside the loop that uses it"
+    );
+    assert!(source.contains("l0 = "), "locals are assigned");
+    assert!(
+        source.matches('{').count() == source.matches('}').count(),
+        "the generated kernel's braces do not balance:\n{source}"
+    );
 }

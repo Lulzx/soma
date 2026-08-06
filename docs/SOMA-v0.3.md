@@ -234,10 +234,19 @@ which is not evidence about a compiler.
 `compiler::body` defines a deliberately small one, because the property under
 test is placement-independent publication, not language design:
 
-- **Pure and total.** No allocation, no division (which would be partial), no
-  loops. Every program terminates in a fixed number of steps decided at
-  validation time. An out-of-range `gather` clamps to the last element rather
-  than faulting, so totality survives a computed index.
+- **Pure and total.** No allocation and no division (which would be partial).
+  Every program terminates in a number of steps decided at validation time:
+  `step_bound` multiplies out the loop nesting and `MAX_STEPS` is the ceiling.
+  Two rules keep that true where it would usually fail — an out-of-range
+  `gather` clamps to the last element rather than faulting, and a loop's trip
+  count is a constant rather than an expression.
+
+  Totality is not a preference. `kernel/epochs.rs` checks a continuation's step
+  budget before dispatch and a collective evaluation is one step of one
+  continuation, so a body that might not terminate makes that check
+  meaningless. That is the constraint a data-dependent trip count would break,
+  and `breakif` is what gives back the useful half of one: leaving a loop early
+  can only lower the count, so the static bound still holds.
 - **One output element per input element.** A reduction is a different
   collective, not a different body. `gather` widens what a body may *read* to
   any element of the frozen input array — `index` supplies its own position, so
@@ -253,13 +262,30 @@ test is placement-independent publication, not language design:
   a reason to pay for it.
 - **Typed against a declared layout.** Reading or writing outside the declared
   element is a validation error, so an invalid body cannot reach a backend.
-- **Branch-free.** `select` is the only control flow, so a cohort of lanes
-  executing one body never diverges. `index` and `gather` do not change this:
-  lanes reading different *addresses* still execute identical instructions in
-  identical order, which is what a uniform-dispatch executive requires.
-  Edge handling is therefore the body's job — `examples::neighbour_max`
-  substitutes its own index at position zero with a `select`, because `0 - 1`
-  wraps and would otherwise clamp to the far end of the array.
+- **Loops carry state in locals, not in values.** SSA and back edges need phi
+  nodes, and "an instruction names an earlier instruction" stops meaning
+  anything once an instruction can run twice. So a value computed inside a loop
+  is visible only within the iteration that computed it — validation rejects a
+  reference that escapes one, including from a `store` — and `get`/`set` over
+  declared locals are how anything outlives an iteration. The escape rule is a
+  prefix test on loop nesting rather than an equality test, so reading a value
+  from an enclosing scope *into* a loop stays legal; that value does not change
+  while the loop runs.
+- **Branch-free is a property of a body, not of the language.** It used to be
+  both, because `select` was the only conditional. `breakif` can put two lanes
+  of a cohort on different iterations, so `is_uniform` is a question a
+  scheduler asks about a body rather than an answer the language guarantees.
+
+  Divergence costs occupancy and not correctness: both lowerings still agree,
+  and I20 checks that on hardware for a body whose lanes leave on different
+  iterations (`examples::run_length`). A counted `repeat` is *not* divergence —
+  every lane runs the same iterations — and neither are `index` and `gather`,
+  where lanes reading different addresses still execute identical instructions
+  in identical order.
+
+  Edge handling remains the body's job. `examples::neighbour_max` substitutes
+  its own index at position zero with a `select`, because `0 - 1` wraps and
+  would otherwise clamp to the far end of the array.
 
 Arithmetic wraps on `u64` and truncates to the field width on store; shifts mask
 their amount to 6 bits. Both rules exist so the CPU interpreter and the

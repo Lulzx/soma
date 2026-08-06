@@ -186,6 +186,17 @@ Added in v0.3:
   neighbours read) are the checked cases. This does *not* make ant sensing
   expressible — see `experiments/ant_scoring.rs` for why that is now a
   collective-level limit rather than a language one.
+- Loops. `repeat` takes a trip count fixed at validation time, `breakif`
+  leaves the innermost one early, and `get`/`set` over declared locals are how
+  a value outlives an iteration -- values computed inside a loop do not escape
+  it, which is the rule that replaces phi nodes. Totality survives because the
+  trip count is static: `step_bound` multiplies out the nesting and `MAX_STEPS`
+  is the ceiling, so a body's worst case is still known before it runs, which
+  is what the continuation step budget needs. Branch-freedom stopped being a
+  property of the language and became `is_uniform`, a property of a body: a
+  counted loop is uniform, a `breakif` is not, and divergence costs occupancy
+  rather than correctness. `examples::WINDOW_SUM` and `examples::RUN_LENGTH`
+  are the checked cases, both agreeing with the CPU interpreter on real Metal.
 - An effect log (I24). A step no longer writes a runnable bin; it produces the
   entries it wants and the kernel applies them, in the order the plan puts the
   producing lanes in. `Scheduler::enqueue` demands a token only the applier can

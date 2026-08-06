@@ -98,6 +98,13 @@ fn every_example_body_agrees_between_metal_and_the_cpu_interpreter() {
         // is being checked on as much as the read.
         examples::NEIGHBOUR_MAX,
         examples::PERMUTE,
+        // The loop bodies. `WINDOW_SUM` is uniform, so the GPU runs eight
+        // identical iterations per lane; `RUN_LENGTH` is not, and its lanes
+        // leave the loop on different iterations. Agreement on the second is
+        // the one worth having -- it is where a lowering that got the break
+        // condition or the iteration count off by one stops matching.
+        examples::WINDOW_SUM,
+        examples::RUN_LENGTH,
     ] {
         // Batch large enough to reach the accelerator.
         let (gpu_bytes, gpu_trace, gpu_stats) = run(evaluator, 8, 1, &mut metal, &mut cpu);
@@ -184,6 +191,8 @@ fn a_reused_buffer_does_not_leak_the_previous_batch_into_a_smaller_one() {
         // `count` would clamp against the wrong end of the array.
         examples::NEIGHBOUR_MAX,
         examples::PERMUTE,
+        examples::WINDOW_SUM,
+        examples::RUN_LENGTH,
     ] {
         metal
             .evaluate(evaluator, &long, 64, stride)

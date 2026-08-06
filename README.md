@@ -268,7 +268,9 @@ Implemented now:
 Not implemented:
 
 - A general-purpose language or compiler for arbitrary evaluator bodies. Bodies
-  gather now, but there are still no loops, no calls, no floating point, and no
+  gather and loop now — counted `repeat`, early `breakif`, and mutable locals,
+  with a validation-time bound on the unrolled length so totality and the step
+  budget survive — but there are still no calls, no floating point, and no
   surface syntax above the `op` lines. A collective also binds one input array,
   so a body can read any element of its own array and cannot name a second one
 - A concurrent, device-resident scheduler/executive, or a distributed backend.
