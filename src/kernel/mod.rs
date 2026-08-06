@@ -175,6 +175,39 @@ impl ContinuationSpec {
     }
 }
 
+/// A second, read-only array bound to a `BatchEvaluate`.
+///
+/// Zero `element_stride` means nothing is bound. That spelling travels
+/// unchanged from here through the collective descriptor to the backend
+/// boundary and on into the Metal buffer bindings, so "not bound" has one
+/// representation rather than four that have to be kept agreeing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuxBinding {
+    pub inputs: Ref64,
+    pub element_count: u32,
+    pub element_stride: u32,
+}
+
+impl AuxBinding {
+    pub const NONE: AuxBinding = AuxBinding {
+        inputs: Ref64::NULL,
+        element_count: 0,
+        element_stride: 0,
+    };
+
+    pub fn new(inputs: Ref64, element_count: u32, element_stride: u32) -> Self {
+        Self {
+            inputs,
+            element_count,
+            element_stride,
+        }
+    }
+
+    pub fn is_bound(&self) -> bool {
+        self.element_stride != 0
+    }
+}
+
 /// One comparable row of a trace snapshot (§21). Two runs are identical exactly
 /// when their snapshot vectors are equal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2734,8 +2767,39 @@ impl Kernel {
         element_count: u32,
         element_stride: u32,
     ) -> Result<(Ref64, Ref64), RuntimeError> {
+        self.create_batch_evaluate_bound(
+            actor,
+            evaluator_id,
+            inputs,
+            element_count,
+            element_stride,
+            AuxBinding::NONE,
+        )
+    }
+
+    /// Create a `BatchEvaluate` binding a second, read-only array.
+    ///
+    /// The second array is authorized and frozen on exactly the same terms as
+    /// the first, and that is the point rather than a convenience. A body
+    /// gathering from an array it does not hold READ on would be a capability
+    /// hole, and one gathering from an array that is not frozen would make the
+    /// published result depend on when the collective ran — which is I19, and
+    /// is the reason the first array was escrowed this way to begin with.
+    pub fn create_batch_evaluate_bound(
+        &mut self,
+        actor: Ref64,
+        evaluator_id: u32,
+        inputs: Ref64,
+        element_count: u32,
+        element_stride: u32,
+        aux: AuxBinding,
+    ) -> Result<(Ref64, Ref64), RuntimeError> {
         self.authorize(actor, crate::abi::Rights::READ, inputs)?;
         self.validate_frozen_array(inputs, element_count, element_stride)?;
+        if aux.is_bound() {
+            self.authorize(actor, crate::abi::Rights::READ, aux.inputs)?;
+            self.validate_frozen_array(aux.inputs, aux.element_count, aux.element_stride)?;
+        }
         let completion = self.create_future(actor);
         let collective = self.collectives.alloc(CollectiveDescriptor::batch_evaluate(
             actor,
@@ -2745,7 +2809,13 @@ impl Kernel {
             element_stride,
             completion,
         ));
-        self.collectives.get_mut(collective)?.id = collective;
+        {
+            let descriptor = self.collectives.get_mut(collective)?;
+            descriptor.id = collective;
+            descriptor.aux_inputs = aux.inputs;
+            descriptor.aux_count = aux.element_count;
+            descriptor.aux_stride = aux.element_stride;
+        }
         self.mint_genesis(actor, collective, 0, 0);
         self.trace(
             EventKind::CollectiveCreated,
@@ -2826,6 +2896,20 @@ impl Kernel {
 
     pub fn collective_module(&self, collective: Ref64) -> Result<Ref64, RuntimeError> {
         Ok(self.collectives.get(collective)?.module)
+    }
+
+    /// The second array a `BatchEvaluate` binds, if any.
+    ///
+    /// Separate from `batch_evaluate_request` rather than widening its tuple,
+    /// because every caller that does not gather from a second array would
+    /// otherwise grow three fields it discards.
+    pub fn batch_evaluate_aux(&self, collective: Ref64) -> Result<AuxBinding, RuntimeError> {
+        let descriptor = self.collectives.get(collective)?;
+        Ok(AuxBinding {
+            inputs: descriptor.aux_inputs,
+            element_count: descriptor.aux_count,
+            element_stride: descriptor.aux_stride,
+        })
     }
 
     pub fn batch_evaluate_request(

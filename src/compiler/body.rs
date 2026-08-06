@@ -210,6 +210,26 @@ pub enum Op {
     Repeat(u32),
     /// Close the innermost open [`Op::Repeat`].
     EndRepeat,
+    /// Read a field of an element of the *second* bound array:
+    /// `GatherAux(index, field)` reads `field` of the aux element at the value
+    /// of instruction `index`.
+    ///
+    /// `Gather` widened what a body may read from its own element to any
+    /// element of its own array. This widens it to an array that is not the
+    /// one it is iterating. That is the difference between a stencil and a
+    /// lookup, and it is the whole reason ant sensing could not be expressed:
+    /// a colony's elements are ants and the thing being sensed is the trail
+    /// grid, which is a different array with a different layout and a
+    /// different length.
+    ///
+    /// It obeys every rule `Gather` obeys and for the same reasons. The aux
+    /// array is frozen and read-only, so no lane can observe another lane's
+    /// store and I19 survives. An out-of-range index clamps to the last aux
+    /// element, so totality survives a computed index. The field is static and
+    /// checked at validation against the *aux* layout, which is declared
+    /// separately — an element of the input array and an element of the aux
+    /// array have no reason to have the same shape.
+    GatherAux(u32, u32),
     /// Leave the innermost enclosing loop when the operand is non-zero.
     ///
     /// This is real divergence: two lanes of a cohort can leave on different
@@ -238,7 +258,7 @@ impl Op {
             Op::Get(_) | Op::Repeat(_) | Op::EndRepeat => Vec::new(),
             Op::Set(_, value) => vec![value],
             Op::BreakIf(cond) => vec![cond],
-            Op::Gather(index, _) => vec![index],
+            Op::Gather(index, _) | Op::GatherAux(index, _) => vec![index],
             Op::Add(a, b)
             | Op::Sub(a, b)
             | Op::Mul(a, b)
@@ -267,6 +287,14 @@ pub struct EvaluatorProgram {
     id: u32,
     name: String,
     layout: ElementLayout,
+    /// The element layout of the second bound array, when the body names one.
+    ///
+    /// `None` is a body that binds one array, which is every body written
+    /// before `GatherAux` existed. It is deliberately a separate layout rather
+    /// than a reuse of `layout`: the aux array is a different array, and
+    /// forcing it to share an element shape would have made the one workload
+    /// this exists for -- ants indexing a trail grid -- inexpressible again.
+    aux: Option<ElementLayout>,
     locals: u32,
     ops: Vec<Op>,
     stores: Vec<Store>,
@@ -294,6 +322,11 @@ pub enum BodyError {
     /// A `repeat` was never closed, an `endrepeat` closed nothing, or a
     /// `breakif` sat outside every loop.
     UnbalancedLoop,
+    /// A `gatheraux` appeared in a body that declares no aux layout, or an
+    /// `aux` layout was declared and never read. Both directions are errors:
+    /// the first has no array to read and the second binds an array the body
+    /// cannot name, which a caller would have had to freeze for nothing.
+    AuxMismatch,
     /// A `repeat` declared no iterations. Zero is not obviously wrong, but it
     /// makes the ops it encloses dead, and a body containing instructions that
     /// provably never run is more likely a mistake than an intention.
@@ -327,10 +360,25 @@ impl EvaluatorProgram {
         ops: Vec<Op>,
         stores: Vec<Store>,
     ) -> Result<Self, BodyError> {
+        Self::bound(id, name, layout, None, locals, ops, stores)
+    }
+
+    /// The full form: an element layout, an optional second array's layout,
+    /// locals, instructions, and stores.
+    pub fn bound(
+        id: u32,
+        name: impl Into<String>,
+        layout: ElementLayout,
+        aux: Option<ElementLayout>,
+        locals: u32,
+        ops: Vec<Op>,
+        stores: Vec<Store>,
+    ) -> Result<Self, BodyError> {
         let program = Self {
             id,
             name: name.into(),
             layout,
+            aux,
             locals,
             ops,
             stores,
@@ -363,6 +411,17 @@ impl EvaluatorProgram {
             // load's is. Only the element index is dynamic, and that clamps.
             if let Op::Load(field) | Op::Gather(_, field) = op {
                 if *field >= field_count {
+                    return Err(BodyError::FieldOutOfRange);
+                }
+            }
+            // The aux field is static and checked against the *aux* layout,
+            // exactly as a load's is checked against the element layout. Only
+            // the aux element index is dynamic, and that clamps.
+            if let Op::GatherAux(_, field) = op {
+                let Some(aux) = &self.aux else {
+                    return Err(BodyError::AuxMismatch);
+                };
+                if *field >= aux.fields().len() as u32 {
                     return Err(BodyError::FieldOutOfRange);
                 }
             }
@@ -399,6 +458,19 @@ impl EvaluatorProgram {
             // where the consumer is not an instruction.
             if !regions[store.value as usize].is_empty() {
                 return Err(BodyError::EscapingValue);
+            }
+        }
+
+        // An aux layout nobody reads means a caller has to freeze and bind an
+        // array the body cannot name. The collective would be well-formed and
+        // the binding would be dead, which is the kind of thing that survives
+        // for a year because nothing is wrong with it.
+        if self.aux.is_some() && !self.ops.iter().any(|op| matches!(op, Op::GatherAux(_, _))) {
+            return Err(BodyError::AuxMismatch);
+        }
+        if let Some(aux) = &self.aux {
+            if aux.fields().is_empty() {
+                return Err(BodyError::EmptyLayout);
             }
         }
 
@@ -494,6 +566,25 @@ impl EvaluatorProgram {
         self.locals
     }
 
+    /// The second array's element layout, when this body names one.
+    pub fn aux_layout(&self) -> Option<&ElementLayout> {
+        self.aux.as_ref()
+    }
+
+    /// The second array's element stride, or zero when no second array is
+    /// bound. Zero is the "not bound" signal everywhere this travels, which is
+    /// why it is a stride rather than an `Option` at the backend boundary: a
+    /// zero-stride array has no elements to read by construction.
+    pub fn aux_stride(&self) -> u32 {
+        self.aux.as_ref().map(|aux| aux.stride()).unwrap_or(0)
+    }
+
+    /// Whether this body reads a second array, and so whether a collective
+    /// using it must bind one.
+    pub fn binds_aux(&self) -> bool {
+        self.aux.is_some()
+    }
+
     pub fn id(&self) -> u32 {
         self.id
     }
@@ -554,6 +645,21 @@ impl EvaluatorProgram {
     /// read the output array, so calling this for the elements of one array in
     /// any order — or concurrently — produces the same bytes.
     pub fn evaluate_at(&self, inputs: &[u8], count: u32, index: u32, output: &mut [u8]) {
+        self.evaluate_bound(Arrays::of(inputs, count), index, output)
+    }
+
+    /// Evaluate the element at `index`, with both arrays supplied.
+    ///
+    /// `evaluate_at` is this with no second array bound, which is what every
+    /// body written before `GatherAux` needs and is the overwhelmingly common
+    /// case. A body that gathers from an array it was not given reads zeroes
+    /// rather than faulting, for the same reason an out-of-range gather clamps
+    /// rather than faulting: this language is total, and a backend handed a
+    /// malformed request rejects it at the boundary (`InvalidInput`) instead of
+    /// the interpreter trapping in the middle of an element.
+    pub fn evaluate_bound(&self, arrays: Arrays<'_>, index: u32, output: &mut [u8]) {
+        let inputs = arrays.inputs;
+        let count = arrays.count;
         let stride = self.stride() as usize;
         let own = (index as usize).saturating_mul(stride);
         let input = inputs.get(own..own + stride).unwrap_or(&[]);
@@ -577,6 +683,16 @@ impl EvaluatorProgram {
                 Op::Gather(at, field) => {
                     self.gather_field(inputs, stride, count, values[at as usize], field)
                 }
+                Op::GatherAux(at, field) => match &self.aux {
+                    Some(layout) => read_clamped(
+                        arrays.aux,
+                        layout,
+                        arrays.aux_count,
+                        values[at as usize],
+                        field,
+                    ),
+                    None => 0,
+                },
                 Op::Const(value) => value,
                 Op::Add(a, b) => values[a as usize].wrapping_add(values[b as usize]),
                 Op::Sub(a, b) => values[a as usize].wrapping_sub(values[b as usize]),
@@ -670,29 +786,12 @@ impl EvaluatorProgram {
     /// generated MSL also has in hand. A backend that clamped against its own
     /// buffer length could disagree with this one whenever a buffer is larger
     /// than the element count it was dispatched with.
-    fn gather_field(&self, inputs: &[u8], stride: usize, count: u32, at: u64, field: u32) -> u64 {
-        if count == 0 {
-            return 0;
-        }
-        let last = u64::from(count - 1);
-        let clamped = if at > last { last } else { at } as usize;
-        let base = clamped.saturating_mul(stride);
-        let element = inputs.get(base..base + stride).unwrap_or(&[]);
-        self.read_field(element, field)
+    fn gather_field(&self, inputs: &[u8], _stride: usize, count: u32, at: u64, field: u32) -> u64 {
+        read_clamped(inputs, &self.layout, count, at, field)
     }
 
     fn read_field(&self, element: &[u8], field: u32) -> u64 {
-        let (Some(offset), Some(width)) = (self.layout.offset(field), self.layout.width(field))
-        else {
-            return 0;
-        };
-        let mut value = 0u64;
-        for byte in 0..width.bytes() {
-            let index = (offset + byte) as usize;
-            let byte_value = element.get(index).copied().unwrap_or(0) as u64;
-            value |= byte_value << (8 * byte);
-        }
-        value
+        read_element_field(element, &self.layout, field)
     }
 
     fn write_field(&self, element: &mut [u8], field: u32, value: u64) {
@@ -728,6 +827,7 @@ impl EvaluatorProgram {
         let mut ops = Vec::new();
         let mut stores = Vec::new();
         let mut locals = 0u32;
+        let mut aux: Vec<FieldWidth> = Vec::new();
 
         for line in lines {
             let parts: Vec<&str> = line.split_whitespace().collect();
@@ -737,6 +837,12 @@ impl EvaluatorProgram {
                         return Err(BodyError::Syntax);
                     }
                     fields.push(FieldWidth::parse(parts[1]).ok_or(BodyError::Syntax)?);
+                }
+                Some("aux") => {
+                    if parts.len() != 2 {
+                        return Err(BodyError::Syntax);
+                    }
+                    aux.push(FieldWidth::parse(parts[1]).ok_or(BodyError::Syntax)?);
                 }
                 Some("locals") => {
                     if parts.len() != 2 {
@@ -767,7 +873,16 @@ impl EvaluatorProgram {
             }
         }
 
-        EvaluatorProgram::with_locals(id, name, ElementLayout::new(fields), locals, ops, stores)
+        let aux = (!aux.is_empty()).then(|| ElementLayout::new(aux));
+        EvaluatorProgram::bound(
+            id,
+            name,
+            ElementLayout::new(fields),
+            aux,
+            locals,
+            ops,
+            stores,
+        )
     }
 
     /// Generate a Metal Shading Language kernel for this body.
@@ -783,6 +898,16 @@ impl EvaluatorProgram {
         let _ = writeln!(body, "    device uchar* output [[buffer(1)]],");
         let _ = writeln!(body, "    constant uint& count [[buffer(2)]],");
         let _ = writeln!(body, "    constant uint& stride [[buffer(3)]],");
+        // The second array's three parameters exist only when the body reads
+        // one. Emitting them unconditionally would mean binding a placeholder
+        // buffer for every body that does not gather from an aux array, which
+        // is nearly all of them; a backend knows which case it is in because it
+        // has the program installed.
+        if self.aux.is_some() {
+            let _ = writeln!(body, "    device const uchar* aux [[buffer(4)]],");
+            let _ = writeln!(body, "    constant uint& aux_count [[buffer(5)]],");
+            let _ = writeln!(body, "    constant uint& aux_stride [[buffer(6)]],");
+        }
         let _ = writeln!(body, "    uint gid [[thread_position_in_grid]])");
         let _ = writeln!(body, "{{");
         let _ = writeln!(body, "    if (gid >= count) return;");
@@ -810,7 +935,7 @@ impl EvaluatorProgram {
         // read, and recomputing it per byte would emit a kernel quadratic in
         // the field width.
         for (index, op) in self.ops.iter().enumerate() {
-            if matches!(op, Op::Gather(_, _)) {
+            if matches!(op, Op::Gather(_, _) | Op::GatherAux(_, _)) {
                 let _ = writeln!(body, "    uint g{index} = 0u;");
                 let _ = writeln!(body, "    uint gb{index} = 0u;");
             }
@@ -830,6 +955,23 @@ impl EvaluatorProgram {
                         body,
                         "{pad}v{index} = {};",
                         self.metal_read(&format!("gb{index}"), field)
+                    );
+                }
+                Op::GatherAux(at, field) => {
+                    let _ = writeln!(
+                        body,
+                        "{pad}g{index} = (v{at} >= (ulong)aux_count) ? (aux_count - 1u) : uint(v{at});"
+                    );
+                    let _ = writeln!(body, "{pad}gb{index} = g{index} * aux_stride;");
+                    let _ = writeln!(
+                        body,
+                        "{pad}v{index} = {};",
+                        self.metal_read_from(
+                            "aux",
+                            self.aux.as_ref(),
+                            &format!("gb{index}"),
+                            field
+                        )
                     );
                 }
                 Op::Set(local, value) => {
@@ -874,6 +1016,7 @@ impl EvaluatorProgram {
                         | Op::Set(_, _)
                         | Op::Repeat(_)
                         | Op::EndRepeat
+                        | Op::GatherAux(_, _)
                         | Op::BreakIf(_) => unreachable!(),
                     };
                     let _ = writeln!(body, "{pad}v{index} = {expression};");
@@ -903,12 +1046,36 @@ impl EvaluatorProgram {
     /// endianness to drift away from `read_field`, and only one of them would
     /// be the one I20 happened to exercise.
     fn metal_read(&self, base: &str, field: u32) -> String {
-        let (Some(offset), Some(width)) = (self.layout.offset(field), self.layout.width(field))
-        else {
+        self.metal_read_from("input", Some(&self.layout), base, field)
+    }
+
+    /// The same byte assembly against a named buffer and layout.
+    ///
+    /// A load, a gather and an aux gather differ only in which buffer they
+    /// index and from which offset; sharing the assembly is what stops the
+    /// endianness drifting between them, and only one of three copies would be
+    /// the one I20's examples happened to exercise.
+    fn metal_read_from(
+        &self,
+        buffer: &str,
+        layout: Option<&ElementLayout>,
+        base: &str,
+        field: u32,
+    ) -> String {
+        let (Some(offset), Some(width)) = (
+            layout.and_then(|l| l.offset(field)),
+            layout.and_then(|l| l.width(field)),
+        ) else {
             return "0ul".to_string();
         };
         (0..width.bytes())
-            .map(|byte| format!("(ulong(input[{base} + {}]) << {})", offset + byte, 8 * byte))
+            .map(|byte| {
+                format!(
+                    "(ulong({buffer}[{base} + {}]) << {})",
+                    offset + byte,
+                    8 * byte
+                )
+            })
             .collect::<Vec<_>>()
             .join(" | ")
     }
@@ -933,6 +1100,76 @@ impl EvaluatorProgram {
     }
 }
 
+/// The arrays one evaluation reads.
+///
+/// A body always has an input array — the one whose elements it is iterating
+/// and whose element it writes — and may have a second, read-only one it
+/// gathers from. Bundling them keeps the interpreter's signature from growing
+/// a parameter every time a binding is added, and keeps the "not bound" case
+/// spelled one way.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Arrays<'a> {
+    pub inputs: &'a [u8],
+    pub count: u32,
+    pub aux: &'a [u8],
+    pub aux_count: u32,
+}
+
+impl<'a> Arrays<'a> {
+    /// One array, no second binding.
+    pub fn of(inputs: &'a [u8], count: u32) -> Self {
+        Self {
+            inputs,
+            count,
+            aux: &[],
+            aux_count: 0,
+        }
+    }
+
+    pub fn with_aux(mut self, aux: &'a [u8], aux_count: u32) -> Self {
+        self.aux = aux;
+        self.aux_count = aux_count;
+        self
+    }
+}
+
+/// Read `field` of the element at `at` in `bytes`, clamping `at` to the last
+/// element.
+///
+/// Shared by `Gather` and `GatherAux` so the clamp cannot drift between them —
+/// two copies of this rule would be two places for the two lowerings to
+/// disagree, and I20 would only be exercising whichever one the examples
+/// happened to use.
+///
+/// The clamp compares against `count` rather than against `bytes.len() /
+/// stride` so that it depends only on values the generated MSL also has in
+/// hand. A backend clamping against its own buffer length could disagree
+/// whenever a buffer is larger than the count it was dispatched with.
+fn read_clamped(bytes: &[u8], layout: &ElementLayout, count: u32, at: u64, field: u32) -> u64 {
+    if count == 0 {
+        return 0;
+    }
+    let stride = layout.stride() as usize;
+    let last = u64::from(count - 1);
+    let clamped = if at > last { last } else { at } as usize;
+    let base = clamped.saturating_mul(stride);
+    let element = bytes.get(base..base + stride).unwrap_or(&[]);
+    read_element_field(element, layout, field)
+}
+
+fn read_element_field(element: &[u8], layout: &ElementLayout, field: u32) -> u64 {
+    let (Some(offset), Some(width)) = (layout.offset(field), layout.width(field)) else {
+        return 0;
+    };
+    let mut value = 0u64;
+    for byte in 0..width.bytes() {
+        let index = (offset + byte) as usize;
+        let byte_value = element.get(index).copied().unwrap_or(0) as u64;
+        value |= byte_value << (8 * byte);
+    }
+    value
+}
+
 fn parse_op(parts: &[&str]) -> Result<Op, BodyError> {
     let number = |index: usize| -> Result<u32, BodyError> {
         parts
@@ -941,13 +1178,13 @@ fn parse_op(parts: &[&str]) -> Result<Op, BodyError> {
             .parse()
             .map_err(|_| BodyError::Syntax)
     };
-    let binary = |make: fn(u32, u32) -> Op| -> Result<Op, BodyError> {
-        Ok(make(number(1)?, number(2)?))
-    };
+    let binary =
+        |make: fn(u32, u32) -> Op| -> Result<Op, BodyError> { Ok(make(number(1)?, number(2)?)) };
     match parts.first().copied().ok_or(BodyError::Syntax)? {
         "load" => Ok(Op::Load(number(1)?)),
         "index" => Ok(Op::Index),
         "gather" => Ok(Op::Gather(number(1)?, number(2)?)),
+        "gatheraux" => Ok(Op::GatherAux(number(1)?, number(2)?)),
         "const" => Ok(Op::Const(
             parts
                 .get(1)

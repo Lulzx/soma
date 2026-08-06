@@ -30,6 +30,16 @@ pub struct CollectiveDescriptor {
     pub outputs: Ref64,
     pub element_count: u32,
     pub element_stride: u32,
+    /// A second, read-only array the evaluator body gathers from.
+    ///
+    /// `NULL` with a zero stride is a collective binding one array, which is
+    /// every collective whose body has no `gatheraux`. The binding is part of
+    /// the collective rather than of the call because it is what the capability
+    /// escrow freezes: an array a body reads has to be frozen for as long as
+    /// the collective can run, and there is nowhere else that knows both facts.
+    pub aux_inputs: Ref64,
+    pub aux_count: u32,
+    pub aux_stride: u32,
     pub completion_future: Ref64,
 }
 
@@ -54,6 +64,9 @@ impl CollectiveDescriptor {
             outputs: Ref64::NULL,
             element_count,
             element_stride,
+            aux_inputs: Ref64::NULL,
+            aux_count: 0,
+            aux_stride: 0,
             completion_future,
         }
     }

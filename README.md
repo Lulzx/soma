@@ -80,12 +80,17 @@ repository — computed from how continuations group, not measured on silicon.
 Clicking *predator* fails an entire colony at epoch 150. One hundred processes
 fail, one hundred terminal notices are delivered, the population settles at
 9,900, and the other ninety-nine colonies are untouched -- with occupancy and
-dispatch count unchanged, because containment is not a scheduling event. `experiments/ant_scoring.rs` lifts the movement-scoring decision into a
-batch evaluator that runs on real Metal hardware under `--features metal`; the
-neighbourhood *gather* stays on the CPU. The body language can express a gather
-now — `gather` reads any element of the frozen input array — but sensing reads
-the trail *grid*, and a `BatchEvaluate` binds one input array, the one the ants
-are elements of. A body can reach any ant and has no name for the grid.
+dispatch count unchanged, because containment is not a scheduling event.
+
+`experiments/ant_scoring.rs` lifts movement into a batch evaluator that runs on
+real Metal hardware under `--features metal` — including the neighbourhood
+*gather*, which used to stay on the CPU. Sensing reads the trail grid, and that
+took two things: `gather`/`index`, so a body can read an element other than its
+own, and a second array binding, so it can name an array other than the one it
+is iterating. `ant_sense_and_score` does the eight reads and the choice in one
+dispatch, checked against an independent host-side reference as well as against
+the CPU interpreter. The colony run itself still senses on the host; wiring the
+collective into the ant step is an executive change and is not made.
 
 Read [docs/SOMA-v0.2.md](docs/SOMA-v0.2.md) for the current machine. The older
 [Phase-1 contract](docs/SOMA-P1.md) records the broader GPU-oriented design that
@@ -268,11 +273,11 @@ Implemented now:
 Not implemented:
 
 - A general-purpose language or compiler for arbitrary evaluator bodies. Bodies
-  gather and loop now — counted `repeat`, early `breakif`, and mutable locals,
-  with a validation-time bound on the unrolled length so totality and the step
-  budget survive — but there are still no calls, no floating point, and no
-  surface syntax above the `op` lines. A collective also binds one input array,
-  so a body can read any element of its own array and cannot name a second one
+  gather, loop, and read a second bound array now — counted `repeat`, early
+  `breakif`, mutable locals, and `gatheraux` against a second frozen array, with
+  a validation-time bound on the unrolled length so totality and the step budget
+  survive. There are still no calls, no floating point, and no surface syntax
+  above the `op` lines
 - A concurrent, device-resident scheduler/executive, or a distributed backend.
   The semantics are ready for one and nothing uses it: admission is
   order-independent (I22), the trace's order is recoverable from event position

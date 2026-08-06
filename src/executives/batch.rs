@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use crate::abi::{ObjectKind, Ref64};
-use crate::compiler::body::EvaluatorProgram;
+use crate::compiler::body::{Arrays, EvaluatorProgram};
 use crate::kernel::ownership::freeze;
 use crate::kernel::payload::Payload;
 use crate::kernel::{Kernel, RuntimeError};
@@ -33,11 +33,46 @@ impl From<RuntimeError> for BackendError {
     }
 }
 
+/// A second, read-only array bound alongside a batch's input array.
+///
+/// Zero `element_stride` means nothing is bound, which is every batch whose
+/// body does not gather from a second array. It is a stride rather than an
+/// `Option` because that is the form the value already travels in through the
+/// collective descriptor and the Metal buffer bindings, and one spelling of
+/// "not bound" is worth more than a tidier type at one of the three layers.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AuxArray<'a> {
+    pub bytes: &'a [u8],
+    pub element_count: u32,
+    pub element_stride: u32,
+}
+
+impl<'a> AuxArray<'a> {
+    pub const NONE: AuxArray<'static> = AuxArray {
+        bytes: &[],
+        element_count: 0,
+        element_stride: 0,
+    };
+
+    pub fn new(bytes: &'a [u8], element_count: u32, element_stride: u32) -> Self {
+        Self {
+            bytes,
+            element_count,
+            element_stride,
+        }
+    }
+
+    pub fn is_bound(&self) -> bool {
+        self.element_stride != 0
+    }
+}
+
 /// One batch a backend has been asked to evaluate.
 #[derive(Clone, Copy, Debug)]
 pub struct BatchRequest<'a> {
     pub evaluator_id: u32,
     pub inputs: &'a [u8],
+    pub aux: AuxArray<'a>,
     pub element_count: u32,
     pub element_stride: u32,
 }
@@ -62,6 +97,30 @@ pub trait BatchBackend {
         element_stride: u32,
     ) -> Result<Vec<u8>, BackendError>;
 
+    /// Evaluate with a second read-only array bound.
+    ///
+    /// The default declines when one is bound, and is `evaluate` when one is
+    /// not. Declining is the important half: a backend that has not been taught
+    /// the second binding must not quietly evaluate the body against the input
+    /// array alone and return bytes. That answer is indistinguishable from a
+    /// correct one to every other invariant in the machine, which is the exact
+    /// failure I20 exists to catch and the reason `UnsupportedEvaluator` is a
+    /// legal answer at all.
+    fn evaluate_with_aux(
+        &mut self,
+        evaluator_id: u32,
+        inputs: &[u8],
+        element_count: u32,
+        element_stride: u32,
+        aux: AuxArray<'_>,
+    ) -> Result<Vec<u8>, BackendError> {
+        if aux.is_bound() {
+            Err(BackendError::UnsupportedEvaluator)
+        } else {
+            self.evaluate(evaluator_id, inputs, element_count, element_stride)
+        }
+    }
+
     /// Evaluate, returning bytes the kernel can take ownership of wherever
     /// they already are.
     ///
@@ -81,8 +140,9 @@ pub trait BatchBackend {
         inputs: &[u8],
         element_count: u32,
         element_stride: u32,
+        aux: AuxArray<'_>,
     ) -> Result<Payload, BackendError> {
-        self.evaluate(evaluator_id, inputs, element_count, element_stride)
+        self.evaluate_with_aux(evaluator_id, inputs, element_count, element_stride, aux)
             .map(Payload::from)
     }
 
@@ -110,6 +170,7 @@ pub trait BatchBackend {
                     request.inputs,
                     request.element_count,
                     request.element_stride,
+                    request.aux,
                 )
             })
             .collect()
@@ -184,6 +245,23 @@ impl BatchBackend for CpuReferenceBackend {
         element_count: u32,
         element_stride: u32,
     ) -> Result<Vec<u8>, BackendError> {
+        self.evaluate_with_aux(
+            evaluator_id,
+            inputs,
+            element_count,
+            element_stride,
+            AuxArray::NONE,
+        )
+    }
+
+    fn evaluate_with_aux(
+        &mut self,
+        evaluator_id: u32,
+        inputs: &[u8],
+        element_count: u32,
+        element_stride: u32,
+        aux: AuxArray<'_>,
+    ) -> Result<Vec<u8>, BackendError> {
         let program = self
             .programs
             .get(&evaluator_id)
@@ -191,8 +269,26 @@ impl BatchBackend for CpuReferenceBackend {
         if program.stride() != element_stride {
             return Err(BackendError::InvalidInput);
         }
+        // The binding is checked in both directions, at the boundary, so that
+        // the interpreter never has to decide what to do about a body reading
+        // an array it was not given. A body that gathers from an aux array and
+        // was handed none is a malformed request; so is an aux array bound to a
+        // body with no name for it, because the caller froze something for
+        // nothing and would never find out.
+        if program.binds_aux() != aux.is_bound() || program.aux_stride() != aux.element_stride {
+            return Err(BackendError::InvalidInput);
+        }
+        if aux.is_bound() {
+            let required = (aux.element_count as usize)
+                .checked_mul(aux.element_stride as usize)
+                .ok_or(BackendError::InvalidInput)?;
+            if aux.bytes.len() < required {
+                return Err(BackendError::InvalidInput);
+            }
+        }
+        let arrays = Arrays::of(inputs, element_count).with_aux(aux.bytes, aux.element_count);
         evaluate_elementwise(inputs, element_count, element_stride, |index, target| {
-            program.evaluate_at(inputs, element_count, index, target)
+            program.evaluate_bound(arrays, index, target)
         })
     }
 }
@@ -329,12 +425,29 @@ pub fn execute_with_spill(
     // is 8MB, which `examples/backend_bench` measured as a third of the
     // published path's time against Metal. The borrow ends at the last use of
     // `input_bytes` instead, which is before `publish`.
-    let input_bytes = kernel.object_bytes(actor, inputs)?;
+    // The second array is bound to the collective rather than passed in, so
+    // this is where it is read. Both arrays come out of one
+    // `object_bytes_many` because `object_bytes` borrows the kernel mutably —
+    // it records the authority decision — and two of those cannot overlap.
+    // An unbound aux slot is NULL and resolves to empty bytes.
+    let binding = kernel.batch_evaluate_aux(collective)?;
+    // An unbound slot is not fetched rather than fetched as NULL: every
+    // reference handed to `object_bytes_many` is authorized, and NULL is not
+    // something an actor can hold READ on.
+    let refs: Vec<Ref64> = if binding.is_bound() {
+        vec![inputs, binding.inputs]
+    } else {
+        vec![inputs]
+    };
+    let fetched = kernel.object_bytes_many(actor, &refs)?;
+    let input_bytes = fetched[0];
+    let aux_bytes: &[u8] = if binding.is_bound() { fetched[1] } else { &[] };
+    let aux = AuxArray::new(aux_bytes, binding.element_count, binding.element_stride);
     let (outputs, kind, spilled) = if count >= minimum_accelerator_batch {
-        match accelerator.evaluate_payload(evaluator, input_bytes, count, stride) {
+        match accelerator.evaluate_payload(evaluator, input_bytes, count, stride, aux) {
             Ok(outputs) => (outputs, accelerator.kind(), false),
             Err(BackendError::Unavailable) => (
-                cpu.evaluate_payload(evaluator, input_bytes, count, stride)?,
+                cpu.evaluate_payload(evaluator, input_bytes, count, stride, aux)?,
                 cpu.kind(),
                 true,
             ),
@@ -342,7 +455,7 @@ pub fn execute_with_spill(
         }
     } else {
         (
-            cpu.evaluate_payload(evaluator, input_bytes, count, stride)?,
+            cpu.evaluate_payload(evaluator, input_bytes, count, stride, aux)?,
             cpu.kind(),
             true,
         )
@@ -391,11 +504,27 @@ pub fn execute_epoch_with_spill(
     let mut plans = Vec::with_capacity(collectives.len());
     for collective in collectives {
         let (evaluator, inputs, count, stride) = kernel.batch_evaluate_request(*collective)?;
-        plans.push((*collective, evaluator, inputs, count, stride));
+        let aux = kernel.batch_evaluate_aux(*collective)?;
+        plans.push((*collective, evaluator, inputs, count, stride, aux));
     }
 
-    let inputs: Vec<Ref64> = plans.iter().map(|plan| plan.2).collect();
-    let bytes = kernel.object_bytes_many(actor, &inputs)?;
+    // One `object_bytes_many` over every array of every collective rather than
+    // one call per array, because it exists to take a single borrow of the
+    // kernel for the whole epoch's inputs. Bound aux arrays are appended after
+    // the inputs and `aux_slot` records where each went; unbound collectives
+    // contribute nothing, since every reference passed here is authorized and
+    // NULL is not something an actor holds READ on.
+    let mut refs: Vec<Ref64> = plans.iter().map(|plan| plan.2).collect();
+    let mut aux_slot: Vec<Option<usize>> = Vec::with_capacity(plans.len());
+    for plan in &plans {
+        if plan.5.is_bound() {
+            aux_slot.push(Some(refs.len()));
+            refs.push(plan.5.inputs);
+        } else {
+            aux_slot.push(None);
+        }
+    }
+    let bytes = kernel.object_bytes_many(actor, &refs)?;
 
     let mut accelerated = Vec::new();
     let mut on_cpu = Vec::new();
@@ -403,6 +532,11 @@ pub fn execute_epoch_with_spill(
         let request = BatchRequest {
             evaluator_id: plan.1,
             inputs: bytes[index],
+            aux: AuxArray::new(
+                aux_slot[index].map(|slot| bytes[slot]).unwrap_or(&[]),
+                plan.5.element_count,
+                plan.5.element_stride,
+            ),
             element_count: plan.3,
             element_stride: plan.4,
         };

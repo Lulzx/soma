@@ -183,9 +183,7 @@ Added in v0.3:
   stay total under a computed index. Both lowerings clamp identically and I20
   checks that on hardware. `examples::NEIGHBOUR_MAX` (a stencil) and
   `examples::PERMUTE` (a reversal, where every element overwrites the field its
-  neighbours read) are the checked cases. This does *not* make ant sensing
-  expressible — see `experiments/ant_scoring.rs` for why that is now a
-  collective-level limit rather than a language one.
+  neighbours read) are the checked cases.
 - Loops. `repeat` takes a trip count fixed at validation time, `breakif`
   leaves the innermost one early, and `get`/`set` over declared locals are how
   a value outlives an iteration -- values computed inside a loop do not escape
@@ -197,6 +195,17 @@ Added in v0.3:
   counted loop is uniform, a `breakif` is not, and divergence costs occupancy
   rather than correctness. `examples::WINDOW_SUM` and `examples::RUN_LENGTH`
   are the checked cases, both agreeing with the CPU interpreter on real Metal.
+- A second array binding. `gatheraux` reads a computed element of a second
+  frozen, read-only array, declared with its own `aux` layout because an aux
+  element has no reason to share the input element's shape. The array is bound
+  to the collective (`create_batch_evaluate_bound`) rather than passed at the
+  call, because that is what the capability escrow freezes; it is authorized
+  and validated on exactly the same terms as the first, since a body gathering
+  from an array it holds no READ on is a capability hole and one gathering from
+  an unfrozen array breaks I19. The binding is checked in *both* directions at
+  the backend boundary -- a body reading an array it was not given, and an
+  array bound to a body with no name for it, are both `InvalidInput`. This is
+  what put ant sensing on the GPU; see `experiments/ant_scoring.rs`.
 - An effect log (I24). A step no longer writes a runnable bin; it produces the
   entries it wants and the kernel applies them, in the order the plan puts the
   producing lanes in. `Scheduler::enqueue` demands a token only the applier can

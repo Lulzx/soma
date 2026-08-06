@@ -7,9 +7,7 @@
 //! verified that a backend applied the function its module named.
 
 use soma::abi::{ObjectKind, ProcessMode};
-use soma::compiler::body::{
-    BodyError, ElementLayout, EvaluatorProgram, FieldWidth, Op, Store,
-};
+use soma::compiler::body::{BodyError, ElementLayout, EvaluatorProgram, FieldWidth, Op, Store};
 use soma::compiler::examples;
 use soma::compiler::ir::{IrError, Module};
 use soma::executives::batch::{
@@ -644,7 +642,11 @@ fn an_early_exit_leaves_on_a_different_iteration_per_element() {
     assert_eq!(at(&out, 0, 1), 3, "element 0 counts its own run");
     assert_eq!(at(&out, 1, 1), 2);
     assert_eq!(at(&out, 2, 1), 1);
-    assert_eq!(at(&out, 3, 1), 0, "an element that is itself zero counts none");
+    assert_eq!(
+        at(&out, 3, 1),
+        0,
+        "an element that is itself zero counts none"
+    );
     assert_eq!(at(&out, 4, 1), 2);
     assert_eq!(at(&out, 5, 1), 1);
     assert_eq!(at(&out, 6, 1), 0);
@@ -910,4 +912,90 @@ fn the_generated_metal_declares_its_values_before_its_loops() {
         source.matches('{').count() == source.matches('}').count(),
         "the generated kernel's braces do not balance:\n{source}"
     );
+}
+
+// ---- the second binding ---------------------------------------------------
+
+#[test]
+fn gathering_from_an_array_the_body_never_declared_is_rejected() {
+    assert_eq!(
+        EvaluatorProgram::bound(
+            1,
+            "no_aux_declared",
+            ElementLayout::new(vec![FieldWidth::U32]),
+            None,
+            0,
+            vec![Op::Const(0), Op::GatherAux(0, 0)],
+            vec![Store { field: 0, value: 1 }],
+        ),
+        Err(BodyError::AuxMismatch)
+    );
+}
+
+#[test]
+fn declaring_an_array_the_body_never_reads_is_rejected() {
+    // The other direction, and the one that would otherwise survive: the
+    // collective is well-formed, the caller freezes an array for the duration,
+    // and nothing ever reads it.
+    assert_eq!(
+        EvaluatorProgram::bound(
+            1,
+            "aux_unread",
+            ElementLayout::new(vec![FieldWidth::U32]),
+            Some(ElementLayout::new(vec![FieldWidth::U16])),
+            0,
+            vec![Op::Load(0)],
+            vec![Store { field: 0, value: 0 }],
+        ),
+        Err(BodyError::AuxMismatch)
+    );
+}
+
+#[test]
+fn an_aux_field_outside_the_aux_layout_is_rejected() {
+    // Checked against the *aux* layout, not the element layout. The element
+    // here has four fields and the aux has one, so field 2 is in range for the
+    // wrong one — which is the mistake this catches.
+    assert_eq!(
+        EvaluatorProgram::bound(
+            1,
+            "aux_field",
+            ElementLayout::new(vec![
+                FieldWidth::U32,
+                FieldWidth::U32,
+                FieldWidth::U32,
+                FieldWidth::U32
+            ]),
+            Some(ElementLayout::new(vec![FieldWidth::U16])),
+            0,
+            vec![Op::Const(0), Op::GatherAux(0, 2)],
+            vec![Store { field: 0, value: 1 }],
+        ),
+        Err(BodyError::FieldOutOfRange)
+    );
+}
+
+#[test]
+fn an_aux_gather_past_the_end_clamps_to_the_last_element() {
+    // The same totality rule `Gather` obeys, against the other array. A
+    // runtime fault here would break the step budget the same way.
+    let program = EvaluatorProgram::bound(
+        1,
+        "aux_clamp",
+        ElementLayout::new(vec![FieldWidth::U32]),
+        Some(ElementLayout::new(vec![FieldWidth::U16])),
+        0,
+        vec![Op::Const(9_999), Op::GatherAux(0, 0)],
+        vec![Store { field: 0, value: 1 }],
+    )
+    .expect("an aux gather validates");
+
+    let aux: Vec<u8> = [7u16, 8, 9].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let mut out = vec![0u8; 4];
+    program.evaluate_bound(
+        soma::compiler::body::Arrays::of(&0u32.to_le_bytes(), 1).with_aux(&aux, 3),
+        0,
+        &mut out,
+    );
+    assert_eq!(word(&out, 0), 9, "an out-of-range aux index reads the last");
 }

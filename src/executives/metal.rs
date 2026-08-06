@@ -19,7 +19,7 @@ use metal::{
     MTLResourceOptions, MTLSize,
 };
 
-use super::batch::{BackendError, BackendKind, BatchBackend, BatchRequest};
+use super::batch::{AuxArray, BackendError, BackendKind, BatchBackend, BatchRequest};
 use crate::compiler::body::EvaluatorProgram;
 use crate::kernel::payload::{ForeignPayload, Payload};
 
@@ -75,7 +75,9 @@ pub struct MetalBatchBackend {
     queue: CommandQueue,
     /// One compiled pipeline per installed evaluator, with the stride the body
     /// declared so a mismatched request is rejected rather than misread.
-    pipelines: HashMap<u32, (ComputePipelineState, u32)>,
+    /// Pipeline, element stride, and aux element stride (zero when the body
+    /// binds one array).
+    pipelines: HashMap<u32, (ComputePipelineState, u32, u32)>,
     /// Grown to the largest batch seen and then reused.
     ///
     /// This looks like a fixed cost and is not one. `new_buffer` itself is
@@ -134,17 +136,32 @@ impl MetalBatchBackend {
         inputs: &[u8],
         element_count: u32,
         element_stride: u32,
+        aux: AuxArray<'_>,
         output_kind: Output,
     ) -> Result<Option<(Buffer, usize)>, BackendError> {
         // Cloned rather than borrowed: `scratch_for` needs `&mut self`, and a
         // `ComputePipelineState` clone is a retain on an object the backend
         // already owns.
-        let (pipeline, declared_stride) = self
+        let (pipeline, declared_stride, declared_aux_stride) = self
             .pipelines
             .get(&evaluator_id)
             .cloned()
             .ok_or(BackendError::UnsupportedEvaluator)?;
         if declared_stride != element_stride {
+            return Err(BackendError::InvalidInput);
+        }
+        // The same both-directions check the reference backend makes, and it
+        // has to be made here too rather than trusted: a kernel compiled with
+        // the aux parameters reads whatever is bound at buffer 4, so a body
+        // expecting a second array and dispatched without one would read
+        // uninitialised device memory and return plausible bytes.
+        if declared_aux_stride != aux.element_stride {
+            return Err(BackendError::InvalidInput);
+        }
+        let aux_required = (aux.element_count as usize)
+            .checked_mul(aux.element_stride as usize)
+            .ok_or(BackendError::InvalidInput)?;
+        if aux.bytes.len() < aux_required {
             return Err(BackendError::InvalidInput);
         }
 
@@ -189,6 +206,34 @@ impl MetalBatchBackend {
             std::mem::size_of::<u32>() as u64,
             (&element_stride as *const u32).cast::<c_void>(),
         );
+        // Buffers 4-6 exist only in kernels generated for a body that reads a
+        // second array; `metal_source` omits the parameters otherwise, so
+        // binding them unconditionally would be binding to a slot the shader
+        // does not declare.
+        // Bound to a name so the allocation outlives the dispatch below. The
+        // encoder holds a reference the driver honours, but the Rust binding is
+        // what stops the buffer being released before `wait_until_completed`.
+        let _aux_buffer = if aux_required > 0 {
+            let buffer = self.device.new_buffer_with_data(
+                aux.bytes.as_ptr().cast::<c_void>(),
+                aux_required as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            encoder.set_buffer(4, Some(&buffer), 0);
+            encoder.set_bytes(
+                5,
+                std::mem::size_of::<u32>() as u64,
+                (&aux.element_count as *const u32).cast::<c_void>(),
+            );
+            encoder.set_bytes(
+                6,
+                std::mem::size_of::<u32>() as u64,
+                (&aux.element_stride as *const u32).cast::<c_void>(),
+            );
+            Some(buffer)
+        } else {
+            None
+        };
         encoder.dispatch_threads(
             MTLSize {
                 width: element_count as u64,
@@ -239,8 +284,10 @@ impl BatchBackend for MetalBatchBackend {
             .device
             .new_compute_pipeline_state_with_function(&function)
             .map_err(|_| BackendError::UnsupportedEvaluator)?;
-        self.pipelines
-            .insert(program.id(), (pipeline, program.stride()));
+        self.pipelines.insert(
+            program.id(),
+            (pipeline, program.stride(), program.aux_stride()),
+        );
         Ok(())
     }
 
@@ -251,11 +298,29 @@ impl BatchBackend for MetalBatchBackend {
         element_count: u32,
         element_stride: u32,
     ) -> Result<Vec<u8>, BackendError> {
+        self.evaluate_with_aux(
+            evaluator_id,
+            inputs,
+            element_count,
+            element_stride,
+            AuxArray::NONE,
+        )
+    }
+
+    fn evaluate_with_aux(
+        &mut self,
+        evaluator_id: u32,
+        inputs: &[u8],
+        element_count: u32,
+        element_stride: u32,
+        aux: AuxArray<'_>,
+    ) -> Result<Vec<u8>, BackendError> {
         let Some((output, required)) = self.run(
             evaluator_id,
             inputs,
             element_count,
             element_stride,
+            aux,
             Output::Reused,
         )?
         else {
@@ -271,12 +336,14 @@ impl BatchBackend for MetalBatchBackend {
         inputs: &[u8],
         element_count: u32,
         element_stride: u32,
+        aux: AuxArray<'_>,
     ) -> Result<Payload, BackendError> {
         let Some((buffer, len)) = self.run(
             evaluator_id,
             inputs,
             element_count,
             element_stride,
+            aux,
             Output::Owned,
         )?
         else {
@@ -311,12 +378,20 @@ impl BatchBackend for MetalBatchBackend {
         let mut plans = Vec::with_capacity(requests.len());
         let mut staged = 0usize;
         for request in requests {
-            let (pipeline, declared_stride) = self
+            let (pipeline, declared_stride, declared_aux_stride) = self
                 .pipelines
                 .get(&request.evaluator_id)
                 .cloned()
                 .ok_or(BackendError::UnsupportedEvaluator)?;
-            if declared_stride != request.element_stride {
+            if declared_stride != request.element_stride
+                || declared_aux_stride != request.aux.element_stride
+            {
+                return Err(BackendError::InvalidInput);
+            }
+            let aux_required = (request.aux.element_count as usize)
+                .checked_mul(request.aux.element_stride as usize)
+                .ok_or(BackendError::InvalidInput)?;
+            if request.aux.bytes.len() < aux_required {
                 return Err(BackendError::InvalidInput);
             }
             let required = (request.element_count as usize)
@@ -329,14 +404,14 @@ impl BatchBackend for MetalBatchBackend {
             staged = staged
                 .checked_add(align_up(required))
                 .ok_or(BackendError::InvalidInput)?;
-            plans.push((pipeline, required, offset));
+            plans.push((pipeline, required, offset, aux_required));
         }
         if staged == 0 {
             return Ok(requests.iter().map(|_| Payload::Host(Vec::new())).collect());
         }
 
         let (input, _) = self.scratch_for(staged as u64);
-        for (request, (_, required, offset)) in requests.iter().zip(&plans) {
+        for (request, (_, required, offset, _)) in requests.iter().zip(&plans) {
             if *required == 0 {
                 continue;
             }
@@ -351,7 +426,7 @@ impl BatchBackend for MetalBatchBackend {
 
         let outputs: Vec<Buffer> = plans
             .iter()
-            .map(|(_, required, _)| {
+            .map(|(_, required, _, _)| {
                 self.device.new_buffer(
                     (*required).max(1) as u64,
                     MTLResourceOptions::StorageModeShared,
@@ -361,8 +436,27 @@ impl BatchBackend for MetalBatchBackend {
 
         let command = self.queue.new_command_buffer();
         let encoder = command.new_compute_command_encoder();
-        for ((request, (pipeline, required, offset)), output) in
-            requests.iter().zip(&plans).zip(&outputs)
+        // An epoch's aux arrays are separate buffers rather than staged into
+        // the shared input allocation. They are read-only and shared between
+        // requests in the common case -- every ant cohort of one epoch senses
+        // the same grid -- so staging them would copy one grid per cohort to
+        // gain an offset nothing needs. The vector holds them alive until the
+        // command buffer completes.
+        let mut aux_buffers: Vec<Option<Buffer>> = Vec::with_capacity(plans.len());
+        for (request, (_, _, _, aux_required)) in requests.iter().zip(&plans) {
+            aux_buffers.push(if *aux_required > 0 {
+                Some(self.device.new_buffer_with_data(
+                    request.aux.bytes.as_ptr().cast::<c_void>(),
+                    *aux_required as u64,
+                    MTLResourceOptions::StorageModeShared,
+                ))
+            } else {
+                None
+            });
+        }
+
+        for (((request, (pipeline, required, offset, _)), output), aux_buffer) in
+            requests.iter().zip(&plans).zip(&outputs).zip(&aux_buffers)
         {
             if *required == 0 {
                 continue;
@@ -380,6 +474,19 @@ impl BatchBackend for MetalBatchBackend {
                 std::mem::size_of::<u32>() as u64,
                 (&request.element_stride as *const u32).cast::<c_void>(),
             );
+            if let Some(buffer) = aux_buffer {
+                encoder.set_buffer(4, Some(buffer), 0);
+                encoder.set_bytes(
+                    5,
+                    std::mem::size_of::<u32>() as u64,
+                    (&request.aux.element_count as *const u32).cast::<c_void>(),
+                );
+                encoder.set_bytes(
+                    6,
+                    std::mem::size_of::<u32>() as u64,
+                    (&request.aux.element_stride as *const u32).cast::<c_void>(),
+                );
+            }
             encoder.dispatch_threads(
                 MTLSize {
                     width: request.element_count as u64,
@@ -405,7 +512,7 @@ impl BatchBackend for MetalBatchBackend {
         Ok(outputs
             .into_iter()
             .zip(&plans)
-            .map(|(buffer, (_, required, _))| {
+            .map(|(buffer, (_, required, _, _))| {
                 if *required == 0 {
                     Payload::Host(Vec::new())
                 } else {

@@ -250,7 +250,29 @@ test is placement-independent publication, not language design:
 - **One output element per input element.** A reduction is a different
   collective, not a different body. `gather` widens what a body may *read* to
   any element of the frozen input array — `index` supplies its own position, so
-  a stencil is expressible — but not what it may write.
+  a stencil is expressible — and `gatheraux` widens it to a *second* frozen
+  array the collective binds. Neither widens what a body may write: it still
+  writes only its own element's fields.
+
+  The second array is what makes a lookup expressible rather than only a
+  stencil, and the distinction is not academic — it is the difference between
+  an ant reading its neighbours and an ant reading the trail grid it is
+  standing on, which is a different array with a different layout and a
+  different length. It is declared with its own `aux` element layout for that
+  reason, and bound to the collective rather than passed at the call, because
+  the binding is what the capability escrow freezes. It is authorized and
+  validated on the same terms as the first array: a body gathering from an
+  array its actor holds no READ on would be a capability hole, and one
+  gathering from an unfrozen array would make the published result depend on
+  when the collective ran, which is I19.
+
+  The binding is checked in both directions at the backend boundary. A body
+  that reads a second array and was given none is `InvalidInput`, rather than
+  being evaluated against the first array alone — that answer is bytes, and
+  bytes are indistinguishable from a correct result to every other invariant in
+  the machine. So is an array bound to a body with no name for it, because the
+  caller froze something for the collective's lifetime and would otherwise
+  never find out.
 - **Reads the input, never the output.** This is what makes a gather safe to
   run in any order, and so what keeps I19 true of a gathering body. The input
   array is frozen and single-assignment, so every lane sees the same bytes
