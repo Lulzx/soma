@@ -89,6 +89,19 @@ pub struct HeuristicFrame {
     pub input: u64,
 }
 
+/// Frame for a `Join` continuation (v0.3 §4.15): the future it awaits, which
+/// it did not create, and the value it read once that future settled.
+#[derive(Clone, Debug)]
+pub struct JoinFrame {
+    pub future: Ref64,
+    /// The value the future took, as the awaiter saw it. A reference rather
+    /// than its contents: the value object is minted by whichever process
+    /// resolved the future, and a `LaneView` has no operation that would let
+    /// that process delegate READ on it mid-epoch, so an awaiter can observe
+    /// *that* a future resolved and to what, and not what is inside.
+    pub observed: Ref64,
+}
+
 /// Frame for one synthetic branching-search node (§25.1).
 #[derive(Clone, Debug)]
 pub struct SearchFrame {
@@ -157,6 +170,20 @@ impl Frame for SearchFrame {
             branching: c.u32()?,
             work_iters: c.u32()?,
             class_count: c.u32()?,
+        })
+    }
+}
+
+impl Frame for JoinFrame {
+    fn encode(&self, out: &mut Vec<u8>) {
+        put_ref64(out, self.future);
+        put_ref64(out, self.observed);
+    }
+
+    fn decode(c: &mut ByteCursor) -> Result<Self, FrameError> {
+        Ok(JoinFrame {
+            future: c.ref64()?,
+            observed: c.ref64()?,
         })
     }
 }

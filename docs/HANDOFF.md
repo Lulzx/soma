@@ -279,6 +279,17 @@ Added in v0.3:
   can reach, because the only awaiting handler creates the future in the step it
   awaits. That is a fact about the handler set and it stops being true the
   moment a handler awaits a future it did not create.
+- The fifth decision, and the wider question (v0.3 §4.15). `JOIN_AWAIT` is that
+  handler: it awaits a future named by its frame, which somebody else made and
+  somebody else resolves (`tests/foreign_await.rs`). Both of §4.14's blind spots
+  close with it, `future_value` being what its second half reads. Under `Plan`
+  the resolver goes first and the awaiter does not park; under `Reverse` it
+  parks and is woken. Same final state, different route. `FutureAwaitSettled` is
+  the fifth traced decision and the first that is *not* a refusal -- the await
+  succeeds either way -- which is what widened the method from "operations that
+  can say no" to "operations whose result another lane can decide". It is also
+  the first workload clause 1 can see, and it sees only the order in which the
+  awaiter parked: the reference order reports nothing from it.
 - A lane-local trace buffer (v0.3 §4.11). A lane produces trace events into
   `lane_trace` and `leave_lane` appends them, which is §4.4's move applied to
   the trace. `logical_time` is handed out at the drain rather than at emission,
@@ -602,6 +613,37 @@ decision that would otherwise depend on `HashMap` iteration order.
   no, not the resources: §4.12 listed the resources, concluded nothing else was
   reachable from a step, and missed the mailbox it had just finished filling
   because a receive refuses a different caller for a different reason (§4.13).
+- **Enumerate the operations whose result another lane can decide, not the ones
+  that can say no.** §4.13's correction was itself too narrow, and §4.15 is what
+  showed it. `await_future` is on `LaneView`'s fifteen, was walked past in four
+  successive rounds, and never fails: it returns normally whether it registered
+  a waiter or found the value already published. Which of the two it returns is
+  decided by whether a resolving lane of the same epoch went first. A refusal is
+  the special case where one of the results is a failure, and it is conspicuous
+  because it faults a step — which is exactly why looking for refusals kept
+  finding them and kept missing this. The next candidate under the wider
+  question is a *read*: `continuations()` hands a step the whole table, and
+  `apply_step_result` writes a continuation's status inside the lane that
+  produced it. No handler reads another's, so it is unreachable in the §4.14
+  sense — a fact about the handlers, with the same expiry.
+- **`Bounded` has an entry that is not a bounded resource.** `FutureSettlement`
+  dispenses nothing; it is a future's state, written by a resolver and read by
+  an awaiter. It is in clause 2 because the clause's subject was never
+  boundedness — it is one lane's outcome being decided by another lane of its
+  epoch — and a bounded resource was the first mechanism found for that. One
+  future is therefore keyed twice, as an assignment (§4.14) and as a state
+  (§4.15), and a `FutureResolved` is a win under both keys. That is why the
+  event-to-resource match in `bounded_resource_independence` produces a *list*
+  rather than one entry; a resolve that registered under only one of them makes
+  the other key winnerless and silently unreportable.
+- **Clause 1 can see a race, and is blind in the reference order when it does.**
+  §4.15 is the first workload where `cross_lane_edges()` is non-empty, because a
+  wake names *another lane's continuation* and the other four races' events name
+  only their resource. It is non-empty in the `Reverse` run and empty in the
+  `Plan` one, where the awaiter never parked — so the plan-order run, the one
+  you would naturally do, reports nothing from clause 1. A single run satisfying
+  clause 1 is not evidence its lanes were independent. Running the workload in a
+  second order and comparing is what reaches the case at all.
 - **A null for one bounded resource is not a null for another.** Clause 2 asks a
   different question depending on what the resource hands out. A quota and a
   mailbox capacity dispense interchangeable units, so two lanes that both

@@ -100,6 +100,26 @@ pub enum EventKind {
     /// refused lane had built and did not publish — an entity, so it goes where
     /// entities go.
     FutureResolutionRefused = 37,
+    /// An await found the future already settled and did not park.
+    ///
+    /// The first traced decision that is not a refusal. The other four exist
+    /// because an operation said no and the trace could not say so; this one
+    /// **succeeded**, and by either route — the awaiting continuation continues
+    /// in its next run class whether it registered as a waiter or found the
+    /// value already published. What differs is which of two states of the
+    /// future it read, and a resolving lane of the same epoch decides that.
+    ///
+    /// That is why it is here. `ContinuationWaiting` records the other branch,
+    /// so an await that registered leaves a mark and an await that did not left
+    /// nothing to distinguish it from any other yield — and a trace with a hole
+    /// exactly where the two branches differ cannot report the run in which the
+    /// resolver went first. See v0.3 §4.15, which widens I25 clause 2's
+    /// question from operations that can refuse to operations whose result
+    /// another lane can decide.
+    ///
+    /// `causal` is the future, as it is for `FutureResolved`, and `subject` is
+    /// the value the await found published.
+    FutureAwaitSettled = 38,
 }
 
 /// The lane an event was emitted from when it was not emitted from one: epoch

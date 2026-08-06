@@ -1257,6 +1257,104 @@ was a claim about the machine and was wrong.
 The remaining twelve either allocate (partitioned, §4.8), write a frame no other
 lane holds (I8), or send and receive, which §4.12 and §4.13 covered.
 
+### 4.15 An await that reads a future somebody else is resolving
+
+§4.14 ended by naming two decisions no *handler* could reach and saying exactly
+why: the only awaiting handler creates the future in the step it awaits, so a
+resolver cannot have run yet. That was a claim about the handler set, and the
+way to test a claim about the handler set is to write the handler. `JOIN_AWAIT`
+awaits a future named by its frame — somebody else's — and `JOIN_RESUME` reads
+what it took. Both blind spots close at once, because the second one,
+`future_value`, is the read the second half does.
+
+One resolver, one awaiter, one future, one epoch. Under `Plan` the resolver is
+lane 1, so the awaiter finds the value published and continues without parking.
+Under `Reverse` the awaiter goes first, parks, and the resolver wakes it. **The
+two runs leave the same state** — the awaiter runs `JOIN_RESUME` in epoch 1 and
+reads the same value either way — so nothing is wrong with either run's result.
+What differs is only the route, and the route is what I18 is about.
+
+**This is the first of the five that clause 1 can see, and it is blind in the
+reference order.** Under `Reverse` the resolver's wake names the parked
+continuation, so the awaiter's `ContinuationWaiting` and the resolver's
+`ContinuationReady` are two events of one continuation's program order emitted
+from two lanes, and `cross_lane_edges()` is finally not empty. The reason it is
+not is worth stating, because it is what the other four lacked: a wake is the
+only one of these events that names **another lane's continuation** rather than
+only the resource. A resolve names a future, a send names a mailbox, a refusal
+names what refused it — none of them says whose lane was affected.
+
+Under `Plan` nothing is woken, there is no edge, and clause 1 reports nothing at
+all. So a plan-order run of this workload passes clause 1 cleanly, and *that*
+run is the reference. A single run satisfying clause 1 was never evidence of
+independence; here is a workload where the run you would naturally do is the one
+that cannot report it. §4.6's discipline — run it again in another order and
+compare — is not an extra check on top of I25, it is what makes I25's first
+clause reach this case.
+
+**The clause the other order needs, and the correction it carries.** Clause 2
+reports the `Plan` run, and needs a new event to do it: an await that did not
+park emitted nothing to tell it from any other yield. `FutureAwaitSettled` is the
+fifth traced decision and **the first that is not a refusal**. Every one so far
+existed because an operation said no and `ProcessFailed` or a bare park could not
+say so; this operation *succeeded*. `await_future` returns normally by both
+routes. What another lane decided is which of two states of the future it read.
+
+That widens the enumeration §4.13 established, and the widening — not the run —
+is what this section is for:
+
+> Enumerate the operations whose **result another lane can decide**, not the
+> operations that can say no.
+
+A refusal is the special case where one of the results is a failure. It was the
+conspicuous case — it faults a step, so it announces itself — which is why four
+rounds of walking the list found refusals and stopped. `await_future` was on the
+list each time and was passed over each time, because nothing about it fails.
+
+Registering it in the checker took one thing that was not obvious. `Bounded` now
+holds an entry, `FutureSettlement`, that is **not a bounded resource**: nothing
+is dispensed, the awaiter draws no unit, it reads which state the future is in.
+It belongs in that clause anyway, and the reason is that the clause's subject was
+never boundedness — it is a lane's outcome being decided by another lane of its
+epoch, and a bounded resource was just the first mechanism found for that. The
+same future is therefore keyed twice, once as an assignment two lanes may
+contest (§4.14) and once as a state one lane writes and another reads, and a
+`FutureResolved` counts as a win under both.
+
+**The nulls.** Three, and each rules out a different reading:
+
+- *Settled before the epoch.* The host publishes, the awaiter finds it settled
+  under every order, no lane resolved anything. Silent — a state nobody wrote
+  this epoch decided nothing — and it is also the run that shows the event alone
+  is not the report.
+- *Different futures.* The resolver publishes into one of its own and the
+  awaited future is untouched, so the awaiter parks under both orders. Silent:
+  the clause is about one future.
+- *No resolver.* The awaiter parks and stays parked; the wake, if it ever comes,
+  comes in another epoch. Silent: the clause is about one epoch.
+
+**What is unchanged.** No existing workload reaches the settled arm — the probe
+is the emission made to `panic!`, and with `--no-fail-fast` the whole suite
+reaches it from two files: this section's, and `kernel_edge_cases`, which calls
+`await_future` on the kernel directly rather than from a step. That second one is
+the distinction §4.14 drew, showing up as a difference between test files: the
+machine could always do this, and until now no handler asked it to. Ten example
+reports are byte-identical.
+
+**What this leaves.** Re-walking the fifteen under the widened question, the
+candidate it now surfaces is not an operation at all but a read: `continuations()`
+hands a step the whole table, and a continuation's status is written by
+`apply_step_result` *inside* the lane that produced it. A handler that read
+another continuation's status would see a write from a lane of its own epoch,
+and no clause would report it — no event is emitted, so there is nothing to key
+on. No handler does; every one of them reads its own `run_class` and its own
+frame. That is the same kind of "not reachable" as §4.14's, with the same
+expiry: it is a fact about the handlers. Unlike §4.14's, the fix is available
+without waiting for a workload to prove it — the view could hand a step its own
+descriptor rather than the table — and it is not done here because narrowing
+`continuations()` is a change to the fifteen and belongs with the concurrent
+executive that will need it.
+
 ---
 
 ## 5. C — distributed, trace-equivalent
@@ -1330,7 +1428,7 @@ cannot reach means the model is charging for the wrong thing.
 | I22 admission determinism | checked | the decision is a function of the candidate set (§4.1) |
 | I23 position-derived emission | checked | the trace's order needs no shared clock (§4.2) |
 | I24 effect-mediated commit | checked | bins are written by an applier, in plan order (§4.4) |
-| I25 lane independence | checked | two clauses: no ≺ edge joins two lanes of one epoch (§4.5), and no two lanes are decided by one bounded resource — a domain quota, a mailbox's capacity, a mailbox's occupancy, or a future's one assignment (§4.12–§4.14) |
+| I25 lane independence | checked | two clauses: no ≺ edge joins two lanes of one epoch (§4.5), and no lane's outcome is decided by another through one resource — a domain quota, a mailbox's capacity, a mailbox's occupancy, a future's one assignment, or a future's settled state (§4.12–§4.15) |
 
 **I21** has two halves. The first — an epoch that admitted work dispatched some
 of it — is a statement about a transition rather than a state, so it is counted

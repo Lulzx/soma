@@ -27,6 +27,19 @@ pub mod run_classes {
     /// Standalone heuristic evaluation used by `Expand` (§22).
     pub const SEARCH_HEURISTIC: u32 = 4;
 
+    /// `Join` (v0.3 §4.15): await a future named in the frame, then read it.
+    ///
+    /// Every other awaiting handler creates the future in the step it awaits,
+    /// which is why `await_future`'s `AlreadySettled` outcome was unreachable —
+    /// a resolver cannot have run before the future exists. This one is handed
+    /// a future somebody else made, so whether the await registers a waiter or
+    /// finds the value already published depends on which lane went first.
+    /// `docs/SOMA-v0.3.md` §4.14 named that blind spot a property of the
+    /// handler set; this is the handler that moves it.
+    pub const JOIN_AWAIT: u32 = 5;
+    /// Where a `JOIN_AWAIT` continues, by either route.
+    pub const JOIN_RESUME: u32 = 6;
+
     /// Synthetic branching-search step (§25.1). This is the *base* of a
     /// contiguous block of run classes: §25.1 exposes the number of distinct
     /// continuation classes as a control variable, so a search node of class

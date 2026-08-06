@@ -21,10 +21,11 @@ use crate::abi::{MessageDescriptor, StateAccess, StepResult};
 use crate::compiler::frame::{ByteCursor, Frame};
 use crate::compiler::run_classes::{
     ant_class_index, search_class_index, COLONY_AGGREGATE, DEFAULT_MAX_STEPS, EXPAND_RESUME_0,
-    EXPAND_RESUME_1, EXPAND_RESUME_2, SEARCH_BRANCH, SEARCH_HEURISTIC, WORLD_STEP,
+    EXPAND_RESUME_1, EXPAND_RESUME_2, JOIN_AWAIT, JOIN_RESUME, SEARCH_BRANCH, SEARCH_HEURISTIC,
+    WORLD_STEP,
 };
 use crate::compiler::state_machine_lowering::{
-    search_step, ExpandFrame, HeuristicFrame, SearchFrame,
+    search_step, ExpandFrame, HeuristicFrame, JoinFrame, SearchFrame,
 };
 use crate::executives::ant_colony;
 use crate::executives::lane::LaneView;
@@ -49,6 +50,8 @@ pub fn dispatch(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepRes
         EXPAND_RESUME_1 => expand_resume_1(lane, cont, process),
         EXPAND_RESUME_2 => expand_resume_2(lane, cont, process),
         SEARCH_HEURISTIC => heuristic(lane, cont, process),
+        JOIN_AWAIT => join_await(lane, cont, process),
+        JOIN_RESUME => join_resume(lane, cont, process),
         COLONY_AGGREGATE => ant_colony::colony_aggregate(lane, cont, process),
         WORLD_STEP => ant_colony::world_step(lane, cont, process),
         // The search classes occupy a contiguous block; each is a distinct
@@ -244,6 +247,51 @@ fn heuristic(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResult
         Ok(()) => StepResult::complete(),
         Err(_) => StepResult::fault(process, SEARCH_HEURISTIC),
     }
+}
+
+/// `JOIN_AWAIT` (v0.3 §4.15): await a future this continuation did not create.
+///
+/// The one handler whose await can go either way. `expand_resume_0` creates the
+/// future in the step it awaits, so no resolver can have run yet and the
+/// `AlreadySettled` arm is dead there; here the future is named by the frame and
+/// somebody else resolves it, so which arm runs is decided by whether the
+/// resolving lane went first.
+fn join_await(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResult {
+    let frame: JoinFrame = load_frame(
+        lane,
+        process,
+        cont,
+        JoinFrame {
+            future: Ref64::NULL,
+            observed: Ref64::NULL,
+        },
+    );
+    match lane.await_future(process, cont, frame.future, JOIN_RESUME) {
+        Ok(AwaitOutcome::Registered) => StepResult::await_on(frame.future, JOIN_RESUME),
+        // Already published: nothing will wake us, because `resolve_future`
+        // drained the waiter list before we asked to be on it.
+        Ok(AwaitOutcome::AlreadySettled(_)) => StepResult::yield_next(JOIN_RESUME),
+        Err(_) => StepResult::fault(process, JOIN_AWAIT),
+    }
+}
+
+/// `JOIN_RESUME`: read the value the future took, by either route.
+fn join_resume(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResult {
+    let mut frame: JoinFrame = load_frame(
+        lane,
+        process,
+        cont,
+        JoinFrame {
+            future: Ref64::NULL,
+            observed: Ref64::NULL,
+        },
+    );
+    // `future_value` is the second decision §4.14 could not reach: it reads a
+    // resolution with no event of its own. This handler reaches it for the same
+    // reason it reaches `AlreadySettled` — the future is somebody else's.
+    frame.observed = lane.future_value(frame.future).unwrap_or(Ref64::NULL);
+    store_frame(lane, process, cont, &frame);
+    StepResult::complete()
 }
 
 /// One synthetic branching-search node of class `index` (§25.1). Reads the

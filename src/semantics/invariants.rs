@@ -257,10 +257,11 @@ fn effect_mediated_commit(kernel: &Kernel, out: &mut Vec<Violation>) {
 /// delivered, resolved or woken. It is carried by a counter.
 ///
 /// That is the general shape of what clause 1 misses: a dependence through
-/// *state* rather than through an event. A quota is the case the machine
-/// already has, because a domain is the only bounded resource an epoch's lanes
-/// can exhaust between them. Anything else with a bound — a mailbox capacity a
-/// second lane fills, a table that can refuse — belongs here as it arrives.
+/// *state* rather than through an event. A quota was the first case; a mailbox's
+/// capacity, a mailbox's occupancy, a future's one assignment and a future's
+/// settled state followed (§4.12–§4.15), each found by asking which results of
+/// the operations a step can perform another lane can decide. Anything else with
+/// that property belongs here as it arrives.
 ///
 /// The clause reads `ProcessCreated`, whose `subject` is the domain the process
 /// was allocated in, so it survives the process being reclaimed. `HOST_LANE` is
@@ -280,7 +281,18 @@ fn effect_mediated_commit(kernel: &Kernel, out: &mut Vec<Violation>) {
 /// at three cohort widths — 1025 events, 441 edges, no cross-lane edge — and
 /// gave the structural reason: the wake events (`MessageReceived`,
 /// `ContinuationReady`, `ChannelReceived`) are emitted by the *acting* lane, so
-/// a delivery edge is either inside one lane or across epochs. §4.3 then
+/// a delivery edge is either inside one lane or across epochs.
+///
+/// **That reason is sound for delivery edges and does not cover program-order
+/// ones**, which §4.15 is the workload that shows. A wake is emitted by the
+/// acting lane and names the *woken* continuation, so it joins that
+/// continuation's own history — and if the woken lane parked earlier in the
+/// same epoch, the ContinuationProgram edge between its park and its wake spans
+/// two lanes. `cross_lane_edges()` is non-empty there, which is the first time
+/// in five races it has been. The measurement stands; what it measured was a
+/// workload in which nothing parked and was woken within one epoch.
+///
+/// §4.3 then
 /// declined to call this an invariant, correctly, because at the time nothing
 /// depended on it: the applier ran per lane, so a run with a cross-lane edge
 /// was merely a run whose lanes could not be reordered.
@@ -326,13 +338,17 @@ fn lane_independence(kernel: &Kernel, out: &mut Vec<Violation>) {
     bounded_resource_independence(kernel, out);
 }
 
-/// Which bounded thing an epoch's lanes were drawing on.
+/// Which thing an epoch's lanes were decided by.
 ///
-/// The four the machine has. A step can exhaust a domain's process quota, it
+/// The five the machine has. A step can exhaust a domain's process quota, it
 /// can fill a receiver's mailbox, it can take the message another lane was about
-/// to receive, and it can publish the one value a future accepts. They were
-/// found by walking the operations a step can perform and asking which of them
-/// can say no, which is a finite list because `LaneView` closes it (§4.10).
+/// to receive, it can publish the one value a future accepts, and it can find
+/// that future already published and not park. They were found by walking the
+/// operations a step can perform, which is a finite list because `LaneView`
+/// closes it (§4.10), and asking of each which of its results another lane can
+/// decide. The first four rounds asked the narrower question — which of them
+/// can say *no* — and the fifth is what showed that to be a special case
+/// (§4.15): `await_future` never fails and is decided all the same.
 ///
 /// The third is the second one read from the other end, and it is a separate
 /// variant because it is contended differently rather than merely elsewhere. A
@@ -359,6 +375,18 @@ enum Bounded {
     /// nothing to tell one such permission from another — not because the run
     /// could not tell the difference.
     FutureAssignment,
+    /// The *state* of that same future, read by a lane that is not writing it
+    /// (v0.3 §4.15). An `await_future` parks or continues depending on whether
+    /// the value has been published, and a resolving lane of the same epoch
+    /// decides which.
+    ///
+    /// This is the first entry that is not a bounded resource at all. Nothing
+    /// is dispensed and the awaiter draws nothing: it reads which of two states
+    /// the future is in. It is in the same clause because the clause's subject
+    /// was never really boundedness — it is a lane's outcome being decided by
+    /// another lane of its epoch, and a refusal was only the first way that was
+    /// found to happen.
+    FutureSettlement,
 }
 
 /// What a resource hands a lane that draws on it successfully.
@@ -377,9 +405,15 @@ enum Dispenses {
 impl Bounded {
     fn dispenses(&self) -> Dispenses {
         match self {
-            Bounded::DomainQuota | Bounded::MailboxCapacity | Bounded::FutureAssignment => {
-                Dispenses::Interchangeable
-            }
+            Bounded::DomainQuota
+            | Bounded::MailboxCapacity
+            | Bounded::FutureAssignment
+            // A settled future hands the awaiter the same news whoever it is,
+            // and there is only ever one lane resolving. The reading below is
+            // "a winner and a lane decided against", which is what
+            // interchangeable already means; a settled await is a lane decided
+            // against without having drawn.
+            | Bounded::FutureSettlement => Dispenses::Interchangeable,
             Bounded::MailboxOccupancy => Dispenses::Identified,
         }
     }
@@ -398,6 +432,9 @@ impl Bounded {
             }
             Bounded::FutureAssignment => {
                 "resolved one future, and it takes one value, so which lane's value it takes"
+            }
+            Bounded::FutureSettlement => {
+                "touched one future, and one of them awaited it, so whether that await parks"
             }
         }
     }
@@ -430,11 +467,17 @@ impl Bounded {
 /// resource" was hiding: the original condition was written when both resources
 /// counted units, and it silently assumed the units were anonymous.
 ///
-/// The refusal has to be in the trace for this to be checkable at all, which is
-/// what `ProcessCreationRefused`, `MessageSendBlocked` and
-/// `MessageReceiveBlocked` are for. Without them the clause can only ask whether
-/// two lanes drew on the resource, which is true of a great many runs that are
-/// perfectly reorderable.
+/// The decision has to be in the trace for this to be checkable at all, which is
+/// what `ProcessCreationRefused`, `MessageSendBlocked`, `MessageReceiveBlocked`,
+/// `FutureResolutionRefused` and `FutureAwaitSettled` are for. Without them the
+/// clause can only ask whether two lanes touched the resource, which is true of
+/// a great many runs that are perfectly reorderable.
+///
+/// The last of the five is not a refusal, and `FutureSettlement` is not a
+/// bounded resource. Both are the same correction: what this clause is about is
+/// one lane's outcome being decided by another lane of its epoch, and a bounded
+/// resource refusing somebody was the first mechanism found for that rather
+/// than the definition of it (v0.3 §4.15).
 ///
 /// **What is not this clause.** The counters themselves — `processes_created`
 /// is incremented by every allocation, in the root domain as much as a bounded
@@ -455,7 +498,10 @@ fn bounded_resource_independence(kernel: &Kernel, out: &mut Vec<Violation>) {
         if event.lane == crate::abi::traces::HOST_LANE {
             continue;
         }
-        let (resource, target, is_refusal) = match event.event_kind {
+        // An event can draw on more than one of these — a resolve both takes
+        // the future's one assignment and publishes the state an awaiter
+        // reads — so this is a list rather than a tuple.
+        let draws: Vec<(Bounded, crate::abi::Ref64, bool)> = match event.event_kind {
             // A domain names itself in `subject`; an unbounded one refuses
             // nobody, and a domain reclaimed since is treated as unbounded
             // rather than guessed at — the run it constrained is over.
@@ -469,43 +515,62 @@ fn bounded_resource_independence(kernel: &Kernel, out: &mut Vec<Violation>) {
                 if !bounded {
                     continue;
                 }
-                (
+                vec![(
                     Bounded::DomainQuota,
                     event.subject,
                     event.event_kind == crate::abi::EventKind::ProcessCreationRefused,
-                )
+                )]
             }
             // A mailbox is named by its receiver, which both events carry in
             // `causal`. Every mailbox is bounded, so there is no exemption.
-            crate::abi::EventKind::MessageSent | crate::abi::EventKind::MessageSendBlocked => (
-                Bounded::MailboxCapacity,
-                event.causal,
-                event.event_kind == crate::abi::EventKind::MessageSendBlocked,
-            ),
+            crate::abi::EventKind::MessageSent | crate::abi::EventKind::MessageSendBlocked => {
+                vec![(
+                    Bounded::MailboxCapacity,
+                    event.causal,
+                    event.event_kind == crate::abi::EventKind::MessageSendBlocked,
+                )]
+            }
             // A future takes one value and refuses every later write. Both
             // events name it in `causal`.
-            crate::abi::EventKind::FutureResolved
-            | crate::abi::EventKind::FutureResolutionRefused => (
-                Bounded::FutureAssignment,
-                event.causal,
-                event.event_kind == crate::abi::EventKind::FutureResolutionRefused,
-            ),
+            crate::abi::EventKind::FutureResolved => vec![
+                (Bounded::FutureAssignment, event.causal, false),
+                // The publication an awaiter of the same epoch may read. A
+                // resolve is the only way to win this one: nothing else moves
+                // a future out of `Pending`.
+                (Bounded::FutureSettlement, event.causal, false),
+            ],
+            crate::abi::EventKind::FutureResolutionRefused => {
+                vec![(Bounded::FutureAssignment, event.causal, true)]
+            }
+            // The same future read rather than written. The awaiter is the
+            // lane decided against — it found the value published and did not
+            // park — and the resolver is the lane that decided it. A resolve
+            // is therefore *both* a draw on the assignment and a write to the
+            // state, and is counted under both keys, which is why this arm
+            // sits after the one above rather than being merged into it.
+            crate::abi::EventKind::FutureAwaitSettled => {
+                vec![(Bounded::FutureSettlement, event.causal, true)]
+            }
             // The same mailbox from the other end, where what is contended is
             // the messages in it rather than the room left. Both events name
             // the mailbox's owner in `process`.
             crate::abi::EventKind::MessageReceived
-            | crate::abi::EventKind::MessageReceiveBlocked => (
-                Bounded::MailboxOccupancy,
-                event.process,
-                event.event_kind == crate::abi::EventKind::MessageReceiveBlocked,
-            ),
+            | crate::abi::EventKind::MessageReceiveBlocked => {
+                vec![(
+                    Bounded::MailboxOccupancy,
+                    event.process,
+                    event.event_kind == crate::abi::EventKind::MessageReceiveBlocked,
+                )]
+            }
             _ => continue,
         };
-        let key = (event.epoch, resource, target.key());
-        if is_refusal {
-            lost.entry(key).or_default().insert(event.lane);
-        } else {
-            won.entry(key).or_default().insert(event.lane);
+        for (resource, target, is_refusal) in draws {
+            let key = (event.epoch, resource, target.key());
+            if is_refusal {
+                lost.entry(key).or_default().insert(event.lane);
+            } else {
+                won.entry(key).or_default().insert(event.lane);
+            }
         }
     }
 

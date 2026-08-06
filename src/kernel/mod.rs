@@ -2500,6 +2500,22 @@ impl Kernel {
             }
         }
         if settled {
+            // Traced for the reason the four refusals are, and for one more.
+            // The other branch of this `if` leaves a `ContinuationWaiting`
+            // behind; this one used to leave nothing, so a run in which the
+            // resolver went first was indistinguishable from one in which
+            // there had never been anything to wait for. It is also what I25
+            // clause 2 reads to tell the two apart (v0.3 §4.15).
+            let value = self.futures.get(future).map(|f| f.value).unwrap_or(Ref64::NULL);
+            self.trace_full(
+                EventKind::FutureAwaitSettled,
+                actor,
+                cont,
+                next_run_class,
+                0,
+                future,
+                value,
+            );
             return Ok(AwaitOutcome::AlreadySettled(future_state));
         }
         self.future_waiters
