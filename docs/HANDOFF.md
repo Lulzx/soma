@@ -206,6 +206,17 @@ Added in v0.3:
   the backend boundary -- a body reading an array it was not given, and an
   array bound to a body with no name for it, are both `InvalidInput`. This is
   what put ant sensing on the GPU; see `experiments/ant_scoring.rs`.
+- Reordered lanes (v0.3 §4.6). `scheduler::lane_order` decides the order an
+  epoch's lanes are *run* in, separately from the order the plan numbers them
+  in: plan order, reversed, or a per-epoch permutation. A lane's number never
+  moves, so it keeps its position space and its allocation partition and a
+  reordered run stays comparable to a plan-order one. This is what turns
+  canonical commit and I25 from claims about a machine that only ever chose one
+  order into properties a run can fail -- `tests/lane_order.rs` requires the
+  effect log's application sequence identical across orders, and putting the
+  applier back inside the lane loop fails it. A reordered run gives up I23's
+  clause 2 and owes I18 after `order::in_position_order`, which is the exemption
+  §4.2 wrote when the clause was written. Still one thread.
 - An effect log (I24). A step no longer writes a runnable bin; it produces the
   entries it wants and the kernel applies them, in the order the plan puts the
   producing lanes in. `Scheduler::enqueue` demands a token only the applier can

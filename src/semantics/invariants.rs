@@ -364,10 +364,27 @@ fn position_derived_emission(kernel: &Kernel, out: &mut Vec<Violation>) {
         }
     }
 
-    // Clause 2. Comparing positions pairwise rather than sorting a copy keeps
-    // the report specific: the first inversion names the two events, where a
-    // sort would only report that the orders differ.
+    // Clause 2, and only of an executive that runs its lanes in plan order.
+    //
+    // §4.2 wrote this exemption before there was anything to exempt: "a
+    // concurrent implementation appends interleaved and will not satisfy it on
+    // its raw trace; what it owes is clauses 1 and 3, and I18 after sorting by
+    // position." A reordering executive (§4.6) is the first thing in this crate
+    // that appends out of position order, and it owes exactly that instead.
+    //
+    // Skipping the clause rather than weakening it is the point. Weakened to
+    // "sorting by position gives *a* total order" it would be clause 1 again
+    // and would hold of anything; the content moves to `tests/lane_order.rs`,
+    // where a reordered run is compared against the plan-order run it must
+    // reproduce.
+    //
+    // Comparing positions pairwise rather than sorting a copy keeps the report
+    // specific: the first inversion names the two events, where a sort would
+    // only report that the orders differ.
     for (index, window) in events.windows(2).enumerate() {
+        if !kernel.lane_order().is_plan_order() {
+            break;
+        }
         if window[0].position() >= window[1].position() {
             let (epoch, lane, sequence) = window[0].position();
             let (next_epoch, next_lane, next_sequence) = window[1].position();

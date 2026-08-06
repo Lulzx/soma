@@ -364,7 +364,9 @@ problem, and the one that gated the applier's move — is settled as I25 rather
 than by deferring the remaining tables, for the reason §4.5 gives.
 
 What is *not* done is the executive that all of this was for. Lanes are
-reorderable and nothing reorders them.
+reorderable and §4.6 reorders them — deterministically, on one thread — so the
+property is checked rather than claimed. Running them on several threads is
+mechanical rather than semantic work, and it is not done.
 
 `kernel/epochs.rs` still cohorts, executes, and commits on the host, one
 continuation at a time. The Metal path dispatches a single collective and blocks
@@ -751,6 +753,66 @@ that no workload has quietly reintroduced a dependence. That is the obligation
 is not written — `src/` still contains no threads, and lanes still run one after
 another in a `for` loop. What changed is that running them elsewhere is now a
 question about the executive rather than about the semantics.
+
+### 4.6 The lanes are reordered, so that "reorderable" can be wrong
+
+§4.5 ended by saying lanes are reorderable and nothing reorders them. That is a
+bad place to leave a property. Canonical commit's whole claim is that an epoch
+commits the same thing whatever order its lanes ran in, and the executive ran
+them in plan order every time, so the claim was about a machine that only ever
+chose one order — as was I25, which is what pays for it.
+
+`scheduler::lane_order` is the choice made explicit. `LaneOrder::Plan` is what
+a sequential interpreter does. `Reverse` inverts every pair, which is the
+cheapest order that is maximally wrong. `Permuted(seed)` shuffles per epoch from
+a counter-based generator, because reversal misses a dependence among three
+lanes that both orderings of every pair happen to satisfy, and because a fixed
+shuffle is something a workload can accidentally agree with.
+
+**A lane's number does not move.** The plan is numbered first and walked second.
+A number is a position in the plan, it stamps every event and effect the lane
+produces (§4.2), and it chooses the lane's allocation partition (§4.3) — so the
+same continuation gets the same number, the same partition and the same position
+space under every order. Only the walk changes. This is what makes a reordered
+run comparable to a plan-order one rather than merely different from it.
+
+**What a reordered run owes, and what it does not.** It gives up I23's clause 2:
+its raw trace's append order is no longer its position order. That is not a
+concession made here — §4.2 wrote the exemption when the clause was written, and
+said what replaces it: clauses 1 and 3, and I18 *after sorting by position*. The
+checker asks which executive it is looking at and skips clause 2 for the ones
+that do not owe it, rather than weakening the clause to something that would
+hold of anything.
+
+`order::in_position_order` is that sort, as an explicit step rather than folded
+into `conforms`. Folding it in would let an implementation that quietly appended
+out of order stop failing clause 2 and start passing a silently-sorted I18, and
+the clause would mean nothing. The sort needs nothing but the trace — a position
+is `(epoch, lane, sequence)`, positions are unique by I23 clause 1, and all of
+it is decided before the work runs — so it is a derivation any implementation
+performs on its own output, not a privilege of the reference.
+
+**What the reordering found.** Nothing, which is the outcome §4.3 (3)'s
+measurement predicted and is worth recording as a result rather than as silence.
+Across the search and Expand workloads at cohort widths 1 through 16, under
+reversal and two permutations, every run is I18-equivalent to its plan-order
+run, every run leaves a legal state, and I25 holds of all of them.
+
+**What it is evidence for.** `tests/lane_order.rs` compares the *effect log's*
+application sequence by production position across orders, and requires it
+identical. That is canonical commit stated as an experiment: the order lanes ran
+in changed, and the order the epoch committed in did not. Putting the applier
+back inside the lane loop fails that test, along with two others — so §4.5 is
+now load-bearing rather than merely believed.
+
+**This is not the concurrent executive.** It is single-threaded and deliberately
+so. A permutation exercises exactly what threads need — no lane observes another
+within its epoch, and commit does not care who finished first — while staying
+deterministic, so a defect is a reproducible failure at a fixed place rather
+than an intermittent corruption. The remaining work to run lanes on threads is
+mechanical rather than semantic, and it is large: handlers take `&mut Kernel`,
+so it means lane-local table shards merged at commit, which is the shape
+partitioned allocation was built for.
 
 ---
 

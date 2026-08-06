@@ -326,6 +326,7 @@ pub struct Kernel {
     /// entities and changes nothing else, which is what I19 checks now that I18
     /// compares up to a correspondence between names (§2.6).
     allocation_partitions: u8,
+    lane_order: crate::scheduler::lane_order::LaneOrder,
     /// The partition every table is currently allocating from.
     active_partition: u8,
     /// SIMD lanes per dispatch (§14). The default of 1 makes every cohort a
@@ -399,6 +400,7 @@ impl Kernel {
             module_evaluators: HashMap::new(),
             scheduler,
             allocation_partitions: 1,
+            lane_order: crate::scheduler::lane_order::LaneOrder::Plan,
             active_partition: 0,
             cohort_width: 1,
             partial_policy: PartialCohortPolicy::default(),
@@ -430,6 +432,26 @@ impl Kernel {
     /// before anything runs and does not depend on which worker picks the lane
     /// up. That is what makes partitioned allocation deterministic: within one
     /// partition, allocations still happen in lane order.
+    /// Choose the order the executive runs an epoch's lanes in.
+    ///
+    /// Only the execution order changes. A lane's number stays its position in
+    /// the plan, so it still stamps every event and effect the lane produces
+    /// and still chooses the lane's allocation partition — which is what makes
+    /// a reordered run comparable to a plan-order one at all.
+    ///
+    /// Anything other than `Plan` gives up I23's clause 2, and gives it up
+    /// deliberately: the raw trace's append order stops being its position
+    /// order, which is the thing §4.2 said a concurrent implementation would do
+    /// and would not owe. What such a run still owes is clauses 1 and 3, I25,
+    /// and I18 against the plan-order run once sorted.
+    pub fn configure_lane_order(&mut self, order: crate::scheduler::lane_order::LaneOrder) {
+        self.lane_order = order;
+    }
+
+    pub fn lane_order(&self) -> crate::scheduler::lane_order::LaneOrder {
+        self.lane_order
+    }
+
     pub fn set_allocation_partitions(&mut self, partitions: u8) {
         self.allocation_partitions = partitions.max(1);
     }

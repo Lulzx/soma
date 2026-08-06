@@ -172,21 +172,33 @@ impl Kernel {
         // counter local to it. Nothing here consults a shared clock, so a
         // concurrent executive can run these lanes in any order and the trace
         // still sorts back into this one.
-        let mut steps = 0;
+        // The plan is numbered first and walked second, so that the order the
+        // executive runs lanes in is a separate decision from what their
+        // numbers are. A lane's number is its position here, before any of
+        // this runs, which is what keeps a reordered run comparable to a
+        // plan-order one: the same continuation gets the same number, the same
+        // allocation partition, and the same position space either way.
+        let mut lanes: Vec<(u32, Ref64)> = Vec::new();
         let mut lane_number = 0u32;
         for plan in &plans {
             for cohort in &plan.cohorts {
                 for cont in cohort.lanes() {
                     lane_number += 1;
-                    let process = match self.continuations.get(*cont) {
-                        Ok(c) => c.process,
-                        Err(_) => continue,
-                    };
-                    self.enter_lane(lane_number);
-                    steps += self.execute_cont(*cont, process);
-                    self.leave_lane();
+                    lanes.push((lane_number, *cont));
                 }
             }
+        }
+        self.lane_order.arrange(&mut lanes, self.epoch);
+
+        let mut steps = 0;
+        for (lane_number, cont) in lanes {
+            let process = match self.continuations.get(cont) {
+                Ok(c) => c.process,
+                Err(_) => continue,
+            };
+            self.enter_lane(lane_number);
+            steps += self.execute_cont(cont, process);
+            self.leave_lane();
         }
 
         // Phase G: Commit. Every lane of the epoch has finished; apply what

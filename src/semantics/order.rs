@@ -316,6 +316,33 @@ pub fn semantic_projection(events: &[TraceSnapshotRow]) -> Vec<TraceSnapshotRow>
         .collect()
 }
 
+/// Re-sort a trace into the order its positions put it in.
+///
+/// I18 compares traces as *emitted*, which is the right relation for an
+/// executive whose append order is its plan order and the wrong one for
+/// anything else. §4.2 said so when I23 was written: a concurrent
+/// implementation appends interleaved, and "what it owes is clauses 1 and 3,
+/// and I18 after sorting by position". This is that sort, made an explicit step
+/// rather than folded into `conforms`.
+///
+/// Explicit because the two relations are genuinely different obligations and
+/// collapsing them would hide which one an implementation met. A plan-order run
+/// is unchanged by this — its emission order already *is* its position order,
+/// which I23's clause 2 checks — so an implementation that quietly appended out
+/// of order would go from failing clause 2 to passing a silently-sorted I18,
+/// and the clause would stop meaning anything.
+///
+/// The sort is total and needs nothing but the trace: a position is
+/// `(epoch, lane, sequence)`, positions are unique (I23 clause 1), and every
+/// one of those is decided before the work runs. So this is a derivation any
+/// implementation can perform on its own output, not a privilege of the
+/// reference.
+pub fn in_position_order(events: &[TraceSnapshotRow]) -> Vec<TraceSnapshotRow> {
+    let mut sorted = events.to_vec();
+    sorted.sort_by_key(|row| (row.epoch, row.lane, row.lane_sequence));
+    sorted
+}
+
 /// Build ≺ from a trace.
 ///
 /// Two structural relations plus five causal ones. Deliberately not included:

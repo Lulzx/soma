@@ -284,9 +284,10 @@ Not implemented:
   rather than a shared clock (I23), allocation is partitioned so lanes need no
   shared allocator, and commit is canonical — an epoch runs every lane, then
   applies what they produced in plan order, so nothing an epoch commits depends
-  on the order its lanes ran (I24, I25). Lanes are reorderable; the executive
-  still runs them one after another in a `for` loop, and `src/` contains no
-  threads
+  on the order its lanes ran (I24, I25). Lanes are reorderable and the executive
+  reorders them — reversed or permuted per epoch, checked to produce the same
+  run and the same commit sequence — but it does so on one thread. `src/`
+  contains no threads
 - Scheduler-overhead and end-to-end migration benchmarks. The batch backend
   itself is measured on hardware — CPU against Metal from 32 to 4M elements,
   where a Metal call's fixed cost goes, what a published cohort costs off-GPU,
