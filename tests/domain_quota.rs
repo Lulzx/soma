@@ -13,6 +13,10 @@
 //!
 //! The dependence carries no ≺ edge: nothing is sent, resolved or woken between
 //! the lanes. `clause_1_does_not_see_it` is the reason clause 2 exists at all.
+//!
+//! A quota is one bounded resource and not the only one. `tests/mailbox_capacity.rs`
+//! is the same experiment on a receiver's mailbox, and it is where the clause's
+//! condition got its final form: a winner *and* a different loser.
 
 use soma::abi::cohorts::PartialCohortPolicy;
 use soma::abi::{EventKind, ProcessMode, StateAccess};
@@ -183,8 +187,9 @@ fn i25_is_silent_when_the_bound_has_room() {
 
 #[test]
 fn i25_is_silent_when_one_lane_is_refused() {
-    // One parent, so one lane draws on the domain and is refused. It would have
-    // been refused whenever it ran, so no order decided anything.
+    // One parent, so one lane draws on the domain, takes what is left and is
+    // then refused. A lane that exhausts a resource against nobody has raced
+    // nobody, whatever order it ran in.
     let kernel = bounded(LaneOrder::Plan, 2, 1);
     assert!(
         !kinds(&kernel, EventKind::ProcessCreationRefused).is_empty(),

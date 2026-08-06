@@ -3193,7 +3193,7 @@ impl Kernel {
 
         // Commit the send inside a scoped block so the mailbox borrow ends
         // before we touch other tables for tracing / waking.
-        let waiter = {
+        let blocked = {
             let mailbox = self
                 .mailboxes
                 .get_mut(&receiver.key())
@@ -3205,8 +3205,31 @@ impl Kernel {
                 if !sender_cont.is_null() && !mailbox.full_waiters.contains(&sender_cont) {
                     mailbox.full_waiters.push_back(sender_cont);
                 }
-                return Err(RuntimeError::MailboxFull);
+                Some(mailbox.capacity as u32)
+            } else {
+                None
             }
+        };
+        if let Some(capacity) = blocked {
+            // Traced for `ProcessCreationRefused`'s reason: a message that did
+            // not arrive is a thing that happened, and back-pressure was
+            // invisible in the record. `causal` is the receiver, as it is for
+            // `MessageSent`, so the two read the same way.
+            self.trace_caused(
+                EventKind::MessageSendBlocked,
+                sender,
+                sender_cont,
+                0,
+                capacity,
+                receiver,
+            );
+            return Err(RuntimeError::MailboxFull);
+        }
+        let waiter = {
+            let mailbox = self
+                .mailboxes
+                .get_mut(&receiver.key())
+                .ok_or(RuntimeError::MissingMailbox)?;
             mailbox.entries.push_back(msg);
             mailbox.recv_waiters.pop_front()
         };

@@ -1051,25 +1051,50 @@ that demonstrably depends on its lane order. The dependence is carried by a
 counter, not by an event, and an order built from the trace cannot contain it.
 
 **I25 gains a second clause.** No two lanes of one epoch may be decided by one
-domain's quota. Two conditions, and neither alone is the clause:
+bounded resource. The condition is that **one lane got the resource and a
+different lane was refused it**, in the same epoch, and each half is doing work:
 
-- two lanes drew on the domain, and
-- the domain refused at least one allocation.
+- Two lanes with room to spare decide nothing — every draw succeeds under every
+  order.
+- Everyone refused decides nothing either. A mailbox that was already full when
+  the epoch began refuses all four of its senders whatever order they ran in.
+- One lane refused after taking the last of something itself has raced nobody.
 
-Two lanes with room to spare decide nothing — every allocation succeeds under
-every order. One lane refused decides nothing either — it would have been
-refused whenever it ran. It is the pair that makes the outcome a function of the
-order, and the clause fires on exactly the quotas where the two lane orders
-disagree and on none of the ones where they agree.
+The clause fires on exactly the runs where the two lane orders disagree and on
+none of the ones where they agree — checked in both directions, for both
+resources.
 
 **A refusal is now traced.** `ProcessCreationRefused` carries the domain in
-`subject` and the quota in `auxiliary`. Two reasons, and the invariant is the
-second one. The first is that a refusal is a thing that happened and the trace
-had no way to say it: a run showed a process faulting and could not say the
-machine had told it no. The second is that the clause needs to tell a bound that
+`subject` and the quota in `auxiliary`; `MessageSendBlocked` carries the
+receiver in `causal`, as `MessageSent` does, and the capacity in `auxiliary`.
+Two reasons each, and the invariant is the second one. The first is that a
+refusal is a thing that happened and the trace had no way to say it: a run
+showed a process faulting, or a sender that had not sent, and could not say the
+machine had told it no. The second is that the clause has to tell a bound that
 bit from a bound with room, and only the refusal says which. `ProcessCreated`
 gained the domain in `subject` for the same reason — a reclaimed process cannot
 be asked which domain it drew on.
+
+**The second resource was a prediction, and it held.** This section first said a
+quota was the case the machine had, and named "a mailbox capacity a second lane
+fills" as what to look at next. It behaves identically: several senders replying
+to one receiver in one epoch with one slot free, and the sender that gets it is
+the one whose lane ran first. Clause 1 is blind for the same reason — occupancy
+is not an event — and the two runs are not I18-equivalent.
+`tests/mailbox_capacity.rs` is the experiment; it is also where the clause's
+condition got its final form, because "two lanes drew and one was refused" fires
+on a mailbox that was already full, which is not a race.
+
+**What that suggests about the rest.** Neither resource was found by a failing
+test; both were found by asking what a lane reads a *decision* off. That
+question is the tool, and the remaining candidates are the ones where an
+operation can say no: a table that can refuse to allocate, and a supervision
+queue with a bound. Neither is reachable from a step today.
+
+**The section heading is now too narrow.** It says quota; the clause is about
+bounded resources, and a quota is one of two. It is left as it is because §4.12
+is what the commits and the handoff point at, and renaming a section to make it
+tidier is how a reference stops matching what refers to it.
 
 **What is *not* this clause.** `processes_created` is incremented by every
 allocation, in the root domain as much as a bounded one, so two lanes writing it
@@ -1166,7 +1191,7 @@ cannot reach means the model is charging for the wrong thing.
 | I22 admission determinism | checked | the decision is a function of the candidate set (§4.1) |
 | I23 position-derived emission | checked | the trace's order needs no shared clock (§4.2) |
 | I24 effect-mediated commit | checked | bins are written by an applier, in plan order (§4.4) |
-| I25 lane independence | checked | two clauses: no ≺ edge joins two lanes of one epoch (§4.5), and no two lanes are decided by one domain's quota (§4.12) |
+| I25 lane independence | checked | two clauses: no ≺ edge joins two lanes of one epoch (§4.5), and no two lanes are decided by one bounded resource — a domain quota or a mailbox capacity (§4.12) |
 
 **I21** has two halves. The first — an epoch that admitted work dispatched some
 of it — is a statement about a transition rather than a state, so it is counted

@@ -4,7 +4,7 @@ Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
 Repository: https://github.com/Lulzx/soma. The default semantic core is
-dependency-free. There are 357 tests (seven of which need the `metal` feature),
+dependency-free. There are 365 tests (seven of which need the `metal` feature),
 six compile-fail doc tests, and no Clippy warnings. The optional `metal`
 feature adds the `metal-rs` implementation dependency on macOS.
 
@@ -245,14 +245,16 @@ Added in v0.3:
   runs single-threaded. Results stay in request order -- the caller publishes
   result i into collective i -- and one failed request fails the epoch, which is
   the contract the sequential path already had.
-- I25 clause 2 (v0.3 §4.12). An epoch's lanes must not be decided by one
-  domain's quota. A step creating a process consumes it, so two lanes drawing on
-  one bounded domain refuse a different process depending on which ran first --
-  `tests/domain_quota.rs` is the counterexample §4.6 did not have, and both runs
-  leave a legal state, so only comparing them reports it. Clause 1 cannot: the
-  dependence carries no ≺ edge, only a counter. Clause 2 needs both a second
-  drawing lane and an actual refusal, since a bound with room decides nothing;
-  `ProcessCreationRefused` is what says the bound bit. The bug it turned up:
+- I25 clause 2 (v0.3 §4.12). An epoch's lanes must not be decided by one bounded
+  resource. Two of them: a domain's process quota (`tests/domain_quota.rs`) and a
+  receiver's mailbox capacity (`tests/mailbox_capacity.rs`). In both, two lanes
+  draw and the one that ran first wins, so the same workload under `Plan` and
+  `Reverse` is not I18-equivalent -- the counterexamples §4.6 did not have. Both
+  runs leave a legal state, so only comparing them reports it, and clause 1
+  cannot: the dependence carries no ≺ edge, just a counter or an occupancy. The
+  condition is a winner *and* a different loser -- everyone refused is not a
+  race. `ProcessCreationRefused` and `MessageSendBlocked` are what let the
+  checker tell a bound that bit from a bound with room. The bug this turned up:
   `LaneView::create_process` was infallible, so a full domain aborted the host
   process instead of faulting the step.
 - A lane-local trace buffer (v0.3 §4.11). A lane produces trace events into
@@ -572,7 +574,9 @@ decision that would otherwise depend on `HashMap` iteration order.
   reorderability result here is conditional on what the workload touches, so a
   new shared, bounded, or refusing resource needs its own reordered run rather
   than inheriting the old conclusion. The place to look is anything a lane reads
-  a *decision* off rather than merely writes.
+  a *decision* off rather than merely writes. That question found both cases so
+  far -- a domain quota and a mailbox capacity — neither by a failing test, and
+  the remaining candidates are wherever an operation can say no.
 - **The lane trace buffer drains in emission order, and must not sort.**
   `drain_lane_trace` appends what the lane produced in the order it produced it,
   which is why the buffer changed no run. Sorting by position there looks like an

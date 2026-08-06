@@ -55,6 +55,18 @@ pub enum EventKind {
     /// lanes drawing on a bounded domain only decide anything by their order
     /// once the bound actually binds, and this is the event that says it did.
     ProcessCreationRefused = 34,
+    /// A send found the receiver's mailbox full and parked the sender.
+    ///
+    /// Back-pressure is a designed outcome and not a failure — the sender is
+    /// registered as a waiter and retries when a slot frees (§11) — but it is
+    /// still something that happened to a message that did not arrive, and the
+    /// trace could not say it. `causal` is the receiver, as it is for
+    /// `MessageSent`, and `auxiliary` is the capacity that was reached.
+    ///
+    /// Like `ProcessCreationRefused`, it is also what makes I25 clause 2
+    /// precise: two lanes sending to one mailbox decide nothing between them
+    /// until the mailbox is actually full.
+    MessageSendBlocked = 35,
 }
 
 /// The lane an event was emitted from when it was not emitted from one: epoch

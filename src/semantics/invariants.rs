@@ -323,72 +323,124 @@ fn lane_independence(kernel: &Kernel, out: &mut Vec<Violation>) {
         // defect buries the other invariants' reports.
         break;
     }
-    bounded_domain_independence(kernel, out);
+    bounded_resource_independence(kernel, out);
 }
 
-/// I25 clause 2: no two lanes of one epoch are decided by the same domain quota.
+/// Which bounded thing an epoch's lanes were drawing on.
 ///
-/// Two conditions together, and neither alone is the clause. Two lanes drawing
-/// on one bounded domain decides nothing while the domain has room for both —
-/// every lane's allocation succeeds under every order, and the run is
-/// reorderable. A refusal with only one lane drawing decides nothing either: the
-/// lane would have been refused whenever it ran. It is the pair that makes the
-/// outcome a function of the order.
+/// The two the machine has. A step can exhaust a domain's process quota and it
+/// can fill a receiver's mailbox, and in both cases the loser is decided by
+/// which lane ran first. Anything else a lane reads a *decision* off — rather
+/// than merely writes — belongs here as it arrives.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Bounded {
+    DomainQuota,
+    MailboxCapacity,
+}
+
+impl Bounded {
+    fn describe(&self) -> &'static str {
+        match self {
+            Bounded::DomainQuota => "allocated in one bounded domain, and it refused at least one",
+            Bounded::MailboxCapacity => "sent to one mailbox, and it was full for at least one",
+        }
+    }
+}
+
+/// I25 clause 2: no two lanes of one epoch are decided by one bounded resource.
 ///
-/// The separate matter of the counter itself — `processes_created` is
-/// incremented by every allocation, in the root domain as much as a bounded one
-/// — is not this clause. That is a write two lanes make and a journal fixes,
-/// because the increment commutes (v0.3 §4.12). What does not commute is the
-/// decision read off it.
-fn bounded_domain_independence(kernel: &Kernel, out: &mut Vec<Violation>) {
+/// The precise condition is that **one lane got the resource and a different
+/// lane was refused it**, in the same epoch. Each half is doing work. Two lanes
+/// drawing on a resource with room for both decide nothing — every lane succeeds
+/// under every order. A refusal with nobody succeeding decides nothing either:
+/// a mailbox that was already full at the start of the epoch refuses all four of
+/// its senders whatever order they run in, and the run is reorderable. So is one
+/// lane refused after succeeding itself, which is a lane exhausting a resource
+/// against nobody. It is a winner *and* a different loser that makes the outcome
+/// a function of the order.
+///
+/// The refusal has to be in the trace for this to be checkable at all, which is
+/// what `ProcessCreationRefused` and `MessageSendBlocked` are for. Without them
+/// the clause can only ask whether two lanes drew on the resource, which is true
+/// of a great many runs that are perfectly reorderable.
+///
+/// **What is not this clause.** The counters themselves — `processes_created`
+/// is incremented by every allocation, in the root domain as much as a bounded
+/// one — are writes two lanes make and a journal fixes, because they commute
+/// (v0.3 §4.12). What does not commute is the decision read off them.
+fn bounded_resource_independence(kernel: &Kernel, out: &mut Vec<Violation>) {
     use std::collections::{HashMap, HashSet};
-    let mut lanes: HashMap<(u32, u64), HashSet<u32>> = HashMap::new();
-    let mut refused: HashSet<(u32, u64)> = HashSet::new();
+    type Key = (u32, Bounded, u64);
+    // Per (epoch, resource): the lanes that got it, and the lanes that were
+    // refused it.
+    let mut won: HashMap<Key, HashSet<u32>> = HashMap::new();
+    let mut lost: HashMap<Key, HashSet<u32>> = HashMap::new();
+
     for event in kernel.trace_events() {
-        let drawing = matches!(
-            event.event_kind,
-            crate::abi::EventKind::ProcessCreated | crate::abi::EventKind::ProcessCreationRefused
-        );
-        // `HOST_LANE` is excluded for clause 1's reason: the host's allocations
-        // run strictly before or after the epoch's lanes, so an order between
-        // them is the plan's and not a race.
-        if !drawing || event.lane == crate::abi::traces::HOST_LANE {
+        // `HOST_LANE` is excluded for clause 1's reason: the host's part of an
+        // epoch runs strictly before or after the lanes, so an order between it
+        // and a lane is the plan's and not a race.
+        if event.lane == crate::abi::traces::HOST_LANE {
             continue;
         }
-        let domain = event.subject;
-        // An unbounded domain refuses nobody. A domain reclaimed since is
-        // treated as unbounded rather than guessed at — the run it constrained
-        // is over, and it is no longer here to say what it allowed.
-        let bounded = kernel
-            .domains()
-            .get(domain)
-            .map(|d| d.max_processes != 0)
-            .unwrap_or(false);
-        if !bounded {
-            continue;
-        }
-        let key = (event.epoch, domain.key());
-        lanes.entry(key).or_default().insert(event.lane);
-        if event.event_kind == crate::abi::EventKind::ProcessCreationRefused {
-            refused.insert(key);
+        let (resource, target, is_refusal) = match event.event_kind {
+            // A domain names itself in `subject`; an unbounded one refuses
+            // nobody, and a domain reclaimed since is treated as unbounded
+            // rather than guessed at — the run it constrained is over.
+            crate::abi::EventKind::ProcessCreated
+            | crate::abi::EventKind::ProcessCreationRefused => {
+                let bounded = kernel
+                    .domains()
+                    .get(event.subject)
+                    .map(|d| d.max_processes != 0)
+                    .unwrap_or(false);
+                if !bounded {
+                    continue;
+                }
+                (
+                    Bounded::DomainQuota,
+                    event.subject,
+                    event.event_kind == crate::abi::EventKind::ProcessCreationRefused,
+                )
+            }
+            // A mailbox is named by its receiver, which both events carry in
+            // `causal`. Every mailbox is bounded, so there is no exemption.
+            crate::abi::EventKind::MessageSent | crate::abi::EventKind::MessageSendBlocked => (
+                Bounded::MailboxCapacity,
+                event.causal,
+                event.event_kind == crate::abi::EventKind::MessageSendBlocked,
+            ),
+            _ => continue,
+        };
+        let key = (event.epoch, resource, target.key());
+        if is_refusal {
+            lost.entry(key).or_default().insert(event.lane);
+        } else {
+            won.entry(key).or_default().insert(event.lane);
         }
     }
 
-    let mut contended: Vec<_> = refused
+    let mut contended: Vec<(&Key, u32, u32)> = lost
         .iter()
-        .filter(|key| lanes.get(*key).map(|set| set.len() > 1).unwrap_or(false))
+        .filter_map(|(key, losers)| {
+            let winners = won.get(key)?;
+            // A winner and a *different* loser. One lane that exhausts a
+            // resource against nobody has raced nobody.
+            let winner = winners.iter().min()?;
+            let loser = losers.iter().find(|lane| *lane != winner)?;
+            Some((key, *winner, *loser))
+        })
         .collect();
     contended.sort();
     // One report per run, as in clause 1.
-    if let Some((epoch, domain)) = contended.first() {
-        let mut drawn: Vec<u32> = lanes[&(*epoch, *domain)].iter().copied().collect();
-        drawn.sort_unstable();
+    if let Some((key, winner, loser)) = contended.first() {
+        let (epoch, resource, _) = **key;
         out.push(Violation::new(
             Invariant::LaneIndependence,
             format!(
-                "epoch {epoch}: lanes {drawn:?} all allocated in one bounded domain and the \
-                 domain refused at least one of them, so which lane is refused depends on \
-                 which lane ran first"
+                "epoch {epoch}: lanes {winner} and {loser} both {}, so which lane loses \
+                 depends on which lane ran first",
+                resource.describe()
             ),
         ));
     }
