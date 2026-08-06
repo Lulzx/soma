@@ -385,5 +385,51 @@ fn main() {
                 command.wait_until_completed();
             }),
         );
+        // The same command buffer, but each cohort writes into a buffer
+        // allocated for it alone. This is what publishing actually does: an
+        // output the kernel takes ownership of cannot be one the backend
+        // reuses. The rows above quietly shared one output buffer and so
+        // priced a submission shape the epoch path cannot use.
+        line(
+            &format!("{cohorts} cohorts: one buffer, fresh outputs"),
+            median(30, || {
+                let outputs: Vec<metal::Buffer> = (0..cohorts)
+                    .map(|_| device.new_buffer(chunk, MTLResourceOptions::StorageModeShared))
+                    .collect();
+                let command = queue.new_command_buffer();
+                let encoder = command.new_compute_command_encoder();
+                for (slot, output) in outputs.iter().enumerate() {
+                    encoder.set_compute_pipeline_state(&pipeline);
+                    encoder.set_buffer(0, Some(&large_input_buffer), slot as u64 * chunk);
+                    encoder.set_buffer(1, Some(output), 0);
+                    encoder.set_bytes(
+                        2,
+                        std::mem::size_of::<u32>() as u64,
+                        (&cohort_count as *const u32).cast::<c_void>(),
+                    );
+                    encoder.set_bytes(
+                        3,
+                        std::mem::size_of::<u32>() as u64,
+                        (&element_stride as *const u32).cast::<c_void>(),
+                    );
+                    encoder.dispatch_threads(
+                        MTLSize {
+                            width: COHORT as u64,
+                            height: 1,
+                            depth: 1,
+                        },
+                        MTLSize {
+                            width: simd,
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                }
+                encoder.end_encoding();
+                command.commit();
+                command.wait_until_completed();
+                std::hint::black_box(outputs);
+            }),
+        );
     }
 }

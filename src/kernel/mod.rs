@@ -4,6 +4,7 @@
 //! generation-checked (§4 of the historical Phase-1 contract).
 
 pub mod accounting;
+pub mod capability_space;
 pub mod commit;
 pub mod effects;
 pub mod epochs;
@@ -247,7 +248,7 @@ pub struct Kernel {
     objects: GenTable<ObjectDescriptor>,
     /// Capability references are relative to the acting process. Slot zero is
     /// the explicit system principal.
-    capability_spaces: HashMap<u64, GenTable<CapabilityEntry>>,
+    capability_spaces: HashMap<u64, capability_space::CapabilitySpace>,
     continuations: crate::table::GenTable<crate::abi::continuations::ContinuationDescriptor>,
     futures: GenTable<FutureDescriptor>,
     channels: GenTable<ChannelDescriptor>,
@@ -331,7 +332,10 @@ impl Kernel {
             modules: GenTable::new(Kind::Module),
             root_domain: Ref64::NULL,
             objects: GenTable::new(Kind::Object),
-            capability_spaces: HashMap::from([(0, GenTable::new(Kind::Capability))]),
+            capability_spaces: HashMap::from([(
+                0,
+                capability_space::CapabilitySpace::new(Kind::Capability),
+            )]),
             continuations: GenTable::new(Kind::Continuation),
             futures: GenTable::new(Kind::Future),
             channels: GenTable::new(Kind::Channel),
@@ -473,8 +477,23 @@ impl Kernel {
         Ok(self.objects.get(object)?.byte_length)
     }
 
+    /// How many capabilities across all spaces name `target`.
+    ///
+    /// Reporting only: it exists because the cost of an authorization is the
+    /// length of this bucket, so a benchmark that slows down wants to be able
+    /// to say whether the bucket is why.
+    pub fn capabilities_naming(&self, target: Ref64) -> usize {
+        self.capability_spaces
+            .values()
+            .map(|space| space.for_target(target).len())
+            .sum()
+    }
+
     pub fn capability_count(&self) -> usize {
-        self.capability_spaces.values().map(GenTable::len).sum()
+        self.capability_spaces
+            .values()
+            .map(capability_space::CapabilitySpace::len)
+            .sum()
     }
 
     pub fn capability_table_kind(&self) -> Kind {
@@ -607,7 +626,7 @@ impl Kernel {
         &self.objects
     }
 
-    pub(crate) fn capability_spaces(&self) -> &HashMap<u64, GenTable<CapabilityEntry>> {
+    pub(crate) fn capability_spaces(&self) -> &HashMap<u64, capability_space::CapabilitySpace> {
         &self.capability_spaces
     }
 
@@ -921,7 +940,7 @@ impl Kernel {
         let space = self
             .capability_spaces
             .entry(actor.key())
-            .or_insert_with(|| GenTable::new(Kind::Capability));
+            .or_insert_with(|| capability_space::CapabilitySpace::new(Kind::Capability));
         space.set_active_partition(active);
         space.alloc(entry)
     }
@@ -1074,26 +1093,35 @@ impl Kernel {
         } else {
             None
         };
-        space.iter().find_map(|(capability_ref, capability)| {
-            let full_object_access = object_metadata
-                .map(|(_, byte_length)| capability.offset == 0 && capability.length >= byte_length)
-                .unwrap_or(true);
-            let object_access_rights =
-                crate::abi::Rights::READ | crate::abi::Rights::WRITE | crate::abi::Rights::FREEZE;
-            let range_is_sufficient = right & object_access_rights == 0 || full_object_access;
-            (capability.target == target
-                && capability.rights & right == right
-                && capability.valid_until_epoch >= self.epoch
-                && Self::capability_chain_is_live(space, capability_ref)
-                && object_metadata
-                    .map(|(version, _)| capability.object_version == version)
-                    .unwrap_or(true)
-                && range_is_sufficient)
-                .then_some(capability_ref)
-        })
+        space
+            .for_target(target)
+            .into_iter()
+            .find_map(|(capability_ref, capability)| {
+                let full_object_access = object_metadata
+                    .map(|(_, byte_length)| {
+                        capability.offset == 0 && capability.length >= byte_length
+                    })
+                    .unwrap_or(true);
+                let object_access_rights = crate::abi::Rights::READ
+                    | crate::abi::Rights::WRITE
+                    | crate::abi::Rights::FREEZE;
+                let range_is_sufficient = right & object_access_rights == 0 || full_object_access;
+                (capability.target == target
+                    && capability.rights & right == right
+                    && capability.valid_until_epoch >= self.epoch
+                    && Self::capability_chain_is_live(space, capability_ref)
+                    && object_metadata
+                        .map(|(version, _)| capability.object_version == version)
+                        .unwrap_or(true)
+                    && range_is_sufficient)
+                    .then_some(capability_ref)
+            })
     }
 
-    fn capability_chain_is_live(space: &GenTable<CapabilityEntry>, capability: Ref64) -> bool {
+    fn capability_chain_is_live(
+        space: &capability_space::CapabilitySpace,
+        capability: Ref64,
+    ) -> bool {
         let mut current = capability;
         // More parent edges than live entries implies a cycle. The bound also
         // makes corrupted raw-test states terminate deterministically.
@@ -1121,10 +1149,15 @@ impl Kernel {
 
     pub(super) fn revoke_target_right(&mut self, target: Ref64, right: u32) {
         for space in self.capability_spaces.values_mut() {
+            // By target rather than over the whole space: every freeze revokes
+            // WRITE on the object it is freezing, so this runs once per
+            // published batch and a full scan here made publication linear in
+            // every capability the run had ever minted.
             let roots: Vec<Ref64> = space
-                .iter()
+                .for_target(target)
+                .into_iter()
                 .filter_map(|(capability, entry)| {
-                    (entry.target == target && entry.rights & right == right).then_some(capability)
+                    (entry.rights & right == right).then_some(capability)
                 })
                 .collect();
             for root in roots {
@@ -1147,7 +1180,7 @@ impl Kernel {
         capability.object_version = version;
         self.capability_spaces
             .entry(actor.key())
-            .or_insert_with(|| GenTable::new(Kind::Capability))
+            .or_insert_with(|| capability_space::CapabilitySpace::new(Kind::Capability))
             .alloc(capability)
     }
 
@@ -1195,18 +1228,16 @@ impl Kernel {
         Ok(())
     }
 
-    fn revoke_capability_tree(space: &mut GenTable<CapabilityEntry>, root: Ref64) {
+    fn revoke_capability_tree(space: &mut capability_space::CapabilitySpace, root: Ref64) {
         let mut revoked = vec![root];
         let mut index = 0;
         while index < revoked.len() {
             let parent = revoked[index];
-            let children: Vec<Ref64> = space
-                .iter()
-                .filter_map(|(r, capability)| {
-                    (capability.parent_capability == parent && !revoked.contains(&r)).then_some(r)
-                })
-                .collect();
-            revoked.extend(children);
+            for child in space.children_of(parent) {
+                if !revoked.contains(&child) {
+                    revoked.push(child);
+                }
+            }
             index += 1;
         }
         for capability in revoked.into_iter().rev() {
@@ -1402,8 +1433,10 @@ impl Kernel {
             process.inbox = r;
             process.status = ProcessState::Created as u32;
         }
-        self.capability_spaces
-            .insert(r.key(), GenTable::new(Kind::Capability));
+        self.capability_spaces.insert(
+            r.key(),
+            capability_space::CapabilitySpace::new(Kind::Capability),
+        );
         self.mint_genesis(r, r, 0, 0);
         self.mint_genesis(r, domain, 0, 0);
         let state_obj = self.create_object_for(r, ObjectKind::ProcessState, Vec::new());

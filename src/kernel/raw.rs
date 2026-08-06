@@ -5,7 +5,6 @@
 
 use std::collections::HashMap;
 
-use crate::abi::capabilities::CapabilityEntry;
 use crate::abi::continuations::ContinuationDescriptor;
 use crate::abi::{
     ChannelDescriptor, CollectiveDescriptor, DomainDescriptor, ExecutionContract, FutureDescriptor,
@@ -27,7 +26,7 @@ pub struct State<'a> {
     pub contracts: &'a mut GenTable<ExecutionContract>,
     pub modules: &'a mut GenTable<ModuleDescriptor>,
     pub objects: &'a mut GenTable<ObjectDescriptor>,
-    pub capability_spaces: &'a mut HashMap<u64, GenTable<CapabilityEntry>>,
+    pub capability_spaces: &'a mut HashMap<u64, crate::kernel::capability_space::CapabilitySpace>,
     pub continuations: &'a mut GenTable<ContinuationDescriptor>,
     pub futures: &'a mut GenTable<FutureDescriptor>,
     pub channels: &'a mut GenTable<ChannelDescriptor>,
