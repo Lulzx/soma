@@ -116,14 +116,19 @@ pub trait BatchBackend {
     }
 }
 
-/// Split `inputs` into elements, apply `element` to each, and return the
-/// result. Shared by every backend's argument checking so that two backends
-/// cannot disagree about what a malformed request is.
+/// Apply `element` to each element of `inputs` and return the result. Shared
+/// by every backend's argument checking so that two backends cannot disagree
+/// about what a malformed request is.
+///
+/// `element` receives an element's *index* rather than its bytes, because a
+/// body that gathers needs the whole array and slicing one element out would
+/// hide the rest of it. It also removes a per-element copy that existed only
+/// to hand the interpreter an isolated slice.
 pub fn evaluate_elementwise(
     inputs: &[u8],
     element_count: u32,
     element_stride: u32,
-    mut element: impl FnMut(&[u8], &mut [u8]),
+    mut element: impl FnMut(u32, &mut [u8]),
 ) -> Result<Vec<u8>, BackendError> {
     let stride = element_stride as usize;
     if stride == 0 {
@@ -138,10 +143,9 @@ pub fn evaluate_elementwise(
     // The output starts as a copy of the input, so fields a body does not
     // store keep their incoming bytes.
     let mut outputs = inputs[..required].to_vec();
-    for index in 0..element_count as usize {
-        let range = index * stride..(index + 1) * stride;
-        let source = inputs[range.clone()].to_vec();
-        element(&source, &mut outputs[range]);
+    for index in 0..element_count {
+        let at = index as usize * stride;
+        element(index, &mut outputs[at..at + stride]);
     }
     Ok(outputs)
 }
@@ -187,8 +191,8 @@ impl BatchBackend for CpuReferenceBackend {
         if program.stride() != element_stride {
             return Err(BackendError::InvalidInput);
         }
-        evaluate_elementwise(inputs, element_count, element_stride, |source, target| {
-            program.evaluate_element(source, target)
+        evaluate_elementwise(inputs, element_count, element_stride, |index, target| {
+            program.evaluate_at(inputs, element_count, index, target)
         })
     }
 }

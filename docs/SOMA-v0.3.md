@@ -233,11 +233,19 @@ which is not evidence about a compiler.
 `compiler::body` defines a deliberately small one, because the property under
 test is placement-independent publication, not language design:
 
-- **Pure and total.** No allocation, no memory beyond the element, no division
-  (which would be partial), no loops. Every program terminates in a fixed
-  number of steps decided at validation time.
-- **Element-wise.** One input element in, one output element out. A reduction
-  is a different collective, not a different body.
+- **Pure and total.** No allocation, no division (which would be partial), no
+  loops. Every program terminates in a fixed number of steps decided at
+  validation time. An out-of-range `gather` clamps to the last element rather
+  than faulting, so totality survives a computed index.
+- **One output element per input element.** A reduction is a different
+  collective, not a different body. `gather` widens what a body may *read* to
+  any element of the frozen input array — `index` supplies its own position, so
+  a stencil is expressible — but not what it may write.
+- **Reads the input, never the output.** This is what makes a gather safe to
+  run in any order, and so what keeps I19 true of a gathering body. The input
+  array is frozen and single-assignment, so every lane sees the same bytes
+  whenever it runs and no lane can observe another lane's store. A body able to
+  read the output array would make the published result depend on the schedule.
 - **Integer-only.** Admitting `f32` would force I20 to either demand
   bit-identical results across backends — constraining what a GPU may do — or
   weaken to a tolerance, which guts it as an invariant. Deferred until there is
@@ -245,7 +253,12 @@ test is placement-independent publication, not language design:
 - **Typed against a declared layout.** Reading or writing outside the declared
   element is a validation error, so an invalid body cannot reach a backend.
 - **Branch-free.** `select` is the only control flow, so a cohort of lanes
-  executing one body never diverges.
+  executing one body never diverges. `index` and `gather` do not change this:
+  lanes reading different *addresses* still execute identical instructions in
+  identical order, which is what a uniform-dispatch executive requires.
+  Edge handling is therefore the body's job — `examples::neighbour_max`
+  substitutes its own index at position zero with a `select`, because `0 - 1`
+  wraps and would otherwise clamp to the far end of the array.
 
 Arithmetic wraps on `u64` and truncates to the field width on store; shifts mask
 their amount to 6 bits. Both rules exist so the CPU interpreter and the

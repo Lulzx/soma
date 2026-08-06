@@ -92,6 +92,12 @@ fn every_example_body_agrees_between_metal_and_the_cpu_interpreter() {
         examples::DOUBLE_PLUS_ONE_TAGGED,
         examples::MIN_AND_XOR,
         examples::BITMIX,
+        // The gather bodies. `sample_elements` is a good input for `permute`
+        // by accident rather than design: most of its field-0 values are far
+        // past the end of a seven-element array, so the clamp is what the GPU
+        // is being checked on as much as the read.
+        examples::NEIGHBOUR_MAX,
+        examples::PERMUTE,
     ] {
         // Batch large enough to reach the accelerator.
         let (gpu_bytes, gpu_trace, gpu_stats) = run(evaluator, 8, 1, &mut metal, &mut cpu);
@@ -173,6 +179,11 @@ fn a_reused_buffer_does_not_leak_the_previous_batch_into_a_smaller_one() {
         examples::DOUBLE_PLUS_ONE_TAGGED,
         examples::MIN_AND_XOR,
         examples::BITMIX,
+        // A gather body is the sharpest case for a reused buffer: it reads
+        // element indices the *previous* batch's count made valid, so a stale
+        // `count` would clamp against the wrong end of the array.
+        examples::NEIGHBOUR_MAX,
+        examples::PERMUTE,
     ] {
         metal
             .evaluate(evaluator, &long, 64, stride)

@@ -82,8 +82,10 @@ fail, one hundred terminal notices are delivered, the population settles at
 9,900, and the other ninety-nine colonies are untouched -- with occupancy and
 dispatch count unchanged, because containment is not a scheduling event. `experiments/ant_scoring.rs` lifts the movement-scoring decision into a
 batch evaluator that runs on real Metal hardware under `--features metal`; the
-neighbourhood *gather* stays on the CPU, because the body language has no
-indexed read of another element and so cannot express one.
+neighbourhood *gather* stays on the CPU. The body language can express a gather
+now — `gather` reads any element of the frozen input array — but sensing reads
+the trail *grid*, and a `BatchEvaluate` binds one input array, the one the ants
+are elements of. A body can reach any ant and has no name for the grid.
 
 Read [docs/SOMA-v0.2.md](docs/SOMA-v0.2.md) for the current machine. The older
 [Phase-1 contract](docs/SOMA-P1.md) records the broader GPU-oriented design that
@@ -245,6 +247,11 @@ Implemented now:
   proves committed FIFO data survives producer failure
 - A minimal hardware-neutral evaluator IR with frozen-array schemas and resume
   points, connected to `BatchEvaluate` creation
+- Gathering bodies: `index` names an element's own position and `gather` reads
+  any element of the frozen input array, so stencils and permutations lower to
+  both backends. Reads are confined to the frozen input, never the output, so a
+  gather does not make the result depend on the order lanes run in; an
+  out-of-range index clamps rather than faulting, keeping bodies total
 - Direct parent/child supervision with reliable completion, failure, and
   cancellation notices, deterministic waiter wakeup, and opt-in failure
   escalation or bounded restart with replacement lineage
@@ -260,13 +267,21 @@ Implemented now:
 
 Not implemented:
 
-- A general-purpose language or compiler for arbitrary evaluator bodies
+- A general-purpose language or compiler for arbitrary evaluator bodies. Bodies
+  gather now, but there are still no loops, no calls, no floating point, and no
+  surface syntax above the `op` lines. A collective also binds one input array,
+  so a body can read any element of its own array and cannot name a second one
 - A complete device-resident scheduler/executive or distributed backend.
   Admission is order-independent (I22), the trace's order is recoverable from
   event position rather than a shared clock (I23), and allocation is
   partitioned so lanes need no shared allocator; canonical commit and a
   concurrent executive are not started
-- Hardware throughput, scheduler-overhead, and end-to-end migration benchmarks
+- Scheduler-overhead and end-to-end migration benchmarks. The batch backend
+  itself is measured on hardware — CPU against Metal from 32 to 4M elements,
+  where a Metal call's fixed cost goes, what a published cohort costs off-GPU,
+  and cost against accumulated state — see [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+  Whether cohorting beats a bulk schedule is not among those numbers; it is
+  still the structural model above
 
 Every entity and invariant named by the v0.2 machine is now implemented. The
 remaining work extends the completed semantic core beyond the deliberately

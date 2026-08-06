@@ -4,7 +4,7 @@ Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
 Repository: https://github.com/Lulzx/soma. The default semantic core is
-dependency-free. There are 275 tests (five of which need the `metal` feature),
+dependency-free. There are 284 tests (six of which need the `metal` feature),
 three compile-fail doc tests, and no Clippy warnings. The optional `metal`
 feature adds the `metal-rs` implementation dependency on macOS.
 
@@ -175,6 +175,18 @@ Added in v0.3:
 - Partitioned allocation: `GenTable` allocates from a partition chosen by the
   lane's position in the epoch's plan, so lanes need no shared allocator. I19
   varies it at 1/2/4/8 partitions.
+- Gathering bodies. `Op::Index` gives an element its own position and
+  `Op::Gather` reads a computed element of the frozen input array, so a body is
+  no longer confined to its own fields. Two properties keep this from costing
+  anything the machine relies on: a gather reads the frozen *input* and never
+  the output, so lane order still cannot change the result (I19), and an
+  out-of-range index clamps to the last element rather than faulting, so bodies
+  stay total under a computed index. Both lowerings clamp identically and I20
+  checks that on hardware. `examples::NEIGHBOUR_MAX` (a stencil) and
+  `examples::PERMUTE` (a reversal, where every element overwrites the field its
+  neighbours read) are the checked cases. This does *not* make ant sensing
+  expressible — see `experiments/ant_scoring.rs` for why that is now a
+  collective-level limit rather than a language one.
 - An effect log (I24). A step no longer writes a runnable bin; it produces the
   entries it wants and the kernel applies them, in the order the plan puts the
   producing lanes in. `Scheduler::enqueue` demands a token only the applier can

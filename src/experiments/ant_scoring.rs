@@ -4,14 +4,24 @@
 //! # What this does and does not claim
 //!
 //! The obvious thing to say about an ant colony on a GPU is "pheromone sensing
-//! runs on the accelerator". That would not be true here, and the body language
-//! is why. An evaluator body is straight-line SSA over *one element's own
-//! fields*: `Load(field)`, `Const`, the arithmetic and bitwise operators,
-//! `CmpEq`/`CmpLt`, `Select`, `Store`. There is no loop and no indexed read of
-//! another element, so a body cannot gather its neighbours out of a shared
-//! field. Sensing *is* a gather. It is not expressible.
+//! runs on the accelerator". That is still not true here, though the reason has
+//! moved.
 //!
-//! What is expressible is the decision that follows the gather. Once an ant's
+//! It used to be the body language: a body was straight-line SSA over *one
+//! element's own fields*, with no indexed read of another element, and sensing
+//! *is* a gather. `Op::Gather` and `Op::Index` removed that limit — a body can
+//! now read any element of the frozen input array, and `examples::NEIGHBOUR_MAX`
+//! is a stencil doing exactly that on real hardware.
+//!
+//! What remains is a collective-level limit rather than a language one. Sensing
+//! gathers from the *trail grid*, and a `BatchEvaluate` binds exactly one input
+//! array — the one the ants themselves are elements of (`ir.rs`,
+//! `instantiate_batch`). A body can reach any ant; it has no name for the grid.
+//! Expressing sensing needs a second read-only array binding, which is a change
+//! to the collective, the capability escrow that freezes its inputs, and both
+//! backends' signatures. Until that exists, the gather stays on the CPU.
+//!
+//! What is expressible is the decision that follows that gather. Once an ant's
 //! eight neighbour readings are packed into its own element, choosing the best
 //! direction is a fold of `CmpLt` and `Select` — branch-free by construction,
 //! which is exactly the shape a uniform-dispatch executive wants. So:

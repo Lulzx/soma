@@ -21,10 +21,33 @@ use soma::kernel::{Kernel, SYSTEM_PRINCIPAL};
 
 // ---- the language computes what it says ----------------------------------
 
+/// Evaluate a whole array through the reference backend.
+///
+/// Deliberately the production path rather than a loop written here: a test
+/// harness with its own element loop can pass while the loop a backend
+/// actually runs is wrong, which is the same shape of hole as two backends
+/// hardcoding one constant and agreeing.
+fn evaluate_array(program: &EvaluatorProgram, inputs: &[u8]) -> Vec<u8> {
+    let stride = program.stride();
+    let count = inputs.len() as u32 / stride;
+    CpuReferenceBackend::with(&[program])
+        .evaluate(program.id(), inputs, count, stride)
+        .expect("the reference backend evaluates a body it was given")
+}
+
+/// Evaluate a one-element array.
 fn evaluate(program: &EvaluatorProgram, element: &[u8]) -> Vec<u8> {
-    let mut output = element.to_vec();
-    program.evaluate_element(element, &mut output);
-    output
+    evaluate_array(program, element)
+}
+
+/// Pack `(field0, field1)` pairs into a two-`u32` array.
+fn array(pairs: &[(u32, u32)]) -> Vec<u8> {
+    pairs.iter().flat_map(|(a, b)| pair(*a, *b)).collect()
+}
+
+/// Field `field` of element `element` in a two-`u32` array.
+fn at(bytes: &[u8], element: usize, field: usize) -> u32 {
+    word(bytes, element * 2 + field)
 }
 
 fn pair(left: u32, right: u32) -> Vec<u8> {
@@ -40,7 +63,7 @@ fn word(bytes: &[u8], index: usize) -> u32 {
 #[test]
 fn the_example_module_parses_and_derives_its_strides() {
     let module = examples::module();
-    assert_eq!(module.programs().len(), 4);
+    assert_eq!(module.programs().len(), 6);
     assert_eq!(
         module.program(examples::DOUBLE_PLUS_ONE).unwrap().stride(),
         4
@@ -96,7 +119,149 @@ fn a_body_is_deterministic() {
     }
 }
 
+// ---- gather: reading an element other than your own -----------------------
+
+#[test]
+fn neighbour_max_reads_both_neighbours() {
+    let module = examples::module();
+    let program = module.program(examples::NEIGHBOUR_MAX).unwrap();
+    let input = array(&[(3, 0), (1, 0), (9, 0), (2, 0), (5, 0)]);
+    let out = evaluate_array(program, &input);
+
+    // Interior elements see both sides. Element 1 has neighbours 3 and 9.
+    assert_eq!(at(&out, 1, 1), 9);
+    assert_eq!(at(&out, 2, 1), 9);
+    assert_eq!(at(&out, 3, 1), 9);
+    // A body with no gather could not produce any of those: every one of them
+    // exceeds the element's own field 0.
+    assert!(at(&out, 1, 1) > at(&out, 1, 0));
+}
+
+#[test]
+fn the_edges_clamp_instead_of_wrapping_or_faulting() {
+    // The left edge is the interesting one: `0 - 1` wraps to u64::MAX, which
+    // would clamp to the *last* element and silently make the array a ring.
+    // The body substitutes its own index there, so element 0 sees only itself
+    // and its right neighbour.
+    let module = examples::module();
+    let program = module.program(examples::NEIGHBOUR_MAX).unwrap();
+    let input = array(&[(3, 0), (1, 0), (9, 0), (2, 0), (5, 0)]);
+    let out = evaluate_array(program, &input);
+
+    // Element 0: max(3, 1) = 3. If the left index had wrapped to the end it
+    // would have seen 5 and answered 5.
+    assert_eq!(at(&out, 0, 1), 3);
+    // Element 4: max(2, 5) = 5, with the right index clamping back to itself.
+    assert_eq!(at(&out, 4, 1), 5);
+}
+
+#[test]
+fn a_single_element_array_gathers_only_itself() {
+    let module = examples::module();
+    let program = module.program(examples::NEIGHBOUR_MAX).unwrap();
+    let out = evaluate_array(program, &array(&[(7, 0)]));
+    assert_eq!(at(&out, 0, 1), 7);
+}
+
+#[test]
+fn a_gather_reads_the_input_and_never_the_output() {
+    // Every element overwrites the field its neighbours are reading. If a
+    // gather saw the output array, the answer would depend on the order the
+    // elements ran in — and the whole point of the frozen input is that it
+    // cannot. A reversal is the sharpest case: element 0 reads element 4's
+    // payload while element 4 is overwriting its own.
+    let module = examples::module();
+    let program = module.program(examples::PERMUTE).unwrap();
+    let input = array(&[(4, 10), (3, 20), (2, 30), (1, 40), (0, 50)]);
+    let out = evaluate_array(program, &input);
+    assert_eq!(
+        (0..5).map(|i| at(&out, i, 1)).collect::<Vec<_>>(),
+        vec![50, 40, 30, 20, 10]
+    );
+
+    // Same body, elements evaluated back to front. Identical bytes, which is
+    // the property that lets a cohort run these lanes in any order at all.
+    let stride = program.stride() as usize;
+    let mut reversed = input.clone();
+    for index in (0..5u32).rev() {
+        let start = index as usize * stride;
+        program.evaluate_at(&input, 5, index, &mut reversed[start..start + stride]);
+    }
+    assert_eq!(reversed, out);
+}
+
+#[test]
+fn an_out_of_range_gather_index_clamps_to_the_last_element() {
+    // Totality under a computed index: an index past the end is not a fault.
+    let module = examples::module();
+    let program = module.program(examples::PERMUTE).unwrap();
+    let out = evaluate_array(program, &array(&[(99, 10), (0, 20), (u32::MAX, 30)]));
+    assert_eq!(at(&out, 0, 1), 30, "clamped to the last element");
+    assert_eq!(at(&out, 1, 1), 10);
+    assert_eq!(at(&out, 2, 1), 30);
+}
+
+#[test]
+fn index_gives_each_element_its_own_position() {
+    // The one op whose value differs across the lanes of a cohort.
+    let source = "\
+module positions
+evaluator 1 position 4 10 11 ro 12 13 ro
+  field u32
+  op 0 index
+  store 0 0
+";
+    let module = Module::parse(source).unwrap();
+    let program = module.program(1).unwrap();
+    let out = evaluate_array(program, &[0u8; 16]);
+    assert_eq!(
+        (0..4).map(|i| word(&out, i)).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
+}
+
+#[test]
+fn a_gather_counts_as_observing_the_field_it_reads() {
+    let module = examples::module();
+    let program = module.program(examples::PERMUTE).unwrap();
+    // Field 0 is loaded, field 1 is only ever gathered. Both are observed.
+    assert_eq!(
+        program.loaded_fields().iter().copied().collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert!(program.gathers());
+    assert!(!module.program(examples::BITMIX).unwrap().gathers());
+}
+
 // ---- validation rejects what it should -----------------------------------
+
+#[test]
+fn a_gather_cannot_read_a_field_outside_the_declared_element() {
+    // The gathered field is static, so it is checked exactly as a load's is.
+    // Only the element index is dynamic, and that clamps.
+    let layout = ElementLayout::new(vec![FieldWidth::U32]);
+    let result = EvaluatorProgram::new(
+        1,
+        "gather_out_of_range",
+        layout,
+        vec![Op::Index, Op::Gather(0, 1)],
+        vec![Store { field: 0, value: 1 }],
+    );
+    assert_eq!(result.unwrap_err(), BodyError::FieldOutOfRange);
+}
+
+#[test]
+fn a_gather_cannot_take_its_index_from_an_instruction_that_has_not_run() {
+    let layout = ElementLayout::new(vec![FieldWidth::U32]);
+    let result = EvaluatorProgram::new(
+        1,
+        "gather_forward",
+        layout,
+        vec![Op::Gather(3, 0)],
+        vec![Store { field: 0, value: 0 }],
+    );
+    assert_eq!(result.unwrap_err(), BodyError::ForwardReference);
+}
 
 #[test]
 fn a_body_cannot_read_outside_its_declared_element() {

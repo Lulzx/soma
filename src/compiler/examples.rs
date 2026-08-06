@@ -22,6 +22,9 @@ pub const DOUBLE_PLUS_ONE: u32 = 7;
 pub const DOUBLE_PLUS_ONE_TAGGED: u32 = 8;
 pub const MIN_AND_XOR: u32 = 9;
 pub const BITMIX: u32 = 10;
+/// `ant_scoring` occupies 11; the gather examples continue from 12.
+pub const NEIGHBOUR_MAX: u32 = 12;
+pub const PERMUTE: u32 = 13;
 
 pub const SOURCE: &str = r#"
 module soma.examples
@@ -75,6 +78,46 @@ evaluator 10 bitmix 8 100 101 ro 102 103 ro
   op 6 load 1
   op 7 add 5 6
   store 0 7
+
+# A three-point stencil: field 1 becomes the largest of field 0 across this
+# element and its two neighbours. The first body that reads an element other
+# than its own.
+#
+# Edge handling is the body's job and is done without branching. The right
+# edge needs nothing — index `count` clamps back to the last element, which is
+# this one. The left edge does: `0 - 1` wraps to a huge value and would clamp
+# to the *far* end of the array, so op 5 substitutes the element's own index
+# when it is at position zero.
+evaluator 12 neighbour_max 8 120 121 ro 122 123 ro
+  field u32
+  field u32
+  op 0 index
+  op 1 const 0
+  op 2 cmpeq 0 1
+  op 3 const 1
+  op 4 sub 0 3
+  op 5 select 2 0 4
+  op 6 add 0 3
+  op 7 gather 5 0
+  op 8 gather 6 0
+  op 9 load 0
+  op 10 cmplt 9 7
+  op 11 select 10 7 9
+  op 12 cmplt 11 8
+  op 13 select 12 8 11
+  store 1 13
+
+# A permutation gather: field 0 names an element, and field 1 becomes that
+# element's field 1. Every element both reads a payload and has its own
+# overwritten, so this only produces the permutation if a gather reads the
+# frozen *input*. A backend that gathered from the output it was writing would
+# return an order-dependent answer, which is the failure I19 cares about.
+evaluator 13 permute 8 130 131 ro 132 133 ro
+  field u32
+  field u32
+  op 0 load 0
+  op 1 gather 0 1
+  store 1 1
 "#;
 
 /// Parse the example module. Panics only if the source above is malformed,
