@@ -27,13 +27,15 @@
 //! run concurrently and nothing here claims it does. It makes the set of things
 //! that would have to change finite and visible. The categories are:
 //!
-//! * *Reads* — `continuations`, `epoch_number`, `future_value`, `object_bytes`,
+//! * *Reads* — `frame`, `epoch_number`, `future_value`, `object_bytes`,
 //!   `read_u64_object`.
 //!   These need a shared borrow and nothing else once the lane stops holding
 //!   `&mut` — except that three of them are *governed* reads, which trace the
 //!   authority decision and so write one place each. §4.11's per-lane trace
 //!   buffer is that place. `future_value` joined them in §4.16, for the reason
-//!   given on it.
+//!   given on it. The other two read nothing a lane can write: `epoch_number` is
+//!   fixed for the epoch, and `frame` is a copy taken before the step began.
+//!   `continuations` used to sit here and is the subject of §4.17.
 //! * *Allocation* — `create_process`, `create_continuation`, `create_future`,
 //!   `create_object`. §4.8's shards are the lane-local form; wiring them is
 //!   mechanical.
@@ -75,7 +77,15 @@ use crate::kernel::{ContinuationSpec, Kernel, RuntimeError};
 /// }
 /// ```
 ///
-/// The null for those three: the same path, with an operation the view *does*
+/// nor reach the continuation table, which is §4.17's subject:
+///
+/// ```compile_fail
+/// fn f(lane: &mut soma::executives::lane::LaneView<'_>) {
+///     let _ = lane.continuations();
+/// }
+/// ```
+///
+/// The null for those four: the same path, with an operation the view *does*
 /// offer, compiles. Without it a misspelled path would make every block above
 /// fail for the wrong reason and pass vacuously.
 ///
@@ -85,28 +95,59 @@ use crate::kernel::{ContinuationSpec, Kernel, RuntimeError};
 /// }
 /// ```
 ///
-/// nor build one over a kernel it was handed:
+/// nor build one over a kernel it was handed. The argument is spelled out so
+/// that this fails on the constructor's privacy and not on its arity, which is
+/// the same reason the null block above exists:
 ///
 /// ```compile_fail
 /// fn f(kernel: &mut soma::kernel::Kernel) {
-///     let _ = soma::executives::lane::LaneView::new(kernel);
+///     let _ = soma::executives::lane::LaneView::new(kernel, soma::abi::Ref64::NULL);
 /// }
 /// ```
 pub struct LaneView<'a> {
     kernel: &'a mut Kernel,
+
+    /// The running continuation's frame object, copied in before the step.
+    /// See [`LaneView::frame`].
+    frame: Ref64,
 }
 
 impl<'a> LaneView<'a> {
-    pub(crate) fn new(kernel: &'a mut Kernel) -> LaneView<'a> {
-        LaneView { kernel }
+    pub(crate) fn new(kernel: &'a mut Kernel, frame: Ref64) -> LaneView<'a> {
+        LaneView { kernel, frame }
     }
 
     // ---- reads -----------------------------------------------------------
 
-    pub(crate) fn continuations(
-        &self,
-    ) -> &crate::table::GenTable<crate::abi::continuations::ContinuationDescriptor> {
-        self.kernel.continuations()
+    /// The frame object of the continuation this lane is running.
+    ///
+    /// This replaces `continuations()`, which handed a step the whole table by
+    /// shared reference — ungoverned, untraced, and unbounded in what it could
+    /// be asked about (v0.3 §4.17).
+    ///
+    /// Unlike the six before it, that read is not a race anyone can reach
+    /// today: all three of its call sites asked about the running continuation
+    /// and read either `run_class`, which Phase E fixed before any lane ran, or
+    /// `frame`, which is written once at creation. The measurement is worth
+    /// stating in the negative — there was no reordering that made two runs
+    /// disagree, because no handler ever named a continuation other than its
+    /// own.
+    ///
+    /// What the table *did* offer was the ability to. Descriptors do change
+    /// between lanes of one epoch: `apply_step_result` runs inside the lane
+    /// loop, and a fault there can carry containment into a sibling's status
+    /// mid-epoch. A step that read a sibling descriptor would be reading that,
+    /// and — the part that matters — would leave nothing behind for I25 to
+    /// report, exactly as §4.16's poll did.
+    ///
+    /// So this one is narrowed rather than governed. Governing it would mean an
+    /// authority pair and an event on every frame load and store, for a read
+    /// whose answer the epoch loop already holds; narrowing it makes the
+    /// cross-continuation read a compile error instead of a traced one. The
+    /// two fields the call sites wanted are passed in: `run_class` as an
+    /// argument to `dispatch`, and `frame` as this.
+    pub fn frame(&self) -> Ref64 {
+        self.frame
     }
 
     pub(crate) fn epoch_number(&self) -> u32 {

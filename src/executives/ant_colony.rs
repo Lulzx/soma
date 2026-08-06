@@ -171,10 +171,15 @@ fn sense(lane: &mut LaneView<'_>, process: Ref64, frame: &AntFrame, epoch: u32) 
 
 /// One ant's step. `behaviour` is the index within the ant block, so this is
 /// the same switch the scheduler binned on — the run class is both.
-pub fn ant_step(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64, behaviour: u32) -> StepResult {
+pub fn ant_step(
+    lane: &mut LaneView<'_>,
+    _cont: Ref64,
+    process: Ref64,
+    behaviour: u32,
+) -> StepResult {
     let epoch = lane.epoch_number();
     let run_class = ANT_EXPLORE + behaviour;
-    let mut frame: AntFrame = match load_frame_ant(lane, process, cont) {
+    let mut frame: AntFrame = match load_frame_ant(lane, process) {
         Some(frame) => frame,
         None => return StepResult::fault(process, run_class),
     };
@@ -355,11 +360,11 @@ pub fn ant_step(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64, behaviour:
         }
     }
 
-    store_frame(lane, process, cont, &frame);
+    store_frame(lane, process, &frame);
     StepResult::yield_next(next)
 }
 
-fn load_frame_ant(lane: &mut LaneView<'_>, process: Ref64, cont: Ref64) -> Option<AntFrame> {
+fn load_frame_ant(lane: &mut LaneView<'_>, process: Ref64) -> Option<AntFrame> {
     let fallback = AntFrame {
         id: u32::MAX,
         colony: 0,
@@ -382,7 +387,7 @@ fn load_frame_ant(lane: &mut LaneView<'_>, process: Ref64, cont: Ref64) -> Optio
         field_a: Ref64::NULL,
         field_b: Ref64::NULL,
     };
-    let frame: AntFrame = load_frame(lane, process, cont, fallback);
+    let frame: AntFrame = load_frame(lane, process, fallback);
     // A frame that failed to decode comes back as the sentinel, and a zero-sized
     // world is not a world. Faulting is better than stepping an ant that does
     // not exist.
@@ -395,12 +400,11 @@ fn load_frame_ant(lane: &mut LaneView<'_>, process: Ref64, cont: Ref64) -> Optio
 /// slot, so it neither races the ants below it nor the world above it. An ant
 /// that has failed simply stops stamping its record, and a stale stamp is
 /// skipped — nothing has to be told about the death.
-pub fn colony_aggregate(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResult {
+pub fn colony_aggregate(lane: &mut LaneView<'_>, _cont: Ref64, process: Ref64) -> StepResult {
     let epoch = lane.epoch_number();
     let frame: ColonyFrame = load_frame(
         lane,
         process,
-        cont,
         ColonyFrame {
             id: 0,
             summary: Ref64::NULL,
@@ -447,7 +451,7 @@ pub fn colony_aggregate(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) ->
         }
     }
 
-    store_frame(lane, process, cont, &frame);
+    store_frame(lane, process, &frame);
     StepResult::yield_next(COLONY_AGGREGATE)
 }
 
@@ -457,12 +461,11 @@ pub fn colony_aggregate(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) ->
 /// leave the result in the buffer the ants will read next epoch. The world is
 /// the sole `WRITE` holder of both buffers throughout, so nothing here needs a
 /// lock and nothing needs to be frozen.
-pub fn world_step(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResult {
+pub fn world_step(lane: &mut LaneView<'_>, _cont: Ref64, process: Ref64) -> StepResult {
     let epoch = lane.epoch_number();
     let frame: WorldFrame = load_frame(
         lane,
         process,
-        cont,
         WorldFrame {
             width: 0,
             height: 0,
@@ -537,6 +540,6 @@ pub fn world_step(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepR
         }
     }
 
-    store_frame(lane, process, cont, &frame);
+    store_frame(lane, process, &frame);
     StepResult::yield_next(WORLD_STEP)
 }

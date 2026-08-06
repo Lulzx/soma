@@ -39,12 +39,20 @@ pub mod run_classes {
 /// Uniform dispatch over run classes. In a real SIMD cohort the same switch
 /// executes uniformly for every lane because the whole cohort shares one run
 /// class, so the branch introduces no intra-cohort divergence (§15).
-pub fn dispatch(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResult {
-    let rc = lane
-        .continuations()
-        .get(cont)
-        .map(|c| c.run_class)
-        .unwrap_or(0);
+///
+/// The run class is an argument because the epoch loop already decided it:
+/// Phase E built this lane's cohort out of it, and Phase F read it again on the
+/// host's side of the step. Reading it back out of the continuation table from
+/// in here needed the table, and the table was the last ungoverned read a step
+/// could reach (v0.3 §4.17, and [`LaneView::frame`] for what it could have led
+/// to).
+///
+/// Eight handlers now take `_cont`. The parameter stays because the signature
+/// is what makes this a switch rather than eight unrelated calls, and it is
+/// underscored rather than removed so that the count is visible: those eight
+/// wanted the continuation only to ask the table about it, and the frame they
+/// were asking for arrives another way.
+pub fn dispatch(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64, rc: u32) -> StepResult {
     match rc {
         EXPAND_RESUME_0 => expand_resume_0(lane, cont, process),
         EXPAND_RESUME_1 => expand_resume_1(lane, cont, process),
@@ -73,38 +81,44 @@ pub fn dispatch(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepRes
 
 // ---- frame access helpers ------------------------------------------------
 
-fn frame_bytes(lane: &mut LaneView<'_>, actor: Ref64, cont: Ref64) -> Vec<u8> {
-    let obj = lane
-        .continuations()
-        .get(cont)
-        .map(|c| c.frame)
-        .unwrap_or(Ref64::NULL);
+// These four used to take the continuation whose frame they wanted and look up
+// its frame object in the table. They took `cont` for the whole of that reason
+// and every call site passed the running continuation, so the parameter is
+// gone: `lane.frame()` is that same object, copied in before the step began.
+// The narrowing is the point rather than the tidying — with the table reachable,
+// "whose frame" was a question a handler could answer with someone else's
+// (v0.3 §4.17).
+
+fn frame_bytes(lane: &mut LaneView<'_>, actor: Ref64) -> Vec<u8> {
+    let obj = lane.frame();
     lane
         .object_bytes(actor, obj)
         .map(|b| b.to_vec())
         .unwrap_or_default()
 }
 
-fn set_frame_bytes(lane: &mut LaneView<'_>, actor: Ref64, cont: Ref64, bytes: Vec<u8>) {
-    if let Ok(obj) = lane.continuations().get(cont).map(|c| c.frame) {
-        // A frame can change length between steps, so this needs the payload
-        // as a `Vec` rather than the slice `object_bytes_mut` now returns.
-        if let Ok(buf) = lane.host_payload_mut(actor, obj) {
-            *buf = bytes;
-        }
+fn set_frame_bytes(lane: &mut LaneView<'_>, actor: Ref64, bytes: Vec<u8>) {
+    let obj = lane.frame();
+    if obj.is_null() {
+        return;
+    }
+    // A frame can change length between steps, so this needs the payload
+    // as a `Vec` rather than the slice `object_bytes_mut` now returns.
+    if let Ok(buf) = lane.host_payload_mut(actor, obj) {
+        *buf = bytes;
     }
 }
 
-pub(crate) fn load_frame<F: Frame>(lane: &mut LaneView<'_>, actor: Ref64, cont: Ref64, fallback: F) -> F {
-    let bytes = frame_bytes(lane, actor, cont);
+pub(crate) fn load_frame<F: Frame>(lane: &mut LaneView<'_>, actor: Ref64, fallback: F) -> F {
+    let bytes = frame_bytes(lane, actor);
     let mut c = ByteCursor::new(&bytes);
     F::decode(&mut c).unwrap_or(fallback)
 }
 
-pub(crate) fn store_frame<F: Frame>(lane: &mut LaneView<'_>, actor: Ref64, cont: Ref64, frame: &F) {
+pub(crate) fn store_frame<F: Frame>(lane: &mut LaneView<'_>, actor: Ref64, frame: &F) {
     let mut bytes = Vec::new();
     frame.encode(&mut bytes);
-    set_frame_bytes(lane, actor, cont, bytes);
+    set_frame_bytes(lane, actor, bytes);
 }
 
 // ---- handlers (§22) -------------------------------------------------------
@@ -140,7 +154,7 @@ fn expand_resume_0(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> Step
                 )
                 .expect("a process may create its own continuation");
 
-            store_frame(lane, process, cont, &frame);
+            store_frame(lane, process, &frame);
             match lane.await_future(process, cont, fut, EXPAND_RESUME_1) {
                 Ok(AwaitOutcome::Registered) => StepResult::await_on(fut, EXPAND_RESUME_1),
                 // The heuristic already resolved, so there is nothing to wait
@@ -157,9 +171,8 @@ fn expand_resume_0(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> Step
 
 /// `Expand.resume_1`: load the heuristic result and generate a bounded group of
 /// moves, then yield to `EXPAND_RESUME_2`.
-fn expand_resume_1(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResult {
-    let mut frame: ExpandFrame =
-        load_frame(lane, process, cont, ExpandFrame::initial(0, process));
+fn expand_resume_1(lane: &mut LaneView<'_>, _cont: Ref64, process: Ref64) -> StepResult {
+    let mut frame: ExpandFrame = load_frame(lane, process, ExpandFrame::initial(0, process));
     // A denial faults rather than reading as "not resolved yet": those are
     // different answers, and collapsing them is what the ungoverned read did.
     // A *null* future is neither — the frame simply names no future to look at,
@@ -177,7 +190,7 @@ fn expand_resume_1(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> Step
     frame.moves = (1..=3)
         .map(|i| frame.request_value.wrapping_mul(i as u64))
         .collect();
-    store_frame(lane, process, cont, &frame);
+    store_frame(lane, process, &frame);
     StepResult::yield_next(EXPAND_RESUME_2)
 }
 
@@ -187,8 +200,7 @@ fn expand_resume_1(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> Step
 /// therefore recorded in the frame as they happen, so re-entry resumes where it
 /// left off rather than repeating side effects (§8).
 fn expand_resume_2(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResult {
-    let mut frame: ExpandFrame =
-        load_frame(lane, process, cont, ExpandFrame::initial(0, process));
+    let mut frame: ExpandFrame = load_frame(lane, process, ExpandFrame::initial(0, process));
 
     while (frame.move_index as usize) < frame.moves.len() {
         let m = frame.moves[frame.move_index as usize];
@@ -197,7 +209,7 @@ fn expand_resume_2(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> Step
         // supervisor restarting this continuation must not spawn them twice
         // (§8).
         let Ok(child) = lane.create_process(process, crate::abi::ProcessMode::Serial) else {
-            store_frame(lane, process, cont, &frame);
+            store_frame(lane, process, &frame);
             return StepResult::fault(process, 0);
         };
         let cframe = SearchFrame::leaf(m, 0);
@@ -226,7 +238,7 @@ fn expand_resume_2(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> Step
             frame.heuristic_result.to_le_bytes().to_vec(),
         );
     }
-    store_frame(lane, process, cont, &frame);
+    store_frame(lane, process, &frame);
 
     match lane.enqueue_message(process, frame.reply_receiver, frame.reply_payload, cont) {
         Ok(()) => StepResult::complete(),
@@ -239,11 +251,10 @@ fn expand_resume_2(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> Step
 
 /// `SEARCH_HEURISTIC`: compute a deterministic result, publish it into the
 /// future (single-assignment, §12), and complete.
-fn heuristic(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResult {
+fn heuristic(lane: &mut LaneView<'_>, _cont: Ref64, process: Ref64) -> StepResult {
     let hf: HeuristicFrame = load_frame(
         lane,
         process,
-        cont,
         HeuristicFrame {
             future: Ref64::NULL,
             input: 0,
@@ -272,7 +283,6 @@ fn join_await(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResul
     let frame: JoinFrame = load_frame(
         lane,
         process,
-        cont,
         JoinFrame {
             future: Ref64::NULL,
             observed: Ref64::NULL,
@@ -288,11 +298,10 @@ fn join_await(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResul
 }
 
 /// `JOIN_RESUME`: read the value the future took, by either route.
-fn join_resume(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResult {
+fn join_resume(lane: &mut LaneView<'_>, _cont: Ref64, process: Ref64) -> StepResult {
     let mut frame: JoinFrame = load_frame(
         lane,
         process,
-        cont,
         JoinFrame {
             future: Ref64::NULL,
             observed: Ref64::NULL,
@@ -307,16 +316,15 @@ fn join_resume(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResu
             Err(_) => return StepResult::fault(process, JOIN_RESUME),
         }
     }
-    store_frame(lane, process, cont, &frame);
+    store_frame(lane, process, &frame);
     StepResult::complete()
 }
 
 /// `POLL_FUTURE` (v0.3 §4.16): read a future's value without awaiting it.
-fn poll_future(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResult {
+fn poll_future(lane: &mut LaneView<'_>, _cont: Ref64, process: Ref64) -> StepResult {
     let mut frame: JoinFrame = load_frame(
         lane,
         process,
-        cont,
         JoinFrame {
             future: Ref64::NULL,
             observed: Ref64::NULL,
@@ -328,7 +336,7 @@ fn poll_future(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResu
             Err(_) => return StepResult::fault(process, POLL_FUTURE),
         }
     }
-    store_frame(lane, process, cont, &frame);
+    store_frame(lane, process, &frame);
     StepResult::yield_next(POLL_ACT)
 }
 
@@ -341,7 +349,6 @@ fn poll_act(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResult 
     let frame: JoinFrame = load_frame(
         lane,
         process,
-        cont,
         JoinFrame {
             future: Ref64::NULL,
             observed: Ref64::NULL,
@@ -371,11 +378,10 @@ fn poll_act(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResult 
 /// `index` selects the arithmetic, so the search classes are distinct code
 /// paths rather than aliases of one handler — a cohort really can only contain
 /// one of them.
-fn search_branch(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64, index: u32) -> StepResult {
+fn search_branch(lane: &mut LaneView<'_>, _cont: Ref64, process: Ref64, index: u32) -> StepResult {
     let mut sf: SearchFrame = load_frame(
         lane,
         process,
-        cont,
         SearchFrame {
             value: 0,
             depth: 0,
@@ -391,7 +397,7 @@ fn search_branch(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64, index: u3
         for i in 0..sf.branching {
             // As in `expand_resume_2`: a full domain is a fault, not an abort.
             let Ok(child) = lane.create_process(process, crate::abi::ProcessMode::Serial) else {
-                store_frame(lane, process, cont, &sf);
+                store_frame(lane, process, &sf);
                 return StepResult::fault(process, 0);
             };
             let cframe = SearchFrame {
@@ -421,7 +427,7 @@ fn search_branch(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64, index: u3
         // Spawn with no continuation: the commit phase terminates this node.
         StepResult::spawn(process, 0)
     } else {
-        store_frame(lane, process, cont, &sf);
+        store_frame(lane, process, &sf);
         StepResult::complete()
     }
 }

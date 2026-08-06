@@ -1437,6 +1437,73 @@ byte-identical, which is the useful part of the result: fourteen files' worth of
 workloads look at futures, and not one of them looks at a future its own epoch
 is resolving. The clause fires nowhere except where it was built to.
 
+### 4.17 The read that was not a race, and the surface that would have been one
+
+After §4.16 there was one read left on `LaneView` that neither authorized nor
+traced: `continuations`, which handed a step the whole continuation table by
+shared reference. The five before it each turned out to be a race once the
+question was widened, so the honest thing is to report that this one is not.
+
+**Measured first, and the measurement is negative.** Three call sites, all in
+`cpu_scalar`, and every one of them named the continuation the lane was already
+running. Between them they read two fields:
+
+- `run_class`, which Phase E fixed when it built this lane's cohort, and which
+  Phase F reads again on the host's side of the step. Nothing between those two
+  reads can change it.
+- `frame`, which is written once when the continuation is created and never
+  again.
+
+So §4.6's fallback — run it in another order, compare — has nothing to find, and
+this time that is a fact about the handlers rather than a limit of the trace. No
+step ever named a continuation other than its own.
+
+**What the table offered was the ability to.** Descriptors really do change
+between lanes of one epoch. Bin entries, statuses and run classes go through
+effects and land at the boundary (§4.5), but `apply_step_result` does not: it
+runs inside the lane loop, and a fault there carries containment into a
+sibling's status and withdraws that sibling's journal entries mid-epoch. A step
+that read a sibling descriptor would be reading precisely that, and the three
+blindnesses would be §4.16's, unchanged: no ≺ edge, because reading is not
+waking; no event to key clause 2 on, because the read emitted none; and the
+answer disappearing into a frame, which is where §4.16 established that
+`conforms_traces` stops being able to see.
+
+**So this one is narrowed rather than governed**, which is the first time the
+answer has not been "make it a governed read". Governing it would put an
+authority pair and an event on every frame load and store — several per step,
+the highest-frequency read in the machine — to record an answer the epoch loop
+is already holding. Narrowing it makes the cross-continuation read a compile
+error instead of a traced one, which is §4.10's own technique applied to the one
+operation §4.10 left open.
+
+The two fields are passed in. `run_class` becomes an argument to `dispatch`.
+`frame` becomes `LaneView::frame`, a copy taken before the step begins.
+`continuations` is gone from the view, with a `compile_fail` beside the three
+that were already there.
+
+**The nulls**, in the shape this section needs rather than §4.15's: the
+constructor's `compile_fail` gained its new argument, so that it still fails on
+`new` being crate-private and not on its arity — a block that fails for the
+wrong reason passes vacuously, which is the same reason the positive block
+exists at all.
+
+Eight handlers now take `_cont`. Underscored rather than removed, because the
+uniform signature is what makes `dispatch` a switch rather than eight unrelated
+calls — and because the count is the measurement. Eight of the handlers wanted
+their continuation for nothing but asking the table about it.
+
+**Nothing in any trace moved.** No event was added, 402 tests pass, and the ten
+example reports are byte-identical — not "still byte-identical after a growth of
+three events per read", as §4.16 had to say, but unchanged event for event. That
+is the claim of the section: it changes what a step can express, not what any
+step does.
+
+`LaneView` still offers fifteen operations, and its reads are now closed in a
+stronger sense than being counted. Three are governed — `object_bytes`,
+`read_u64_object`, `future_value` — and the other two, `epoch_number` and
+`frame`, read nothing a lane is able to write.
+
 ---
 
 ## 5. C — distributed, trace-equivalent

@@ -302,6 +302,20 @@ Added in v0.3:
   workloads: fourteen test files reach it, all pass, and the example reports are
   byte-identical, which says no existing workload polls a future its own epoch
   is resolving.
+- The last ungoverned read, and the first that is not a race (v0.3 §4.17).
+  `LaneView::continuations` handed a step the whole continuation table. All
+  three call sites named the running continuation and read `run_class`, which
+  Phase E fixed before any lane ran, or `frame`, which is written once -- so
+  reordering finds nothing, and that is a fact about the handlers rather than a
+  limit of the trace. The surface is what was wrong: `apply_step_result` runs
+  inside the lane loop, so sibling descriptors do change mid-epoch, and a step
+  reading one would have hit §4.16's three blindnesses exactly. Narrowed rather
+  than governed, because the epoch loop already holds both answers and an
+  authority pair per frame load would buy nothing: `dispatch` takes the run
+  class as an argument, `LaneView::frame` is a copy taken before the step, and
+  the table is a `compile_fail`. No event added, no trace changed. Eight
+  handlers now take `_cont`, which is the count of handlers that wanted their
+  continuation only to ask the table about it.
 - A lane-local trace buffer (v0.3 §4.11). A lane produces trace events into
   `lane_trace` and `leave_lane` appends them, which is §4.4's move applied to
   the trace. `logical_time` is handed out at the drain rather than at emission,

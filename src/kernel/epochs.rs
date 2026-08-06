@@ -275,11 +275,15 @@ impl Kernel {
         {
             return 0;
         }
-        let (run_class, remaining, dependency) = self
+        // `frame` joins the three because the step needs it and no longer has a
+        // way to look it up: `LaneView` stopped offering the continuation table
+        // in §4.17, so the frame reference is read here, once, on the host's
+        // side of the epoch, and carried into the lane.
+        let (run_class, remaining, dependency, frame) = self
             .continuations
             .get(cont)
-            .map(|c| (c.run_class, c.remaining_steps, c.dependency))
-            .unwrap_or((0, 0, Ref64::NULL));
+            .map(|c| (c.run_class, c.remaining_steps, c.dependency, c.frame))
+            .unwrap_or((0, 0, Ref64::NULL, Ref64::NULL));
 
         // Step budget (§8): a continuation must not exceed its declared maximum.
         // The check happens *before* dispatch, so an exhausted continuation is
@@ -320,9 +324,14 @@ impl Kernel {
         // operations a handler actually performs and nothing else, so an
         // operation with no lane-local form is a compile error inside a step
         // rather than something to discover by audit later (v0.3 §4.10).
+        //
+        // The run class is passed rather than looked up. It is the same value
+        // `dispatch` used to read back out of the descriptor for itself, and
+        // nothing between that read and the one above can change it — which is
+        // why §4.17 could take the read away without changing a run.
         let result = {
-            let mut lane = crate::executives::lane::LaneView::new(self);
-            cpu_scalar::dispatch(&mut lane, cont, process)
+            let mut lane = crate::executives::lane::LaneView::new(self, frame);
+            cpu_scalar::dispatch(&mut lane, cont, process, run_class)
         };
         if let Ok(descriptor) = self.processes.get_mut(process) {
             descriptor.active_continuation = Ref64::NULL;
