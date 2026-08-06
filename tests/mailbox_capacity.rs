@@ -204,6 +204,47 @@ fn i25_is_silent_when_the_mailbox_has_room() {
 
 // ---- the trace ------------------------------------------------------------
 
+/// A lane that both won and lost is still raced by a lane that only won.
+///
+/// The clause used to take the lowest-numbered winner and look for a loser that
+/// was not it, which is not the same question: a lane that sends twice fills the
+/// last slot and is then refused itself, and if it is also the lowest winner
+/// then asking only about it finds nothing, while a *higher* lane that got in
+/// ahead of it plainly decided the outcome. No workload reaches the shape — a
+/// handler sends once — so it is built by appending the three events a workload
+/// that sent twice would have produced, in the fault-injection style the
+/// repository uses for states it cannot reach by running.
+#[test]
+fn a_lane_that_won_and_lost_is_still_raced_by_a_lane_that_only_won() {
+    let mut kernel = Kernel::new();
+    let receiver = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let sender = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+
+    let event = |kind: EventKind, lane: u32, sequence: u32| {
+        let mut row = soma::abi::TraceEvent::new(0, 0, kind, sender, Ref64::NULL, 0);
+        row.lane = lane;
+        row.lane_sequence = sequence;
+        row.causal = receiver;
+        row.auxiliary = MAILBOX_CAPACITY as u32;
+        row
+    };
+    let rows = vec![
+        // Lane 2 gets in, then fills the mailbox and is refused its second send.
+        event(EventKind::MessageSent, 2, 0),
+        event(EventKind::MessageSendBlocked, 2, 1),
+        // Lane 5 got in too — and if it had run first, lane 2's first send is
+        // the one that would have been refused.
+        event(EventKind::MessageSent, 5, 0),
+    ];
+    unsafe { soma::kernel::raw::state(&mut kernel) }
+        .trace
+        .extend(rows);
+
+    let reported = violations(&kernel);
+    assert_eq!(reported.len(), 1, "{reported:?}");
+    assert!(reported[0].contains("lanes 2 and 5"), "{}", reported[0]);
+}
+
 #[test]
 fn a_blocked_send_is_in_the_trace() {
     // Back-pressure used to leave no record: the trace showed a sender that had

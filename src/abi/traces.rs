@@ -67,6 +67,27 @@ pub enum EventKind {
     /// precise: two lanes sending to one mailbox decide nothing between them
     /// until the mailbox is actually full.
     MessageSendBlocked = 35,
+    /// A receive found the mailbox empty and parked the receiver.
+    ///
+    /// `MessageSendBlocked`'s mirror, and it exists for the same two reasons.
+    /// A receive that found nothing left no record at all: the trace showed a
+    /// continuation that started and then waited, and could not say whether it
+    /// was waiting on a future or on an empty mailbox. And I25 clause 2 cannot
+    /// tell a mailbox several lanes drained between them from one that had a
+    /// message for each of them without it.
+    ///
+    /// `process` is the mailbox's owner, as it is for `MessageReceived`, which
+    /// is what lets the clause key the two on one resource.
+    ///
+    /// `auxiliary` is the occupancy that refused the receive, which is always
+    /// zero — a receive is refused by emptiness and by nothing else. It is
+    /// recorded as the constant rather than filled with the receiver-waiter
+    /// queue's depth, which would be the more informative number and is the
+    /// wrong one: the depth is the *parking order*, and parking order differs
+    /// between two lane orders in runs whose epoch outcome does not, so putting
+    /// it in the trace would make those runs disagree over something no epoch
+    /// decided.
+    MessageReceiveBlocked = 36,
 }
 
 /// The lane an event was emitted from when it was not emitted from one: epoch

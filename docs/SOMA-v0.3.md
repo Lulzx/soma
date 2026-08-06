@@ -1064,6 +1064,12 @@ The clause fires on exactly the runs where the two lane orders disagree and on
 none of the ones where they agree — checked in both directions, for both
 resources.
 
+That condition is now the one clause 2 asks of these two resources rather than
+of all of them, and the first bullet above is where it turned out to be a
+statement about *them*: a resource that hands out identified items rather than
+interchangeable units decides something between two lanes that both succeed.
+§4.13 is that case and carries the corrected clause.
+
 **A refusal is now traced.** `ProcessCreationRefused` carries the domain in
 `subject` and the quota in `auxiliary`; `MessageSendBlocked` carries the
 receiver in `causal`, as `MessageSent` does, and the capacity in `auxiliary`.
@@ -1091,6 +1097,15 @@ question is the tool, and the remaining candidates are the ones where an
 operation can say no: a table that can refuse to allocate, and a supervision
 queue with a bound. Neither is reachable from a step today.
 
+That last sentence was wrong when it was written, and §4.13 is the case it
+missed. The candidates were listed by looking for a *new* bounded thing, and the
+one that was there already is this same mailbox read from the other end: a
+receive that finds it empty says no exactly as a send that finds it full does,
+and `receive_message` is one of §4.10's fifteen. The lesson is the narrower of
+the two available: a list of "where else can an operation say no" has to be
+taken over operations, not over resources, because one resource can refuse two
+different callers for two different reasons.
+
 **The section heading is now too narrow.** It says quota; the clause is about
 bounded resources, and a quota is one of two. It is left as it is because §4.12
 is what the commits and the handoff point at, and renaming a section to make it
@@ -1117,6 +1132,79 @@ fail.
 executive cannot take, and I25 names it at the point the workload does it. That
 is the standing §4.3 gave clause 1 and it is unchanged: the kernel does not
 refuse such a workload, the checker reports it.
+
+### 4.13 The same mailbox, drained
+
+§4.12 closed by naming the remaining candidates and saying none of them was
+reachable from a step. One was, and it was not a new resource: it was the
+mailbox §4.12 had just finished filling, read from the other end. A send that
+finds a full mailbox says no; a receive that finds an empty one says no just as
+definitely, and `receive_message` is one of the fifteen operations §4.10 sorted.
+
+The experiment is `mailbox_capacity.rs` with the arrow reversed. One process, four
+read-only continuations at a resume point that receives — so I13 admits all four
+in one epoch and each is a lane — and one message waiting. The message goes to
+lane 1 under `Plan` and to lane 4 under `Reverse`, the other three park, and the
+two runs are not I18-equivalent. Clause 1 is blind for the third time and for the
+third version of the same reason: `cross_lane_edges()` is empty, because how many
+messages are in a mailbox is not an event.
+
+`MessageReceiveBlocked` is `MessageSendBlocked`'s mirror, with the same two
+justifications. A receive that found nothing left no record at all — a trace
+showed a continuation that started and then waited, and could not say whether it
+was waiting on a future or on an empty mailbox — and the checker cannot tell a
+mailbox several lanes drained between them from one that had a message for each
+of them without it. It carries the mailbox's owner in `process`, as
+`MessageReceived` does, which is what lets the clause key both on one resource.
+
+**Its `auxiliary` is a constant, on purpose.** A receive is refused by emptiness
+and nothing else, so the occupancy that refused it is always zero. The more
+informative number available — how many receivers are already parked — is the
+wrong one to record, and the reason is worth keeping: that depth is the *parking
+order*, and parking order differs between two lane orders in runs whose epoch
+outcome does not. Putting it in the trace would make those runs disagree over
+something no epoch decided. The same observation applies to `full_waiters` and is
+why §4.12's already-full null holds: a queue of losers is order-dependent state
+that this trace does not expose, and a later epoch that drains it is a race in
+that epoch rather than in the one that parked them.
+
+**The clause was asking the wrong question, and this is what showed it.** Four
+receivers and four messages looks like the "room for everyone" null that a quota
+and a capacity both have — every lane succeeds, no refusal anywhere — and it is
+not one. The runs disagree. A quota and a capacity dispense **interchangeable**
+units: one slot in a mailbox is like every other, and which one a sender got is
+not in the trace. A mailbox's occupancy dispenses **identified** items — this
+message, from that sender, with that sequence number — so two lanes that both
+succeed still took different things, and which lane took which is precisely what
+the order decided.
+
+So clause 2 now asks a condition per resource kind rather than one condition:
+
+- **Interchangeable** — a winner and a *different* loser, unchanged, which is
+  what §4.12 established and what both of its nulls still turn on.
+- **Identified** — a winner and any other lane that drew, won or lost. A refusal
+  is one way to lose; getting the other message is another.
+
+The nulls change shape with it. For a drained mailbox, "everybody succeeded" is
+not a null and "everybody was refused" still is — an empty mailbox refuses every
+receiver under every order — and the null that says the clause is about *one*
+mailbox is two lanes each draining their own.
+
+**A second defect, in the pairing.** The clause took the lowest-numbered winner
+and looked for a loser that was not it. That misses a lane which both won and
+lost: if it is also the lowest winner, asking only about it finds nothing, while
+a higher-numbered winner that got in ahead of it plainly decided the outcome.
+Every pair is now considered, and the minimum over pairs is taken — which also
+makes the report the same text every run, where picking a loser out of a
+`HashSet` did not. No workload reaches the shape, because a handler sends once,
+so it is checked by appending the three events a workload that sent twice would
+have produced.
+
+**What is unchanged.** No existing workload emits a blocked receive: the suite's
+receiving workloads ingest the message before the receiver runs, so every receive
+in them finds one. Eight example reports are byte-identical, and the probe that
+says so is stronger than the reports — making the emission `panic!` and running
+the whole suite reaches it from exactly one test file, this one.
 
 ---
 
@@ -1191,7 +1279,7 @@ cannot reach means the model is charging for the wrong thing.
 | I22 admission determinism | checked | the decision is a function of the candidate set (§4.1) |
 | I23 position-derived emission | checked | the trace's order needs no shared clock (§4.2) |
 | I24 effect-mediated commit | checked | bins are written by an applier, in plan order (§4.4) |
-| I25 lane independence | checked | two clauses: no ≺ edge joins two lanes of one epoch (§4.5), and no two lanes are decided by one bounded resource — a domain quota or a mailbox capacity (§4.12) |
+| I25 lane independence | checked | two clauses: no ≺ edge joins two lanes of one epoch (§4.5), and no two lanes are decided by one bounded resource — a domain quota, a mailbox's capacity, or a mailbox's occupancy (§4.12, §4.13) |
 
 **I21** has two halves. The first — an epoch that admitted work dispatched some
 of it — is a statement about a transition rather than a state, so it is counted

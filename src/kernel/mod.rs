@@ -628,6 +628,15 @@ impl Kernel {
             .unwrap_or(0)
     }
 
+    /// Receivers parked on an empty mailbox, the counterpart of
+    /// `mailbox_full_waiter_count`.
+    pub fn mailbox_recv_waiter_count(&self, process: Ref64) -> usize {
+        self.mailboxes
+            .get(&process.key())
+            .map(|mailbox| mailbox.recv_waiters.len())
+            .unwrap_or(0)
+    }
+
     pub fn mailbox_first_full_waiter(&self, process: Ref64) -> Option<Ref64> {
         self.mailboxes
             .get(&process.key())
@@ -3309,6 +3318,12 @@ impl Kernel {
             return Ok(Some(msg));
         }
         mailbox.recv_waiters.push_back(cont);
+        // Traced for `MessageSendBlocked`'s reason, from the other end. A
+        // receive that found nothing used to leave no record: the continuation
+        // parked, and the trace could not say an empty mailbox was why. It is
+        // also what I25 clause 2 reads to tell a mailbox two lanes drained
+        // between them from one that had a message for each of them.
+        self.trace(EventKind::MessageReceiveBlocked, process, cont, 0, 0);
         Ok(None)
     }
 

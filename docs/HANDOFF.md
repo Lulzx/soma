@@ -4,7 +4,7 @@ Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
 Repository: https://github.com/Lulzx/soma. The default semantic core is
-dependency-free. There are 365 tests (seven of which need the `metal` feature),
+dependency-free. There are 375 tests (seven of which need the `metal` feature),
 six compile-fail doc tests, and no Clippy warnings. The optional `metal`
 feature adds the `metal-rs` implementation dependency on macOS.
 
@@ -257,6 +257,17 @@ Added in v0.3:
   checker tell a bound that bit from a bound with room. The bug this turned up:
   `LaneView::create_process` was infallible, so a full domain aborted the host
   process instead of faulting the step.
+- I25 clause 2's third resource, and the correction it forced (v0.3 §4.13). The
+  same mailbox drained rather than filled (`tests/mailbox_drain.rs`): several
+  continuations of one process receive in one epoch, the message goes to
+  whichever lane ran first, and `MessageReceiveBlocked` is the record a parked
+  receiver had none of. What it corrected is the condition. A quota and a
+  capacity hand out interchangeable units, so a winner and a different loser is
+  right for them; a mailbox hands out identified messages, so four receivers and
+  four messages disagree across orders with nobody refused. Clause 2 now asks
+  per resource kind. It also stopped taking the lowest winner and looking for an
+  unequal loser, which missed a lane that both won and lost -- and made the
+  report the same text every run.
 - A lane-local trace buffer (v0.3 §4.11). A lane produces trace events into
   `lane_trace` and `leave_lane` appends them, which is §4.4's move applied to
   the trace. `logical_time` is handed out at the drain rather than at emission,
@@ -574,9 +585,21 @@ decision that would otherwise depend on `HashMap` iteration order.
   reorderability result here is conditional on what the workload touches, so a
   new shared, bounded, or refusing resource needs its own reordered run rather
   than inheriting the old conclusion. The place to look is anything a lane reads
-  a *decision* off rather than merely writes. That question found both cases so
-  far -- a domain quota and a mailbox capacity — neither by a failing test, and
-  the remaining candidates are wherever an operation can say no.
+  a *decision* off rather than merely writes. That question found all three
+  cases so far — a domain quota, a mailbox's capacity, and the same mailbox's
+  occupancy — none by a failing test. Enumerate the *operations* that can say
+  no, not the resources: §4.12 listed the resources, concluded nothing else was
+  reachable from a step, and missed the mailbox it had just finished filling
+  because a receive refuses a different caller for a different reason (§4.13).
+- **A null for one bounded resource is not a null for another.** Clause 2 asks a
+  different question depending on what the resource hands out. A quota and a
+  mailbox capacity dispense interchangeable units, so two lanes that both
+  succeed decide nothing and contention needs a refusal. A mailbox's messages
+  are *identified* — a sender, a sequence number — so two lanes that both
+  succeed took different messages and the order decided which. "Four receivers,
+  four messages" is not room for everyone; it is a race with no refusal in it.
+  Adding a resource means asking which kind it is before reusing either
+  condition (v0.3 §4.13).
 - **The lane trace buffer drains in emission order, and must not sort.**
   `drain_lane_trace` appends what the lane produced in the order it produced it,
   which is why the buffer changed no run. Sorting by position there looks like an

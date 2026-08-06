@@ -328,41 +328,99 @@ fn lane_independence(kernel: &Kernel, out: &mut Vec<Violation>) {
 
 /// Which bounded thing an epoch's lanes were drawing on.
 ///
-/// The two the machine has. A step can exhaust a domain's process quota and it
-/// can fill a receiver's mailbox, and in both cases the loser is decided by
-/// which lane ran first. Anything else a lane reads a *decision* off — rather
-/// than merely writes — belongs here as it arrives.
+/// The three the machine has. A step can exhaust a domain's process quota, it
+/// can fill a receiver's mailbox, and it can take the message another lane was
+/// about to receive. Anything else a lane reads a *decision* off — rather than
+/// merely writes — belongs here as it arrives.
+///
+/// The third is the second one read from the other end, and it is a separate
+/// variant because it is contended differently rather than merely elsewhere. A
+/// capacity and a quota hand out **interchangeable** units: a slot in a mailbox
+/// is like every other slot, and which one a sender gets is not in the trace. An
+/// occupancy hands out **identified** ones — this message, from that sender,
+/// with that sequence number — so two lanes that both succeed still got
+/// different things, and which lane got which is decided by the order.
+///
+/// That is why `Dispenses` exists rather than one condition for all three. It
+/// is also the first place clause 2's original condition, "a winner and a
+/// different loser", turned out to be a statement about the two resources that
+/// happened to exist when it was written.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Bounded {
     DomainQuota,
     MailboxCapacity,
+    MailboxOccupancy,
+}
+
+/// What a resource hands a lane that draws on it successfully.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dispenses {
+    /// Units no run can tell apart. Two lanes that both succeed are not decided
+    /// by their order, so contention needs a refusal: a winner and a *different*
+    /// loser.
+    Interchangeable,
+    /// Distinct items with identities of their own. Two lanes that both succeed
+    /// took different items, so a second lane drawing at all is enough — a
+    /// refusal is one way to lose and getting the other message is another.
+    Identified,
 }
 
 impl Bounded {
+    fn dispenses(&self) -> Dispenses {
+        match self {
+            Bounded::DomainQuota | Bounded::MailboxCapacity => Dispenses::Interchangeable,
+            Bounded::MailboxOccupancy => Dispenses::Identified,
+        }
+    }
+
     fn describe(&self) -> &'static str {
         match self {
-            Bounded::DomainQuota => "allocated in one bounded domain, and it refused at least one",
-            Bounded::MailboxCapacity => "sent to one mailbox, and it was full for at least one",
+            Bounded::DomainQuota => {
+                "allocated in one bounded domain, and it refused at least one, so which lane is \
+                 refused"
+            }
+            Bounded::MailboxCapacity => {
+                "sent to one mailbox, and it was full for at least one, so which lane is refused"
+            }
+            Bounded::MailboxOccupancy => {
+                "received from one mailbox, so which lane gets which message"
+            }
         }
     }
 }
 
 /// I25 clause 2: no two lanes of one epoch are decided by one bounded resource.
 ///
-/// The precise condition is that **one lane got the resource and a different
+/// The condition depends on what the resource hands out, and that is a
+/// correction rather than a complication.
+///
+/// For a resource dispensing **interchangeable** units — a domain's quota, a
+/// mailbox's capacity — it is that **one lane got the resource and a different
 /// lane was refused it**, in the same epoch. Each half is doing work. Two lanes
 /// drawing on a resource with room for both decide nothing — every lane succeeds
-/// under every order. A refusal with nobody succeeding decides nothing either:
-/// a mailbox that was already full at the start of the epoch refuses all four of
-/// its senders whatever order they run in, and the run is reorderable. So is one
-/// lane refused after succeeding itself, which is a lane exhausting a resource
-/// against nobody. It is a winner *and* a different loser that makes the outcome
-/// a function of the order.
+/// under every order, and nothing in the trace says which slot each took. A
+/// refusal with nobody succeeding decides nothing either: a mailbox that was
+/// already full at the start of the epoch refuses all four of its senders
+/// whatever order they run in, and the run is reorderable. So is one lane
+/// refused after succeeding itself, which is a lane exhausting a resource
+/// against nobody.
+///
+/// For a resource dispensing **identified** items — the messages in a mailbox —
+/// a refusal is not required, and requiring one would miss the common case.
+/// Four receivers and four messages is not "room for everyone": each lane takes
+/// a different message, and which lane takes which is exactly what the order
+/// decides. The condition there is a winner and any other lane that drew, won
+/// or lost.
+///
+/// The distinction is not a special case for mailboxes. It is what "bounded
+/// resource" was hiding: the original condition was written when both resources
+/// counted units, and it silently assumed the units were anonymous.
 ///
 /// The refusal has to be in the trace for this to be checkable at all, which is
-/// what `ProcessCreationRefused` and `MessageSendBlocked` are for. Without them
-/// the clause can only ask whether two lanes drew on the resource, which is true
-/// of a great many runs that are perfectly reorderable.
+/// what `ProcessCreationRefused`, `MessageSendBlocked` and
+/// `MessageReceiveBlocked` are for. Without them the clause can only ask whether
+/// two lanes drew on the resource, which is true of a great many runs that are
+/// perfectly reorderable.
 ///
 /// **What is not this clause.** The counters themselves — `processes_created`
 /// is incremented by every allocation, in the root domain as much as a bounded
@@ -410,6 +468,15 @@ fn bounded_resource_independence(kernel: &Kernel, out: &mut Vec<Violation>) {
                 event.causal,
                 event.event_kind == crate::abi::EventKind::MessageSendBlocked,
             ),
+            // The same mailbox from the other end, where what is contended is
+            // the messages in it rather than the room left. Both events name
+            // the mailbox's owner in `process`.
+            crate::abi::EventKind::MessageReceived
+            | crate::abi::EventKind::MessageReceiveBlocked => (
+                Bounded::MailboxOccupancy,
+                event.process,
+                event.event_kind == crate::abi::EventKind::MessageReceiveBlocked,
+            ),
             _ => continue,
         };
         let key = (event.epoch, resource, target.key());
@@ -420,26 +487,50 @@ fn bounded_resource_independence(kernel: &Kernel, out: &mut Vec<Violation>) {
         }
     }
 
-    let mut contended: Vec<(&Key, u32, u32)> = lost
+    // A winner is required either way: a resource nobody got out of decided
+    // nothing between the lanes that were refused it.
+    let no_losers: HashSet<u32> = HashSet::new();
+    let mut contended: Vec<(&Key, u32, u32)> = won
         .iter()
-        .filter_map(|(key, losers)| {
-            let winners = won.get(key)?;
-            // A winner and a *different* loser. One lane that exhausts a
-            // resource against nobody has raced nobody.
-            let winner = winners.iter().min()?;
-            let loser = losers.iter().find(|lane| *lane != winner)?;
-            Some((key, *winner, *loser))
+        .filter_map(|(key, winners)| {
+            let (_, resource, _) = *key;
+            let losers = lost.get(key).unwrap_or(&no_losers);
+            // Who counts as the *other* lane is the whole of the distinction
+            // `Dispenses` draws. Against an interchangeable unit only a refused
+            // lane was decided against; against an identified one a second
+            // winner was too, because it got the other message.
+            let others: Vec<u32> = match resource.dispenses() {
+                Dispenses::Interchangeable => losers.iter().copied().collect(),
+                Dispenses::Identified => winners.iter().chain(losers.iter()).copied().collect(),
+            };
+            // Every pair is considered rather than the lowest-numbered winner
+            // and someone unequal to it. Those are not the same test: a lane
+            // that draws twice can both win and lose, and if it is the lowest
+            // winner then asking only about *it* misses a higher-numbered
+            // winner that raced it. Taking the minimum over pairs also makes
+            // the report the same text every run, which picking out of a
+            // `HashSet` did not.
+            others
+                .iter()
+                .flat_map(|other| {
+                    winners
+                        .iter()
+                        .filter(move |winner| *winner != other)
+                        .map(move |winner| {
+                            (key, (*winner).min(*other), (*winner).max(*other))
+                        })
+                })
+                .min_by_key(|(_, first, second)| (*first, *second))
         })
         .collect();
     contended.sort();
     // One report per run, as in clause 1.
-    if let Some((key, winner, loser)) = contended.first() {
+    if let Some((key, first, second)) = contended.first() {
         let (epoch, resource, _) = **key;
         out.push(Violation::new(
             Invariant::LaneIndependence,
             format!(
-                "epoch {epoch}: lanes {winner} and {loser} both {}, so which lane loses \
-                 depends on which lane ran first",
+                "epoch {epoch}: lanes {first} and {second} both {} depends on which lane ran first",
                 resource.describe()
             ),
         ));
