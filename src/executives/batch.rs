@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use crate::abi::{ObjectKind, Ref64};
 use crate::compiler::body::EvaluatorProgram;
 use crate::kernel::ownership::freeze;
+use crate::kernel::payload::Payload;
 use crate::kernel::{Kernel, RuntimeError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +52,30 @@ pub trait BatchBackend {
         element_count: u32,
         element_stride: u32,
     ) -> Result<Vec<u8>, BackendError>;
+
+    /// Evaluate, returning bytes the kernel can take ownership of wherever
+    /// they already are.
+    ///
+    /// `evaluate` returns a `Vec`, which on Apple silicon means a backend that
+    /// has just written its answer into memory the CPU can already read copies
+    /// it into memory the CPU can also already read, so that it has the right
+    /// type. This is the same operation without that copy: a backend holding
+    /// its result in an allocation it is willing to give away hands the
+    /// allocation over instead.
+    ///
+    /// The default is the copy, so a backend need not implement it, and I20
+    /// still compares backends through `evaluate` — agreement is about bytes,
+    /// not about where they live.
+    fn evaluate_payload(
+        &mut self,
+        evaluator_id: u32,
+        inputs: &[u8],
+        element_count: u32,
+        element_stride: u32,
+    ) -> Result<Payload, BackendError> {
+        self.evaluate(evaluator_id, inputs, element_count, element_stride)
+            .map(Payload::from)
+    }
 }
 
 /// Split `inputs` into elements, apply `element` to each, and return the
@@ -162,9 +187,9 @@ fn publish(
     kernel: &mut Kernel,
     actor: Ref64,
     collective: Ref64,
-    outputs: Vec<u8>,
+    outputs: Payload,
 ) -> Result<Ref64, BackendError> {
-    let output = kernel.create_object(actor, ObjectKind::FrozenArray, outputs);
+    let output = kernel.create_object_from_payload(actor, ObjectKind::FrozenArray, outputs);
     freeze(kernel, actor, output)?;
     kernel.complete_batch_evaluate(actor, collective, output)?;
     Ok(output)
@@ -255,12 +280,19 @@ pub fn execute_with_spill(
     stats: &mut PlacementStats,
 ) -> Result<Ref64, BackendError> {
     let (evaluator, inputs, count, stride) = kernel.batch_evaluate_request(collective)?;
-    let input_bytes = kernel.object_bytes(actor, inputs)?.to_vec();
+    // Borrowed, not copied. This was a `to_vec` because the borrow of the
+    // kernel has to end before `publish` takes it mutably again, and copying
+    // the batch is the way to end a borrow without thinking about it. The
+    // copy is a whole pass over the input — at a million 8-byte elements it
+    // is 8MB, which `examples/backend_bench` measured as a third of the
+    // published path's time against Metal. The borrow ends at the last use of
+    // `input_bytes` instead, which is before `publish`.
+    let input_bytes = kernel.object_bytes(actor, inputs)?;
     let (outputs, kind, spilled) = if count >= minimum_accelerator_batch {
-        match accelerator.evaluate(evaluator, &input_bytes, count, stride) {
+        match accelerator.evaluate_payload(evaluator, input_bytes, count, stride) {
             Ok(outputs) => (outputs, accelerator.kind(), false),
             Err(BackendError::Unavailable) => (
-                cpu.evaluate(evaluator, &input_bytes, count, stride)?,
+                cpu.evaluate_payload(evaluator, input_bytes, count, stride)?,
                 cpu.kind(),
                 true,
             ),
@@ -268,7 +300,7 @@ pub fn execute_with_spill(
         }
     } else {
         (
-            cpu.evaluate(evaluator, &input_bytes, count, stride)?,
+            cpu.evaluate_payload(evaluator, input_bytes, count, stride)?,
             cpu.kind(),
             true,
         )

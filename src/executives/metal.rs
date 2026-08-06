@@ -21,6 +21,49 @@ use metal::{
 
 use super::batch::{BackendError, BackendKind, BatchBackend};
 use crate::compiler::body::EvaluatorProgram;
+use crate::kernel::payload::{ForeignPayload, Payload};
+
+/// An object whose bytes are an `MTLBuffer` the GPU wrote and the backend has
+/// given away.
+///
+/// The buffer is shared storage, so the CPU can read these bytes without any
+/// transfer; that is the entire point. `len` is the batch, which can be less
+/// than the buffer's capacity, and the slice is clipped to it so a published
+/// object never exposes whatever the allocation happens to be carrying past
+/// the end of the batch.
+/// Where a batch's output should be written: into the buffer the backend
+/// reuses, or into one allocated for this batch and given away.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Output {
+    Reused,
+    Owned,
+}
+
+struct MetalPayload {
+    buffer: Buffer,
+    len: usize,
+}
+
+// Safety: the buffer is exclusively owned — `MetalBatchBackend` allocates it
+// for one batch, hands it over, and never writes to it again. Metal objects
+// are internally reference counted, and no thread mutates this one after the
+// command buffer that wrote it has completed, which `evaluate_payload` waits
+// for before constructing this.
+unsafe impl Send for MetalPayload {}
+
+impl ForeignPayload for MetalPayload {
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.buffer.contents().cast::<u8>(), self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.buffer.contents().cast::<u8>(), self.len) }
+    }
+
+    fn provenance(&self) -> &'static str {
+        "metal-shared"
+    }
+}
 
 pub struct MetalBatchBackend {
     device: Device,
@@ -75,6 +118,98 @@ impl MetalBatchBackend {
         (input.clone(), output.clone())
     }
 
+    /// Run one batch and return the buffer holding its output, or `None` when
+    /// the batch is empty.
+    ///
+    /// `Output::Reused` writes into the scratch buffer the backend keeps, for
+    /// callers that are about to copy the bytes out anyway. `Output::Owned`
+    /// allocates an output buffer for this batch alone, because a caller that
+    /// publishes the buffer as a SOMA object takes ownership of it: the
+    /// backend must not be able to overwrite a frozen object on its next
+    /// batch. The input side is reused either way, since nothing outlives the
+    /// call.
+    fn run(
+        &mut self,
+        evaluator_id: u32,
+        inputs: &[u8],
+        element_count: u32,
+        element_stride: u32,
+        output_kind: Output,
+    ) -> Result<Option<(Buffer, usize)>, BackendError> {
+        // Cloned rather than borrowed: `scratch_for` needs `&mut self`, and a
+        // `ComputePipelineState` clone is a retain on an object the backend
+        // already owns.
+        let (pipeline, declared_stride) = self
+            .pipelines
+            .get(&evaluator_id)
+            .cloned()
+            .ok_or(BackendError::UnsupportedEvaluator)?;
+        if declared_stride != element_stride {
+            return Err(BackendError::InvalidInput);
+        }
+
+        let stride = element_stride as usize;
+        let required = (element_count as usize)
+            .checked_mul(stride)
+            .ok_or(BackendError::InvalidInput)?;
+        if inputs.len() < required {
+            return Err(BackendError::InvalidInput);
+        }
+        if required == 0 {
+            return Ok(None);
+        }
+
+        // Safe to overwrite in place: this backend waits for completion below,
+        // so no previously submitted command buffer can still be reading it.
+        // That stops being true the moment submission becomes asynchronous,
+        // which is why a ring rather than one slot is the next shape.
+        let (input, scratch_output) = self.scratch_for(required as u64);
+        unsafe {
+            std::ptr::copy_nonoverlapping(inputs.as_ptr(), input.contents().cast::<u8>(), required);
+        }
+        let output = match output_kind {
+            Output::Reused => scratch_output,
+            Output::Owned => self
+                .device
+                .new_buffer(required as u64, MTLResourceOptions::StorageModeShared),
+        };
+
+        let command = self.queue.new_command_buffer();
+        let encoder = command.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&input), 0);
+        encoder.set_buffer(1, Some(&output), 0);
+        encoder.set_bytes(
+            2,
+            std::mem::size_of::<u32>() as u64,
+            (&element_count as *const u32).cast::<c_void>(),
+        );
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<u32>() as u64,
+            (&element_stride as *const u32).cast::<c_void>(),
+        );
+        encoder.dispatch_threads(
+            MTLSize {
+                width: element_count as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: pipeline.thread_execution_width().min(element_count as u64),
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.end_encoding();
+        command.commit();
+        command.wait_until_completed();
+        if command.status() != MTLCommandBufferStatus::Completed {
+            return Err(BackendError::ExecutionFailed);
+        }
+        Ok(Some((output, required)))
+    }
+
     /// Compile every body in one pass, so a codegen defect surfaces at
     /// installation rather than in the middle of a collective.
     pub fn with(programs: &[&EvaluatorProgram]) -> Result<Self, BackendError> {
@@ -116,73 +251,27 @@ impl BatchBackend for MetalBatchBackend {
         element_count: u32,
         element_stride: u32,
     ) -> Result<Vec<u8>, BackendError> {
-        // Cloned rather than borrowed: `scratch_for` needs `&mut self`, and a
-        // `ComputePipelineState` clone is a retain on an object the backend
-        // already owns.
-        let (pipeline, declared_stride) = self
-            .pipelines
-            .get(&evaluator_id)
-            .cloned()
-            .ok_or(BackendError::UnsupportedEvaluator)?;
-        if declared_stride != element_stride {
-            return Err(BackendError::InvalidInput);
-        }
-
-        let stride = element_stride as usize;
-        let required = (element_count as usize)
-            .checked_mul(stride)
-            .ok_or(BackendError::InvalidInput)?;
-        if inputs.len() < required {
-            return Err(BackendError::InvalidInput);
-        }
-        if required == 0 {
+        let Some((output, required)) =
+            self.run(evaluator_id, inputs, element_count, element_stride, Output::Reused)?
+        else {
             return Ok(Vec::new());
-        }
-
-        // Safe to overwrite in place: this backend waits for completion below,
-        // so no previously submitted command buffer can still be reading it.
-        // That stops being true the moment submission becomes asynchronous,
-        // which is why a ring rather than one slot is the next shape.
-        let (input, output) = self.scratch_for(required as u64);
-        unsafe {
-            std::ptr::copy_nonoverlapping(inputs.as_ptr(), input.contents().cast::<u8>(), required);
-        }
-
-        let command = self.queue.new_command_buffer();
-        let encoder = command.new_compute_command_encoder();
-        encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(0, Some(&input), 0);
-        encoder.set_buffer(1, Some(&output), 0);
-        encoder.set_bytes(
-            2,
-            std::mem::size_of::<u32>() as u64,
-            (&element_count as *const u32).cast::<c_void>(),
-        );
-        encoder.set_bytes(
-            3,
-            std::mem::size_of::<u32>() as u64,
-            (&element_stride as *const u32).cast::<c_void>(),
-        );
-        encoder.dispatch_threads(
-            MTLSize {
-                width: element_count as u64,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width: pipeline.thread_execution_width().min(element_count as u64),
-                height: 1,
-                depth: 1,
-            },
-        );
-        encoder.end_encoding();
-        command.commit();
-        command.wait_until_completed();
-        if command.status() != MTLCommandBufferStatus::Completed {
-            return Err(BackendError::ExecutionFailed);
-        }
-
+        };
         let bytes = unsafe { std::slice::from_raw_parts(output.contents().cast::<u8>(), required) };
         Ok(bytes.to_vec())
+    }
+
+    fn evaluate_payload(
+        &mut self,
+        evaluator_id: u32,
+        inputs: &[u8],
+        element_count: u32,
+        element_stride: u32,
+    ) -> Result<Payload, BackendError> {
+        let Some((buffer, len)) =
+            self.run(evaluator_id, inputs, element_count, element_stride, Output::Owned)?
+        else {
+            return Ok(Payload::Host(Vec::new()));
+        };
+        Ok(Payload::Foreign(Box::new(MetalPayload { buffer, len })))
     }
 }

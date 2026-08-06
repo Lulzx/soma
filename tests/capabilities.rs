@@ -100,7 +100,10 @@ fn write_requires_live_unexpired_authority_at_use() {
     let stranger = kernel.create_process(SYSTEM_PRINCIPAL, soma::abi::ProcessMode::Serial);
     let object = kernel.create_object(actor, ObjectKind::RawBytes, vec![1]);
 
-    kernel.object_bytes_mut(actor, object).unwrap().push(2);
+    // An in-place write rather than a `push`: `object_bytes_mut` hands out a
+    // slice now, since a payload is not always a `Vec`. What is under test is
+    // the authority the write needs, not the length it changes.
+    kernel.object_bytes_mut(actor, object).unwrap()[0] = 2;
     assert!(matches!(
         kernel.object_bytes_mut(stranger, object),
         Err(RuntimeError::AuthorityDenied)

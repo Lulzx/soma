@@ -8,6 +8,7 @@ pub mod commit;
 pub mod effects;
 pub mod epochs;
 pub mod ownership;
+pub mod payload;
 pub mod retention;
 #[doc(hidden)]
 pub mod raw;
@@ -254,7 +255,7 @@ pub struct Kernel {
 
     /// Object payload bytes, keyed by object slot. Kernel-private (§6: user
     /// programs cannot inspect or construct the physical mapping).
-    object_payloads: HashMap<u64, Vec<u8>>,
+    object_payloads: HashMap<u64, payload::Payload>,
     /// Mailboxes keyed by process slot.
     mailboxes: HashMap<u64, Mailbox>,
     /// Future waiters keyed by future slot.
@@ -455,6 +456,19 @@ impl Kernel {
     /// it spans the whole object (`find_authorized_capability`), so a caller
     /// delegating authority needs this to ask for a grant that will actually
     /// authorise anything.
+    /// Where an object's bytes live: `"host"` for a kernel-allocated `Vec`,
+    /// or whatever a foreign payload calls itself.
+    ///
+    /// Not semantic — nothing in the abstract machine may branch on this. It
+    /// exists so a test can tell a batch that was published in place from one
+    /// that was copied out and back, which is otherwise invisible: both
+    /// produce identical bytes, which is the whole point.
+    pub fn object_provenance(&self, object: Ref64) -> Option<&'static str> {
+        self.object_payloads
+            .get(&object.key())
+            .map(|payload| payload.provenance())
+    }
+
     pub fn object_byte_length(&self, object: Ref64) -> Result<u64, RuntimeError> {
         Ok(self.objects.get(object)?.byte_length)
     }
@@ -849,7 +863,26 @@ impl Kernel {
         self.create_object_for(actor, kind, bytes)
     }
 
-    fn create_object_for(&mut self, actor: Ref64, kind: ObjectKind, bytes: Vec<u8>) -> Ref64 {
+    /// Create an object whose bytes the kernel did not allocate.
+    ///
+    /// The caller transfers ownership of the allocation; see
+    /// `kernel::payload` for what that obliges it to stop doing.
+    pub fn create_object_from_payload(
+        &mut self,
+        actor: Ref64,
+        kind: ObjectKind,
+        bytes: payload::Payload,
+    ) -> Ref64 {
+        self.create_object_for(actor, kind, bytes)
+    }
+
+    fn create_object_for(
+        &mut self,
+        actor: Ref64,
+        kind: ObjectKind,
+        bytes: impl Into<payload::Payload>,
+    ) -> Ref64 {
+        let bytes = bytes.into();
         let owner_domain = if actor == SYSTEM_PRINCIPAL {
             self.root_domain
         } else {
@@ -1198,7 +1231,7 @@ impl Kernel {
         &mut self,
         actor: Ref64,
         obj: Ref64,
-    ) -> Result<&mut Vec<u8>, RuntimeError> {
+    ) -> Result<&mut [u8], RuntimeError> {
         if self.objects.get(obj)?.object_kind == ObjectKind::ProcessState {
             return Err(RuntimeError::InvalidStateAccess);
         }
@@ -1207,6 +1240,39 @@ impl Kernel {
         self.authority_effect(actor, crate::abi::Rights::WRITE, obj);
         self.object_payloads
             .get_mut(&obj.key())
+            .map(|v| v.as_mut_slice())
+            .ok_or(RuntimeError::MissingPayload)
+    }
+
+    /// A host payload as the growable `Vec` it is, for the one caller that
+    /// legitimately replaces a frame with a longer or shorter one.
+    ///
+    /// Growth cannot go through `object_bytes_mut`, which now hands out a
+    /// slice because a payload is not always a `Vec`. It also cannot go
+    /// through anything that updates `ObjectDescriptor::byte_length` to match:
+    /// authorization at `find_authorized_capability` admits a write only when
+    /// `capability.length >= byte_length`, and a capability carries the length
+    /// the object had when it was minted. Growing the descriptor therefore
+    /// revokes every capability over the object, which is what made the
+    /// `Expand` machine stop replying when this was written the obvious way.
+    ///
+    /// So the payload may exceed the length authorization checks against, and
+    /// this method preserves that rather than quietly changing what a
+    /// capability covers. That is a real inconsistency in the object model and
+    /// it predates the payload split; it wants deciding, not papering over.
+    pub fn host_payload_mut(
+        &mut self,
+        actor: Ref64,
+        obj: Ref64,
+    ) -> Result<&mut Vec<u8>, RuntimeError> {
+        if self.objects.get(obj)?.object_kind == ObjectKind::ProcessState {
+            return Err(RuntimeError::InvalidStateAccess);
+        }
+        self.authorize(actor, crate::abi::Rights::WRITE, obj)?;
+        self.authority_effect(actor, crate::abi::Rights::WRITE, obj);
+        self.object_payloads
+            .get_mut(&obj.key())
+            .and_then(|v| v.as_mut_vec())
             .ok_or(RuntimeError::MissingPayload)
     }
 
@@ -1244,8 +1310,12 @@ impl Kernel {
         }
         self.authorize(actor, crate::abi::Rights::WRITE, state)?;
         self.authority_effect(actor, crate::abi::Rights::WRITE, state);
+        // Process state is created here and never handed to a backend, so it
+        // is always host-backed; a foreign payload would report as missing
+        // rather than silently refusing to grow.
         self.object_payloads
             .get_mut(&state.key())
+            .and_then(|v| v.as_mut_vec())
             .ok_or(RuntimeError::MissingPayload)
     }
 

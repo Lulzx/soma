@@ -75,7 +75,9 @@ fn frame_bytes(kernel: &mut Kernel, actor: Ref64, cont: Ref64) -> Vec<u8> {
 
 fn set_frame_bytes(kernel: &mut Kernel, actor: Ref64, cont: Ref64, bytes: Vec<u8>) {
     if let Ok(obj) = kernel.continuations().get(cont).map(|c| c.frame) {
-        if let Ok(buf) = kernel.object_bytes_mut(actor, obj) {
+        // A frame can change length between steps, so this needs the payload
+        // as a `Vec` rather than the slice `object_bytes_mut` now returns.
+        if let Ok(buf) = kernel.host_payload_mut(actor, obj) {
             *buf = bytes;
         }
     }

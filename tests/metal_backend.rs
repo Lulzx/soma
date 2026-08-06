@@ -192,3 +192,59 @@ fn a_reused_buffer_does_not_leak_the_previous_batch_into_a_smaller_one() {
         );
     }
 }
+
+#[test]
+fn a_gpu_batch_is_published_where_the_gpu_wrote_it() {
+    // The bytes of a published object are the same either way, so nothing in
+    // the semantics can tell whether the GPU's output buffer was published in
+    // place or copied into a `Vec` first. That is what makes the copy easy to
+    // reintroduce by accident, and why provenance is worth asserting once:
+    // `examples/backend_bench` measures the copy at about a sixth of the
+    // published path at a million elements.
+    let module = examples::module();
+    let programs = module.programs();
+    let mut metal = MetalBatchBackend::with(&programs).unwrap();
+    let mut cpu = CpuReferenceBackend::with(&programs);
+
+    let mut kernel = Kernel::new();
+    let owner = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let inputs = frozen_input(&mut kernel, owner, sample_elements());
+    let (collective, _) = kernel
+        .create_batch_evaluate_for(owner, examples::MIN_AND_XOR, inputs, 7, 8)
+        .unwrap();
+    let output = execute_with_spill(
+        &mut kernel,
+        owner,
+        collective,
+        1,
+        &mut metal,
+        &mut cpu,
+        &mut PlacementStats::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        kernel.object_provenance(output),
+        Some("metal-shared"),
+        "the GPU's output was copied into host memory before publication"
+    );
+    // And the same collective placed on the CPU is host-backed, so the
+    // assertion above is about placement and not about every published object.
+    let (cpu_collective, _) = kernel
+        .create_batch_evaluate_for(owner, examples::MIN_AND_XOR, inputs, 7, 8)
+        .unwrap();
+    let cpu_output = execute_with_spill(
+        &mut kernel,
+        owner,
+        cpu_collective,
+        u32::MAX,
+        &mut metal,
+        &mut cpu,
+        &mut PlacementStats::default(),
+    )
+    .unwrap();
+    assert_eq!(kernel.object_provenance(cpu_output), Some("host"));
+    let gpu_bytes = kernel.object_bytes(owner, output).unwrap().to_vec();
+    let cpu_bytes = kernel.object_bytes(owner, cpu_output).unwrap().to_vec();
+    assert_eq!(gpu_bytes, cpu_bytes, "placement changed the published bytes");
+}
