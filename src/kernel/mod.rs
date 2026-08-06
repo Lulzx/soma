@@ -12,6 +12,7 @@ pub mod ownership;
 pub mod payload;
 #[doc(hidden)]
 pub mod raw;
+pub mod reclaim;
 pub mod retention;
 
 use std::collections::{HashMap, VecDeque};
@@ -467,6 +468,25 @@ impl Kernel {
 
     pub fn continuation_count(&self) -> usize {
         self.continuations.len()
+    }
+
+    pub fn object_count(&self) -> usize {
+        self.objects.len()
+    }
+
+    /// Processes that have finished and whose state the kernel is still
+    /// holding. Reporting only — it exists so a memory probe can say how much
+    /// of the population is reclaimable rather than live.
+    pub fn terminated_process_count(&self) -> usize {
+        self.processes
+            .iter()
+            .filter(|(process, _)| {
+                matches!(
+                    self.process_state(*process),
+                    Ok(ProcessState::Terminated | ProcessState::Failed | ProcessState::Cancelled)
+                )
+            })
+            .count()
     }
 
     /// An object's declared byte length.

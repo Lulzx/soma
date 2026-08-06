@@ -35,11 +35,51 @@ use crate::abi::capabilities::CapabilityEntry;
 use crate::abi::{AbiError, Kind, Ref64};
 use crate::table::GenTable;
 
+/// The capabilities under one index key.
+///
+/// Almost every bucket holds one entry — an object is typically named by a
+/// single capability, and a capability has few children — and a `Vec` for one
+/// `Ref64` is a heap allocation per key. `examples/memory_profile` prices a
+/// published batch at about 1.3KB against 32 bytes of payload, and three
+/// capabilities with two index entries each is a large part of that.
+#[derive(Debug)]
+enum Bucket {
+    One(Ref64),
+    Many(Vec<Ref64>),
+}
+
+impl Bucket {
+    fn push(&mut self, reference: Ref64) {
+        match self {
+            Bucket::One(held) => *self = Bucket::Many(vec![*held, reference]),
+            Bucket::Many(held) => held.push(reference),
+        }
+    }
+
+    /// Remove `reference`; reports whether the bucket is now empty.
+    fn remove(&mut self, reference: Ref64) -> bool {
+        match self {
+            Bucket::One(held) => *held == reference,
+            Bucket::Many(held) => {
+                held.retain(|entry| *entry != reference);
+                held.is_empty()
+            }
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = Ref64> + '_ {
+        match self {
+            Bucket::One(held) => std::slice::from_ref(held).iter().copied(),
+            Bucket::Many(held) => held.as_slice().iter().copied(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CapabilitySpace {
     table: GenTable<CapabilityEntry>,
-    by_target: HashMap<u64, Vec<Ref64>>,
-    by_parent: HashMap<u64, Vec<Ref64>>,
+    by_target: HashMap<u64, Bucket>,
+    by_parent: HashMap<u64, Bucket>,
     /// Set when an entry has been handed out mutably, since a caller may have
     /// changed the target or parent the indexes are built on. While set, both
     /// queries fall back to scanning, which is slow and correct. Nothing in
@@ -65,9 +105,9 @@ impl CapabilitySpace {
         // undoing the point of the index. Roots are never looked up by parent.
         let parent = (!entry.parent_capability.is_null()).then(|| entry.parent_capability.key());
         let reference = self.table.alloc(entry);
-        self.by_target.entry(target).or_default().push(reference);
+        insert_into(&mut self.by_target, target, reference);
         if let Some(parent) = parent {
-            self.by_parent.entry(parent).or_default().push(reference);
+            insert_into(&mut self.by_parent, parent, reference);
         }
         reference
     }
@@ -105,6 +145,14 @@ impl CapabilitySpace {
 
     /// The capabilities naming `target`, which is the only question
     /// authorization asks.
+    ///
+    /// The bucket key is `Ref64::key()`, which is partition and slot and *not*
+    /// kind or generation, so a process and an object occupying the same slot
+    /// share a bucket. Every lookup therefore re-checks the whole reference:
+    /// the index narrows the search and does not decide the answer. Skipping
+    /// that check let a revocation aimed at an object delete a capability over
+    /// the domain in the same slot, which the `CapabilityIntegrity` invariant
+    /// caught only because reclamation started deleting things.
     ///
     /// A stale reference in a bucket — one whose slot was reused under a new
     /// generation — is filtered by `get`, so the index may lag deletions
@@ -145,7 +193,7 @@ impl CapabilitySpace {
 
     fn lookup(
         &self,
-        index: &HashMap<u64, Vec<Ref64>>,
+        index: &HashMap<u64, Bucket>,
         key: u64,
         matches: impl Fn(&CapabilityEntry) -> bool,
     ) -> Vec<(Ref64, &CapabilityEntry)> {
@@ -159,8 +207,9 @@ impl CapabilitySpace {
         index
             .get(&key)
             .into_iter()
-            .flatten()
-            .filter_map(|reference| Some((*reference, self.table.get(*reference).ok()?)))
+            .flat_map(Bucket::iter)
+            .filter_map(|reference| Some((reference, self.table.get(reference).ok()?)))
+            .filter(|(_, entry)| matches(entry))
             .collect()
     }
 
@@ -181,18 +230,12 @@ impl CapabilitySpace {
     /// Only needed if a capability's `target` was changed in place, which
     /// nothing in the kernel does.
     pub fn reindex(&mut self) {
-        let mut by_target: HashMap<u64, Vec<Ref64>> = HashMap::new();
-        let mut by_parent: HashMap<u64, Vec<Ref64>> = HashMap::new();
+        let mut by_target: HashMap<u64, Bucket> = HashMap::new();
+        let mut by_parent: HashMap<u64, Bucket> = HashMap::new();
         for (reference, entry) in self.table.iter() {
-            by_target
-                .entry(entry.target.key())
-                .or_default()
-                .push(reference);
+            insert_into(&mut by_target, entry.target.key(), reference);
             if !entry.parent_capability.is_null() {
-                by_parent
-                    .entry(entry.parent_capability.key())
-                    .or_default()
-                    .push(reference);
+                insert_into(&mut by_parent, entry.parent_capability.key(), reference);
             }
         }
         self.by_target = by_target;
@@ -201,10 +244,18 @@ impl CapabilitySpace {
     }
 }
 
-fn remove_from(index: &mut HashMap<u64, Vec<Ref64>>, key: u64, reference: Ref64) {
+fn insert_into(index: &mut HashMap<u64, Bucket>, key: u64, reference: Ref64) {
+    match index.get_mut(&key) {
+        Some(bucket) => bucket.push(reference),
+        None => {
+            index.insert(key, Bucket::One(reference));
+        }
+    }
+}
+
+fn remove_from(index: &mut HashMap<u64, Bucket>, key: u64, reference: Ref64) {
     if let Some(bucket) = index.get_mut(&key) {
-        bucket.retain(|held| *held != reference);
-        if bucket.is_empty() {
+        if bucket.remove(reference) {
             index.remove(&key);
         }
     }
