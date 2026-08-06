@@ -69,6 +69,8 @@ pub enum Invariant {
     /// I24. Every runnable-bin entry is an effect a step produced and the
     /// kernel applied, in the order the plan puts the producing lanes in.
     EffectMediatedCommit,
+    /// I25. No lane of an epoch observes another lane of the same epoch.
+    LaneIndependence,
 }
 
 /// A specific way in which a state was illegal.
@@ -118,6 +120,7 @@ pub fn check(kernel: &Kernel) -> Vec<Violation> {
     admission_determinism(kernel, &mut v);
     position_derived_emission(kernel, &mut v);
     effect_mediated_commit(kernel, &mut v);
+    lane_independence(kernel, &mut v);
     v.sort();
     v
 }
@@ -164,10 +167,11 @@ pub fn check(kernel: &Kernel) -> Vec<Violation> {
 ///
 /// **What the clause does not say.** Only bin entry is mediated. Mailboxes,
 /// futures, capability spaces and the object tables are still written as the
-/// step runs, and allocation is still eager — §4.3 (2) shows it has to be.
-/// Reading this clause as "effects are applied after the epoch" would be
-/// reading canonical commit as done, and it is not: the applier runs at the end
-/// of each lane, which is where a sequential interpreter already was.
+/// step runs, and allocation is still eager — §4.3 (2) shows it has to be. The
+/// applier does now run at the epoch boundary rather than at the end of each
+/// lane (§4.5), so "effects are applied after the epoch" is true of the effects
+/// this clause covers and of no others. I25 is the clause that says what the
+/// rest of a step's writes owe in exchange.
 fn effect_mediated_commit(kernel: &Kernel, out: &mut Vec<Violation>) {
     let log = kernel.effect_log();
 
@@ -232,6 +236,70 @@ fn effect_mediated_commit(kernel: &Kernel, out: &mut Vec<Violation>) {
                 log.len()
             ),
         ));
+    }
+}
+
+// ---- I25 -----------------------------------------------------------------
+
+/// **I25. Lane independence.**
+///
+/// No ≺ edge joins two distinct lanes of one epoch.
+///
+/// This is the invariant canonical commit is paid for with, and it is worth
+/// being precise about which direction that goes. Applying an epoch's effects
+/// at the epoch boundary rather than at the end of each lane does not *make*
+/// lanes independent — mailboxes, futures, capability spaces and the object
+/// tables are still written as a step runs, and §4.3 (2) shows allocation has
+/// to stay eager. What it does is remove the executive's own reason for lanes
+/// to have run in a particular order, leaving the workload's. I25 is the
+/// question of whether the workload has one.
+///
+/// `docs/SOMA-v0.3.md` §4.3 (3) measured the answer across the Expand workload
+/// at three cohort widths — 1025 events, 441 edges, no cross-lane edge — and
+/// gave the structural reason: the wake events (`MessageReceived`,
+/// `ContinuationReady`, `ChannelReceived`) are emitted by the *acting* lane, so
+/// a delivery edge is either inside one lane or across epochs. §4.3 then
+/// declined to call this an invariant, correctly, because at the time nothing
+/// depended on it: the applier ran per lane, so a run with a cross-lane edge
+/// was merely a run whose lanes could not be reordered.
+///
+/// The applier now runs once per epoch, so such a run is a run this executive
+/// commits differently from the order its lanes actually observed each other
+/// in. That is the difference between a measurement and a requirement, and it
+/// is why the clause moves here rather than staying prose.
+///
+/// **What it does not claim.** It is a property of a *run*, not of the model —
+/// exactly the standing §4.3 gave it. A workload that drives `channel_send`
+/// from one lane and receives it in a later lane of the same epoch is still
+/// expressible, and I25 reports it rather than the kernel refusing it. The
+/// report is the useful outcome: it names the workload the concurrent executive
+/// cannot take, at the point the workload does it, rather than leaving it to
+/// surface as a nondeterministic result on hardware.
+///
+/// Edges touching `HOST_LANE` are excluded and are not an exemption. The host's
+/// part of an epoch — admission's deferrals, the cohort records, the deferred
+/// lanes — runs strictly before or strictly after the lanes, so an order
+/// between it and a lane is the plan's and not a race between two things that
+/// could have gone either way.
+fn lane_independence(kernel: &Kernel, out: &mut Vec<Violation>) {
+    let order = crate::semantics::order::SemanticOrder::of(kernel);
+    let events = order.events();
+    for edge in order.cross_lane_edges() {
+        let (Some(a), Some(b)) = (events.get(edge.earlier), events.get(edge.later)) else {
+            continue;
+        };
+        out.push(Violation::new(
+            Invariant::LaneIndependence,
+            format!(
+                "epoch {} lane {} is ordered before lane {} by {:?}, so one lane of the epoch \
+                 observed another and the epoch's lanes are not reorderable",
+                a.epoch, a.lane, b.lane, edge.reason
+            ),
+        ));
+        // One report per run. The edges come in families — a chatty workload
+        // produces one per delivery — and a hundred lines all naming the same
+        // defect buries the other invariants' reports.
+        break;
     }
 }
 
@@ -342,10 +410,7 @@ fn position_derived_emission(kernel: &Kernel, out: &mut Vec<Violation>) {
                     format!(
                         "epoch {} lane {} carried continuations {} and {}, so their events share \
                          one sequence space",
-                        event.epoch,
-                        event.lane,
-                        previous.slot,
-                        event.continuation.slot
+                        event.epoch, event.lane, previous.slot, event.continuation.slot
                     ),
                 ));
             }

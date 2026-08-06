@@ -264,3 +264,113 @@ fn two_effects_at_one_position_are_rejected() {
         "an ambiguous production position gives the applier no order to follow"
     );
 }
+
+// ---- canonical commit: withdrawal -----------------------------------------
+
+/// A step that produces work and then loses it in the same lane.
+///
+/// §4.4 wrote the ordering rule for this case and could not test it: with the
+/// applier running per lane, cancellation applied the journal and then emptied
+/// the bins, so the entry was made and removed and no run could tell the
+/// difference. With the applier at the epoch boundary the entry has not been
+/// made yet, so cancellation has to withdraw it from the journal instead — and
+/// a withdrawn effect is one that never reaches the log at all.
+///
+/// The state is constructed rather than reached by a workload, for the reason
+/// §4.4 gave: no handler in this executive cancels a process it is running in.
+/// What is constructed is only the precondition — a process cancelled while its
+/// continuation is mid-step, which `cancel_process` produces whenever the
+/// target has an active continuation. Everything after that is the real path.
+#[test]
+fn cancelling_a_process_withdraws_the_effects_its_lane_produced() {
+    use soma::abi::ProcessState;
+    use soma::compiler::run_classes::EXPAND_RESUME_1;
+
+    let mut kernel = Kernel::new();
+    let process = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+
+    // `expand_resume_1` yields unconditionally, so this lane produces exactly
+    // one `Resume` and nothing else.
+    let continuation = kernel
+        .create_continuation(
+            process,
+            process,
+            ContinuationSpec::new(
+                StateAccess::ReadOnly,
+                EXPAND_RESUME_1,
+                0,
+                Vec::new(),
+                DEFAULT_MAX_STEPS,
+            ),
+        )
+        .unwrap();
+
+    // The `Bin` effect for the continuation's own creation, which the host
+    // produced and applied before the epoch. Everything after this index is
+    // the epoch's.
+    let before = kernel.effect_log().len();
+
+    unsafe { raw::state(&mut kernel) }
+        .processes
+        .get_mut(process)
+        .unwrap()
+        .status = ProcessState::CancelPending as u32;
+
+    kernel.run_epoch();
+
+    let produced: Vec<_> = kernel.effect_log()[before..].to_vec();
+    assert!(
+        produced
+            .iter()
+            .all(|record| record.continuation != continuation),
+        "the resume this lane produced was applied instead of withdrawn: {produced:?}"
+    );
+
+    // Withdrawal is not the same as never having produced: the point is that
+    // the continuation ends up cancelled and out of every bin, which is where
+    // applying-then-removing used to leave it.
+    assert_eq!(
+        kernel.continuation_state(continuation).unwrap(),
+        soma::abi::continuations::ContinuationState::Cancelled
+    );
+    assert_eq!(kernel.total_pending(), 0);
+    assert_legal(&kernel);
+}
+
+/// The null: without the cancellation, that lane's resume really is applied.
+///
+/// Otherwise the test above would pass on a run where `expand_resume_1`
+/// produced no effect at all, which is the reading that makes it check nothing.
+#[test]
+fn the_same_lane_applies_its_resume_when_the_process_survives() {
+    use soma::compiler::run_classes::EXPAND_RESUME_1;
+
+    let mut kernel = Kernel::new();
+    let process = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let continuation = kernel
+        .create_continuation(
+            process,
+            process,
+            ContinuationSpec::new(
+                StateAccess::ReadOnly,
+                EXPAND_RESUME_1,
+                0,
+                Vec::new(),
+                DEFAULT_MAX_STEPS,
+            ),
+        )
+        .unwrap();
+
+    let before = kernel.effect_log().len();
+    kernel.run_epoch();
+
+    let produced: Vec<_> = kernel.effect_log()[before..].to_vec();
+    assert!(
+        produced
+            .iter()
+            .any(|record| record.continuation == continuation
+                && record.kind == EffectKind::Resume),
+        "the lane produced no resume, so withdrawing one proves nothing: {produced:?}"
+    );
+    assert_legal(&kernel);
+}

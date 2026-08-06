@@ -116,7 +116,7 @@ continuation boundary.
 
 ## Specification
 
-The specification defines twenty-three numbered invariants. Each clause has one of
+The specification defines twenty-four numbered invariants. Each clause has one of
 three states:
 
 - `checked`: evaluated against interpreter state after each transition
@@ -271,11 +271,15 @@ Not implemented:
   gather now, but there are still no loops, no calls, no floating point, and no
   surface syntax above the `op` lines. A collective also binds one input array,
   so a body can read any element of its own array and cannot name a second one
-- A complete device-resident scheduler/executive or distributed backend.
-  Admission is order-independent (I22), the trace's order is recoverable from
-  event position rather than a shared clock (I23), and allocation is
-  partitioned so lanes need no shared allocator; canonical commit and a
-  concurrent executive are not started
+- A concurrent, device-resident scheduler/executive, or a distributed backend.
+  The semantics are ready for one and nothing uses it: admission is
+  order-independent (I22), the trace's order is recoverable from event position
+  rather than a shared clock (I23), allocation is partitioned so lanes need no
+  shared allocator, and commit is canonical — an epoch runs every lane, then
+  applies what they produced in plan order, so nothing an epoch commits depends
+  on the order its lanes ran (I24, I25). Lanes are reorderable; the executive
+  still runs them one after another in a `for` loop, and `src/` contains no
+  threads
 - Scheduler-overhead and end-to-end migration benchmarks. The batch backend
   itself is measured on hardware — CPU against Metal from 32 to 4M elements,
   where a Metal call's fixed cost goes, what a published cohort costs off-GPU,

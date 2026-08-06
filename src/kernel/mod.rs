@@ -1872,15 +1872,19 @@ impl Kernel {
         }
 
         // Cancellation empties the bins of everything it cancels, so it has to
-        // see the whole lane, not the part of it that has landed. Applying the
-        // journal first is what makes that true, and it leaves the state
-        // exactly where performing the effects inline used to: the entry is
-        // made, then removed. The alternative — withdrawing pending effects
-        // instead — would leave the same state by a path no handler in this
-        // executive can currently reach, and so by a path nothing tests.
-        self.apply_lane_effects();
-
+        // account for the whole epoch and not just the part that has landed.
+        // Under the per-lane applier that was one move: apply the journal, then
+        // `remove_all`. With canonical commit nothing this epoch has landed, so
+        // the entries produced by lanes that already ran are still in the
+        // journal and are withdrawn from it. Applying it here instead would
+        // commit the epoch's earlier lanes in the middle of a later one, which
+        // is the ordering canonical commit exists to remove.
+        //
+        // The two moves are not alternatives: `withdraw` takes this epoch's
+        // unapplied entries and `remove_all` takes the ones earlier epochs
+        // applied, and a process being cancelled can easily have both.
         let cancelled_set: std::collections::HashSet<Ref64> = cancelled.iter().copied().collect();
+        self.withdraw_effects(&cancelled_set);
         self.scheduler.remove_all(&cancelled_set);
         for continuation in &cancelled {
             self.set_continuation_status(

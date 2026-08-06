@@ -165,8 +165,7 @@ Added in v0.3:
 - Admission as a pure function of the epoch's candidate set (I22), replacing
   the first-come `HashSet` claim.
 - Lane-relative trace positions (I23), so the run's order is recoverable
-  without a shared clock. Two of the device scheduler's four obligations;
-  canonical commit is the one that gates a concurrent executive.
+  without a shared clock. Two of the device scheduler's four obligations.
 - I18 up to a renaming of entity references, so an implementation whose
   allocator names entities differently is no longer non-conforming by
   construction. `Ref64` gains a `partition` byte in place of the unused
@@ -190,10 +189,16 @@ Added in v0.3:
 - An effect log (I24). A step no longer writes a runnable bin; it produces the
   entries it wants and the kernel applies them, in the order the plan puts the
   producing lanes in. `Scheduler::enqueue` demands a token only the applier can
-  build, so writing a bin inline is a compile error. The applier still runs at
-  the end of each lane — which is where a sequential interpreter already wrote,
-  so no run changed. Moving it to the end of the epoch is canonical commit, and
-  that is blocked on read visibility (v0.3 §4.3 (3)), not on this.
+  build, so writing a bin inline is a compile error.
+- Canonical commit (v0.3 §4.5). The applier moved out of the lane loop: an
+  epoch runs every lane, then applies what they produced, sorted by the position
+  each effect was produced at. Nothing an epoch commits depends on the order its
+  lanes ran, so lanes are reorderable — which was the last of the device
+  scheduler's four obligations. The price is I25: no ≺ edge may join two lanes
+  of one epoch, which is §4.3 (3)'s measured precondition asked of every run
+  instead of once. The existing suite passed unmodified, which is that
+  measurement coming true rather than a weak result. Cancellation now withdraws
+  the entries its epoch has not applied instead of applying the journal first.
 
 ### Semantic boundary
 
@@ -382,13 +387,15 @@ complete, that sorting the log by production position recovers the application
 order, and that the scheduler's own entry count is fully accounted for by the
 log.
 
-Read the scope claim exactly. Only bin entry is mediated, and the applier runs
-at the end of each lane — which is where a sequential interpreter already wrote,
-so no run changed and no test needed modifying. Mailboxes, futures, capability
-spaces and the object tables are still written as the step runs, and allocation
-is still eager because v0.3 §4.3 (2) shows it has to be. What this buys is that
-canonical commit is now the move of a single call out of the lane loop, gated on
-read visibility (§4.3 (3)) rather than on a refactor.
+Read the scope claim exactly. Only bin entry is mediated. Mailboxes, futures,
+capability spaces and the object tables are still written as the step runs, and
+allocation is still eager because v0.3 §4.3 (2) shows it has to be. That does
+not change with canonical commit and cannot: a step stores references it
+allocated into opaque frame bytes, so eager allocation is not a stage of the
+refactor that has yet to happen. What the applier's move to the epoch boundary
+buys is that no lane can observe another lane's *bin entry or status write*, and
+what it costs is I25 — the obligation that no workload lets a lane observe
+another lane by any of the paths that remain.
 
 ---
 
@@ -476,14 +483,18 @@ decision that would otherwise depend on `HashMap` iteration order.
   is the only place that can build the `Committing` token `Scheduler::enqueue`
   demands, so a handler that enqueues inline does not compile. If you find
   yourself reaching for `raw::enqueue_unmediated` outside a fault injection, the
-  thing you are about to undo is I24 clause 3 — and with it the only reason
-  canonical commit is one line away rather than a rewrite.
-- **Cancellation applies the journal before it runs.** `cancel_process_continuations`
-  starts with `apply_lane_effects()` because it empties the bins of everything it
-  cancels, and a bin entry the same lane produced but has not applied yet would
-  land afterwards. No current handler creates work and then fails in the same
-  step, so no test covers it; it is one line whose correctness is visible by
-  inspection for exactly that reason.
+  thing you are about to undo is I24 clause 3 — and with it the reason canonical
+  commit was one line away rather than a rewrite.
+- **Cancellation withdraws; it does not apply.** `cancel_process_continuations`
+  takes the entries its epoch has produced and not yet applied out of the
+  journal, then `remove_all`s what earlier epochs applied. Calling
+  `apply_epoch_effects()` there instead — which is what it used to do, back when
+  the journal held one lane — commits the epoch's earlier lanes in the middle of
+  a later one, which is the ordering canonical commit exists to remove.
+  `cancelling_a_process_withdraws_the_effects_its_lane_produced` fails if you
+  do. The note this replaced said no handler reached the case and no test
+  covered it. One does reach it: the `CancelPending` check at the end of
+  `apply_step_result` runs after the branch that emits the resume.
 - **A bare slot is not an identity.** Two partitions each mint slot 7. Anything
   keyed or compared by `.slot` is wrong; use `Ref64::key()` for map keys and the
   whole reference for comparison. `.slot` belongs in error messages and nowhere
@@ -524,6 +535,5 @@ decision that would otherwise depend on `HashMap` iteration order.
 4. Read `docs/SOMA-v0.3.md`. §2 and §3 explain the two pieces of machinery
    most likely to surprise you — why trace equality had to go, and why both
    backends used to agree about nothing. Then pick up §4 (the persistent device
-   scheduler). Three of its four obligations are discharged in §4.1, §4.2 and
-   §4.4; the next piece is the rest of canonical commit, which §4.4 ends by
-   describing.
+   scheduler). All four of its obligations are discharged in §4.1, §4.2, §4.4
+   and §4.5; what is not built is the concurrent executive they were for.

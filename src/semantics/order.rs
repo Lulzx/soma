@@ -113,6 +113,45 @@ impl SemanticOrder {
     pub fn is_self_consistent(&self) -> bool {
         self.edges.iter().all(|edge| edge.earlier < edge.later)
     }
+
+    /// Every ≺ edge that joins two distinct lanes of one epoch.
+    ///
+    /// An edge like this is a lane observing another lane's write within the
+    /// epoch they share. That is what canonical commit forbids: the applier
+    /// runs once, after every lane, so the only inter-lane ordering an epoch
+    /// has is the plan's — and a run containing such an edge is one whose
+    /// result depends on which lane went first, which is the schedule
+    /// dependence §2 removed from the equivalence relation.
+    ///
+    /// `docs/SOMA-v0.3.md` §4.3 (3) measured this across the Expand workload
+    /// and found none, and was careful to call the result a precondition to
+    /// check per run rather than a property of the model. It is still exactly
+    /// that. What changed is that the executive now *relies* on it, so I25 asks
+    /// it of every run instead of it having been asked once.
+    ///
+    /// Edges within one lane are the common case and are not reported: a lane
+    /// is sequential, so `ContinuationProgram` and `AuthorityEffect` edges
+    /// cannot join two lanes at all. Edges touching `HOST_LANE` are not
+    /// reported either — the host's part of an epoch runs before and after the
+    /// lanes rather than beside them, so an order between it and a lane is the
+    /// plan's own and is not a race.
+    pub fn cross_lane_edges(&self) -> Vec<Edge> {
+        self.edges
+            .iter()
+            .copied()
+            .filter(|edge| {
+                let (Some(a), Some(b)) =
+                    (self.events.get(edge.earlier), self.events.get(edge.later))
+                else {
+                    return false;
+                };
+                a.epoch == b.epoch
+                    && a.lane != b.lane
+                    && a.lane != crate::abi::traces::HOST_LANE
+                    && b.lane != crate::abi::traces::HOST_LANE
+            })
+            .collect()
+    }
 }
 
 /// Key identifying the position of an event within its entity's history, used

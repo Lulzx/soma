@@ -1,8 +1,9 @@
 # SOMA v0.3
 
 **Status:** partially implemented. §1–§3 are specification and are
-machine-checked, as are §4.1, §4.2 and §4.4. §4.3's remaining two problems and
-all of §5–§6 are scope.
+machine-checked, as are §4.1, §4.2, §4.4 and §4.5. §4's four obligations are
+discharged; the concurrent executive they were for is not written. §5–§6 are
+scope.
 
 v0.2 closed the semantic core: every entity and invariant it named was
 implemented and checked. v0.3 is the first version whose work is not "finish the
@@ -17,12 +18,12 @@ did not depend on it are done; the rest is scoped below.
 | **0** | Carried debts on the critical path | **done** (§1) |
 | **S** | An equivalence a concurrent implementation can satisfy | **done** (§2) |
 | **A** | General evaluator bodies and a compiler | **done** (§3) |
-| **B** | Persistent device-resident scheduler | **started** (§4) |
+| **B** | Persistent device-resident scheduler | **started** (§4) — semantics done, executive not |
 | **C** | Distributed / multi-node implementation | scope (§5) |
 | **D** | Performance work on real hardware | scope (§6) |
 
-Seven new clauses are now checked — I18 through I24 — and v0.2's only
-`[modelled]` clause is gone. The test suite went from 151 to 231.
+Eight new clauses are now checked — I18 through I25 — and v0.2's only
+`[modelled]` clause is gone. The test suite went from 151 to 284.
 
 ---
 
@@ -307,13 +308,15 @@ bytes and semantic trace against the CPU interpreter.
 
 ## 4. B — persistent device-resident scheduler
 
-**Started.** S was its blocker and S is done. Three of its four obligations are
-discharged and checked: admission (§4.1), trace emission (§4.2), and commit's
-first half — the scheduler's bins are now written by an applier over an effect
-list rather than by the steps that produced it (§4.4). The step-budget check's
-position holds already. What remains of commit is the two problems §4.3 names
-alongside mutation ordering: read visibility, and moving the applier from the
-end of a lane to the end of an epoch.
+**Started.** S was its blocker and S is done. All four of its obligations are
+discharged and checked: admission (§4.1), trace emission (§4.2), commit (§4.4
+produces the bin entries, §4.5 applies them at the epoch boundary), and the
+step-budget check's position, which held already. Read visibility — §4.3's third
+problem, and the one that gated the applier's move — is settled as I25 rather
+than by deferring the remaining tables, for the reason §4.5 gives.
+
+What is *not* done is the executive that all of this was for. Lanes are
+reorderable and nothing reorders them.
 
 `kernel/epochs.rs` still cohorts, executes, and commits on the host, one
 continuation at a time. The Metal path dispatches a single collective and blocks
@@ -327,8 +330,8 @@ What must hold, and why each is hard:
   be "whoever gets there first". **Done — §4.1.**
 - **Commit** is the sole path to `Runnable` (v0.2 §3.4), which is what makes I7
   checkable. A device commit must preserve that exclusivity across concurrent
-  writers. **Half done — §4.4.** Bin entry is produced and applied rather than
-  performed; when the applier runs is still per lane.
+  writers. **Done — §4.4 and §4.5.** Bin entry is produced rather than
+  performed, and the applier runs once at the epoch boundary in plan order.
 - **The step-budget check must precede dispatch** (`epochs.rs`, and
   `HANDOFF.md` §7 records the bug from getting this wrong). Concurrency does not
   relax this.
@@ -468,11 +471,17 @@ That is structural rather than lucky: the wake events (`MessageReceived`,
 `ContinuationReady`, `ChannelReceived`) are emitted by the *acting* lane, so a
 delivery edge is either within one lane or across epochs.
 
-It is not an invariant, and the specification should not claim it as one. The
-channel workloads drive their sends from outside any lane, so they do not
-exercise the case; a lane-driven `channel_send` followed by a later lane's
-receive in the same epoch is reachable in principle. It is a **precondition to
-check per run**, not a property of the model.
+It is not an invariant of the model, and the specification should not claim it
+as one. The channel workloads drive their sends from outside any lane, so they
+do not exercise the case; a lane-driven `channel_send` followed by a later
+lane's receive in the same epoch is reachable in principle. It is a
+**precondition to check per run**, not a property of the model.
+
+§4.5 keeps that standing exactly and makes the checking continuous: I25 asks it
+of every run rather than of the one workload measured here. The reason it has to
+be asked rather than arranged is also settled there — deferring the remaining
+tables until reads are snapshots is not reachable, because (2) above forces
+allocation to stay eager.
 
 **(2) is the same problem as C's node identity.** §1.2 deferred "a node
 identity, so that two nodes allocating slot 7 do not produce colliding
@@ -568,16 +577,13 @@ all write. §4.3 (2) establishes that allocation *has* to stay eager, because a
 step stores references it allocated into opaque frame bytes; partitioned
 allocation is what makes that safe for concurrent lanes.
 
-**The applier runs at the end of each lane**, which is exactly where a
-sequential interpreter already wrote. So no run changed: the whole suite passes
-with one call site edited, and that one only because the seal below moved a
-deliberate fault injection into `kernel::raw`. This is the point at which it
-would be easy to overclaim. Producing effects is not canonical commit; it is
-what makes canonical commit a *change of one line*. Move the
-`apply_lane_effects()` call out of the lane loop and after it, and an epoch
-applies its lanes in plan order rather than in the order they ran. That move is
-blocked on §4.3 (3), read visibility, which is a semantic change and not a
-refactor.
+**The applier ran at the end of each lane** when this section was written,
+which is exactly where a sequential interpreter already wrote. So no run
+changed: the whole suite passed with one call site edited, and that one only
+because the seal below moved a deliberate fault injection into `kernel::raw`.
+This was the point at which it would have been easy to overclaim. Producing
+effects is not canonical commit; it is what makes canonical commit a *change of
+one line*. §4.5 makes that change.
 
 **I24. Effect-mediated commit [checked].** Three clauses:
 
@@ -610,19 +616,93 @@ crate did not compile.
 
 **One ordering rule came out of it.** Cancellation empties the bins of
 everything it cancels, so it has to see the whole lane and not the part that has
-landed: `cancel_process_continuations` applies the journal before it runs. No
-handler in the current executive creates work and then fails in the same step,
-so no run exercises it — which is why it is a one-line ordering statement whose
-correctness is visible by inspection, rather than a withdrawal list with
-retention logic nothing tests. It becomes load-bearing the moment such a handler
-exists.
+landed: `cancel_process_continuations` applied the journal before it ran. No
+handler in the executive creates work and then fails in the same step, so no run
+exercised it — which is why it was a one-line ordering statement whose
+correctness was visible by inspection, rather than a withdrawal list with
+retention logic nothing tests. §4.5 is where it became load-bearing, and the
+withdrawal list is what replaced it.
 
 **What §4.4 does not do.** It does not make lanes reorderable, for the same
 reason §4.2 did not: what a lane *reads* still depends on when it ran. §4.3 (3)
 measured that no ≺ edge joins two lanes of one epoch across the workloads
 checked, and was careful to call that a precondition to check per run rather
 than an invariant. Applying an epoch's effects at the epoch boundary is what
-turns that precondition into a requirement, and it is the next piece.
+turns that precondition into a requirement, and it is §4.5.
+
+### 4.5 Canonical commit
+
+`apply_lane_effects()` moved out of the lane loop. An epoch runs every lane,
+then applies what they produced, sorted by the position each effect was
+produced at. That is the whole diff, and §4.4 predicted it would be — what it
+could not do was pay for it.
+
+**The price is read visibility, and it is paid by checking rather than by
+deferring.** This is the decision worth recording, because the obvious reading
+of §4.3 (3) is that the remaining tables should be deferred too until a lane
+provably reads a snapshot. They cannot be. §4.3 (2) establishes that allocation
+has to stay eager, because a step stores references it allocated into opaque
+frame bytes; a step will therefore keep writing tables as it runs no matter how
+much of *commit* moves out of the lane. Snapshot reads are not reachable by
+continuing the §4.4 refactor, and pretending otherwise would have made the next
+slice an infinite one.
+
+So the clause is stated as an obligation on the run instead:
+
+**I25. Lane independence [checked].** No ≺ edge joins two distinct lanes of one
+epoch.
+
+The relation is §2's, unchanged, and the exclusion of `HOST_LANE` is not an
+exemption: the host's part of an epoch — admission's deferrals, the cohort
+records, the lanes a partial policy held back — runs strictly before or strictly
+after the lanes, so an order between it and a lane is the plan's own rather than
+a race between two things that could have gone either way.
+
+What I25 asserts is exactly what §4.3 (3) measured, with its standing changed.
+It was a property nothing depended on: with the applier running per lane, a run
+with a cross-lane edge was merely a run whose lanes could not be reordered, and
+the executive did not reorder them. With the applier at the epoch boundary such
+a run is one this executive commits in an order its lanes did not observe. That
+is the difference between a measurement and a requirement.
+
+It remains a property of a *run* and not of the model, which is the standing
+§4.3 gave it and the honest one. A workload driving `channel_send` from one lane
+and receiving it in a later lane of the same epoch is still expressible; I25
+reports it rather than the kernel refusing it. The report is the useful outcome
+— it names the workload a concurrent executive cannot take, at the point the
+workload does it, rather than leaving it to surface as a nondeterministic result
+on hardware.
+
+**Cancellation stopped being a one-line ordering statement.** §4.4's rule was
+that `cancel_process_continuations` applies the journal before emptying the
+bins, so that it sees the whole lane. Applying it now would commit the epoch's
+earlier lanes in the middle of a later one, which is the ordering this section
+exists to remove. It withdraws instead: entries this epoch produced and has not
+applied come out of the journal, and `remove_all` still takes the ones earlier
+epochs applied. The two are not alternatives — a cancelled process can easily
+have both — and a withdrawn effect never reaches the log at all, which is what
+distinguishes the new path from the old one in a test rather than by inspection.
+
+§4.4 declined to write this because no handler reached it. One does: the
+`CancelPending` check at the end of `apply_step_result` runs after the branch
+that emits the resume, so a process cancelled while its continuation is
+mid-step cancels a continuation whose bin entry is still pending. The test
+constructs that precondition and lets the real path run from there, and it fails
+if withdrawal is replaced by application.
+
+**The existing suite passes unmodified**, which §4.3's exit criteria demand and
+which is not a weak result here: it is §4.3 (3)'s measurement coming true. No
+workload in the suite has a cross-lane intra-epoch edge, so no workload could
+tell the two appliers apart. A test needing modification would have been a
+semantic difference owing an explanation, and there was none to give.
+
+**What is now unblocked, and what is not.** Lanes are reorderable: nothing an
+epoch commits depends on the order its lanes ran, and I25 is the standing check
+that no workload has quietly reintroduced a dependence. That is the obligation
+§4.3 listed as commit's, and it is discharged. The concurrent executive itself
+is not written — `src/` still contains no threads, and lanes still run one after
+another in a `for` loop. What changed is that running them elsewhere is now a
+question about the executive rather than about the semantics.
 
 ---
 
@@ -697,6 +777,7 @@ cannot reach means the model is charging for the wrong thing.
 | I22 admission determinism | checked | the decision is a function of the candidate set (§4.1) |
 | I23 position-derived emission | checked | the trace's order needs no shared clock (§4.2) |
 | I24 effect-mediated commit | checked | bins are written by an applier, in plan order (§4.4) |
+| I25 lane independence | checked | no ≺ edge joins two lanes of one epoch (§4.5) |
 
 **I21** has two halves. The first — an epoch that admitted work dispatched some
 of it — is a statement about a transition rather than a state, so it is counted

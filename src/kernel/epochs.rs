@@ -184,18 +184,29 @@ impl Kernel {
                     };
                     self.enter_lane(lane_number);
                     steps += self.execute_cont(*cont, process);
-                    // Phase G: apply what the lane produced, in the order it
-                    // produced it. This call is the whole of canonical commit's
-                    // remaining distance: moving it out of the lane loop and
-                    // after it applies an epoch's lanes in plan order instead of
-                    // in the order they happened to run (v0.3 §4.4). It stays
-                    // inside the lane so that anything the application traces is
-                    // still attributed to the lane that caused it (I23).
-                    self.apply_lane_effects();
                     self.leave_lane();
                 }
             }
         }
+
+        // Phase G: Commit. Every lane of the epoch has finished; apply what
+        // they produced, in plan order.
+        //
+        // This call used to sit inside the loop above, one lane at a time,
+        // which is where a sequential interpreter already wrote and is why
+        // §4.4 could say no run changed. Out here it is canonical commit: the
+        // order the epoch's bin entries land in comes from the plan and not
+        // from the order the lanes ran, so a lane may be run whenever and
+        // wherever and the epoch commits the same.
+        //
+        // What this costs is stated as an invariant rather than left implicit.
+        // No lane can now observe another lane's bin entry or status write, so
+        // a run in which one lane's behaviour depended on another's is a run
+        // this executive no longer reproduces. §4.3 (3) measured that no ≺ edge
+        // joins two lanes of one epoch and was careful to call that a
+        // precondition to check per run; I25 is that precondition promoted to
+        // something the checker asks, which is what moving this line requires.
+        self.apply_epoch_effects();
 
         // Phase H: Account.
         let total = self.scheduler.total_pending();
