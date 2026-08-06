@@ -245,6 +245,16 @@ Added in v0.3:
   runs single-threaded. Results stay in request order -- the caller publishes
   result i into collective i -- and one failed request fails the epoch, which is
   the contract the sequential path already had.
+- A sealed step surface (v0.3 §4.10). A handler takes `executives::lane::LaneView`
+  rather than `&mut Kernel`, and the view offers fifteen operations -- measured
+  from what `cpu_scalar` and `executives::ant_colony` already called, not
+  chosen. No `Deref` to `Kernel` and no constructor outside the crate, both as
+  `compile_fail` doctests with a passing null beside them. The value is that an
+  operation with no lane-local form is now a compile error inside a step, so
+  what remains before lanes can run concurrently is four cross-lane writes
+  (`enqueue_message`, `receive_message`, `resolve_future`, `await_future`)
+  rather than an audit of the kernel. Reads need a shared borrow, allocation has
+  §4.8's shards, own-frame writes are disjoint by I8.
 - An effect log (I24). A step no longer writes a runnable bin; it produces the
   entries it wants and the kernel applies them, in the order the plan puts the
   producing lanes in. `Scheduler::enqueue` demands a token only the applier can

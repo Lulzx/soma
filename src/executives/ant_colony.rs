@@ -23,7 +23,7 @@ use crate::experiments::ant_colony::{
     read_trail, split_mix, write_slot, write_trail, AntFrame, ColonyFrame, Deposit, Terrain,
     WorldFrame, DEPOSIT_RECORD, DIRECTIONS, TRAIL_FOOD, TRAIL_HOME,
 };
-use crate::kernel::Kernel;
+use crate::executives::lane::LaneView;
 
 /// What an ant can see from where it stands. Gathered once per step so the
 /// decision below is a pure function of it.
@@ -125,18 +125,18 @@ fn at_home(frame: &AntFrame) -> bool {
 
 /// Read the terrain and the readable field buffer into a `Senses`.
 ///
-/// Two borrows, taken one after the other: `object_bytes` borrows the kernel,
+/// Two borrows, taken one after the other: `object_bytes` borrows the lane,
 /// so the values are copied out of each before the next call. Only the eight
 /// neighbours are read — the field is tens of kilobytes and an ant has no reason
 /// to touch more of it than it can see.
-fn sense(kernel: &mut Kernel, process: Ref64, frame: &AntFrame, epoch: u32) -> Option<Senses> {
+fn sense(lane: &mut LaneView<'_>, process: Ref64, frame: &AntFrame, epoch: u32) -> Option<Senses> {
     let width = frame.width;
     let height = frame.height;
     let cells = width as usize * height as usize;
     let (x, y) = (frame.x as i32, frame.y as i32);
 
     let (passable, on_food) = {
-        let bytes = kernel.object_bytes(process, frame.terrain).ok()?;
+        let bytes = lane.object_bytes(process, frame.terrain).ok()?;
         let mut passable = [false; 8];
         for (index, (dx, dy)) in DIRECTIONS.iter().enumerate() {
             passable[index] = !Terrain::is_obstacle(bytes, width, height, x + dx, y + dy);
@@ -146,7 +146,7 @@ fn sense(kernel: &mut Kernel, process: Ref64, frame: &AntFrame, epoch: u32) -> O
 
     let (food_trail, home_trail) = {
         let field = frame.readable_field(epoch);
-        let bytes = kernel.object_bytes(process, field).ok()?;
+        let bytes = lane.object_bytes(process, field).ok()?;
         let mut food = [0u16; 8];
         let mut home = [0u16; 8];
         for (index, (dx, dy)) in DIRECTIONS.iter().enumerate() {
@@ -171,15 +171,15 @@ fn sense(kernel: &mut Kernel, process: Ref64, frame: &AntFrame, epoch: u32) -> O
 
 /// One ant's step. `behaviour` is the index within the ant block, so this is
 /// the same switch the scheduler binned on — the run class is both.
-pub fn ant_step(kernel: &mut Kernel, cont: Ref64, process: Ref64, behaviour: u32) -> StepResult {
-    let epoch = kernel.epoch_number();
+pub fn ant_step(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64, behaviour: u32) -> StepResult {
+    let epoch = lane.epoch_number();
     let run_class = ANT_EXPLORE + behaviour;
-    let mut frame: AntFrame = match load_frame_ant(kernel, process, cont) {
+    let mut frame: AntFrame = match load_frame_ant(lane, process, cont) {
         Some(frame) => frame,
         None => return StepResult::fault(process, run_class),
     };
 
-    let Some(senses) = sense(kernel, process, &frame, epoch) else {
+    let Some(senses) = sense(lane, process, &frame, epoch) else {
         return StepResult::fault(process, run_class);
     };
 
@@ -349,17 +349,17 @@ pub fn ant_step(kernel: &mut Kernel, cont: Ref64, process: Ref64, behaviour: u32
         },
     };
     let slot = write_slot(epoch) * DEPOSIT_RECORD;
-    if let Ok(bytes) = kernel.object_bytes_mut(process, frame.deposit) {
+    if let Ok(bytes) = lane.object_bytes_mut(process, frame.deposit) {
         if bytes.len() >= slot + DEPOSIT_RECORD {
             deposit.write(&mut bytes[slot..slot + DEPOSIT_RECORD]);
         }
     }
 
-    store_frame(kernel, process, cont, &frame);
+    store_frame(lane, process, cont, &frame);
     StepResult::yield_next(next)
 }
 
-fn load_frame_ant(kernel: &mut Kernel, process: Ref64, cont: Ref64) -> Option<AntFrame> {
+fn load_frame_ant(lane: &mut LaneView<'_>, process: Ref64, cont: Ref64) -> Option<AntFrame> {
     let fallback = AntFrame {
         id: u32::MAX,
         colony: 0,
@@ -382,7 +382,7 @@ fn load_frame_ant(kernel: &mut Kernel, process: Ref64, cont: Ref64) -> Option<An
         field_a: Ref64::NULL,
         field_b: Ref64::NULL,
     };
-    let frame: AntFrame = load_frame(kernel, process, cont, fallback);
+    let frame: AntFrame = load_frame(lane, process, cont, fallback);
     // A frame that failed to decode comes back as the sentinel, and a zero-sized
     // world is not a world. Faulting is better than stepping an ant that does
     // not exist.
@@ -395,10 +395,10 @@ fn load_frame_ant(kernel: &mut Kernel, process: Ref64, cont: Ref64) -> Option<An
 /// slot, so it neither races the ants below it nor the world above it. An ant
 /// that has failed simply stops stamping its record, and a stale stamp is
 /// skipped — nothing has to be told about the death.
-pub fn colony_aggregate(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResult {
-    let epoch = kernel.epoch_number();
+pub fn colony_aggregate(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResult {
+    let epoch = lane.epoch_number();
     let frame: ColonyFrame = load_frame(
-        kernel,
+        lane,
         process,
         cont,
         ColonyFrame {
@@ -416,7 +416,7 @@ pub fn colony_aggregate(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> Ste
     let mut records: Vec<Deposit> = Vec::with_capacity(frame.deposits.len());
     for raw in &frame.deposits {
         let deposit = Ref64::from_u64(*raw);
-        let Ok(bytes) = kernel.object_bytes(process, deposit) else {
+        let Ok(bytes) = lane.object_bytes(process, deposit) else {
             continue;
         };
         if bytes.len() < read_at + DEPOSIT_RECORD {
@@ -432,7 +432,7 @@ pub fn colony_aggregate(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> Ste
 
     let slot_bytes = 4 + frame.deposits.len() * 8;
     let write_at = write_slot(epoch) * slot_bytes;
-    if let Ok(bytes) = kernel.object_bytes_mut(process, frame.summary) {
+    if let Ok(bytes) = lane.object_bytes_mut(process, frame.summary) {
         if bytes.len() >= write_at + slot_bytes {
             let slot = &mut bytes[write_at..write_at + slot_bytes];
             let count = records.len().min(frame.deposits.len());
@@ -447,7 +447,7 @@ pub fn colony_aggregate(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> Ste
         }
     }
 
-    store_frame(kernel, process, cont, &frame);
+    store_frame(lane, process, cont, &frame);
     StepResult::yield_next(COLONY_AGGREGATE)
 }
 
@@ -457,10 +457,10 @@ pub fn colony_aggregate(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> Ste
 /// leave the result in the buffer the ants will read next epoch. The world is
 /// the sole `WRITE` holder of both buffers throughout, so nothing here needs a
 /// lock and nothing needs to be frozen.
-pub fn world_step(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResult {
-    let epoch = kernel.epoch_number();
+pub fn world_step(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResult {
+    let epoch = lane.epoch_number();
     let frame: WorldFrame = load_frame(
-        kernel,
+        lane,
         process,
         cont,
         WorldFrame {
@@ -484,7 +484,7 @@ pub fn world_step(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResul
     let mut deposits: Vec<(u16, u16, u16, u16)> = Vec::new();
     for raw in &frame.summaries {
         let summary = Ref64::from_u64(*raw);
-        let Ok(bytes) = kernel.object_bytes(process, summary) else {
+        let Ok(bytes) = lane.object_bytes(process, summary) else {
             continue;
         };
         let slot_bytes = bytes.len() / 2;
@@ -506,14 +506,14 @@ pub fn world_step(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResul
         }
     }
 
-    let carried: Vec<u8> = match kernel.object_bytes(process, readable) {
+    let carried: Vec<u8> = match lane.object_bytes(process, readable) {
         Ok(bytes) => bytes.to_vec(),
         Err(_) => return StepResult::fault(process, WORLD_STEP),
     };
 
     let decay = frame.decay;
     let width = frame.width as usize;
-    if let Ok(bytes) = kernel.object_bytes_mut(process, writable) {
+    if let Ok(bytes) = lane.object_bytes_mut(process, writable) {
         bytes.copy_from_slice(&carried);
         for trail in [TRAIL_FOOD, TRAIL_HOME] {
             for cell in 0..cells {
@@ -537,6 +537,6 @@ pub fn world_step(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResul
         }
     }
 
-    store_frame(kernel, process, cont, &frame);
+    store_frame(lane, process, cont, &frame);
     StepResult::yield_next(WORLD_STEP)
 }

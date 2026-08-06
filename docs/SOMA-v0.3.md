@@ -909,12 +909,64 @@ holding some published outputs and some unstarted collectives with no way to say
 which.
 
 **What is still missing for a threaded executive.** The shards are the
-allocator. What has no lane-local form yet is the rest of what a step writes —
-mailboxes, futures, capability spaces, object payloads — and the read-through
-view that would let a handler take a lane rather than `&mut Kernel`. That is
-mechanical work across the handler surface rather than a further semantic
-question, which is the state §4 has been trying to reach: everything left is a
-refactor, and nothing left is an unanswered question about the model.
+allocator. What has no lane-local form yet is the rest of what a step writes,
+and §4.10 is where that stops being a vague quantity.
+
+### 4.10 What a step is allowed to touch
+
+§4.3 could name execute/commit fusion as *the* obstacle to a concurrent
+executive without saying much more, because a handler took `&mut Kernel` and
+that settles it: a step holding the whole kernel mutably can do anything to it,
+and several steps cannot hold it at once. Everything since has removed a reason
+that has to be true — effects produced rather than performed (§4.4), applied at
+the epoch boundary (§4.5), lanes reordered without changing a run (§4.6),
+allocation given a lane-local form (§4.8).
+
+What was never established is the part that sounds like bookkeeping: *what a
+step actually does*. "A handler can do anything to the kernel" is a fact about a
+type signature and not about the handlers, and the difference decides whether
+the rest of the work is a week or a rewrite.
+
+A step now takes a `LaneView`, and a `LaneView` offers **fifteen operations**.
+Measured rather than chosen — they are what `cpu_scalar` and
+`executives::ant_colony` already called, and the type was written around that
+list. The count is not the point; the point is that the list is closed and the
+compiler holds it closed, so an operation with no lane-local form is a compile
+error inside a handler rather than something to find by audit. That is
+`SOMA-CAPABILITIES.md`'s technique for closing the operation set and §4.1's for
+sealing `Admission`, applied to the executive. `LaneView` has no `Deref` to
+`Kernel` and no constructor outside the crate; both are `compile_fail`
+doctests, with a passing one alongside them so a misspelled path cannot make
+the failures vacuous.
+
+Sorting the fifteen by what a concurrent lane would need turns the remaining
+work into four items rather than a quantity:
+
+- **Reads** (`continuations`, `epoch_number`, `future_value`, `object_bytes`,
+  `read_u64_object`) need a shared borrow and nothing else. Two of them take
+  `&mut` today only because reading is a governed effect whose authority
+  decision is traced (I10c) — which is a real write, and the reason a concurrent
+  lane needs the lane-local trace buffer §4.2's position scheme already
+  anticipates.
+- **Allocation** (`create_process`, `create_continuation`, `create_future`,
+  `create_object`) has its lane-local form in §4.8's shards. Wiring is
+  mechanical.
+- **Own-frame writes** (`host_payload_mut`, `object_bytes_mut`) are disjoint
+  across lanes by I8, which the checker already enforces — no two continuations
+  share a frame object.
+- **Cross-lane writes** (`enqueue_message`, `receive_message`, `resolve_future`,
+  `await_future`) are the genuinely hard ones. They touch state another lane may
+  touch, so they need journalling in the shape §4.4 used for bin entries, and
+  I25 is what makes deferring them safe.
+
+**Four operations, not a kernel.** That is the result of writing it down, and it
+is the answer §4.3 could not give.
+
+**This view still borrows the kernel mutably**, so it does not make lanes run
+concurrently and nothing here claims it does. Retyping the handlers changed no
+run, which is the whole evidence offered for it: the same workloads produce the
+same traces and leave legal states. What it changed is that the remaining
+distance is enumerable.
 
 ---
 

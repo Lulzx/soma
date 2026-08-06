@@ -9,6 +9,12 @@
 //! no register state is migrated, and its durable frame already resides in
 //! shared memory. The same continuation descriptor, frame layout, capability
 //! model, step result, and message semantics are used here as everywhere else.
+//!
+//! A step takes a [`LaneView`] rather than the kernel (v0.3 §4.10). That is
+//! what makes the set of things a step does finite and visible: the view offers
+//! fifteen operations, an operation with no lane-local form is a compile error
+//! inside a handler, and the remaining work to run lanes concurrently is
+//! therefore enumerable rather than an audit.
 
 use crate::abi::Ref64;
 use crate::abi::{MessageDescriptor, StateAccess, StepResult};
@@ -17,11 +23,12 @@ use crate::compiler::run_classes::{
     ant_class_index, search_class_index, COLONY_AGGREGATE, DEFAULT_MAX_STEPS, EXPAND_RESUME_0,
     EXPAND_RESUME_1, EXPAND_RESUME_2, SEARCH_BRANCH, SEARCH_HEURISTIC, WORLD_STEP,
 };
-use crate::executives::ant_colony;
 use crate::compiler::state_machine_lowering::{
     search_step, ExpandFrame, HeuristicFrame, SearchFrame,
 };
-use crate::kernel::{AwaitOutcome, ContinuationSpec, Kernel, RuntimeError};
+use crate::executives::ant_colony;
+use crate::executives::lane::LaneView;
+use crate::kernel::{AwaitOutcome, ContinuationSpec, RuntimeError};
 
 /// Run-class identifiers recognized by this executive (mirrors §15's switch).
 pub mod run_classes {
@@ -31,28 +38,28 @@ pub mod run_classes {
 /// Uniform dispatch over run classes. In a real SIMD cohort the same switch
 /// executes uniformly for every lane because the whole cohort shares one run
 /// class, so the branch introduces no intra-cohort divergence (§15).
-pub fn dispatch(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResult {
-    let rc = kernel
+pub fn dispatch(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResult {
+    let rc = lane
         .continuations()
         .get(cont)
         .map(|c| c.run_class)
         .unwrap_or(0);
     match rc {
-        EXPAND_RESUME_0 => expand_resume_0(kernel, cont, process),
-        EXPAND_RESUME_1 => expand_resume_1(kernel, cont, process),
-        EXPAND_RESUME_2 => expand_resume_2(kernel, cont, process),
-        SEARCH_HEURISTIC => heuristic(kernel, cont, process),
-        COLONY_AGGREGATE => ant_colony::colony_aggregate(kernel, cont, process),
-        WORLD_STEP => ant_colony::world_step(kernel, cont, process),
+        EXPAND_RESUME_0 => expand_resume_0(lane, cont, process),
+        EXPAND_RESUME_1 => expand_resume_1(lane, cont, process),
+        EXPAND_RESUME_2 => expand_resume_2(lane, cont, process),
+        SEARCH_HEURISTIC => heuristic(lane, cont, process),
+        COLONY_AGGREGATE => ant_colony::colony_aggregate(lane, cont, process),
+        WORLD_STEP => ant_colony::world_step(lane, cont, process),
         // The search classes occupy a contiguous block; each is a distinct
         // case of this switch with its own arithmetic (§25.1).
         rc => match search_class_index(rc) {
-            Some(index) => search_branch(kernel, cont, process, index),
+            Some(index) => search_branch(lane, cont, process, index),
             // The ant behaviours are their own contiguous block. Each is a
             // separate case for the same reason the search classes are: a
             // cohort really can only hold one of them.
             None => match ant_class_index(rc) {
-                Some(behaviour) => ant_colony::ant_step(kernel, cont, process, behaviour),
+                Some(behaviour) => ant_colony::ant_step(lane, cont, process, behaviour),
                 None => StepResult::fault(process, rc),
             },
         },
@@ -61,52 +68,52 @@ pub fn dispatch(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResult 
 
 // ---- frame access helpers ------------------------------------------------
 
-fn frame_bytes(kernel: &mut Kernel, actor: Ref64, cont: Ref64) -> Vec<u8> {
-    let obj = kernel
+fn frame_bytes(lane: &mut LaneView<'_>, actor: Ref64, cont: Ref64) -> Vec<u8> {
+    let obj = lane
         .continuations()
         .get(cont)
         .map(|c| c.frame)
         .unwrap_or(Ref64::NULL);
-    kernel
+    lane
         .object_bytes(actor, obj)
         .map(|b| b.to_vec())
         .unwrap_or_default()
 }
 
-fn set_frame_bytes(kernel: &mut Kernel, actor: Ref64, cont: Ref64, bytes: Vec<u8>) {
-    if let Ok(obj) = kernel.continuations().get(cont).map(|c| c.frame) {
+fn set_frame_bytes(lane: &mut LaneView<'_>, actor: Ref64, cont: Ref64, bytes: Vec<u8>) {
+    if let Ok(obj) = lane.continuations().get(cont).map(|c| c.frame) {
         // A frame can change length between steps, so this needs the payload
         // as a `Vec` rather than the slice `object_bytes_mut` now returns.
-        if let Ok(buf) = kernel.host_payload_mut(actor, obj) {
+        if let Ok(buf) = lane.host_payload_mut(actor, obj) {
             *buf = bytes;
         }
     }
 }
 
-pub(crate) fn load_frame<F: Frame>(kernel: &mut Kernel, actor: Ref64, cont: Ref64, fallback: F) -> F {
-    let bytes = frame_bytes(kernel, actor, cont);
+pub(crate) fn load_frame<F: Frame>(lane: &mut LaneView<'_>, actor: Ref64, cont: Ref64, fallback: F) -> F {
+    let bytes = frame_bytes(lane, actor, cont);
     let mut c = ByteCursor::new(&bytes);
     F::decode(&mut c).unwrap_or(fallback)
 }
 
-pub(crate) fn store_frame<F: Frame>(kernel: &mut Kernel, actor: Ref64, cont: Ref64, frame: &F) {
+pub(crate) fn store_frame<F: Frame>(lane: &mut LaneView<'_>, actor: Ref64, cont: Ref64, frame: &F) {
     let mut bytes = Vec::new();
     frame.encode(&mut bytes);
-    set_frame_bytes(kernel, actor, cont, bytes);
+    set_frame_bytes(lane, actor, cont, bytes);
 }
 
 // ---- handlers (§22) -------------------------------------------------------
 
 /// `Expand.resume_0`: receive the request, store it in the frame, spawn the
 /// heuristic evaluation, and await its future. Continues at `EXPAND_RESUME_1`.
-fn expand_resume_0(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResult {
-    match kernel.receive_message(process, cont) {
+fn expand_resume_0(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResult {
+    match lane.receive_message(process, cont) {
         Ok(Some(msg)) => {
-            let request_value = kernel.read_u64_object(process, msg.payload).unwrap_or(0);
+            let request_value = lane.read_u64_object(process, msg.payload).unwrap_or(0);
             let mut frame = ExpandFrame::initial(request_value, msg.sender);
 
             // Spawn the heuristic and await its future.
-            let fut = kernel.create_future(process);
+            let fut = lane.create_future(process);
             frame.heuristic_future = fut;
             let hframe = HeuristicFrame {
                 future: fut,
@@ -114,7 +121,7 @@ fn expand_resume_0(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResu
             };
             let mut hb = Vec::new();
             hframe.encode(&mut hb);
-            kernel
+            lane
                 .create_continuation(
                     process,
                     process,
@@ -128,8 +135,8 @@ fn expand_resume_0(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResu
                 )
                 .expect("a process may create its own continuation");
 
-            store_frame(kernel, process, cont, &frame);
-            match kernel.await_future(process, cont, fut, EXPAND_RESUME_1) {
+            store_frame(lane, process, cont, &frame);
+            match lane.await_future(process, cont, fut, EXPAND_RESUME_1) {
                 Ok(AwaitOutcome::Registered) => StepResult::await_on(fut, EXPAND_RESUME_1),
                 // The heuristic already resolved, so there is nothing to wait
                 // for; go straight to the next resume point.
@@ -145,17 +152,17 @@ fn expand_resume_0(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResu
 
 /// `Expand.resume_1`: load the heuristic result and generate a bounded group of
 /// moves, then yield to `EXPAND_RESUME_2`.
-fn expand_resume_1(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResult {
+fn expand_resume_1(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResult {
     let mut frame: ExpandFrame =
-        load_frame(kernel, process, cont, ExpandFrame::initial(0, process));
-    if let Some(vobj) = kernel.future_value(frame.heuristic_future) {
-        frame.heuristic_result = kernel.read_u64_object(process, vobj).unwrap_or(0);
+        load_frame(lane, process, cont, ExpandFrame::initial(0, process));
+    if let Some(vobj) = lane.future_value(frame.heuristic_future) {
+        frame.heuristic_result = lane.read_u64_object(process, vobj).unwrap_or(0);
     }
     // Bounded move generation: legal_moves(node) in the §22 sketch.
     frame.moves = (1..=3)
         .map(|i| frame.request_value.wrapping_mul(i as u64))
         .collect();
-    store_frame(kernel, process, cont, &frame);
+    store_frame(lane, process, cont, &frame);
     StepResult::yield_next(EXPAND_RESUME_2)
 }
 
@@ -164,17 +171,17 @@ fn expand_resume_1(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResu
 /// runs again once capacity frees. Child creation and payload allocation are
 /// therefore recorded in the frame as they happen, so re-entry resumes where it
 /// left off rather than repeating side effects (§8).
-fn expand_resume_2(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResult {
+fn expand_resume_2(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResult {
     let mut frame: ExpandFrame =
-        load_frame(kernel, process, cont, ExpandFrame::initial(0, process));
+        load_frame(lane, process, cont, ExpandFrame::initial(0, process));
 
     while (frame.move_index as usize) < frame.moves.len() {
         let m = frame.moves[frame.move_index as usize];
-        let child = kernel.create_process(process, crate::abi::ProcessMode::Serial);
+        let child = lane.create_process(process, crate::abi::ProcessMode::Serial);
         let cframe = SearchFrame::leaf(m, 0);
         let mut cb = Vec::new();
         cframe.encode(&mut cb);
-        kernel
+        lane
             .create_continuation(
                 process,
                 child,
@@ -191,15 +198,15 @@ fn expand_resume_2(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResu
     }
 
     if frame.reply_payload.is_null() {
-        frame.reply_payload = kernel.create_object(
+        frame.reply_payload = lane.create_object(
             process,
             crate::abi::ObjectKind::MessagePayload,
             frame.heuristic_result.to_le_bytes().to_vec(),
         );
     }
-    store_frame(kernel, process, cont, &frame);
+    store_frame(lane, process, cont, &frame);
 
-    match kernel.enqueue_message(process, frame.reply_receiver, frame.reply_payload, cont) {
+    match lane.enqueue_message(process, frame.reply_receiver, frame.reply_payload, cont) {
         Ok(()) => StepResult::complete(),
         Err(RuntimeError::MailboxFull) => {
             StepResult::await_on(frame.reply_receiver, EXPAND_RESUME_2)
@@ -210,9 +217,9 @@ fn expand_resume_2(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResu
 
 /// `SEARCH_HEURISTIC`: compute a deterministic result, publish it into the
 /// future (single-assignment, §12), and complete.
-fn heuristic(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResult {
+fn heuristic(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> StepResult {
     let hf: HeuristicFrame = load_frame(
-        kernel,
+        lane,
         process,
         cont,
         HeuristicFrame {
@@ -221,12 +228,12 @@ fn heuristic(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResult {
         },
     );
     let result = hf.input.wrapping_mul(2).wrapping_add(1);
-    let vobj = kernel.create_object(
+    let vobj = lane.create_object(
         process,
         crate::abi::ObjectKind::FutureValue,
         result.to_le_bytes().to_vec(),
     );
-    match kernel.resolve_future(process, hf.future, vobj) {
+    match lane.resolve_future(process, hf.future, vobj) {
         Ok(()) => StepResult::complete(),
         Err(_) => StepResult::fault(process, SEARCH_HEURISTIC),
     }
@@ -240,9 +247,9 @@ fn heuristic(kernel: &mut Kernel, cont: Ref64, process: Ref64) -> StepResult {
 /// `index` selects the arithmetic, so the search classes are distinct code
 /// paths rather than aliases of one handler — a cohort really can only contain
 /// one of them.
-fn search_branch(kernel: &mut Kernel, cont: Ref64, process: Ref64, index: u32) -> StepResult {
+fn search_branch(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64, index: u32) -> StepResult {
     let mut sf: SearchFrame = load_frame(
-        kernel,
+        lane,
         process,
         cont,
         SearchFrame {
@@ -258,7 +265,7 @@ fn search_branch(kernel: &mut Kernel, cont: Ref64, process: Ref64, index: u32) -
 
     if sf.depth > 0 {
         for i in 0..sf.branching {
-            let child = kernel.create_process(process, crate::abi::ProcessMode::Serial);
+            let child = lane.create_process(process, crate::abi::ProcessMode::Serial);
             let cframe = SearchFrame {
                 value: sf.value.wrapping_add(i as u64),
                 depth: sf.depth - 1,
@@ -269,7 +276,7 @@ fn search_branch(kernel: &mut Kernel, cont: Ref64, process: Ref64, index: u32) -
             let run_class = cframe.run_class();
             let mut cb = Vec::new();
             cframe.encode(&mut cb);
-            kernel
+            lane
                 .create_continuation(
                     process,
                     child,
@@ -286,7 +293,7 @@ fn search_branch(kernel: &mut Kernel, cont: Ref64, process: Ref64, index: u32) -
         // Spawn with no continuation: the commit phase terminates this node.
         StepResult::spawn(process, 0)
     } else {
-        store_frame(kernel, process, cont, &sf);
+        store_frame(lane, process, cont, &sf);
         StepResult::complete()
     }
 }

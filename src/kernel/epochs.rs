@@ -316,7 +316,14 @@ impl Kernel {
         if let Ok(descriptor) = self.processes.get_mut(process) {
             descriptor.active_continuation = cont;
         }
-        let result = cpu_scalar::dispatch(self, cont, process);
+        // The step gets a lane, not the kernel. `LaneView` offers the fifteen
+        // operations a handler actually performs and nothing else, so an
+        // operation with no lane-local form is a compile error inside a step
+        // rather than something to discover by audit later (v0.3 §4.10).
+        let result = {
+            let mut lane = crate::executives::lane::LaneView::new(self);
+            cpu_scalar::dispatch(&mut lane, cont, process)
+        };
         if let Ok(descriptor) = self.processes.get_mut(process) {
             descriptor.active_continuation = Ref64::NULL;
         }
