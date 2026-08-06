@@ -1562,7 +1562,28 @@ impl Kernel {
 
     // ---- processes -------------------------------------------------------
 
+    /// Create a process in the actor's own domain, for a caller that knows the
+    /// domain has room.
+    ///
+    /// The panic is a real precondition and not a formality: the actor's domain
+    /// is the *actor's*, so it is the root domain only when the actor is the
+    /// system principal. A process in a bounded domain creating a process is
+    /// exactly the case that can fail, which is why the lane surface calls
+    /// `try_create_process` instead and turns exhaustion into a fault. Setup
+    /// code creating processes as `SYSTEM_PRINCIPAL` cannot reach the failure —
+    /// the root domain is unbounded.
     pub fn create_process(&mut self, actor: Ref64, mode: ProcessMode) -> Ref64 {
+        self.try_create_process(actor, mode)
+            .expect("the actor's domain has room for another process")
+    }
+
+    /// Create a process in the actor's own domain, reporting a domain that is
+    /// full rather than aborting.
+    pub fn try_create_process(
+        &mut self,
+        actor: Ref64,
+        mode: ProcessMode,
+    ) -> Result<Ref64, RuntimeError> {
         let domain = if actor == SYSTEM_PRINCIPAL {
             self.root_domain
         } else {
@@ -1572,7 +1593,6 @@ impl Kernel {
                 .unwrap_or(self.root_domain)
         };
         self.allocate_process(actor, domain, mode)
-            .expect("default domain is unbounded and resolves")
     }
 
     pub fn create_process_in_domain(
@@ -1602,6 +1622,20 @@ impl Kernel {
         if domain_descriptor.max_processes != 0
             && domain_descriptor.processes_created >= domain_descriptor.max_processes
         {
+            // Traced, because a refusal is a thing that happened. Without it a
+            // run's trace shows a process faulting and cannot say the machine
+            // told it no, and I25 clause 2 has no way to tell a bound that bit
+            // from a bound with room left.
+            let quota = domain_descriptor.max_processes;
+            self.trace_full(
+                EventKind::ProcessCreationRefused,
+                actor,
+                Ref64::NULL,
+                0,
+                quota,
+                Ref64::NULL,
+                domain,
+            );
             return Err(RuntimeError::DomainQuotaExceeded);
         }
         let r = self.processes.alloc(ProcessDescriptor::new(mode));
@@ -1631,7 +1665,20 @@ impl Kernel {
         }
         let domain_descriptor = self.domains.get_mut(domain)?;
         domain_descriptor.processes_created = domain_descriptor.processes_created.saturating_add(1);
-        self.trace(EventKind::ProcessCreated, r, Ref64::NULL, 0, mode as u32);
+        // The domain goes in `subject`, not because the event reads better with
+        // it but because I25 clause 2 asks which domain a lane drew on and the
+        // process table cannot answer for a process that has since been
+        // reclaimed. It is an entity, so it belongs in `subject`; `auxiliary`
+        // is numeric and already holds the mode.
+        self.trace_full(
+            EventKind::ProcessCreated,
+            r,
+            Ref64::NULL,
+            0,
+            mode as u32,
+            Ref64::NULL,
+            domain,
+        );
         Ok(r)
     }
 

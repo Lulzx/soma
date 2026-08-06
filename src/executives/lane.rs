@@ -129,8 +129,20 @@ impl<'a> LaneView<'a> {
 
     // ---- allocation (§4.8 shards are the lane-local form) -----------------
 
-    pub fn create_process(&mut self, actor: Ref64, mode: ProcessMode) -> Ref64 {
-        self.kernel.create_process(actor, mode)
+    /// Fallible, unlike `Kernel::create_process`.
+    ///
+    /// A step creates a process in its own process's domain, and that domain
+    /// may be bounded — so this is the one allocation whose failure is a
+    /// decision the machine already has a word for. It used to be the kernel's
+    /// infallible form, which turned a `DomainQuotaExceeded` a handler could
+    /// have faulted on into an abort of the host process. A step that cannot
+    /// allocate should fault; nothing about the machine says it should stop.
+    pub fn create_process(
+        &mut self,
+        actor: Ref64,
+        mode: ProcessMode,
+    ) -> Result<Ref64, RuntimeError> {
+        self.kernel.try_create_process(actor, mode)
     }
 
     pub fn create_continuation(

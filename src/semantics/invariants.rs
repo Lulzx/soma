@@ -241,9 +241,31 @@ fn effect_mediated_commit(kernel: &Kernel, out: &mut Vec<Violation>) {
 
 // ---- I25 -----------------------------------------------------------------
 
-/// **I25. Lane independence.**
+/// **I25. Lane independence.** Two clauses:
 ///
-/// No ≺ edge joins two distinct lanes of one epoch.
+/// 1. no ≺ edge joins two distinct lanes of one epoch; and
+/// 2. no two lanes of one epoch draw on the same bounded domain.
+///
+/// Clause 2 is not a second way of saying clause 1, and it was added because
+/// clause 1 alone accepted a run whose lanes are demonstrably not reorderable.
+/// A step creating a process consumes its domain's quota. Two lanes of an epoch
+/// creating processes in one bounded domain therefore race for it: the same
+/// workload run under `LaneOrder::Plan` and `LaneOrder::Reverse` faults a
+/// *different* pair of processes, and both runs leave a legal state, so nothing
+/// but a comparison of the two runs reports it. Clause 1 does not, because it
+/// reads the semantic order and the dependence carries no ≺ edge — nothing is
+/// delivered, resolved or woken. It is carried by a counter.
+///
+/// That is the general shape of what clause 1 misses: a dependence through
+/// *state* rather than through an event. A quota is the case the machine
+/// already has, because a domain is the only bounded resource an epoch's lanes
+/// can exhaust between them. Anything else with a bound — a mailbox capacity a
+/// second lane fills, a table that can refuse — belongs here as it arrives.
+///
+/// The clause reads `ProcessCreated`, whose `subject` is the domain the process
+/// was allocated in, so it survives the process being reclaimed. `HOST_LANE` is
+/// excluded for clause 1's reason: the host's allocations are the plan's, and
+/// they run strictly before or after the lanes rather than beside them.
 ///
 /// This is the invariant canonical commit is paid for with, and it is worth
 /// being precise about which direction that goes. Applying an epoch's effects
@@ -300,6 +322,75 @@ fn lane_independence(kernel: &Kernel, out: &mut Vec<Violation>) {
         // produces one per delivery — and a hundred lines all naming the same
         // defect buries the other invariants' reports.
         break;
+    }
+    bounded_domain_independence(kernel, out);
+}
+
+/// I25 clause 2: no two lanes of one epoch are decided by the same domain quota.
+///
+/// Two conditions together, and neither alone is the clause. Two lanes drawing
+/// on one bounded domain decides nothing while the domain has room for both —
+/// every lane's allocation succeeds under every order, and the run is
+/// reorderable. A refusal with only one lane drawing decides nothing either: the
+/// lane would have been refused whenever it ran. It is the pair that makes the
+/// outcome a function of the order.
+///
+/// The separate matter of the counter itself — `processes_created` is
+/// incremented by every allocation, in the root domain as much as a bounded one
+/// — is not this clause. That is a write two lanes make and a journal fixes,
+/// because the increment commutes (v0.3 §4.12). What does not commute is the
+/// decision read off it.
+fn bounded_domain_independence(kernel: &Kernel, out: &mut Vec<Violation>) {
+    use std::collections::{HashMap, HashSet};
+    let mut lanes: HashMap<(u32, u64), HashSet<u32>> = HashMap::new();
+    let mut refused: HashSet<(u32, u64)> = HashSet::new();
+    for event in kernel.trace_events() {
+        let drawing = matches!(
+            event.event_kind,
+            crate::abi::EventKind::ProcessCreated | crate::abi::EventKind::ProcessCreationRefused
+        );
+        // `HOST_LANE` is excluded for clause 1's reason: the host's allocations
+        // run strictly before or after the epoch's lanes, so an order between
+        // them is the plan's and not a race.
+        if !drawing || event.lane == crate::abi::traces::HOST_LANE {
+            continue;
+        }
+        let domain = event.subject;
+        // An unbounded domain refuses nobody. A domain reclaimed since is
+        // treated as unbounded rather than guessed at — the run it constrained
+        // is over, and it is no longer here to say what it allowed.
+        let bounded = kernel
+            .domains()
+            .get(domain)
+            .map(|d| d.max_processes != 0)
+            .unwrap_or(false);
+        if !bounded {
+            continue;
+        }
+        let key = (event.epoch, domain.key());
+        lanes.entry(key).or_default().insert(event.lane);
+        if event.event_kind == crate::abi::EventKind::ProcessCreationRefused {
+            refused.insert(key);
+        }
+    }
+
+    let mut contended: Vec<_> = refused
+        .iter()
+        .filter(|key| lanes.get(*key).map(|set| set.len() > 1).unwrap_or(false))
+        .collect();
+    contended.sort();
+    // One report per run, as in clause 1.
+    if let Some((epoch, domain)) = contended.first() {
+        let mut drawn: Vec<u32> = lanes[&(*epoch, *domain)].iter().copied().collect();
+        drawn.sort_unstable();
+        out.push(Violation::new(
+            Invariant::LaneIndependence,
+            format!(
+                "epoch {epoch}: lanes {drawn:?} all allocated in one bounded domain and the \
+                 domain refused at least one of them, so which lane is refused depends on \
+                 which lane ran first"
+            ),
+        ));
     }
 }
 

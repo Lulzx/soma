@@ -46,6 +46,15 @@ pub enum EventKind {
     /// it. It is traced because it changes what a process may do next, and
     /// because it is what makes something collectable.
     AuthorityReleased = 33,
+    /// A domain refused a process creation because its quota was full.
+    ///
+    /// The refusal is a thing that happened and the trace had no way to say it:
+    /// a step whose allocation is refused faults, and `ProcessFailed` alone does
+    /// not distinguish a program that failed from one that was told no. It is
+    /// also what makes I25's clause 2 precise rather than conservative — two
+    /// lanes drawing on a bounded domain only decide anything by their order
+    /// once the bound actually binds, and this is the event that says it did.
+    ProcessCreationRefused = 34,
 }
 
 /// The lane an event was emitted from when it was not emitted from one: epoch

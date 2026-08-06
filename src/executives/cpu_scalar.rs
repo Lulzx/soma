@@ -177,7 +177,14 @@ fn expand_resume_2(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> Step
 
     while (frame.move_index as usize) < frame.moves.len() {
         let m = frame.moves[frame.move_index as usize];
-        let child = lane.create_process(process, crate::abi::ProcessMode::Serial);
+        // A full domain faults this node rather than aborting the machine. The
+        // frame is stored first: the children already spawned happened, and a
+        // supervisor restarting this continuation must not spawn them twice
+        // (§8).
+        let Ok(child) = lane.create_process(process, crate::abi::ProcessMode::Serial) else {
+            store_frame(lane, process, cont, &frame);
+            return StepResult::fault(process, 0);
+        };
         let cframe = SearchFrame::leaf(m, 0);
         let mut cb = Vec::new();
         cframe.encode(&mut cb);
@@ -265,7 +272,11 @@ fn search_branch(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64, index: u3
 
     if sf.depth > 0 {
         for i in 0..sf.branching {
-            let child = lane.create_process(process, crate::abi::ProcessMode::Serial);
+            // As in `expand_resume_2`: a full domain is a fault, not an abort.
+            let Ok(child) = lane.create_process(process, crate::abi::ProcessMode::Serial) else {
+                store_frame(lane, process, cont, &sf);
+                return StepResult::fault(process, 0);
+            };
             let cframe = SearchFrame {
                 value: sf.value.wrapping_add(i as u64),
                 depth: sf.depth - 1,

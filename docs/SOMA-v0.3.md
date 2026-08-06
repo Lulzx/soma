@@ -798,6 +798,13 @@ Across the search and Expand workloads at cohort widths 1 through 16, under
 reversal and two permutations, every run is I18-equivalent to its plan-order
 run, every run leaves a legal state, and I25 holds of all of them.
 
+That sentence stood until §4.12 went looking for a workload it was wrong about
+and found one. It is a result about the workloads run here, all of which
+allocate in the unbounded root domain; a bounded domain makes the same
+reordering disagree. The machinery was right and the conclusion was
+under-qualified — which is the argument for keeping the reordering rather than
+against it, since it is what reported the disagreement.
+
 **What it is evidence for.** `tests/lane_order.rs` compares the *effect log's*
 application sequence by production position across orders, and requires it
 identical. That is canonical commit stated as an experiment: the order lanes ran
@@ -1021,6 +1028,71 @@ its own table shards (§4.8). Five workloads produce byte-identical output, whic
 is the whole evidence offered. What changed is that the *read* category of §4.10
 now writes one place, and that place is per-lane.
 
+### 4.12 An epoch's lanes share a quota
+
+§4.6 reordered an epoch's lanes and reported that **it found nothing**, and
+recorded that as a result rather than as silence. It was a result about the
+workloads it ran. Every one of them allocates in the root domain, which is
+unbounded, and a bounded domain is the case it did not have.
+
+A step creating a process consumes its domain's quota. Two lanes of one epoch
+creating processes in one bounded domain therefore race for it — and the loser
+is not slowed down, it is refused. The same workload under `LaneOrder::Plan` and
+`LaneOrder::Reverse` refuses a *different pair* of processes and faults a
+different pair of continuations. Both runs leave a legal state. Nothing but a
+comparison of the two runs reports it, which is exactly the shape §4.6 built the
+comparison for.
+
+**I25 clause 1 does not see this**, and that is the interesting part rather than
+an oversight to be embarrassed about. Clause 1 reads the semantic order and asks
+for a ≺ edge joining two lanes. Here there is none: nothing is sent, resolved,
+delivered or woken between the lanes. `cross_lane_edges()` is empty for a run
+that demonstrably depends on its lane order. The dependence is carried by a
+counter, not by an event, and an order built from the trace cannot contain it.
+
+**I25 gains a second clause.** No two lanes of one epoch may be decided by one
+domain's quota. Two conditions, and neither alone is the clause:
+
+- two lanes drew on the domain, and
+- the domain refused at least one allocation.
+
+Two lanes with room to spare decide nothing — every allocation succeeds under
+every order. One lane refused decides nothing either — it would have been
+refused whenever it ran. It is the pair that makes the outcome a function of the
+order, and the clause fires on exactly the quotas where the two lane orders
+disagree and on none of the ones where they agree.
+
+**A refusal is now traced.** `ProcessCreationRefused` carries the domain in
+`subject` and the quota in `auxiliary`. Two reasons, and the invariant is the
+second one. The first is that a refusal is a thing that happened and the trace
+had no way to say it: a run showed a process faulting and could not say the
+machine had told it no. The second is that the clause needs to tell a bound that
+bit from a bound with room, and only the refusal says which. `ProcessCreated`
+gained the domain in `subject` for the same reason — a reclaimed process cannot
+be asked which domain it drew on.
+
+**What is *not* this clause.** `processes_created` is incremented by every
+allocation, in the root domain as much as a bounded one, so two lanes writing it
+is a data race in every workload. That one is mechanical: the increment
+commutes, so it is a journalled effect in §4.4's shape, applied at commit. What
+does not commute — and what no journal fixes — is the *decision* read off the
+counter, because a lane needs the answer before it can continue and §4.3 (2)
+already established that allocation cannot be deferred.
+
+**The bug this found.** `LaneView::create_process` was infallible, so
+`DomainQuotaExceeded` inside a handler reached an `expect` and aborted the host
+process. The machine has a word for a step that cannot proceed — v0.2 §6.3's
+`Fault`, with a supervision model behind it — and was not using it. The lane
+surface's `create_process` returns a `Result`, and both spawning handlers store
+their frame and fault. That is the second time §4.10's list has paid: the first
+was learning what a step touches, and this is learning that one entry on it can
+fail.
+
+**What this costs.** A workload with a contended quota is one the concurrent
+executive cannot take, and I25 names it at the point the workload does it. That
+is the standing §4.3 gave clause 1 and it is unchanged: the kernel does not
+refuse such a workload, the checker reports it.
+
 ---
 
 ## 5. C — distributed, trace-equivalent
@@ -1094,7 +1166,7 @@ cannot reach means the model is charging for the wrong thing.
 | I22 admission determinism | checked | the decision is a function of the candidate set (§4.1) |
 | I23 position-derived emission | checked | the trace's order needs no shared clock (§4.2) |
 | I24 effect-mediated commit | checked | bins are written by an applier, in plan order (§4.4) |
-| I25 lane independence | checked | no ≺ edge joins two lanes of one epoch (§4.5) |
+| I25 lane independence | checked | two clauses: no ≺ edge joins two lanes of one epoch (§4.5), and no two lanes are decided by one domain's quota (§4.12) |
 
 **I21** has two halves. The first — an epoch that admitted work dispatched some
 of it — is a statement about a transition rather than a state, so it is counted

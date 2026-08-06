@@ -4,7 +4,7 @@ Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
 Repository: https://github.com/Lulzx/soma. The default semantic core is
-dependency-free. There are 347 tests (seven of which need the `metal` feature),
+dependency-free. There are 357 tests (seven of which need the `metal` feature),
 six compile-fail doc tests, and no Clippy warnings. The optional `metal`
 feature adds the `metal-rs` implementation dependency on macOS.
 
@@ -245,6 +245,16 @@ Added in v0.3:
   runs single-threaded. Results stay in request order -- the caller publishes
   result i into collective i -- and one failed request fails the epoch, which is
   the contract the sequential path already had.
+- I25 clause 2 (v0.3 §4.12). An epoch's lanes must not be decided by one
+  domain's quota. A step creating a process consumes it, so two lanes drawing on
+  one bounded domain refuse a different process depending on which ran first --
+  `tests/domain_quota.rs` is the counterexample §4.6 did not have, and both runs
+  leave a legal state, so only comparing them reports it. Clause 1 cannot: the
+  dependence carries no ≺ edge, only a counter. Clause 2 needs both a second
+  drawing lane and an actual refusal, since a bound with room decides nothing;
+  `ProcessCreationRefused` is what says the bound bit. The bug it turned up:
+  `LaneView::create_process` was infallible, so a full domain aborted the host
+  process instead of faulting the step.
 - A lane-local trace buffer (v0.3 §4.11). A lane produces trace events into
   `lane_trace` and `leave_lane` appends them, which is §4.4's move applied to
   the trace. `logical_time` is handed out at the drain rather than at emission,
@@ -556,6 +566,13 @@ decision that would otherwise depend on `HashMap` iteration order.
   a single host counter satisfies "sorted by position equals emitted order"
   perfectly — while the trace goes back to needing a shared clock. Clause 3 of
   I23 is the only thing that reports it.
+- **"The reordering found nothing" is a statement about the workloads run.**
+  §4.6 said it, and it stood until someone built a workload it was wrong about:
+  a bounded domain makes the same reordering disagree (v0.3 §4.12). Every
+  reorderability result here is conditional on what the workload touches, so a
+  new shared, bounded, or refusing resource needs its own reordered run rather
+  than inheriting the old conclusion. The place to look is anything a lane reads
+  a *decision* off rather than merely writes.
 - **The lane trace buffer drains in emission order, and must not sort.**
   `drain_lane_trace` appends what the lane produced in the order it produced it,
   which is why the buffer changed no run. Sorting by position there looks like an
