@@ -10,6 +10,17 @@ implementation choices. This repository contains the semantic specification, a
 deterministic Rust interpreter, executable invariant checks, and scheduler
 experiments.
 
+## Discovery execution model
+
+`src/discovery` builds a content-addressed research DAG above the unchanged SOMA
+ABI. It replays one deterministic logical trace through literal and optimized
+executors, deduplicates deterministic derivations, preserves independent
+observation multiplicity, withdraws work with no remaining hypothesis interest,
+and fuses only pointwise `BatchEvaluate` requests. CPU and real Metal backends
+share the same path, and D1-D7 compare terminal hypotheses, evidence, and
+provenance. See [docs/DISCOVERY.md](docs/DISCOVERY.md) and run
+`cargo run --release --example discovery_report`.
+
 Stable Rust. The semantic core has no dependencies. The optional macOS Metal
 backend is enabled with `--features metal`.
 
@@ -32,6 +43,7 @@ cargo run --example streaming_report
 cargo run --example supervision_report
 cargo run --example multi_input_report
 cargo run --example ant_colony_report      # cohorting on a population of agents
+cargo run --example discovery_report       # naive vs semantic discovery replay
 ```
 
 ## The ant colony
