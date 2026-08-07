@@ -15,11 +15,13 @@ use crate::abi::{EventKind, ProcessState, Ref64, StepKind, StepResult};
 use crate::executives::cpu_scalar;
 use crate::kernel::commit;
 use crate::kernel::payload::Payload;
-use crate::kernel::speculation::{EpochExecutive, LaneJournal, Resource};
+use crate::kernel::speculation::{EpochExecutive, LaneJournal, LaneOperation, Resource};
 use crate::kernel::Kernel;
 use crate::scheduler::admission::{admit, AdmissionRecord, Candidate};
 use crate::scheduler::cohorts::{build_cohorts, CohortPlan};
-use crate::scheduler::device::{reference_lane_conflicts, LaneConflictValidator};
+use crate::scheduler::device::{
+    reference_lane_conflicts, DeviceEpochBackend, DeviceEvaluatorLane, LaneConflictValidator,
+};
 use crate::scheduler::device_ops::{
     await_result, decode_spec, message_result, object_kind, observe_result, process_mode,
     ref_result, unit_result, DeviceOperationJournal, OP_AWAIT_FUTURE, OP_CREATE_CONTINUATION,
@@ -51,7 +53,7 @@ impl Kernel {
     /// buffer) is promoted to `current`, executed, and any work it produces
     /// lands in `next` for the following epoch (§13, §18).
     pub fn run_epoch(&mut self) -> usize {
-        self.run_epoch_validated(None)
+        self.run_epoch_validated(None, None)
     }
 
     /// Run one epoch and use `validator` for the complete speculative lane
@@ -61,12 +63,19 @@ impl Kernel {
         &mut self,
         validator: &mut dyn LaneConflictValidator,
     ) -> usize {
-        self.run_epoch_validated(Some(validator))
+        self.run_epoch_validated(Some(validator), None)
+    }
+
+    /// Run one epoch with a physical backend that evaluates supported handler
+    /// bodies and validates their complete journals before canonical commit.
+    pub fn run_epoch_with_device_backend(&mut self, backend: &mut dyn DeviceEpochBackend) -> usize {
+        self.run_epoch_validated(None, Some(backend))
     }
 
     fn run_epoch_validated(
         &mut self,
         mut validator: Option<&mut dyn LaneConflictValidator>,
+        mut backend: Option<&mut dyn DeviceEpochBackend>,
     ) -> usize {
         // Under a bounded retention policy the logs carry only the epoch that
         // just ran, so this is where last epoch's records stop being the
@@ -235,11 +244,19 @@ impl Kernel {
 
         let steps = match self.epoch_executive {
             EpochExecutive::Speculative { max_lanes } => {
-                let speculative = match validator.take() {
-                    Some(validator) => {
-                        self.execute_lanes_speculatively(&lanes, max_lanes, Some(validator))
+                let speculative = match backend.take() {
+                    Some(backend) => {
+                        self.execute_lanes_speculatively(&lanes, max_lanes, None, Some(backend))
                     }
-                    None => self.execute_lanes_speculatively(&lanes, max_lanes, None),
+                    None => match validator.take() {
+                        Some(validator) => self.execute_lanes_speculatively(
+                            &lanes,
+                            max_lanes,
+                            Some(validator),
+                            None,
+                        ),
+                        None => self.execute_lanes_speculatively(&lanes, max_lanes, None, None),
+                    },
                 };
                 speculative.unwrap_or_else(|| self.execute_lanes_reference(&lanes))
             }
@@ -422,11 +439,119 @@ impl Kernel {
         steps
     }
 
+    fn evaluate_lanes_on_device(
+        &mut self,
+        lanes: &[(u32, Ref64)],
+        backend: &mut dyn DeviceEpochBackend,
+    ) -> Option<Vec<SpeculativeLane>> {
+        let mut inputs = Vec::with_capacity(lanes.len());
+        let mut frames = Vec::new();
+        let mut metadata = Vec::with_capacity(lanes.len());
+        for &(lane, continuation) in lanes {
+            let descriptor = self.continuations.get(continuation).ok()?;
+            if descriptor.status != ContinuationState::Runnable
+                || descriptor.remaining_steps == 0
+                || !descriptor.dependency.is_null()
+            {
+                return None;
+            }
+            let process = descriptor.process;
+            let frame = descriptor.frame;
+            let process_descriptor = self.processes.get(process).ok()?;
+            if process_descriptor.status == ProcessState::CancelPending as u32 {
+                return None;
+            }
+            let bytes = self.object_payloads.get(&frame.key())?.as_slice();
+            let frame_offset: u32 = frames.len().try_into().ok()?;
+            let frame_len: u32 = bytes.len().try_into().ok()?;
+            frames.extend_from_slice(bytes);
+            inputs.push(DeviceEvaluatorLane {
+                continuation: continuation.to_u64(),
+                process: process.to_u64(),
+                frame: frame.to_u64(),
+                lane,
+                run_class: descriptor.run_class,
+                frame_offset,
+                frame_len,
+            });
+            metadata.push((continuation, process, frame, process_descriptor.supervisor));
+        }
+
+        let evaluation = backend.evaluate_lanes(&inputs, &frames).ok()?;
+        if evaluation.results.len() != inputs.len() {
+            return None;
+        }
+        let mut outcomes = Vec::with_capacity(inputs.len());
+        for (index, result) in evaluation.results.iter().copied().enumerate() {
+            let input = inputs[index];
+            if result.status != 1 || result.lane != input.lane {
+                return None;
+            }
+            let start = result.frame_offset as usize;
+            let end = start.checked_add(result.frame_len as usize)?;
+            let output_frame = evaluation.frames.get(start..end)?.to_vec();
+            if result.frame_len != input.frame_len {
+                return None;
+            }
+            let kind = match result.step_kind {
+                1 => StepKind::Complete,
+                2 => StepKind::Yield,
+                3 => StepKind::Await,
+                4 => StepKind::Send,
+                5 => StepKind::Spawn,
+                6 => StepKind::Fault,
+                _ => return None,
+            };
+            let (continuation, process, frame, supervisor) = metadata[index];
+            let mut journal = LaneJournal::default();
+            journal.write(Resource::Process(process));
+            if !supervisor.is_null() {
+                journal.write(Resource::Process(supervisor));
+            }
+            journal.read(Resource::Object(frame));
+            journal.write(Resource::Object(frame));
+            journal.mutated_objects.insert(frame);
+            journal.push(LaneOperation::ReadObject {
+                actor: process,
+                object: frame,
+            });
+            journal.push(LaneOperation::WriteObject {
+                actor: process,
+                object: frame,
+                growable: true,
+            });
+            let device_operations = journal.device_operations(input.lane)?;
+            outcomes.push(SpeculativeLane {
+                lane: input.lane,
+                continuation,
+                process,
+                evaluated: EvaluatedStep {
+                    result: StepResult {
+                        kind,
+                        next_run_class: result.next_run_class,
+                        target: Ref64::from_u64(result.target),
+                        value: Ref64::from_u64(result.value),
+                        consumed_steps: result.consumed_steps,
+                        flags: result.flags,
+                    },
+                    executed: true,
+                },
+                journal,
+                device_operations,
+                payloads: vec![(frame, output_frame)],
+            });
+        }
+        self.speculation_stats.device_evaluated_epochs += 1;
+        self.speculation_stats.device_evaluated_lanes += outcomes.len() as u64;
+        Some(outcomes)
+    }
+
     fn execute_lanes_speculatively(
         &mut self,
         lanes: &[(u32, Ref64)],
         max_lanes: usize,
         validator: Option<&mut dyn LaneConflictValidator>,
+        mut backend: Option<&mut dyn DeviceEpochBackend>,
     ) -> Option<usize> {
         if lanes.len() < 2 || lanes.len() > max_lanes.max(1) {
             return None;
@@ -435,61 +560,70 @@ impl Kernel {
         self.speculation_stats.attempted_epochs += 1;
         self.speculation_stats.speculative_lanes += lanes.len() as u64;
 
+        // A physical backend receives only pointer-free lane descriptors and
+        // frame bytes. If it declines the batch, evaluation continues through
+        // isolated CPU snapshots below without any semantic state changed.
+        let device_outcomes = backend
+            .as_deref_mut()
+            .and_then(|backend| self.evaluate_lanes_on_device(lanes, backend));
+
         // Each worker receives the exact same pre-Phase-F state. Cloning is
         // intentionally outside the timed handler threads: it is isolation,
         // not work whose completion order may affect a lane.
-        let snapshots: Vec<_> = lanes.iter().map(|_| self.clone()).collect();
-        let outcomes = std::thread::scope(|scope| {
-            let handles: Vec<_> = snapshots
-                .into_iter()
-                .zip(lanes.iter().copied())
-                .map(|(mut snapshot, (lane, continuation))| {
-                    scope.spawn(move || {
-                        let process = snapshot.continuations.get(continuation).ok()?.process;
-                        let process_descriptor = snapshot.processes.get(process).ok()?.clone();
-                        snapshot.enter_lane(lane);
-                        snapshot.begin_speculative_recording();
-                        snapshot.record_speculative_write(Resource::Process(process));
-                        if !process_descriptor.supervisor.is_null() {
-                            snapshot.record_speculative_write(Resource::Process(
-                                process_descriptor.supervisor,
-                            ));
-                        }
-                        if process_descriptor.status == ProcessState::CancelPending as u32 {
-                            snapshot.mark_speculation_unsupported();
-                        }
-                        let evaluated = snapshot.evaluate_cont(continuation, process)?;
-                        let mut journal = snapshot.finish_speculative_recording();
-                        if evaluated.result.kind == StepKind::Fault {
-                            journal.unsupported = true;
-                        }
-                        let device_operations = journal.device_operations(lane)?;
-                        let payloads = journal
-                            .mutated_objects
-                            .iter()
-                            .filter_map(|object| {
-                                snapshot
-                                    .object_payloads
-                                    .get(&object.key())
-                                    .map(|payload| (*object, payload.as_slice().to_vec()))
+        let outcomes = device_outcomes.or_else(|| {
+            let snapshots: Vec<_> = lanes.iter().map(|_| self.clone()).collect();
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = snapshots
+                    .into_iter()
+                    .zip(lanes.iter().copied())
+                    .map(|(mut snapshot, (lane, continuation))| {
+                        scope.spawn(move || {
+                            let process = snapshot.continuations.get(continuation).ok()?.process;
+                            let process_descriptor = snapshot.processes.get(process).ok()?.clone();
+                            snapshot.enter_lane(lane);
+                            snapshot.begin_speculative_recording();
+                            snapshot.record_speculative_write(Resource::Process(process));
+                            if !process_descriptor.supervisor.is_null() {
+                                snapshot.record_speculative_write(Resource::Process(
+                                    process_descriptor.supervisor,
+                                ));
+                            }
+                            if process_descriptor.status == ProcessState::CancelPending as u32 {
+                                snapshot.mark_speculation_unsupported();
+                            }
+                            let evaluated = snapshot.evaluate_cont(continuation, process)?;
+                            let mut journal = snapshot.finish_speculative_recording();
+                            if evaluated.result.kind == StepKind::Fault {
+                                journal.unsupported = true;
+                            }
+                            let device_operations = journal.device_operations(lane)?;
+                            let payloads = journal
+                                .mutated_objects
+                                .iter()
+                                .filter_map(|object| {
+                                    snapshot
+                                        .object_payloads
+                                        .get(&object.key())
+                                        .map(|payload| (*object, payload.as_slice().to_vec()))
+                                })
+                                .collect();
+                            Some(SpeculativeLane {
+                                lane,
+                                continuation,
+                                process,
+                                evaluated,
+                                journal,
+                                device_operations,
+                                payloads,
                             })
-                            .collect();
-                        Some(SpeculativeLane {
-                            lane,
-                            continuation,
-                            process,
-                            evaluated,
-                            journal,
-                            device_operations,
-                            payloads,
                         })
                     })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|handle| handle.join().ok().flatten())
-                .collect::<Option<Vec<_>>>()
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().ok().flatten())
+                    .collect::<Option<Vec<_>>>()
+            })
         });
 
         let Some(mut outcomes) = outcomes else {
@@ -515,7 +649,7 @@ impl Kernel {
         // Execution order is deliberately discarded here. Lane number is the
         // canonical position assigned by the epoch plan.
         outcomes.sort_by_key(|outcome| outcome.lane);
-        if let Some(validator) = validator {
+        if backend.is_some() || validator.is_some() {
             let accesses: Vec<_> = outcomes
                 .iter()
                 .enumerate()
@@ -525,15 +659,24 @@ impl Kernel {
                 .iter()
                 .map(|outcome| &outcome.device_operations)
                 .collect();
-            let conflicts =
-                match validator.validate_epoch(&accesses, outcomes.len() as u32, &operations) {
-                    Ok(conflicts) if conflicts.len() == outcomes.len() => conflicts,
-                    _ => {
-                        self.speculation_stats.fallback_epochs += 1;
-                        self.speculation_stats.unsupported_fallbacks += 1;
-                        return None;
-                    }
-                };
+            let validated = match backend {
+                Some(backend) => {
+                    backend.validate_epoch(&accesses, outcomes.len() as u32, &operations)
+                }
+                None => validator.expect("checked above").validate_epoch(
+                    &accesses,
+                    outcomes.len() as u32,
+                    &operations,
+                ),
+            };
+            let conflicts = match validated {
+                Ok(conflicts) if conflicts.len() == outcomes.len() => conflicts,
+                _ => {
+                    self.speculation_stats.fallback_epochs += 1;
+                    self.speculation_stats.unsupported_fallbacks += 1;
+                    return None;
+                }
+            };
             debug_assert_eq!(
                 conflicts,
                 reference_lane_conflicts(&accesses, outcomes.len() as u32)

@@ -48,24 +48,52 @@ fn disjoint_lanes_commit_the_reference_run() {
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
-fn actual_epoch_journals_are_validated_on_metal_before_commit() {
+fn actual_search_leaf_handlers_execute_and_validate_on_metal_before_commit() {
     use soma::executives::metal_scheduler::MetalDeviceScheduler;
 
     let knobs = leaf_knobs();
     let mut reference = build(&knobs);
     let mut device_validated = build(&knobs);
+    let continuations: Vec<_> = reference
+        .trace_snapshot()
+        .into_iter()
+        .filter(|row| {
+            row.event_kind == soma::abi::EventKind::ContinuationReady
+                && row.run_class >= soma::compiler::run_classes::SEARCH_BRANCH
+        })
+        .map(|row| {
+            (
+                Ref64::from_u64(row.process),
+                Ref64::from_u64(row.continuation),
+            )
+        })
+        .collect();
     device_validated.configure_epoch_executive(EpochExecutive::Speculative { max_lanes: 16 });
     let mut metal = MetalDeviceScheduler::new().unwrap();
 
     reference.run_epoch();
-    device_validated.run_epoch_with_lane_validator(&mut metal);
+    device_validated.run_epoch_with_device_backend(&mut metal);
 
-    assert_eq!(device_validated.speculation_stats().committed_epochs, 1);
+    let stats = device_validated.speculation_stats();
+    assert_eq!(stats.device_evaluated_epochs, 1);
+    assert_eq!(stats.device_evaluated_lanes, knobs.process_count as u64);
+    assert_eq!(stats.committed_epochs, 1);
     assert!(conforms_traces(
         &reference.trace_snapshot(),
         &device_validated.trace_snapshot()
     )
     .is_empty());
+    for (process, continuation) in continuations {
+        let reference_frame = reference.continuation_frame(continuation).unwrap();
+        let device_frame = device_validated.continuation_frame(continuation).unwrap();
+        assert_eq!(
+            reference.object_bytes(process, reference_frame).unwrap(),
+            device_validated
+                .object_bytes(process, device_frame)
+                .unwrap(),
+            "device handler must publish the exact reference frame bytes"
+        );
+    }
     assert_legal(&device_validated);
 }
 

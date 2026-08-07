@@ -38,6 +38,10 @@ pub struct SpeculationStats {
     pub committed_lanes: u64,
     pub conflict_fallbacks: u64,
     pub unsupported_fallbacks: u64,
+    /// Epochs and lanes whose handler body itself executed through a physical
+    /// device evaluator rather than an isolated CPU snapshot.
+    pub device_evaluated_epochs: u64,
+    pub device_evaluated_lanes: u64,
     /// Bit `opcode - 1` for every internal lane operation successfully lowered
     /// to the fixed-width device ABI, including epochs later rejected for a
     /// semantic conflict.

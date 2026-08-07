@@ -15,7 +15,8 @@ use metal::{
 use crate::abi::cohorts::PartialCohortPolicy;
 use crate::scheduler::admission::Candidate;
 use crate::scheduler::device::{
-    DeviceCandidate, DeviceLaneAccess, DeviceLaneConflict, DevicePlacement, DeviceSchedule,
+    DeviceCandidate, DeviceEpochBackend, DeviceEvaluation, DeviceEvaluatorLane,
+    DeviceEvaluatorResult, DeviceLaneAccess, DeviceLaneConflict, DevicePlacement, DeviceSchedule,
     LaneConflictValidator, LaneValidationError,
 };
 use crate::scheduler::device::{ResidentSearchConfig, ResidentSearchResult};
@@ -78,6 +79,33 @@ struct OperationSlice {
     uint payload_len;
     uint expected_lane;
 };
+
+struct EvaluatorLane {
+    ulong continuation; ulong process; ulong frame;
+    uint lane; uint run_class; uint frame_offset; uint frame_len;
+};
+
+struct EvaluatorResult {
+    ulong target; ulong value;
+    uint lane; uint status; uint step_kind; uint next_run_class;
+    uint consumed_steps; uint flags; uint frame_offset; uint frame_len;
+};
+
+inline ulong load_u64_le(device const uchar* bytes, uint at) {
+    ulong value = 0ul;
+    for (uint i = 0u; i < 8u; ++i) value |= ulong(bytes[at + i]) << (i * 8u);
+    return value;
+}
+
+inline uint load_u32_le(device const uchar* bytes, uint at) {
+    uint value = 0u;
+    for (uint i = 0u; i < 4u; ++i) value |= uint(bytes[at + i]) << (i * 8u);
+    return value;
+}
+
+inline void store_u64_le(device uchar* bytes, uint at, ulong value) {
+    for (uint i = 0u; i < 8u; ++i) bytes[at + i] = uchar(value >> (i * 8u));
+}
 
 inline bool wins_mutable_claim(
     device const Candidate* candidates,
@@ -282,6 +310,49 @@ kernel void soma_device_validate_operations(
     }
     valid[gid] = ok;
 }
+
+// First real continuation-body lowering. Search leaves have no allocation or
+// external side effect: they update their private frame and complete. Internal
+// search nodes deliberately decline here and take the canonical CPU fallback.
+kernel void soma_device_evaluate_search_leaf(
+    device const EvaluatorLane* lanes [[buffer(0)]],
+    device const uchar* input_frames [[buffer(1)]],
+    device EvaluatorResult* results [[buffer(2)]],
+    device uchar* output_frames [[buffer(3)]],
+    constant uint& lane_count [[buffer(4)]],
+    constant uint& frame_bytes [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= lane_count) return;
+    EvaluatorLane lane = lanes[gid];
+    EvaluatorResult result = {0ul, 0ul, lane.lane, 0u, 0u, 0u, 0u, 0u,
+                              lane.frame_offset, lane.frame_len};
+    bool bounds = lane.frame_offset <= frame_bytes
+        && lane.frame_len <= frame_bytes - lane.frame_offset;
+    bool search_class = lane.run_class >= 10u && lane.run_class < 18u;
+    if (!bounds || lane.frame_len != 24u || !search_class) {
+        results[gid] = result;
+        return;
+    }
+    uint at = lane.frame_offset;
+    ulong value = load_u64_le(input_frames, at);
+    uint depth = load_u32_le(input_frames, at + 8u);
+    uint work_iters = load_u32_le(input_frames, at + 16u);
+    if (depth != 0u) {
+        results[gid] = result;
+        return;
+    }
+    for (uint i = 0u; i < 24u; ++i) output_frames[at + i] = input_frames[at + i];
+    uint class_index = lane.run_class - 10u;
+    ulong multiplier = 31ul + ulong(class_index) * 2ul;
+    ulong addend = 7ul + ulong(class_index);
+    for (uint i = 0u; i < work_iters; ++i) value = value * multiplier + addend;
+    store_u64_le(output_frames, at, value);
+    result.status = 1u;
+    result.step_kind = 1u;
+    result.consumed_steps = 1u;
+    results[gid] = result;
+}
 "#;
 
 pub struct MetalDeviceScheduler {
@@ -294,6 +365,7 @@ pub struct MetalDeviceScheduler {
     placement: ComputePipelineState,
     journal_validation: ComputePipelineState,
     operation_validation: ComputePipelineState,
+    evaluator: ComputePipelineState,
     resident: Option<(Buffer, Buffer, Buffer, usize)>,
     journal_resident: Option<(Buffer, Buffer, usize, usize)>,
     operation_resident: Option<(Buffer, Buffer, Buffer, usize, usize)>,
@@ -327,6 +399,9 @@ impl MetalDeviceScheduler {
         let operation_validation_fn = library
             .get_function("soma_device_validate_operations", None)
             .map_err(|_| BackendError::ExecutionFailed)?;
+        let evaluator_fn = library
+            .get_function("soma_device_evaluate_search_leaf", None)
+            .map_err(|_| BackendError::ExecutionFailed)?;
         let admission = device
             .new_compute_pipeline_state_with_function(&admission_fn)
             .map_err(|_| BackendError::ExecutionFailed)?;
@@ -348,6 +423,9 @@ impl MetalDeviceScheduler {
         let operation_validation = device
             .new_compute_pipeline_state_with_function(&operation_validation_fn)
             .map_err(|_| BackendError::ExecutionFailed)?;
+        let evaluator = device
+            .new_compute_pipeline_state_with_function(&evaluator_fn)
+            .map_err(|_| BackendError::ExecutionFailed)?;
         Ok(Self {
             device,
             queue,
@@ -358,6 +436,7 @@ impl MetalDeviceScheduler {
             placement,
             journal_validation,
             operation_validation,
+            evaluator,
             resident: None,
             journal_resident: None,
             operation_resident: None,
@@ -851,6 +930,95 @@ impl LaneConflictValidator for MetalDeviceScheduler {
             .map_err(lane_validation_error)?;
         self.validate_lane_journals(accesses, lane_count)
             .map_err(lane_validation_error)
+    }
+}
+
+impl DeviceEpochBackend for MetalDeviceScheduler {
+    fn evaluate_lanes(
+        &mut self,
+        lanes: &[DeviceEvaluatorLane],
+        frames: &[u8],
+    ) -> Result<DeviceEvaluation, LaneValidationError> {
+        if lanes.is_empty() {
+            return Ok(DeviceEvaluation::default());
+        }
+        if lanes.len() > u32::MAX as usize || frames.len() > u32::MAX as usize {
+            return Err(LaneValidationError::InvalidInput);
+        }
+        let lane_count = lanes.len() as u32;
+        let frame_bytes = frames.len() as u32;
+        let lane_buffer = self.device.new_buffer(
+            std::mem::size_of_val(lanes) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let input_buffer = self.device.new_buffer(
+            frames.len().max(1) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let result_buffer = self.device.new_buffer(
+            (lanes.len() * std::mem::size_of::<DeviceEvaluatorResult>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let output_buffer = self.device.new_buffer(
+            frames.len().max(1) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                lanes.as_ptr().cast::<u8>(),
+                lane_buffer.contents().cast::<u8>(),
+                std::mem::size_of_val(lanes),
+            );
+            if !frames.is_empty() {
+                std::ptr::copy_nonoverlapping(
+                    frames.as_ptr(),
+                    input_buffer.contents().cast::<u8>(),
+                    frames.len(),
+                );
+            }
+        }
+        let command = self.queue.new_command_buffer();
+        let encoder = command.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.evaluator);
+        encoder.set_buffer(0, Some(&lane_buffer), 0);
+        encoder.set_buffer(1, Some(&input_buffer), 0);
+        encoder.set_buffer(2, Some(&result_buffer), 0);
+        encoder.set_buffer(3, Some(&output_buffer), 0);
+        encoder.set_bytes(
+            4,
+            std::mem::size_of::<u32>() as u64,
+            (&lane_count as *const u32).cast::<c_void>(),
+        );
+        encoder.set_bytes(
+            5,
+            std::mem::size_of::<u32>() as u64,
+            (&frame_bytes as *const u32).cast::<c_void>(),
+        );
+        dispatch(encoder, &self.evaluator, lane_count);
+        encoder.end_encoding();
+        command.commit();
+        command.wait_until_completed();
+        if command.status() != MTLCommandBufferStatus::Completed {
+            return Err(LaneValidationError::ExecutionFailed);
+        }
+        let results = unsafe {
+            std::slice::from_raw_parts(
+                result_buffer.contents().cast::<DeviceEvaluatorResult>(),
+                lanes.len(),
+            )
+        }
+        .to_vec();
+        if results.iter().any(|result| result.status != 1) {
+            return Err(LaneValidationError::InvalidInput);
+        }
+        let output = unsafe {
+            std::slice::from_raw_parts(output_buffer.contents().cast::<u8>(), frames.len())
+        }
+        .to_vec();
+        Ok(DeviceEvaluation {
+            results,
+            frames: output,
+        })
     }
 }
 

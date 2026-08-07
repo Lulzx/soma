@@ -29,6 +29,57 @@ pub enum LaneValidationError {
     ExecutionFailed,
 }
 
+/// Pointer-free input for one continuation evaluator lane. Variable frame
+/// bytes live in the epoch arena named by `frame_offset`/`frame_len`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeviceEvaluatorLane {
+    pub continuation: u64,
+    pub process: u64,
+    pub frame: u64,
+    pub lane: u32,
+    pub run_class: u32,
+    pub frame_offset: u32,
+    pub frame_len: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<DeviceEvaluatorLane>() == 40);
+
+/// Pointer-free result of one evaluator lane. The returned frame is a slice
+/// of `DeviceEvaluation::frames`; step fields mirror `StepResult` exactly.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeviceEvaluatorResult {
+    pub target: u64,
+    pub value: u64,
+    pub lane: u32,
+    pub status: u32,
+    pub step_kind: u32,
+    pub next_run_class: u32,
+    pub consumed_steps: u32,
+    pub flags: u32,
+    pub frame_offset: u32,
+    pub frame_len: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<DeviceEvaluatorResult>() == 48);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeviceEvaluation {
+    pub results: Vec<DeviceEvaluatorResult>,
+    pub frames: Vec<u8>,
+}
+
+/// An epoch backend may decline a body without changing semantic state. The
+/// kernel then runs the same lanes through the reference evaluator.
+pub trait DeviceEpochBackend: LaneConflictValidator {
+    fn evaluate_lanes(
+        &mut self,
+        lanes: &[DeviceEvaluatorLane],
+        frames: &[u8],
+    ) -> Result<DeviceEvaluation, LaneValidationError>;
+}
+
 /// Pluggable validator used at the speculative epoch's pre-commit boundary.
 pub trait LaneConflictValidator {
     fn validate_lane_journals(
