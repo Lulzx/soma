@@ -427,9 +427,16 @@ impl Kernel {
         let remote_program = self.remote_lane_programs.get(&run_class).cloned();
         let remote_completed = self.remote_lane_completed.remove(&cont.key());
         let remote_failed = self.remote_lane_failed.remove(&cont.key());
+        let result_frame_valid = remote_program.as_ref().is_none_or(|program| {
+            self.remote_lane_result_frame_len(cont)
+                .ok()
+                .is_some_and(|len| program.validate_result_frame_len(len).is_ok())
+        });
         let mut remote_instantiated = if let Some(program) = remote_program.as_ref() {
             if remote_completed || remote_failed {
                 Ok(None)
+            } else if !result_frame_valid {
+                Err(crate::distributed::remote_lane_effect::RemoteLaneError::InvalidProgram)
             } else {
                 program
                     .instantiate(self.epoch, self.current_lane, process, |target, send| {
@@ -528,12 +535,18 @@ impl Kernel {
             }
         };
         if let Ok(Some(batch)) = remote_instantiated {
+            let read_destinations = remote_program
+                .as_ref()
+                .expect("an instantiated remote program exists")
+                .result_destinations(&batch)
+                .expect("validated program and instantiated batch have identical shapes");
             self.remote_lane_emissions.push(
                 crate::distributed::remote_lane_effect::KernelRemoteLaneEmission {
                     continuation: cont,
                     process,
                     run_class,
                     batch,
+                    read_destinations,
                 },
             );
         }

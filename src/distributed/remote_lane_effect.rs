@@ -779,6 +779,8 @@ impl RemoteLaneProgram {
 
         let mut blocking = 0usize;
         let mut payload_cursor = 0usize;
+        let mut result_bytes = 0usize;
+        let mut result_ranges = Vec::new();
         let mut route: Option<(NodeId, NodeId, Ref64)> = None;
         for i in &instructions {
             if i.reserved != 0 {
@@ -846,9 +848,38 @@ impl RemoteLaneProgram {
                     }
                     Rights::RECEIVE
                 }
-                // Reads need an explicit result-frame destination contract.  Do
-                // not pretend that a verified byte result can currently be used.
-                PROGRAM_OBJECT_READ => return Err(RemoteLaneError::InvalidProgram),
+                PROGRAM_OBJECT_READ => {
+                    if i.argument1 == 0
+                        || u32::try_from(i.argument1).is_err()
+                        || i.payload_offset != 0
+                        || i.payload_len != 0
+                    {
+                        return Err(RemoteLaneError::InvalidProgram);
+                    }
+                    let start =
+                        usize::try_from(i.value).map_err(|_| RemoteLaneError::InvalidProgram)?;
+                    let stored = 8usize
+                        .checked_add(i.argument1 as usize)
+                        .ok_or(RemoteLaneError::InvalidProgram)?;
+                    let end = start
+                        .checked_add(stored)
+                        .ok_or(RemoteLaneError::InvalidProgram)?;
+                    if end > MAX_REMOTE_LANE_PROGRAM_FRAME_BYTES
+                        || result_ranges.iter().any(|(other_start, other_end)| {
+                            start < *other_end && *other_start < end
+                        })
+                    {
+                        return Err(RemoteLaneError::InvalidProgram);
+                    }
+                    result_bytes = result_bytes
+                        .checked_add(stored)
+                        .ok_or(RemoteLaneError::InvalidProgram)?;
+                    if result_bytes > MAX_REMOTE_LANE_PROGRAM_PAYLOAD {
+                        return Err(RemoteLaneError::InvalidProgram);
+                    }
+                    result_ranges.push((start, end));
+                    Rights::READ
+                }
                 PROGRAM_OBJECT_WRITE => {
                     if i.value != 0 || i.payload_offset as usize != payload_cursor {
                         return Err(RemoteLaneError::InvalidProgram);
@@ -878,6 +909,52 @@ impl RemoteLaneProgram {
     pub fn instructions(&self) -> &[RemoteLaneInstruction] {
         &self.instructions
     }
+    pub(crate) fn validate_result_frame_len(
+        &self,
+        frame_len: usize,
+    ) -> Result<(), RemoteLaneError> {
+        for instruction in &self.instructions {
+            if instruction.opcode != PROGRAM_OBJECT_READ {
+                continue;
+            }
+            let start =
+                usize::try_from(instruction.value).map_err(|_| RemoteLaneError::InvalidProgram)?;
+            let length = usize::try_from(instruction.argument1)
+                .map_err(|_| RemoteLaneError::InvalidProgram)?;
+            if start
+                .checked_add(8)
+                .and_then(|end| end.checked_add(length))
+                .is_none_or(|end| end > frame_len)
+            {
+                return Err(RemoteLaneError::InvalidProgram);
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn result_destinations(
+        &self,
+        batch: &RemoteLaneEffectBatch,
+    ) -> Result<Vec<KernelRemoteLaneReadDestination>, RemoteLaneError> {
+        if batch.effects.len() != self.instructions.len() {
+            return Err(RemoteLaneError::InvalidProgram);
+        }
+        let mut destinations = Vec::new();
+        for (instruction, effect) in self.instructions.iter().zip(&batch.effects) {
+            if instruction.opcode != PROGRAM_OBJECT_READ {
+                continue;
+            }
+            let RemoteLaneOperation::ObjectRead { length, .. } = &effect.operation else {
+                return Err(RemoteLaneError::InvalidProgram);
+            };
+            destinations.push(KernelRemoteLaneReadDestination {
+                request_id: effect.request_id,
+                offset: instruction.value,
+                length: *length,
+            });
+        }
+        Ok(destinations)
+    }
+
     pub(crate) fn instantiate<F>(
         &self,
         epoch: u32,
@@ -934,12 +1011,22 @@ impl RemoteLaneProgram {
         Ok(api.finish())
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KernelRemoteLaneReadDestination {
+    pub request_id: RemoteLaneRequestId,
+    /// Start of the result record in the continuation's private frame. The
+    /// record is the owner version as eight little-endian bytes followed by the
+    /// exact object bytes.
+    pub offset: u64,
+    pub length: u32,
+}
 #[derive(Clone, Debug)]
 pub struct KernelRemoteLaneEmission {
     pub continuation: Ref64,
     pub process: Ref64,
     pub run_class: u32,
     pub batch: RemoteLaneEffectBatch,
+    pub(crate) read_destinations: Vec<KernelRemoteLaneReadDestination>,
 }
 
 use super::remote_channel::{

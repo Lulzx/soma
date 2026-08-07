@@ -140,6 +140,7 @@ enum RemoteLaneOperationKind {
     FutureResolve,
     ChannelSend,
     ChannelReceive,
+    ObjectRead,
     ObjectWrite,
 }
 impl RemoteLaneOperationKind {
@@ -149,6 +150,7 @@ impl RemoteLaneOperationKind {
             RemoteLaneOperation::FutureResolve { .. } => Some(Self::FutureResolve),
             RemoteLaneOperation::ChannelSend { .. } => Some(Self::ChannelSend),
             RemoteLaneOperation::ChannelReceive { .. } => Some(Self::ChannelReceive),
+            RemoteLaneOperation::ObjectRead { .. } => Some(Self::ObjectRead),
             RemoteLaneOperation::ObjectWrite { .. } => Some(Self::ObjectWrite),
             _ => None,
         }
@@ -165,6 +167,8 @@ struct RemoteLaneExpectedOutcome {
     request_id: RemoteLaneRequestId,
     target: RemoteRef,
     kind: RemoteLaneOperationKind,
+    /// For object reads only: private-frame destination and exact byte count.
+    read_destination: Option<(u64, u32)>,
 }
 #[derive(Clone)]
 struct RemoteLaneWaitReceipt {
@@ -178,30 +182,25 @@ struct RemoteLaneWaitReceipt {
 }
 
 fn valid_remote_lane_shape(
-    kind: RemoteLaneOperationKind,
+    expected: &RemoteLaneExpectedOutcome,
     result: &Result<RemoteLaneApply, RemoteLaneError>,
 ) -> bool {
     match result {
-        Err(_) | Ok(RemoteLaneApply::WouldBlock) => true,
-        Ok(RemoteLaneApply::Applied(value)) => matches!(
-            (kind, value),
-            (
-                RemoteLaneOperationKind::FutureAwait,
-                RemoteLaneValue::Ref(_)
-            ) | (
-                RemoteLaneOperationKind::FutureResolve,
-                RemoteLaneValue::Unit
-            ) | (
-                RemoteLaneOperationKind::ChannelReceive,
-                RemoteLaneValue::Ref(_)
-            ) | (RemoteLaneOperationKind::ChannelSend, RemoteLaneValue::Unit)
-                | (
-                    RemoteLaneOperationKind::ObjectWrite,
-                    RemoteLaneValue::Version { .. }
-                )
-        ),
+        Err(_) => true,
+        Ok(RemoteLaneApply::WouldBlock) => expected.kind.is_blocking(),
+        Ok(RemoteLaneApply::Applied(value)) => match (expected.kind, value) {
+            (RemoteLaneOperationKind::FutureAwait, RemoteLaneValue::Ref(_))
+            | (RemoteLaneOperationKind::FutureResolve, RemoteLaneValue::Unit)
+            | (RemoteLaneOperationKind::ChannelReceive, RemoteLaneValue::Ref(_))
+            | (RemoteLaneOperationKind::ChannelSend, RemoteLaneValue::Unit)
+            | (RemoteLaneOperationKind::ObjectWrite, RemoteLaneValue::Version { .. }) => true,
+            (RemoteLaneOperationKind::ObjectRead, RemoteLaneValue::Bytes { bytes, .. }) => expected
+                .read_destination
+                .is_some_and(|(_, length)| bytes.len() == length as usize),
+            _ => false,
+        },
         Ok(RemoteLaneApply::Closed) => matches!(
-            kind,
+            expected.kind,
             RemoteLaneOperationKind::ChannelSend | RemoteLaneOperationKind::ChannelReceive
         ),
         Ok(RemoteLaneApply::Lost) => true,
@@ -377,7 +376,7 @@ impl RemoteNodeRuntime {
                 ))?;
             if receipt.session_binding != Some(session_binding)
                 || outcome.target != expected.target
-                || !valid_remote_lane_shape(expected.kind, &outcome.result)
+                || !valid_remote_lane_shape(expected, &outcome.result)
             {
                 return Err(RemoteNodeRuntimeError::Lane(
                     RemoteLaneError::InvalidEnvelope,
@@ -438,6 +437,31 @@ impl RemoteNodeRuntime {
                 .iter()
                 .all(|outcome| matches!(outcome.result, Ok(RemoteLaneApply::Applied(_))));
             if success {
+                for (expected, outcome) in receipt.expected.iter().zip(&group_outcomes) {
+                    let Some((offset, length)) = expected.read_destination else {
+                        continue;
+                    };
+                    let Ok(RemoteLaneApply::Applied(RemoteLaneValue::Bytes { version, bytes })) =
+                        &outcome.result
+                    else {
+                        return Err(RemoteNodeRuntimeError::Lane(
+                            RemoteLaneError::InvalidEnvelope,
+                        ));
+                    };
+                    if bytes.len() != length as usize {
+                        return Err(RemoteNodeRuntimeError::Lane(
+                            RemoteLaneError::InvalidEnvelope,
+                        ));
+                    }
+                    kernel
+                        .publish_remote_lane_read_result(
+                            receipt.continuation,
+                            offset,
+                            *version,
+                            bytes,
+                        )
+                        .map_err(RemoteNodeRuntimeError::Kernel)?;
+                }
                 kernel
                     .complete_remote_lane_program(receipt.continuation)
                     .map_err(RemoteNodeRuntimeError::Kernel)?;
@@ -1002,6 +1026,20 @@ impl RemoteNodeRuntime {
             let mut expected = Vec::with_capacity(emission.batch.effects().len());
             let mut blocking = Vec::new();
             let mut owner = None;
+            let mut read_destinations = std::collections::HashMap::new();
+            for destination in &emission.read_destinations {
+                if read_destinations
+                    .insert(
+                        destination.request_id,
+                        (destination.offset, destination.length),
+                    )
+                    .is_some()
+                {
+                    return Err(RemoteNodeRuntimeError::Lane(
+                        RemoteLaneError::InvalidProgram,
+                    ));
+                }
+            }
             for effect in emission.batch.effects() {
                 let kind = RemoteLaneOperationKind::from_operation(&effect.operation).ok_or(
                     RemoteNodeRuntimeError::Lane(RemoteLaneError::InvalidProgram),
@@ -1018,13 +1056,20 @@ impl RemoteNodeRuntime {
                 if kind.is_blocking() {
                     blocking.push((effect.request_id, effect.target, kind));
                 }
+                let read_destination = read_destinations.remove(&effect.request_id);
+                if (kind == RemoteLaneOperationKind::ObjectRead) != read_destination.is_some() {
+                    return Err(RemoteNodeRuntimeError::Lane(
+                        RemoteLaneError::InvalidProgram,
+                    ));
+                }
                 expected.push(RemoteLaneExpectedOutcome {
                     request_id: effect.request_id,
                     target: effect.target,
                     kind,
+                    read_destination,
                 });
             }
-            if blocking.len() != 1 || expected.is_empty() {
+            if blocking.len() != 1 || expected.is_empty() || !read_destinations.is_empty() {
                 return Err(RemoteNodeRuntimeError::Lane(
                     RemoteLaneError::InvalidProgram,
                 ));
@@ -1234,24 +1279,46 @@ impl RemoteNodeRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::{valid_remote_lane_shape, RemoteLaneOperationKind};
-    use crate::distributed::remote_lane_effect::{RemoteLaneApply, RemoteLaneValue};
+    use super::{valid_remote_lane_shape, RemoteLaneExpectedOutcome, RemoteLaneOperationKind};
+    use crate::abi::{Kind, Ref64};
+    use crate::distributed::remote_lane_effect::{
+        RemoteLaneApply, RemoteLaneRequestId, RemoteLaneValue,
+    };
+    use crate::distributed::{NodeId, RemoteRef};
+
+    fn shape(
+        kind: RemoteLaneOperationKind,
+        result: &Result<RemoteLaneApply, crate::distributed::remote_lane_effect::RemoteLaneError>,
+    ) -> bool {
+        valid_remote_lane_shape(
+            &RemoteLaneExpectedOutcome {
+                request_id: RemoteLaneRequestId([0; 32]),
+                target: RemoteRef {
+                    node: NodeId(1),
+                    entity: Ref64::new(1, 1, Kind::Object),
+                },
+                kind,
+                read_destination: None,
+            },
+            result,
+        )
+    }
 
     #[test]
     fn verified_terminal_shapes_accept_lost_but_not_future_closed() {
-        assert!(valid_remote_lane_shape(
+        assert!(shape(
             RemoteLaneOperationKind::FutureAwait,
             &Ok(RemoteLaneApply::Lost),
         ));
-        assert!(!valid_remote_lane_shape(
+        assert!(!shape(
             RemoteLaneOperationKind::FutureAwait,
             &Ok(RemoteLaneApply::Closed),
         ));
-        assert!(valid_remote_lane_shape(
+        assert!(shape(
             RemoteLaneOperationKind::ChannelReceive,
             &Ok(RemoteLaneApply::Closed),
         ));
-        assert!(!valid_remote_lane_shape(
+        assert!(!shape(
             RemoteLaneOperationKind::FutureAwait,
             &Ok(RemoteLaneApply::Applied(RemoteLaneValue::Unit)),
         ));
@@ -1294,11 +1361,13 @@ mod tests {
                 request_id: wait_id,
                 target: future,
                 kind: RemoteLaneOperationKind::FutureAwait,
+                read_destination: None,
             },
             super::RemoteLaneExpectedOutcome {
                 request_id: write_id,
                 target: object,
                 kind: RemoteLaneOperationKind::ObjectWrite,
+                read_destination: None,
             },
         ];
         let receipt = super::RemoteLaneWaitReceipt {
@@ -1354,6 +1423,109 @@ mod tests {
         assert_eq!(
             runtime.kernel.continuation_state(continuation).unwrap(),
             crate::abi::ContinuationState::Waiting
+        );
+    }
+
+    #[test]
+    fn object_read_length_refusal_preserves_frame_and_group_atomically() {
+        use crate::abi::{ContinuationState, ProcessMode, StateAccess};
+        use crate::distributed::remote_lane_effect::{RemoteLaneError, RemoteLaneOutcome};
+        use crate::kernel::{ContinuationSpec, Kernel, SYSTEM_PRINCIPAL};
+
+        let worker = NodeId(910);
+        let owner = NodeId(911);
+        let mut kernel = Kernel::new();
+        let actor = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+        let continuation = kernel
+            .create_continuation(
+                actor,
+                actor,
+                ContinuationSpec::new(StateAccess::ReadOnly, 9101, 9101, vec![0xaa; 32], 2),
+            )
+            .unwrap();
+        let future = RemoteRef {
+            node: owner,
+            entity: Ref64::new(1, 1, Kind::Future),
+        };
+        let object = RemoteRef {
+            node: owner,
+            entity: Ref64::new(2, 1, Kind::Object),
+        };
+        kernel
+            .register_remote_future_waiter(continuation, owner.0, future.entity, 9101)
+            .unwrap();
+        let wait_id = RemoteLaneRequestId([1; 32]);
+        let read_id = RemoteLaneRequestId([2; 32]);
+        let binding = ([5; 16], worker, owner);
+        let expected = vec![
+            RemoteLaneExpectedOutcome {
+                request_id: wait_id,
+                target: future,
+                kind: RemoteLaneOperationKind::FutureAwait,
+                read_destination: None,
+            },
+            RemoteLaneExpectedOutcome {
+                request_id: read_id,
+                target: object,
+                kind: RemoteLaneOperationKind::ObjectRead,
+                read_destination: Some((4, 4)),
+            },
+        ];
+        let receipt = super::RemoteLaneWaitReceipt {
+            continuation,
+            blocking_target: future,
+            blocking_kind: RemoteLaneOperationKind::FutureAwait,
+            group_id: wait_id,
+            expected,
+            session_binding: Some(binding),
+        };
+        let mut runtime = super::RemoteNodeRuntime::new(worker, kernel);
+        runtime.remote_lane_waiters.insert(wait_id, receipt.clone());
+        runtime.remote_lane_waiters.insert(read_id, receipt);
+        let outcomes = |bytes: Vec<u8>| {
+            vec![
+                RemoteLaneOutcome {
+                    request_id: wait_id,
+                    target: future,
+                    result: Ok(RemoteLaneApply::Applied(RemoteLaneValue::Ref(object))),
+                },
+                RemoteLaneOutcome {
+                    request_id: read_id,
+                    target: object,
+                    result: Ok(RemoteLaneApply::Applied(RemoteLaneValue::Bytes {
+                        version: 7,
+                        bytes,
+                    })),
+                },
+            ]
+        };
+        assert_eq!(
+            runtime.apply_remote_lane_outcomes(&outcomes(vec![1, 2, 3]), binding),
+            Err(super::RemoteNodeRuntimeError::Lane(
+                RemoteLaneError::InvalidEnvelope
+            ))
+        );
+        let frame = runtime.kernel.continuation_frame(continuation).unwrap();
+        assert_eq!(
+            runtime.kernel.object_bytes(actor, frame).unwrap(),
+            &[0xaa; 32]
+        );
+        assert_eq!(runtime.remote_lane_waiters.len(), 2);
+        assert_eq!(
+            runtime.kernel.continuation_state(continuation),
+            Ok(ContinuationState::Waiting)
+        );
+
+        runtime
+            .apply_remote_lane_outcomes(&outcomes(vec![1, 2, 3, 4]), binding)
+            .unwrap();
+        let bytes = runtime.kernel.object_bytes(actor, frame).unwrap();
+        assert_eq!(&bytes[4..12], &7u64.to_le_bytes());
+        assert_eq!(&bytes[12..16], &[1, 2, 3, 4]);
+        assert_eq!(runtime.remote_lane_waiters.len(), 0);
+        assert_eq!(
+            runtime.kernel.continuation_state(continuation),
+            Ok(ContinuationState::Runnable)
         );
     }
 }

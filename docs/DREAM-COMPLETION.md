@@ -80,13 +80,16 @@ operations with exact grant rebinding, issuer-qualified actors, canonical
 apply-once positions, late/collision rejection, and preserved transport error
 classes. A deliberately narrower validated Kernel dispatch can emit one
 blocking future-await, channel-send, or channel-receive together with bounded
-object writes or future resolves as one exact emission, park in private
+object reads/writes or future resolves as one exact emission, park in private
 node-qualified state, and retry exact retained work across two real runtimes/TCP.
-The whole result vector is one transactional/session-bound receipt group; any
-retryable member retains the complete waiter and outbox, while only an
-all-terminal vector completes or faults. Object reads and arbitrary mixtures
-remain unsupported, so this is special dispatch, not general `LaneView`. Its
-bounded multiplexed response transport now authenticates configured peers and binds
+Object reads bind nonempty, bounded, nonoverlapping continuation-frame result
+records before emission; an authenticated success atomically publishes the
+owner version as eight little-endian bytes followed by the exact requested
+bytes. The whole result vector is one transactional/session-bound receipt group;
+any retryable member retains the complete waiter and outbox, while only an
+all-terminal vector publishes every read and completes, or faults without any
+frame publication. Arbitrary mixtures remain unsupported, so this is special
+dispatch, not general `LaneView`. Its bounded multiplexed response transport now authenticates configured peers and binds
 ordered outcomes to the exact session, issuer, owner, nonce, request digest,
 boundary, and response ordinal before any Kernel wake or fault. Atomic
 multi-frame staging, boundary-first refusal, exact temporary retry, mixed live
@@ -100,9 +103,9 @@ ledgers. Owner-side process templates provide content-bound create/restart
 receipts, terminal lifecycle observation, bounded snapshot/WAL apply-once
 durability, and exact terminal recovery. Signed bounded lifecycle requests now
 cross TCP between two real runtimes, but responses are not mutually
-authenticated and live-state recovery remains explicitly refused. General remote `LaneView`, direct canonical remote park, object-read/result-frame
-publication, arbitrary or multiple-blocking Kernel mixtures, persisted lane
-replay state, and durable live process recovery remain gates.
+authenticated and live-state recovery remains explicitly refused. General remote `LaneView`, direct canonical remote park, arbitrary or
+multiple-blocking Kernel mixtures, persisted lane replay state, and durable
+live process recovery remain gates.
 
 ## G4 — Bounded programming surface [complete]
 

@@ -608,6 +608,43 @@ impl Kernel {
         std::mem::take(&mut self.remote_lane_emissions)
     }
     #[doc(hidden)]
+    pub(crate) fn remote_lane_result_frame_len(
+        &self,
+        continuation: Ref64,
+    ) -> Result<usize, RuntimeError> {
+        let frame = self.continuations.get(continuation)?.frame;
+        self.object_payloads
+            .get(&frame.key())
+            .map(|payload| payload.as_slice().len())
+            .ok_or(RuntimeError::MissingPayload)
+    }
+    #[doc(hidden)]
+    pub(crate) fn publish_remote_lane_read_result(
+        &mut self,
+        continuation: Ref64,
+        offset: u64,
+        version: u64,
+        bytes: &[u8],
+    ) -> Result<(), RuntimeError> {
+        let frame = self.continuations.get(continuation)?.frame;
+        let start = usize::try_from(offset).map_err(|_| RuntimeError::InvalidModule)?;
+        let bytes_start = start.checked_add(8).ok_or(RuntimeError::InvalidModule)?;
+        let end = bytes_start
+            .checked_add(bytes.len())
+            .ok_or(RuntimeError::InvalidModule)?;
+        let payload = self
+            .object_payloads
+            .get_mut(&frame.key())
+            .ok_or(RuntimeError::MissingPayload)?
+            .as_mut_slice();
+        if end > payload.len() {
+            return Err(RuntimeError::InvalidModule);
+        }
+        payload[start..bytes_start].copy_from_slice(&version.to_le_bytes());
+        payload[bytes_start..end].copy_from_slice(bytes);
+        Ok(())
+    }
+    #[doc(hidden)]
     pub fn fail_remote_lane_program(&mut self, continuation: Ref64) -> Result<(), RuntimeError> {
         let _ = self.continuations.get(continuation)?;
         self.remote_lane_failed.insert(continuation.key());
