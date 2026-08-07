@@ -2,8 +2,8 @@ use soma::abi::cohorts::PartialCohortPolicy;
 use soma::abi::{Kind, Ref64, StateAccess};
 use soma::scheduler::admission::Candidate;
 use soma::scheduler::device::{
-    reference_device_schedule, DEVICE_DEFERRED, DEVICE_POLICY_DEFERRED, DEVICE_RUN,
-    DEVICE_SEND_TO_CPU,
+    reference_device_schedule, reference_resident_search, ResidentSearchConfig, DEVICE_DEFERRED,
+    DEVICE_POLICY_DEFERRED, DEVICE_RUN, DEVICE_SEND_TO_CPU,
 };
 
 fn candidate(
@@ -22,6 +22,26 @@ fn candidate(
         state_access,
         waiting_since,
     }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn dynamic_search_stays_on_device_across_epochs() {
+    use soma::executives::metal_scheduler::MetalResidentSearch;
+
+    let config = ResidentSearchConfig {
+        roots: 7,
+        branching: 3,
+        depth: 4,
+        class_count: 4,
+        work_iters: 17,
+    };
+    let expected = reference_resident_search(config);
+    let actual = MetalResidentSearch::new().unwrap().run(config).unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(actual.nodes, config.node_count().unwrap());
+    assert_eq!(actual.epochs, config.depth + 1);
+    assert_eq!(actual.overflow, 0);
 }
 
 fn workload() -> Vec<Candidate> {

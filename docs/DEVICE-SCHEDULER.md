@@ -48,9 +48,19 @@ benchmarks will measure where that crossover is justified.
 
 ## Remaining integration
 
-This is the device-resident planning phase, not yet the complete persistent
-executive. The next integration carries admitted descriptors through device
-continuation execution, lane-local event/effect journals, and canonical commit
-without returning the plan to host code between those phases. Completion means
-one epoch command graph with no host round trip inside it, followed by I19 and
-trace comparison against the reference run.
+`MetalResidentSearch` is the first end-to-end resident execution path. It keeps
+double-buffered continuation descriptors, frontier counters, completion
+accounting, and result digests in Metal buffers while a single command graph
+runs every level of a dynamic branching search. Reset, concurrent execution,
+child publication, and frontier swap are device phases; the host reads state
+only after the graph completes. A 7-root, three-way, depth-four test executes
+all 847 nodes over five epochs and agrees exactly with the independent CPU
+transition on node count, epoch count, wrapping checksum sum, XOR digest, and
+overflow status.
+
+This is not yet the complete persistent executive. The resident path currently
+executes the bounded search transition, while the full `LaneView` operation
+language still needs device lowering, lane-local event/effect journals, and
+canonical commit. Completion means the general lane program runs through that
+same no-round-trip graph, followed by I19 and trace comparison against the
+reference kernel.

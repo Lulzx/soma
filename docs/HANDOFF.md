@@ -48,8 +48,10 @@ The first device-scheduler hardware slice lives in `scheduler::device` and
 admission, stable run-class placement, and cohort disposition from persistent
 buffers in one command buffer. `tests/device_scheduler.rs` compares every
 placement field with the independent reference lowering. This is the planning
-phase; execution and canonical commit still need to be chained behind it. See
-`docs/DEVICE-SCHEDULER.md`.
+phase. `MetalResidentSearch` additionally runs a dynamic branching workload to
+quiescence across several device-resident epochs in one command graph, with no
+intermediate host read and exact CPU digest agreement. General lane execution
+and canonical commit still need device lowering. See `docs/DEVICE-SCHEDULER.md`.
 
 Read §1 for the project state and §6 for the test discipline before changing
 the code.

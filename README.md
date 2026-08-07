@@ -302,6 +302,9 @@ Implemented now:
   concurrent deterministic admission, run-class bin placement, cohort lanes,
   and all partial-cohort dispositions, checked field-for-field against an
   independent reference schedule
+- A no-round-trip multi-epoch Metal execution graph for dynamic branching
+  search, with device-resident double-buffered continuation frontiers and exact
+  CPU agreement on work, epochs, and two order-independent result digests
 
 Not implemented:
 
@@ -312,9 +315,10 @@ Not implemented:
   cross-lane output reads, and unbounded control flow; see
   [docs/EVALUATOR-LANGUAGE.md](docs/EVALUATOR-LANGUAGE.md)
 - A complete device-resident executive or a distributed backend. Metal now
-  performs admission and cohort placement from resident buffers in one command
-  buffer, but continuation execution, lane journals, and canonical commit are
-  not yet chained behind that plan without a host boundary; see
+  performs admission and cohort placement from resident buffers and runs the
+  bounded dynamic-search transition through several resident epochs, but the
+  complete `LaneView` operation language, lane journals, and canonical commit
+  are not yet lowered to that graph; see
   [docs/DEVICE-SCHEDULER.md](docs/DEVICE-SCHEDULER.md)
 - Scheduler-overhead and end-to-end migration benchmarks. The batch backend
   itself is measured on hardware — CPU against Metal from 32 to 4M elements,

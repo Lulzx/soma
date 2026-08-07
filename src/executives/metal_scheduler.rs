@@ -15,6 +15,7 @@ use metal::{
 use crate::abi::cohorts::PartialCohortPolicy;
 use crate::scheduler::admission::Candidate;
 use crate::scheduler::device::{DeviceCandidate, DevicePlacement, DeviceSchedule};
+use crate::scheduler::device::{ResidentSearchConfig, ResidentSearchResult};
 
 use super::batch::BackendError;
 
@@ -292,4 +293,191 @@ fn dispatch(
             depth: 1,
         },
     );
+}
+
+const RESIDENT_SEARCH_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+struct Node { ulong value; uint depth; uint branching; uint work_iters; uint class_count; };
+struct Config { uint capacity; uint branching; uint work_iters; uint class_count; };
+struct State {
+    atomic_uint current_count; atomic_uint next_count; atomic_uint active_count;
+    atomic_uint nodes; atomic_uint epochs; atomic_uint checksum_sum;
+    atomic_uint checksum_xor; atomic_uint overflow;
+};
+kernel void resident_reset(device State& state [[buffer(0)]], uint gid [[thread_position_in_grid]]) {
+    if (gid != 0u) return;
+    atomic_store_explicit(&state.active_count, atomic_load_explicit(&state.current_count, memory_order_relaxed), memory_order_relaxed);
+    atomic_store_explicit(&state.next_count, 0u, memory_order_relaxed);
+}
+kernel void resident_execute(
+    device const Node* input [[buffer(0)]], device Node* output [[buffer(1)]],
+    device State& state [[buffer(2)]], constant Config& config [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint count = atomic_load_explicit(&state.active_count, memory_order_relaxed);
+    if (gid >= count) return;
+    Node node = input[gid];
+    uint classes = max(node.class_count, 1u);
+    uint cls = uint(node.value % ulong(classes));
+    ulong multiplier = 31ul + ulong(cls) * 2ul;
+    ulong addend = 7ul + ulong(cls);
+    ulong value = node.value;
+    for (uint i = 0u; i < node.work_iters; ++i) value = value * multiplier + addend;
+    uint word = uint(value) ^ uint(value >> 32) ^ (node.depth * 0x9E3779B9u);
+    atomic_fetch_add_explicit(&state.nodes, 1u, memory_order_relaxed);
+    atomic_fetch_add_explicit(&state.checksum_sum, word, memory_order_relaxed);
+    atomic_fetch_xor_explicit(&state.checksum_xor, word, memory_order_relaxed);
+    if (node.depth == 0u || node.branching == 0u) return;
+    uint first = atomic_fetch_add_explicit(&state.next_count, node.branching, memory_order_relaxed);
+    if (first > config.capacity || node.branching > config.capacity - first) {
+        atomic_store_explicit(&state.overflow, 1u, memory_order_relaxed);
+        return;
+    }
+    for (uint child = 0u; child < node.branching; ++child) {
+        Node next = { value + ulong(child), node.depth - 1u, node.branching, node.work_iters, node.class_count };
+        output[first + child] = next;
+    }
+}
+kernel void resident_finish(device State& state [[buffer(0)]], uint gid [[thread_position_in_grid]]) {
+    if (gid != 0u) return;
+    uint active = atomic_load_explicit(&state.active_count, memory_order_relaxed);
+    if (active != 0u) atomic_fetch_add_explicit(&state.epochs, 1u, memory_order_relaxed);
+    atomic_store_explicit(&state.current_count, atomic_load_explicit(&state.next_count, memory_order_relaxed), memory_order_relaxed);
+}
+"#;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ResidentNode {
+    value: u64,
+    depth: u32,
+    branching: u32,
+    work_iters: u32,
+    class_count: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ResidentConfig {
+    capacity: u32,
+    branching: u32,
+    work_iters: u32,
+    class_count: u32,
+}
+
+/// A bounded multi-epoch command graph whose scheduler state never returns to
+/// the host between epochs.
+pub struct MetalResidentSearch {
+    device: Device,
+    queue: CommandQueue,
+    reset: ComputePipelineState,
+    execute: ComputePipelineState,
+    finish: ComputePipelineState,
+}
+
+impl MetalResidentSearch {
+    pub fn new() -> Result<Self, BackendError> {
+        let device = Device::system_default().ok_or(BackendError::Unavailable)?;
+        let library = device
+            .new_library_with_source(RESIDENT_SEARCH_SOURCE, &CompileOptions::new())
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let pipeline = |name| -> Result<ComputePipelineState, BackendError> {
+            let function = library
+                .get_function(name, None)
+                .map_err(|_| BackendError::ExecutionFailed)?;
+            device
+                .new_compute_pipeline_state_with_function(&function)
+                .map_err(|_| BackendError::ExecutionFailed)
+        };
+        Ok(Self {
+            queue: device.new_command_queue(),
+            reset: pipeline("resident_reset")?,
+            execute: pipeline("resident_execute")?,
+            finish: pipeline("resident_finish")?,
+            device,
+        })
+    }
+
+    pub fn run(
+        &mut self,
+        config: ResidentSearchConfig,
+    ) -> Result<ResidentSearchResult, BackendError> {
+        let capacity = config
+            .node_count()
+            .ok_or(BackendError::InvalidInput)?
+            .max(config.roots)
+            .max(1);
+        let bytes = u64::from(capacity) * std::mem::size_of::<ResidentNode>() as u64;
+        let buffers = [
+            self.device
+                .new_buffer(bytes, MTLResourceOptions::StorageModeShared),
+            self.device
+                .new_buffer(bytes, MTLResourceOptions::StorageModeShared),
+        ];
+        let state = self
+            .device
+            .new_buffer(8 * 4, MTLResourceOptions::StorageModeShared);
+        unsafe { std::ptr::write_bytes(state.contents(), 0, 8 * 4) };
+        unsafe {
+            let words = std::slice::from_raw_parts_mut(state.contents().cast::<u32>(), 8);
+            words[0] = config.roots;
+            let roots = std::slice::from_raw_parts_mut(
+                buffers[0].contents().cast::<ResidentNode>(),
+                config.roots as usize,
+            );
+            for (root, node) in roots.iter_mut().enumerate() {
+                *node = ResidentNode {
+                    value: root as u64 + 1,
+                    depth: config.depth,
+                    branching: config.branching,
+                    work_iters: config.work_iters,
+                    class_count: config.class_count,
+                };
+            }
+        }
+        let constants = ResidentConfig {
+            capacity,
+            branching: config.branching,
+            work_iters: config.work_iters,
+            class_count: config.class_count,
+        };
+        let command = self.queue.new_command_buffer();
+        for epoch in 0..=config.depth {
+            let reset = command.new_compute_command_encoder();
+            reset.set_compute_pipeline_state(&self.reset);
+            reset.set_buffer(0, Some(&state), 0);
+            dispatch(reset, &self.reset, 1);
+            reset.end_encoding();
+            let execute = command.new_compute_command_encoder();
+            execute.set_compute_pipeline_state(&self.execute);
+            execute.set_buffer(0, Some(&buffers[(epoch & 1) as usize]), 0);
+            execute.set_buffer(1, Some(&buffers[((epoch + 1) & 1) as usize]), 0);
+            execute.set_buffer(2, Some(&state), 0);
+            execute.set_bytes(
+                3,
+                std::mem::size_of::<ResidentConfig>() as u64,
+                (&constants as *const ResidentConfig).cast(),
+            );
+            dispatch(execute, &self.execute, capacity);
+            execute.end_encoding();
+            let finish = command.new_compute_command_encoder();
+            finish.set_compute_pipeline_state(&self.finish);
+            finish.set_buffer(0, Some(&state), 0);
+            dispatch(finish, &self.finish, 1);
+            finish.end_encoding();
+        }
+        command.commit();
+        command.wait_until_completed();
+        if command.status() != MTLCommandBufferStatus::Completed {
+            return Err(BackendError::ExecutionFailed);
+        }
+        let words = unsafe { std::slice::from_raw_parts(state.contents().cast::<u32>(), 8) };
+        Ok(ResidentSearchResult {
+            nodes: words[3],
+            epochs: words[4],
+            checksum_sum: words[5],
+            checksum_xor: words[6],
+            overflow: words[7],
+        })
+    }
 }

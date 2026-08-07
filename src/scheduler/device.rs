@@ -142,3 +142,67 @@ pub fn state_access_code(access: StateAccess) -> u32 {
 pub fn continuation_from_device(value: u64) -> Ref64 {
     Ref64::from_u64(value)
 }
+
+/// Bounded dynamic search used to verify that scheduler state survives several
+/// device epochs without an epoch-by-epoch host decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidentSearchConfig {
+    pub roots: u32,
+    pub branching: u32,
+    pub depth: u32,
+    pub class_count: u32,
+    pub work_iters: u32,
+}
+
+impl ResidentSearchConfig {
+    pub fn node_count(self) -> Option<u32> {
+        let mut total = 0u64;
+        let mut level = u64::from(self.roots);
+        for _ in 0..=self.depth {
+            total = total.checked_add(level)?;
+            level = level.checked_mul(u64::from(self.branching))?;
+        }
+        total.try_into().ok()
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResidentSearchResult {
+    pub nodes: u32,
+    pub epochs: u32,
+    pub checksum_sum: u32,
+    pub checksum_xor: u32,
+    pub overflow: u32,
+}
+
+pub fn reference_resident_search(config: ResidentSearchConfig) -> ResidentSearchResult {
+    let mut current: Vec<(u64, u32)> = (0..config.roots)
+        .map(|root| (u64::from(root) + 1, config.depth))
+        .collect();
+    let mut result = ResidentSearchResult::default();
+    while !current.is_empty() {
+        let mut next = Vec::new();
+        for (value, depth) in current {
+            let class = (value % u64::from(config.class_count.max(1))) as u32;
+            let value = crate::compiler::state_machine_lowering::search_step(
+                value,
+                config.work_iters,
+                class,
+            );
+            let word = value as u32 ^ (value >> 32) as u32 ^ depth.wrapping_mul(0x9E37_79B9);
+            result.nodes = result.nodes.wrapping_add(1);
+            result.checksum_sum = result.checksum_sum.wrapping_add(word);
+            result.checksum_xor ^= word;
+            if depth > 0 {
+                next.extend(
+                    (0..config.branching)
+                        .map(|child| (value.wrapping_add(u64::from(child)), depth - 1)),
+                );
+            }
+        }
+        current = next;
+        result.epochs += 1;
+    }
+    result
+}
