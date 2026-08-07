@@ -133,6 +133,16 @@ impl MetalBatchBackend {
         self.tuning
     }
 
+    /// Change dispatch policy without recompiling the installed evaluators.
+    ///
+    /// Configuration searches use one backend so every candidate sees the
+    /// same compiled pipelines. Scratch allocations deliberately survive a
+    /// switch: reuse-on candidates measure the steady-state warm-buffer path,
+    /// while reuse-off candidates ignore the cache and allocate afresh.
+    pub fn set_tuning(&mut self, tuning: MetalTuning) {
+        self.tuning = tuning;
+    }
+
     /// Input and output buffers of at least `bytes`, allocating only when the
     /// batch is larger than any seen so far.
     fn scratch_for(&mut self, bytes: u64) -> (Buffer, Buffer) {
