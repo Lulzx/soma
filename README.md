@@ -35,8 +35,10 @@ state and replay through the deterministic reference loop. See
 
 Validated evaluator programs can also be installed as user continuation run
 classes. A private frame is one evaluator element; the interpreter, Cranelift
-JIT, and generated Metal code all execute the same typed integer, gather,
-structured-loop, and divergent-break IR. Native and Metal epochs return only
+JIT, and generated Metal code all execute the same typed integer and bounded
+binary32, gather, structured-loop, and divergent-break IR. The initial f32
+slice provides strict add/multiply with canonical NaN and zero results; Metal
+fast math is disabled and backend tests compare special values byte-for-byte. Native and Metal epochs return only
 pointer-free results and frame arenas, then pass through the ordinary operation
 journal validation, dry replay, and canonical commit. A backend may decline a
 body or mixed batch without changing state, in which case the reference path
@@ -124,8 +126,19 @@ took two things: `gather`/`index`, so a body can read an element other than its
 own, and a second array binding, so it can name an array other than the one it
 is iterating. `ant_sense_and_score` does the eight reads and the choice in one
 dispatch, checked against an independent host-side reference as well as against
-the CPU interpreter. The colony run itself still senses on the host; wiring the
-collective into the ant step is an executive change and is not made.
+the CPU interpreter. The epoch sensing executive now feeds those choices into
+the durable ant frames before the ordinary colony step, with an epoch stamp so
+stale scores cannot be consumed. `ant_step` treats a supplied score as
+authoritative rather than silently recomputing the argmax on the host. The
+end-to-end control runs the whole colony with the independent host reference and
+with the collective backend and requires identical ants, delivered food, trail
+fields, and step counts; Metal runs the same control when available.
+
+```sh
+cargo run --release --example ant_collective_report
+cargo test --test ant_collective
+cargo test --features metal --test ant_collective  # macOS / Apple GPU
+```
 
 Read [docs/SOMA-v0.2.md](docs/SOMA-v0.2.md) for the current machine. The older
 [Phase-1 contract](docs/SOMA-P1.md) records the broader GPU-oriented design that
@@ -291,6 +304,10 @@ Implemented now:
 - A named-value evaluator source language with declarations, immutable values,
   mutable loop locals, structured counted loops, source-line diagnostics, and
   lowering to the validated evaluator IR
+- Bounded reusable evaluator functions expanded into validated SSA with
+  recursion/arity/step-bound diagnostics, plus typed canonical `f32`
+  add/multiply whose NaN/zero/subnormal semantics agree byte-for-byte across
+  reference, Cranelift, and real Metal
 - Gathering bodies: `index` names an element's own position and `gather` reads
   any element of the frozen input array, so stencils and permutations lower to
   both backends. Reads are confined to the frozen input, never the output, so a
@@ -326,6 +343,11 @@ Implemented now:
   apply-once response ledger, revocation-before-replay ordering, remote
   placement accounting, ordered epoch multiplexing, and distinct
   unavailable/lost/protocol failures
+- Authoritative remote future and bounded-channel services whose canonical
+  state lives on the node named by `RemoteRef`, with operation-specific grants,
+  apply-once mutation, stale-safe epoch-boundary waiter bridges, FIFO and
+  back-pressure semantics, revocation-before-replay, no local shadow resource,
+  and distinct transport/protocol/authority failures
 - Explicit process node ownership and epoch-boundary node-loss containment,
   with system-only idempotent declaration, rejected placement on lost nodes,
   `ProcessLost` traces, and distinct remote-supervisor notices
@@ -335,28 +357,37 @@ Implemented now:
 
 Not implemented:
 
-- Evaluator calls and floating point. The general-purpose evaluator compiler
-  now covers arbitrary programs within SOMA's pure, total, element-wise
-  contract and lowers named source to reference, native CPU, and Metal
-  execution. Its intentional semantic boundary excludes allocation, I/O,
+- The complete evaluator numeric surface. Bounded reusable calls are expanded
+  and validated at compile time, and typed canonical `f32` add/multiply run
+  byte-identically through reference, native CPU, and Metal. Float
+  subtraction/division/comparison/select and typed float locals remain. The
+  intentional pure, total evaluator boundary still excludes allocation, I/O,
   cross-lane output reads, and unbounded control flow; see
-  [docs/EVALUATOR-LANGUAGE.md](docs/EVALUATOR-LANGUAGE.md)
-- A complete device-resident executive or a distributed backend. Metal now
-  performs admission and cohort placement from resident buffers and runs the
-  bounded dynamic-search transition through several resident epochs, but the
-  complete `LaneView` operation language, lane journals, and canonical commit
-  are not yet lowered to that graph; see
-  [docs/DEVICE-SCHEDULER.md](docs/DEVICE-SCHEDULER.md)
-- Scheduler-overhead and end-to-end migration benchmarks. The batch backend
-  itself is measured on hardware — CPU against Metal from 32 to 4M elements,
-  where a Metal call's fixed cost goes, what a published cohort costs off-GPU,
-  and cost against accumulated state — see [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
-  Whether cohorting beats a bulk schedule is not among those numbers; it is
-  still the structural model above
+  [docs/EVALUATOR-LANGUAGE.md](docs/EVALUATOR-LANGUAGE.md).
+- The complete device-resident operation vocabulary. Installed user frame
+  evaluators now run inside the no-round-trip graph and the normal kernel path
+  validates and canonically commits their exact object read/write journals.
+  Allocation, mailbox, future, channel, supervision, and dynamic-successor
+  operations still need resident lowering; see
+  [docs/DEVICE-SCHEDULER.md](docs/DEVICE-SCHEDULER.md).
+- A fully multi-kernel distributed application. Futures and bounded channels
+  can now be canonically owned by remote nodes and wake local continuations
+  without shadow resource state. Remote mailboxes, supervision, process
+  execution/recovery, and application-level multi-node measurements remain;
+  see [docs/DISTRIBUTED.md](docs/DISTRIBUTED.md).
+- A positive end-to-end cohorting result. Scheduler, migration, compiled-handler,
+  Discovery, and full 10,000-ant wall-clock benchmarks now exist. The current
+  scalar ant control is a negative result: run-class scheduling is slower than
+  FIFO because fuller cohorts are not yet executing the behavior pipeline as
+  SIMD work. A resident Metal application must beat FIFO and sorted bulk
+  controls before Phase-1 is claimed; see [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 Every entity and invariant named by the v0.2 machine is now implemented. The
 remaining work extends the completed semantic core beyond the deliberately
 small module surface and collective-level Metal implementation.
+The stricter end-state audit is tracked in
+[docs/DREAM-COMPLETION.md](docs/DREAM-COMPLETION.md); incomplete gates there are
+not release claims.
 
 ## License
 

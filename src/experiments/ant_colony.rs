@@ -368,6 +368,12 @@ pub struct AntFrame {
     pub sense_threshold: u16,
     /// Loads delivered home, for the report.
     pub delivered: u16,
+    /// Directions supplied by the epoch sensing executive. `score_epoch` is a
+    /// validity stamp; ordinary scalar runs leave it at `u32::MAX` and retain
+    /// the original host-sensing path.
+    pub score_epoch: u32,
+    pub food_score: u8,
+    pub home_score: u8,
     pub deposit: Ref64,
     pub terrain: Ref64,
     pub field_a: Ref64,
@@ -407,6 +413,9 @@ impl Frame for AntFrame {
         put_u16(out, self.deposit_amount);
         put_u16(out, self.sense_threshold);
         put_u16(out, self.delivered);
+        put_u32(out, self.score_epoch);
+        put_u8(out, self.food_score);
+        put_u8(out, self.home_score);
         put_ref64(out, self.deposit);
         put_ref64(out, self.terrain);
         put_ref64(out, self.field_a);
@@ -431,6 +440,9 @@ impl Frame for AntFrame {
             deposit_amount: cursor.u16()?,
             sense_threshold: cursor.u16()?,
             delivered: cursor.u16()?,
+            score_epoch: cursor.u32()?,
+            food_score: cursor.u8()?,
+            home_score: cursor.u8()?,
             deposit: cursor.ref64()?,
             terrain: cursor.ref64()?,
             field_a: cursor.ref64()?,
@@ -759,6 +771,9 @@ pub fn build_in(mut kernel: Kernel, knobs: &ColonyKnobs) -> (Kernel, AntColony) 
                 deposit_amount: knobs.deposit,
                 sense_threshold: knobs.sense_threshold,
                 delivered: 0,
+                score_epoch: u32::MAX,
+                food_score: 0,
+                home_score: 0,
                 deposit,
                 terrain,
                 field_a,

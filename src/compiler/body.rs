@@ -47,10 +47,11 @@
 //!   observe another lane's store. A body that could read the output array
 //!   would make the result depend on the schedule and take I19
 //!   (placement-neutrality) with it.
-//! - **Integer-only.** Admitting `f32` would force I20 to either demand
-//!   bit-identical results across backends — constraining what a GPU may do —
-//!   or weaken to a tolerance, which guts it as an invariant. Deferred until
-//!   there is a reason to pay for it.
+//! - **Bounded deterministic f32.** Binary32 add/multiply are admitted with
+//!   fast math disabled and canonical NaN/zero results, so I20 remains a byte
+//!   invariant rather than weakening to a tolerance. Integer and float values
+//!   are statically separated. Other float operations remain unimplemented
+//!   until their exact cross-backend semantics are specified.
 //! - **Typed against a declared layout.** Reading or writing outside the
 //!   declared element is a validation error, not a runtime fault, so an
 //!   invalid body cannot reach a backend at all.
@@ -70,6 +71,8 @@ pub enum FieldWidth {
     U16,
     U32,
     U64,
+    /// IEEE-754 binary32 stored as four little-endian bytes.
+    F32,
 }
 
 impl FieldWidth {
@@ -77,7 +80,7 @@ impl FieldWidth {
         match self {
             FieldWidth::U8 => 1,
             FieldWidth::U16 => 2,
-            FieldWidth::U32 => 4,
+            FieldWidth::U32 | FieldWidth::F32 => 4,
             FieldWidth::U64 => 8,
         }
     }
@@ -86,7 +89,7 @@ impl FieldWidth {
         match self {
             FieldWidth::U8 => 0xFF,
             FieldWidth::U16 => 0xFFFF,
-            FieldWidth::U32 => 0xFFFF_FFFF,
+            FieldWidth::U32 | FieldWidth::F32 => 0xFFFF_FFFF,
             FieldWidth::U64 => u64::MAX,
         }
     }
@@ -97,6 +100,7 @@ impl FieldWidth {
             "u16" => Some(FieldWidth::U16),
             "u32" => Some(FieldWidth::U32),
             "u64" => Some(FieldWidth::U64),
+            "f32" => Some(FieldWidth::F32),
             _ => None,
         }
     }
@@ -162,9 +166,17 @@ pub enum Op {
     /// I20 checks.
     Gather(u32, u32),
     Const(u64),
+    /// An exact binary32 bit pattern. Float values remain encoded in the low
+    /// 32 bits of value slots at backend boundaries.
+    FConst(u32),
     Add(u32, u32),
     Sub(u32, u32),
     Mul(u32, u32),
+    /// Deterministic binary32 arithmetic. Each result is rounded to f32,
+    /// canonicalizes every NaN to 0x7fc00000, and canonicalizes both zeros and
+    /// all subnormals to +0. These rules are part of I20, not an optimization choice.
+    FAdd(u32, u32),
+    FMul(u32, u32),
     And(u32, u32),
     Or(u32, u32),
     Xor(u32, u32),
@@ -254,7 +266,7 @@ pub const MAX_STEPS: u64 = 1 << 20;
 impl Op {
     fn operands(self) -> Vec<u32> {
         match self {
-            Op::Load(_) | Op::Const(_) | Op::Index => Vec::new(),
+            Op::Load(_) | Op::Const(_) | Op::FConst(_) | Op::Index => Vec::new(),
             Op::Get(_) | Op::Repeat(_) | Op::EndRepeat => Vec::new(),
             Op::Set(_, value) => vec![value],
             Op::BreakIf(cond) => vec![cond],
@@ -262,6 +274,8 @@ impl Op {
             Op::Add(a, b)
             | Op::Sub(a, b)
             | Op::Mul(a, b)
+            | Op::FAdd(a, b)
+            | Op::FMul(a, b)
             | Op::And(a, b)
             | Op::Or(a, b)
             | Op::Xor(a, b)
@@ -338,7 +352,32 @@ pub enum BodyError {
     /// The body's unrolled length exceeds [`MAX_STEPS`], so it is not
     /// obviously total and the step budget could not bound it.
     Unbounded,
+    /// An integer operation consumed a float, a float operation consumed an
+    /// integer, or a store's value disagreed with its field kind.
+    TypeMismatch,
     Syntax,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ValueKind {
+    Integer,
+    Float,
+}
+
+fn field_kind(width: FieldWidth) -> ValueKind {
+    if width == FieldWidth::F32 {
+        ValueKind::Float
+    } else {
+        ValueKind::Integer
+    }
+}
+
+fn require_kind(kinds: &[ValueKind], index: u32, expected: ValueKind) -> Result<(), BodyError> {
+    if kinds.get(index as usize).copied() == Some(expected) {
+        Ok(())
+    } else {
+        Err(BodyError::TypeMismatch)
+    }
 }
 
 impl EvaluatorProgram {
@@ -445,6 +484,68 @@ impl EvaluatorProgram {
             }
         }
 
+        // Type validation is independent of storage width: all u* fields
+        // produce integer values, while f32 fields and float ops produce
+        // binary32 values. Integer behavior remains the original u64 algebra.
+        let mut kinds = Vec::with_capacity(self.ops.len());
+        for op in &self.ops {
+            let kind = match *op {
+                Op::Load(field) => {
+                    field_kind(self.layout.width(field).ok_or(BodyError::FieldOutOfRange)?)
+                }
+                Op::Gather(at, field) => {
+                    require_kind(&kinds, at, ValueKind::Integer)?;
+                    field_kind(self.layout.width(field).ok_or(BodyError::FieldOutOfRange)?)
+                }
+                Op::GatherAux(at, field) => {
+                    require_kind(&kinds, at, ValueKind::Integer)?;
+                    let layout = self.aux.as_ref().ok_or(BodyError::AuxMismatch)?;
+                    field_kind(layout.width(field).ok_or(BodyError::FieldOutOfRange)?)
+                }
+                Op::FConst(_) => ValueKind::Float,
+                Op::FAdd(a, b) | Op::FMul(a, b) => {
+                    require_kind(&kinds, a, ValueKind::Float)?;
+                    require_kind(&kinds, b, ValueKind::Float)?;
+                    ValueKind::Float
+                }
+                Op::Set(_, value) => {
+                    // Locals retain their historical integer-zero type. A
+                    // future float-local declaration can extend this without
+                    // making today's untyped `local` source ambiguous.
+                    require_kind(&kinds, value, ValueKind::Integer)?;
+                    ValueKind::Integer
+                }
+                Op::Add(a, b)
+                | Op::Sub(a, b)
+                | Op::Mul(a, b)
+                | Op::And(a, b)
+                | Op::Or(a, b)
+                | Op::Xor(a, b)
+                | Op::Shl(a, b)
+                | Op::Shr(a, b)
+                | Op::CmpEq(a, b)
+                | Op::CmpLt(a, b) => {
+                    require_kind(&kinds, a, ValueKind::Integer)?;
+                    require_kind(&kinds, b, ValueKind::Integer)?;
+                    ValueKind::Integer
+                }
+                Op::Select(c, a, b) => {
+                    require_kind(&kinds, c, ValueKind::Integer)?;
+                    require_kind(&kinds, a, ValueKind::Integer)?;
+                    require_kind(&kinds, b, ValueKind::Integer)?;
+                    ValueKind::Integer
+                }
+                Op::BreakIf(c) => {
+                    require_kind(&kinds, c, ValueKind::Integer)?;
+                    ValueKind::Integer
+                }
+                Op::Index | Op::Const(_) | Op::Get(_) | Op::Repeat(_) | Op::EndRepeat => {
+                    ValueKind::Integer
+                }
+            };
+            kinds.push(kind);
+        }
+
         for store in &self.stores {
             if store.field >= field_count {
                 return Err(BodyError::FieldOutOfRange);
@@ -458,6 +559,13 @@ impl EvaluatorProgram {
             // where the consumer is not an instruction.
             if !regions[store.value as usize].is_empty() {
                 return Err(BodyError::EscapingValue);
+            }
+            let field = self
+                .layout
+                .width(store.field)
+                .ok_or(BodyError::FieldOutOfRange)?;
+            if kinds[store.value as usize] != field_kind(field) {
+                return Err(BodyError::TypeMismatch);
             }
         }
 
@@ -694,9 +802,20 @@ impl EvaluatorProgram {
                     None => 0,
                 },
                 Op::Const(value) => value,
+                Op::FConst(bits) => u64::from(canonical_f32_bits(bits)),
                 Op::Add(a, b) => values[a as usize].wrapping_add(values[b as usize]),
                 Op::Sub(a, b) => values[a as usize].wrapping_sub(values[b as usize]),
                 Op::Mul(a, b) => values[a as usize].wrapping_mul(values[b as usize]),
+                Op::FAdd(a, b) => u64::from(canonical_f32_bits(
+                    (f32::from_bits(canonical_f32_bits(values[a as usize] as u32))
+                        + f32::from_bits(canonical_f32_bits(values[b as usize] as u32)))
+                    .to_bits(),
+                )),
+                Op::FMul(a, b) => u64::from(canonical_f32_bits(
+                    (f32::from_bits(canonical_f32_bits(values[a as usize] as u32))
+                        * f32::from_bits(canonical_f32_bits(values[b as usize] as u32)))
+                    .to_bits(),
+                )),
                 Op::And(a, b) => values[a as usize] & values[b as usize],
                 Op::Or(a, b) => values[a as usize] | values[b as usize],
                 Op::Xor(a, b) => values[a as usize] ^ values[b as usize],
@@ -799,7 +918,11 @@ impl EvaluatorProgram {
         else {
             return;
         };
-        let value = value & width.mask();
+        let value = if width == FieldWidth::F32 {
+            u64::from(canonical_f32_bits(value as u32))
+        } else {
+            value & width.mask()
+        };
         for byte in 0..width.bytes() {
             let index = (offset + byte) as usize;
             if let Some(slot) = element.get_mut(index) {
@@ -999,9 +1122,18 @@ impl EvaluatorProgram {
                         Op::Load(field) => self.metal_read("base", field),
                         Op::Index => "ulong(gid)".to_string(),
                         Op::Const(value) => format!("{value}ul"),
+                        Op::FConst(bits) => {
+                            format!("ulong(soma_f32_bits(as_type<float>({bits}u)))")
+                        }
                         Op::Add(a, b) => format!("v{a} + v{b}"),
                         Op::Sub(a, b) => format!("v{a} - v{b}"),
                         Op::Mul(a, b) => format!("v{a} * v{b}"),
+                        Op::FAdd(a, b) => format!(
+                            "ulong(soma_f32_bits(soma_f32_value(v{a}) + soma_f32_value(v{b})))"
+                        ),
+                        Op::FMul(a, b) => format!(
+                            "ulong(soma_f32_bits(soma_f32_value(v{a}) * soma_f32_value(v{b})))"
+                        ),
                         Op::And(a, b) => format!("v{a} & v{b}"),
                         Op::Or(a, b) => format!("v{a} | v{b}"),
                         Op::Xor(a, b) => format!("v{a} ^ v{b}"),
@@ -1030,7 +1162,7 @@ impl EvaluatorProgram {
 
         let _ = writeln!(body, "}}");
 
-        format!("#include <metal_stdlib>\nusing namespace metal;\n\n{body}")
+        format!("#include <metal_stdlib>\nusing namespace metal;\n\ninline uint soma_f32_bits(float x) {{\n    uint bits = as_type<uint>(x);\n    uint magnitude = bits & 0x7fffffffu;\n    return isnan(x) ? 0x7fc00000u : ((magnitude < 0x00800000u) ? 0u : bits);\n}}\ninline float soma_f32_value(ulong bits) {{ return as_type<float>(soma_f32_bits(as_type<float>(uint(bits)))); }}\n\n{body}")
     }
 
     pub fn metal_entry_point(&self) -> String {
@@ -1087,12 +1219,20 @@ impl EvaluatorProgram {
         ) else {
             return String::new();
         };
+        let value = if width == FieldWidth::F32 {
+            format!(
+                "ulong(soma_f32_bits(as_type<float>(uint(v{}))))",
+                store.value
+            )
+        } else {
+            format!("v{}", store.value)
+        };
         let mut lines = Vec::new();
         for byte in 0..width.bytes() {
             lines.push(format!(
-                "    output[base + {}] = uchar((v{} >> {}) & 0xFFul);",
+                "    output[base + {}] = uchar(({} >> {}) & 0xFFul);",
                 offset + byte,
-                store.value,
+                value,
                 8 * byte
             ));
         }
@@ -1145,6 +1285,22 @@ impl<'a> Arrays<'a> {
 /// stride` so that it depends only on values the generated MSL also has in
 /// hand. A backend clamping against its own buffer length could disagree
 /// whenever a buffer is larger than the count it was dispatched with.
+/// Canonical representation used at every float-producing boundary.
+/// All NaNs collapse to one quiet positive NaN and both signed zeros collapse
+/// to +0, removing backend choices that would otherwise violate I20.
+fn canonical_f32_bits(bits: u32) -> u32 {
+    let magnitude = bits & 0x7fff_ffff;
+    if magnitude > 0x7f80_0000 {
+        0x7fc0_0000
+    } else if magnitude < 0x0080_0000 {
+        // Apple GPU arithmetic flushes binary32 subnormals. Making that
+        // boundary explicit on every backend preserves byte-level I20.
+        0
+    } else {
+        bits
+    }
+}
+
 fn read_clamped(bytes: &[u8], layout: &ElementLayout, count: u32, at: u64, field: u32) -> u64 {
     if count == 0 {
         return 0;
@@ -1192,9 +1348,22 @@ fn parse_op(parts: &[&str]) -> Result<Op, BodyError> {
                 .parse()
                 .map_err(|_| BodyError::Syntax)?,
         )),
+        "fconst" => {
+            let text = parts.get(1).ok_or(BodyError::Syntax)?;
+            let bits = if let Some(hex) = text.strip_prefix("0x") {
+                u32::from_str_radix(hex, 16).map_err(|_| BodyError::Syntax)?
+            } else {
+                text.parse::<f32>()
+                    .map_err(|_| BodyError::Syntax)?
+                    .to_bits()
+            };
+            Ok(Op::FConst(bits))
+        }
         "add" => binary(Op::Add),
         "sub" => binary(Op::Sub),
         "mul" => binary(Op::Mul),
+        "fadd" => binary(Op::FAdd),
+        "fmul" => binary(Op::FMul),
         "and" => binary(Op::And),
         "or" => binary(Op::Or),
         "xor" => binary(Op::Xor),

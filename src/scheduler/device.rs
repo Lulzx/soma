@@ -189,30 +189,94 @@ pub fn reference_lane_conflicts(
     accesses: &[DeviceLaneAccess],
     lane_count: u32,
 ) -> Vec<DeviceLaneConflict> {
-    (0..lane_count)
-        .map(|lane| {
-            let first_other_lane = accesses
-                .iter()
-                .filter(|access| access.lane == lane)
-                .flat_map(|access| {
-                    accesses.iter().filter_map(move |other| {
-                        (other.lane != lane
-                            && other.resource == access.resource
-                            && other.resource_kind == access.resource_kind
-                            && (access.mode == DEVICE_ACCESS_WRITE
-                                || other.mode == DEVICE_ACCESS_WRITE))
-                            .then_some(other.lane)
-                    })
-                })
-                .min();
-            DeviceLaneConflict {
-                lane,
-                conflicts: u32::from(first_other_lane.is_some()),
-                first_other_lane: first_other_lane.unwrap_or(u32::MAX),
-                reserved: 0,
-            }
+    let mut conflicts: Vec<_> = (0..lane_count)
+        .map(|lane| DeviceLaneConflict {
+            lane,
+            conflicts: 0,
+            first_other_lane: u32::MAX,
+            reserved: 0,
         })
-        .collect()
+        .collect();
+
+    // Resource and lane grouping turns the old all-pairs comparison into one
+    // sort followed by linear scans. An access's ordinal and physical input
+    // position are intentionally absent from the key: duplicate records in a
+    // lane collapse to the same semantic read/write claim.
+    let mut sorted: Vec<_> = accesses.iter().collect();
+    sorted.sort_unstable_by_key(|access| (access.resource_kind, access.resource, access.lane));
+
+    let mut resource_start = 0;
+    while resource_start < sorted.len() {
+        let resource_kind = sorted[resource_start].resource_kind;
+        let resource = sorted[resource_start].resource;
+        let mut resource_end = resource_start + 1;
+        while resource_end < sorted.len()
+            && sorted[resource_end].resource_kind == resource_kind
+            && sorted[resource_end].resource == resource
+        {
+            resource_end += 1;
+        }
+
+        // The first two lanes and first two writing lanes are sufficient to
+        // answer "smallest conflicting other lane" for every member. Keeping
+        // two handles the case where the smallest one is the member itself.
+        let mut first_lane = None;
+        let mut second_lane = None;
+        let mut first_writer = None;
+        let mut second_writer = None;
+        let mut lane_start = resource_start;
+        while lane_start < resource_end {
+            let lane = sorted[lane_start].lane;
+            let mut lane_end = lane_start + 1;
+            let mut writes = sorted[lane_start].mode == DEVICE_ACCESS_WRITE;
+            while lane_end < resource_end && sorted[lane_end].lane == lane {
+                writes |= sorted[lane_end].mode == DEVICE_ACCESS_WRITE;
+                lane_end += 1;
+            }
+            if first_lane.is_none() {
+                first_lane = Some(lane);
+            } else if second_lane.is_none() {
+                second_lane = Some(lane);
+            }
+            if writes {
+                if first_writer.is_none() {
+                    first_writer = Some(lane);
+                } else if second_writer.is_none() {
+                    second_writer = Some(lane);
+                }
+            }
+            lane_start = lane_end;
+        }
+
+        lane_start = resource_start;
+        while lane_start < resource_end {
+            let lane = sorted[lane_start].lane;
+            let mut lane_end = lane_start + 1;
+            let mut writes = sorted[lane_start].mode == DEVICE_ACCESS_WRITE;
+            while lane_end < resource_end && sorted[lane_end].lane == lane {
+                writes |= sorted[lane_end].mode == DEVICE_ACCESS_WRITE;
+                lane_end += 1;
+            }
+            let candidates = if writes {
+                (first_lane, second_lane)
+            } else {
+                (first_writer, second_writer)
+            };
+            let other = if candidates.0 != Some(lane) {
+                candidates.0
+            } else {
+                candidates.1
+            };
+            if let (Some(other), Some(result)) = (other, conflicts.get_mut(lane as usize)) {
+                result.conflicts = 1;
+                result.first_other_lane = result.first_other_lane.min(other);
+            }
+            lane_start = lane_end;
+        }
+        resource_start = resource_end;
+    }
+
+    conflicts
 }
 
 /// Candidate data copied into persistent device-visible storage.
@@ -381,17 +445,177 @@ pub struct ResidentSearchResult {
 }
 
 pub fn reference_resident_search(config: ResidentSearchConfig) -> ResidentSearchResult {
+    reference_resident_search_with_trace(config).0
+}
+
+/// Canonical lane-local event emitted by the bounded resident graph.
+///
+/// The physical Metal thread writes directly to its epoch/lane slot; no atomic
+/// append or shared clock participates. `lane_sequence` is therefore local to
+/// the lane, matching the trace-position rule used by the general executive.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResidentTraceEvent {
+    pub value: u64,
+    pub epoch: u32,
+    pub lane: u32,
+    pub lane_sequence: u32,
+    pub run_class: u32,
+    pub word: u32,
+    pub reserved: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<ResidentTraceEvent>() == 32);
+
+/// One root in a compiled resident frame graph. Each lane owns its frame for
+/// the lifetime of the graph; `actor`/`target` are retained for the canonical
+/// host write journal emitted after the last evaluator dispatch.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResidentFrameBinding {
+    pub continuation: u64,
+    pub process: u64,
+    pub frame: u64,
+    pub actor: u64,
+    pub target: u64,
+}
+
+const _: () = assert!(std::mem::size_of::<ResidentFrameBinding>() == 40);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidentFrameGraphConfig {
+    pub run_class: u32,
+    pub epochs: u32,
+    pub cohort_width: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResidentFrameTraceEvent {
+    pub epoch: u32,
+    pub lane: u32,
+    pub run_class: u32,
+    pub word: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResidentFrameGraphResult {
+    pub frames: Vec<u8>,
+    pub accesses: Vec<DeviceLaneAccess>,
+    pub operations: Vec<DeviceOperationJournal>,
+    pub trace: Vec<ResidentFrameTraceEvent>,
+}
+
+/// CPU oracle for the general compiled resident handler path.
+///
+/// This intentionally uses the evaluator interpreter, rather than duplicating
+/// its arithmetic. The operation/access ABI is the same one accepted by the
+/// epoch validator; final private frames remain available to the host snapshot
+/// commit that performs each `OP_WRITE_OBJECT`.
+pub fn reference_resident_frame_graph(
+    program: &crate::compiler::body::EvaluatorProgram,
+    config: ResidentFrameGraphConfig,
+    bindings: &[ResidentFrameBinding],
+    input_frames: &[u8],
+) -> Option<ResidentFrameGraphResult> {
+    use crate::scheduler::device_ops::{DeviceLaneOperation, OP_WRITE_OBJECT};
+    let stride = program.stride() as usize;
+    if config.run_class < 1024
+        || config.cohort_width == 0
+        || program.binds_aux()
+        || program.ops().iter().any(|op| {
+            matches!(
+                op,
+                crate::compiler::body::Op::Gather(_, _)
+                    | crate::compiler::body::Op::GatherAux(_, _)
+            )
+        })
+        || stride == 0
+        || input_frames.len() != bindings.len().checked_mul(stride)?
+    {
+        return None;
+    }
+    let mut frames = input_frames.to_vec();
+    let mut trace = Vec::with_capacity(bindings.len().checked_mul(config.epochs as usize)?);
+    for epoch in 0..config.epochs {
+        let input = frames.clone();
+        for lane in 0..bindings.len() {
+            let range = lane * stride..(lane + 1) * stride;
+            program.evaluate_at(
+                &input,
+                bindings.len() as u32,
+                lane as u32,
+                &mut frames[range.clone()],
+            );
+            let word = frames[range].iter().fold(2_166_136_261u32, |hash, byte| {
+                (hash ^ u32::from(*byte)).wrapping_mul(16_777_619)
+            });
+            trace.push(ResidentFrameTraceEvent {
+                epoch,
+                lane: lane as u32 + 1,
+                run_class: config.run_class,
+                word,
+            });
+        }
+    }
+    let accesses = bindings
+        .iter()
+        .enumerate()
+        .flat_map(|(lane, binding)| {
+            [
+                DeviceLaneAccess::new(lane as u32, 1, binding.target, DEVICE_ACCESS_READ, 0),
+                DeviceLaneAccess::new(lane as u32, 1, binding.target, DEVICE_ACCESS_WRITE, 1),
+            ]
+        })
+        .collect();
+    let operations = bindings
+        .iter()
+        .enumerate()
+        .map(|(lane, binding)| DeviceOperationJournal {
+            operations: vec![
+                DeviceLaneOperation {
+                    lane: lane as u32,
+                    ordinal: 0,
+                    opcode: crate::scheduler::device_ops::OP_READ_OBJECT,
+                    actor: binding.actor,
+                    target: binding.target,
+                    ..DeviceLaneOperation::default()
+                },
+                DeviceLaneOperation {
+                    lane: lane as u32,
+                    ordinal: 1,
+                    opcode: OP_WRITE_OBJECT,
+                    actor: binding.actor,
+                    target: binding.target,
+                    ..DeviceLaneOperation::default()
+                },
+            ],
+            payload: Vec::new(),
+        })
+        .collect();
+    Some(ResidentFrameGraphResult {
+        frames,
+        accesses,
+        operations,
+        trace,
+    })
+}
+
+/// Independent transition and trace oracle for the no-round-trip graph.
+pub fn reference_resident_search_with_trace(
+    config: ResidentSearchConfig,
+) -> (ResidentSearchResult, Vec<ResidentTraceEvent>) {
     let mut current: Vec<(u64, u32)> = (0..config.roots)
         .map(|root| (u64::from(root) + 1, config.depth))
         .collect();
     let mut result = ResidentSearchResult::default();
+    let mut trace = Vec::new();
     while !current.is_empty() {
         let width = config.cohort_width.max(1);
+        let classes = u64::from(config.class_count.max(1));
         let mut class_counts = std::collections::BTreeMap::<u32, u32>::new();
         for (value, _) in &current {
-            *class_counts
-                .entry((*value % u64::from(config.class_count.max(1))) as u32)
-                .or_default() += 1;
+            *class_counts.entry((*value % classes) as u32).or_default() += 1;
         }
         for count in class_counts.values() {
             let cohorts = count.div_ceil(width);
@@ -399,15 +623,27 @@ pub fn reference_resident_search(config: ResidentSearchConfig) -> ResidentSearch
             result.lane_slots = result.lane_slots.wrapping_add(cohorts.wrapping_mul(width));
             result.useful_lane_slots = result.useful_lane_slots.wrapping_add(*count);
         }
+        // resident_place is a stable class ordering. Child publication uses
+        // this canonical lane order, rather than physical completion order.
+        current.sort_by_key(|(value, _)| *value % classes);
         let mut next = Vec::new();
-        for (value, depth) in current {
-            let class = (value % u64::from(config.class_count.max(1))) as u32;
+        for (lane, (input_value, depth)) in current.into_iter().enumerate() {
+            let class = (input_value % classes) as u32;
             let value = crate::compiler::state_machine_lowering::search_step(
-                value,
+                input_value,
                 config.work_iters,
                 class,
             );
             let word = value as u32 ^ (value >> 32) as u32 ^ depth.wrapping_mul(0x9E37_79B9);
+            trace.push(ResidentTraceEvent {
+                value,
+                epoch: result.epochs,
+                lane: lane as u32 + 1,
+                lane_sequence: 0,
+                run_class: class,
+                word,
+                reserved: 0,
+            });
             result.nodes = result.nodes.wrapping_add(1);
             result.checksum_sum = result.checksum_sum.wrapping_add(word);
             result.checksum_xor ^= word;
@@ -421,5 +657,5 @@ pub fn reference_resident_search(config: ResidentSearchConfig) -> ResidentSearch
         current = next;
         result.epochs += 1;
     }
-    result
+    (result, trace)
 }

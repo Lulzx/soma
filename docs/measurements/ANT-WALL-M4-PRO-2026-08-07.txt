@@ -1,0 +1,11 @@
+SOMA 10k-ant scalar executive wall-clock control
+Date: 2026-08-07
+Base revision: db14ab9 plus ant_wall_bench and current working changes
+Machine: Apple M4 Pro, aarch64 macOS, release profile
+Command: cargo run --release --example ant_wall_bench -- --full 3
+Policies alternated run order. Non-isolated local run; raw samples follow.
+
+SOMA ant wall-clock control: ants=10000 epochs=260 trials=3
+persistent-fifo median_ms=8230.364 raw_ns=12425787875,8230364250,8174323833
+run-class      median_ms=9375.098 raw_ns=12162237417,9375097917,9077346125
+fifo/run-class ratio=0.878x identical_world=true

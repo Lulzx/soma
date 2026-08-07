@@ -467,11 +467,59 @@ private one-element frame binding per lane, because treating the epoch arena as
 one array would let a gather read a sibling continuation's frame. The
 `RUN_LENGTH` controls exercise that exact distinction on native and Metal.
 
-The Metal curve identifies the next concrete bottleneck: complete access
-validation still compares lane journals quadratically. The scheduler's own
-stable-sort result in §8.1 does not fix that separate kernel. Until journal
-validation is sorted/grouped as well, a placement policy should keep these
-small stateful handlers on the reference/native path and reserve Metal for
-large collective evaluator batches or resident search. Raw trials, including
-p10/p90 and every nanosecond sample, are in
-`docs/measurements/COMPILED-HANDLER-M4-PRO-2026-08-07.txt`.
+That capture identified complete access validation as the next concrete
+bottleneck: it still compared lane journals quadratically. The validator now
+sorts claims by `(resource kind, resource, lane)`, aggregates duplicate claims,
+and scans resource groups. The Metal path uploads the same stable grouping and
+runs ordered initialize/group/finalize passes, so validation is O(A log A) on
+the host plus O(A) on the device rather than O(A²). Randomized pairwise-oracle
+controls and a 4,096-record real-Metal control pin the exact minimum-other-lane
+semantics.
+
+A repeated local release run after that change measured the following medians:
+
+| lanes | reference | native | Metal |
+|---:|---:|---:|---:|
+| 32 | 22µs | 72µs | 628µs |
+| 256 | 153µs | 347µs | 798µs |
+| 1,024 | 583µs | 1.246ms | 1.919ms |
+| 8,192 | 7.959ms | 18.277ms | 19.632ms |
+
+This removes the pathological curve (the earlier 1,024-lane Metal result was
+35.931ms), but it is still an overhead result, not a speedup result. General
+handlers still leave the resident graph for journal validation and canonical
+commit. A placement policy should keep these small stateful handlers on the
+reference path and reserve Metal for large collective evaluator batches or
+resident search until the general handler pipeline stays resident. The original
+raw trials are in
+`docs/measurements/COMPILED-HANDLER-M4-PRO-2026-08-07.txt`; post-fix raw
+samples are in
+`docs/measurements/COMPILED-HANDLER-GROUPED-M4-PRO-2026-08-07.txt`. The command
+is `cargo run --release --all-features --example scheduler_migration_bench --
+--handlers-only`, which now includes the 8,192-lane point.
+
+
+## 10. End-to-end ant scheduler wall-clock control
+
+`ant_wall_bench` times the complete scalar executive for the published 10,000-ant,
+260-epoch world, alternating policy order and requiring the final worlds to be
+identical. A local three-trial release capture measured:
+
+| policy | median | raw range |
+|---|---:|---:|
+| persistent FIFO | 8.230s | 8.174–12.426s |
+| run-class bins | 9.375s | 9.077–12.162s |
+
+The FIFO/run-class ratio is **0.878×**: the current scalar implementation of
+cohort construction is slower, not faster. This does not contradict the
+structural occupancy reduction; scalar execution cannot receive SIMD throughput
+from a fuller cohort. It does falsify any claim that the present host executive
+already meets the Phase-1 end-to-end success condition. The required next
+measurement is the same world with the continuation behavior pipeline resident
+and actually executing cohorts on Metal, against both this FIFO control and a
+sorted bulk frontier.
+
+Raw samples and capture metadata are in
+`docs/measurements/ANT-WALL-M4-PRO-2026-08-07.txt`. Run the small repeatable
+control with `cargo run --release --example ant_wall_bench`; add `--full 3` for
+the published 10,000-ant world.

@@ -620,9 +620,29 @@ fn lower_op(
             )
         }
         Op::Const(value) => builder.ins().iconst(types::I64, value as i64),
+        Op::FConst(bits) => {
+            let raw = builder.ins().iconst(types::I64, i64::from(bits));
+            canonical_f32_value(builder, raw)
+        }
         Op::Add(a, b) => builder.ins().iadd(values[a as usize], values[b as usize]),
         Op::Sub(a, b) => builder.ins().isub(values[a as usize], values[b as usize]),
         Op::Mul(a, b) => builder.ins().imul(values[a as usize], values[b as usize]),
+        Op::FAdd(a, b) | Op::FMul(a, b) => {
+            let left_bits = canonical_f32_value(builder, values[a as usize]);
+            let right_bits = canonical_f32_value(builder, values[b as usize]);
+            let left32 = builder.ins().ireduce(types::I32, left_bits);
+            let right32 = builder.ins().ireduce(types::I32, right_bits);
+            let left = builder.ins().bitcast(types::F32, MemFlags::new(), left32);
+            let right = builder.ins().bitcast(types::F32, MemFlags::new(), right32);
+            let result = if matches!(op, Op::FAdd(_, _)) {
+                builder.ins().fadd(left, right)
+            } else {
+                builder.ins().fmul(left, right)
+            };
+            let raw32 = builder.ins().bitcast(types::I32, MemFlags::new(), result);
+            let raw = builder.ins().uextend(types::I64, raw32);
+            canonical_f32_value(builder, raw)
+        }
         Op::And(a, b) => builder.ins().band(values[a as usize], values[b as usize]),
         Op::Or(a, b) => builder.ins().bor(values[a as usize], values[b as usize]),
         Op::Xor(a, b) => builder.ins().bxor(values[a as usize], values[b as usize]),
@@ -669,6 +689,22 @@ fn lower_op(
     Ok(value)
 }
 
+fn canonical_f32_value(builder: &mut FunctionBuilder<'_>, raw: Value) -> Value {
+    let magnitude_mask = builder.ins().iconst(types::I64, 0x7fff_ffff);
+    let magnitude = builder.ins().band(raw, magnitude_mask);
+    let infinity = builder.ins().iconst(types::I64, 0x7f80_0000);
+    let is_nan = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThan, magnitude, infinity);
+    let is_zero = builder
+        .ins()
+        .icmp_imm(IntCC::UnsignedLessThan, magnitude, 0x0080_0000);
+    let zero = builder.ins().iconst(types::I64, 0);
+    let canonical_nan = builder.ins().iconst(types::I64, 0x7fc0_0000);
+    let zeroed = builder.ins().select(is_zero, zero, raw);
+    builder.ins().select(is_nan, canonical_nan, zeroed)
+}
+
 fn load_field(
     builder: &mut FunctionBuilder<'_>,
     element: Value,
@@ -694,6 +730,11 @@ fn store_field(
     value: Value,
 ) {
     let ty = field_type(width);
+    let value = if width == FieldWidth::F32 {
+        canonical_f32_value(builder, value)
+    } else {
+        value
+    };
     let value = if ty == types::I64 {
         value
     } else {
@@ -708,7 +749,7 @@ fn field_type(width: FieldWidth) -> cranelift_codegen::ir::Type {
     match width {
         FieldWidth::U8 => types::I8,
         FieldWidth::U16 => types::I16,
-        FieldWidth::U32 => types::I32,
+        FieldWidth::U32 | FieldWidth::F32 => types::I32,
         FieldWidth::U64 => types::I64,
     }
 }

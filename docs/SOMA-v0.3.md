@@ -236,9 +236,11 @@ which is not evidence about a compiler.
 test is placement-independent publication, not language design:
 
 `compiler::surface` is its named-value source front end. It adds human-readable
-field, auxiliary-array, local, value, loop, and store declarations with
-source-line diagnostics, then lowers to the same validated body IR used by the
-reference interpreter, Cranelift native CPU backend, and Metal code generator.
+field, auxiliary-array, local, value, loop, store, and reusable pure-function
+declarations with source-line diagnostics. Function calls are compile-time
+inlined, recursive cycles are rejected, and the fully expanded program lowers
+to the same step-bounded body IR used by the reference interpreter, Cranelift
+native CPU backend, and Metal code generator.
 It is general-purpose within the pure, total, element-wise evaluator contract;
 the contract's deliberate exclusions are described in
 `docs/EVALUATOR-LANGUAGE.md`.
@@ -287,10 +289,11 @@ the contract's deliberate exclusions are described in
   array is frozen and single-assignment, so every lane sees the same bytes
   whenever it runs and no lane can observe another lane's store. A body able to
   read the output array would make the published result depend on the schedule.
-- **Integer-only.** Admitting `f32` would force I20 to either demand
-  bit-identical results across backends — constraining what a GPU may do — or
-  weaken to a tolerance, which guts it as an invariant. Deferred until there is
-  a reason to pay for it.
+- **Typed integer plus bounded binary32.** Integer semantics remain unchanged.
+  The first `f32` slice admits add and multiply only, disables Metal fast math,
+  flushes subnormal inputs/results to positive zero, and canonicalizes NaNs and
+  signed zero. That deliberately constrains every backend so I20 remains
+  bit-identical rather than weakening to a tolerance.
 - **Typed against a declared layout.** Reading or writing outside the declared
   element is a validation error, so an invalid body cannot reach a backend.
 - **Loops carry state in locals, not in values.** SSA and back edges need phi
@@ -1690,7 +1693,9 @@ Named so that nothing here is quietly assumed:
 - **Preemption.** §4.
 - **Loops and reductions in evaluator bodies.** A reduction is a new
   collective, not a new body.
-- **Floating-point bodies.** §3.2, pending a reason to pay for I20 under float.
+- **Complete floating-point bodies.** The deterministic `f32` add/multiply
+  subset is implemented; subtraction, division, comparisons, float select, and
+  float locals remain outside v0.3.
 - **Relaxed-determinism and wall-clock contracts.** Both contradict clauses the
   model relies on.
 - **A general-purpose surface language.** v0.2 §7 item 1 says

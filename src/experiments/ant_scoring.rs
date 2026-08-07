@@ -434,3 +434,158 @@ pub fn expected_direction(sensor: &Sensor, grid: &[u8]) -> u32 {
     }
     Neighbourhood { readings }.expected()
 }
+
+// ---- colony epoch executive -----------------------------------------------
+
+use crate::abi::ObjectKind;
+use crate::compiler::frame::Frame;
+use crate::executives::batch::{
+    execute_with_spill, BackendError, BatchBackend, CpuReferenceBackend, PlacementStats,
+};
+use crate::experiments::ant_colony::{read_frame, AntColony, AntFrame, TRAIL_FOOD, TRAIL_HOME};
+use crate::kernel::ownership::freeze;
+use crate::kernel::{AuxBinding, Kernel, SYSTEM_PRINCIPAL};
+
+/// Which implementation supplies the sensing result consumed by `ant_step`.
+/// Both variants cross the same explicit epoch boundary and write the same
+/// stamped frame fields; only the implementation of sense-and-score differs.
+pub enum ColonySensing<'a> {
+    /// Independent host reference (`expected_direction`), not evaluator IR.
+    HostReference,
+    /// The `ant_sense_and_score` evaluator through a physical batch backend.
+    Collective(&'a mut dyn BatchBackend),
+}
+
+/// Sense both trail channels for every live ant and publish the choices into
+/// its durable frame for `epoch`.
+///
+/// This is the missing executive slice between the batch evaluator and the
+/// persistent colony. The score is stamped with its epoch, so a stale result is
+/// never consumed, and it is installed before `Kernel::run_epoch`: the ordinary
+/// ant continuation then uses it while retaining terrain, capability, deposit,
+/// and scheduling semantics.
+pub fn prepare_colony_epoch(
+    kernel: &mut Kernel,
+    colony: &AntColony,
+    epoch: u32,
+    mut sensing: ColonySensing<'_>,
+) -> Result<usize, BackendError> {
+    let field_ref = colony.readable_field(epoch);
+    let grid = kernel.object_bytes(colony.world, field_ref)?.to_vec();
+    let mut frames = Vec::with_capacity(colony.ant_count());
+    let mut sensors = Vec::with_capacity(colony.ant_count() * 2);
+
+    for handle in colony.colonies.iter().flat_map(|c| &c.ants) {
+        let Some(frame) = read_frame::<AntFrame>(kernel, handle.process, handle.continuation)
+        else {
+            continue;
+        };
+        for channel in [TRAIL_FOOD as u32, TRAIL_HOME as u32] {
+            sensors.push(Sensor {
+                x: frame.x as u32,
+                y: frame.y as u32,
+                width: frame.width as u32,
+                height: frame.height as u32,
+                channel,
+            });
+        }
+        frames.push((handle.process, handle.continuation, frame));
+    }
+
+    let directions = match &mut sensing {
+        ColonySensing::HostReference => sensors
+            .iter()
+            .map(|sensor| expected_direction(sensor, &grid))
+            .collect(),
+        ColonySensing::Collective(backend) => {
+            // Snapshot the mutable world buffers at the continuation boundary.
+            // BatchEvaluate admits frozen inputs only; the world keeps owning
+            // and updating its double buffers while this epoch gets immutable
+            // input objects with ordinary collective authority/escrow rules.
+            //
+            // All five resources in this dispatch are epoch-local.  Keep their
+            // references in one cleanup set from the instant they are created,
+            // including failure paths: at 10k ants, retaining one such set per
+            // epoch is hundreds of megabytes of input/output payload plus five
+            // growing kernel tables over a 260-epoch run.
+            let program = sensing_program();
+            backend.install(&program)?;
+            let mut temporaries = Vec::with_capacity(5);
+            let result: Result<Vec<u32>, BackendError> = (|| {
+                let input = kernel.create_object(
+                    colony.world,
+                    ObjectKind::FrozenArray,
+                    pack_sensors(&sensors),
+                );
+                temporaries.push(input);
+                freeze(kernel, colony.world, input)?;
+
+                let trail = kernel.create_object(colony.world, ObjectKind::FrozenArray, grid);
+                temporaries.push(trail);
+                freeze(kernel, colony.world, trail)?;
+
+                let (collective, completion) = kernel.create_batch_evaluate_bound(
+                    colony.world,
+                    ANT_SENSE_AND_SCORE,
+                    input,
+                    sensors.len() as u32,
+                    SENSE_STRIDE,
+                    AuxBinding::new(trail, (colony.knobs.cells() * 2) as u32, 2),
+                )?;
+                temporaries.push(collective);
+                temporaries.push(completion);
+
+                let mut reference = CpuReferenceBackend::with(&[&program]);
+                let mut stats = PlacementStats::default();
+                let output = execute_with_spill(
+                    kernel,
+                    colony.world,
+                    collective,
+                    1,
+                    *backend,
+                    &mut reference,
+                    &mut stats,
+                )?;
+                temporaries.push(output);
+                let published = kernel.object_bytes(colony.world, output)?.to_vec();
+                Ok(unpack_sensors(&published, sensors.len()))
+            })();
+
+            // Copying/unpacking ends every borrow of the published output. Drop
+            // the world's genesis authority for the complete dispatch bundle,
+            // then reclaim the now-unreachable descriptor closure immediately.
+            // Cleanup failure takes precedence: continuing would silently turn
+            // a recoverable backend failure into epoch-over-epoch state growth.
+            kernel.reclaim_temporaries(colony.world, &temporaries)?;
+            result?
+        }
+    };
+    if directions.len() != frames.len() * 2 {
+        return Err(BackendError::InvalidInput);
+    }
+
+    for ((process, continuation, mut frame), pair) in
+        frames.into_iter().zip(directions.chunks_exact(2))
+    {
+        frame.score_epoch = epoch;
+        frame.food_score = pair[0] as u8;
+        frame.home_score = pair[1] as u8;
+        let frame_object = kernel
+            .continuations()
+            .get(continuation)
+            .map_err(|_| BackendError::InvalidInput)?
+            .frame;
+        let mut encoded = Vec::new();
+        frame.encode(&mut encoded);
+        let payload = kernel.host_payload_mut(SYSTEM_PRINCIPAL, frame_object)?;
+        if payload.len() != encoded.len() {
+            return Err(BackendError::InvalidInput);
+        }
+        payload.copy_from_slice(&encoded);
+        // `process` is retained in the tuple deliberately: it is the authority
+        // used to decode the frame above, while SYSTEM performs the executive
+        // boundary write just as the predator/control instrumentation does.
+        let _ = process;
+    }
+    Ok(directions.len() / 2)
+}

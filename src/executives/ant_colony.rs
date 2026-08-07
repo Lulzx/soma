@@ -70,6 +70,25 @@ fn best_direction(
     best.map(|(index, _)| index)
 }
 
+/// Choose the accelerator result when this frame was scored for the current
+/// epoch. A rejected winner does not silently re-run the argmax on the host:
+/// the executive result remains authoritative, and the behaviour falls back in
+/// exactly the same way on the CPU-reference and physical backend paths.
+fn sensed_direction(
+    scores: &[u16; 8],
+    passable: &[bool; 8],
+    threshold: u16,
+    rng: &mut u64,
+    scored: Option<u8>,
+) -> Option<usize> {
+    if let Some(direction) = scored {
+        let direction = direction as usize;
+        return (direction < 8 && passable[direction] && scores[direction] > threshold)
+            .then_some(direction);
+    }
+    best_direction(scores, passable, threshold, rng)
+}
+
 /// A passable direction chosen at random, if there is one.
 fn random_direction(passable: &[bool; 8], rng: &mut u64) -> Option<usize> {
     let start = (split_mix(rng) % 8) as usize;
@@ -101,18 +120,24 @@ fn direction_towards(dx: i32, dy: i32) -> usize {
 }
 
 /// Prefer the trail, fall back to heading for the nest.
-fn homeward(senses: &Senses, frame: &AntFrame, rng: &mut u64) -> Option<usize> {
+fn homeward(
+    senses: &Senses,
+    frame: &AntFrame,
+    rng: &mut u64,
+    home_score: Option<u8>,
+) -> Option<usize> {
     let dx = frame.home_x as i32 - frame.x as i32;
     let dy = frame.home_y as i32 - frame.y as i32;
     let direct = direction_towards(dx, dy);
     if senses.passable[direct] {
         return Some(direct);
     }
-    best_direction(
+    sensed_direction(
         &senses.home_trail,
         &senses.passable,
         frame.sense_threshold,
         rng,
+        home_score,
     )
     .or_else(|| random_direction(&senses.passable, rng))
 }
@@ -187,6 +212,11 @@ pub fn ant_step(
     let Some(senses) = sense(lane, process, &frame, epoch) else {
         return StepResult::fault(process, run_class);
     };
+    let (food_score, home_score) = if frame.score_epoch == epoch {
+        (Some(frame.food_score), Some(frame.home_score))
+    } else {
+        (None, None)
+    };
 
     let mut rng = frame.rng;
     let next;
@@ -211,11 +241,12 @@ pub fn ant_step(
             step = random_direction(&senses.passable, &mut rng);
             next = if frame.carrying == 1 {
                 ANT_CARRY_FOOD
-            } else if best_direction(
+            } else if sensed_direction(
                 &senses.food_trail,
                 &senses.passable,
                 frame.sense_threshold,
                 &mut rng,
+                food_score,
             )
             .is_some()
             {
@@ -229,11 +260,12 @@ pub fn ant_step(
             if senses.on_food && frame.carrying == 0 {
                 frame.carrying = 1;
                 next = ANT_CARRY_FOOD;
-            } else if best_direction(
+            } else if sensed_direction(
                 &senses.food_trail,
                 &senses.passable,
                 frame.sense_threshold,
                 &mut rng,
+                food_score,
             )
             .is_some()
             {
@@ -279,11 +311,12 @@ pub fn ant_step(
                 // is what makes trail-following go somewhere.
                 let mut allowed = senses.passable;
                 allowed[(frame.heading as usize + 4) % 8] = false;
-                match best_direction(
+                match sensed_direction(
                     &senses.food_trail,
                     &allowed,
                     frame.sense_threshold,
                     &mut rng,
+                    food_score,
                 ) {
                     Some(heading) => {
                         step = Some(heading);
@@ -301,7 +334,7 @@ pub fn ant_step(
                 frame.delivered = frame.delivered.saturating_add(1);
                 next = ANT_EXPLORE;
             } else {
-                match homeward(&senses, &frame, &mut rng) {
+                match homeward(&senses, &frame, &mut rng, home_score) {
                     Some(heading) => {
                         step = Some(heading);
                         next = ANT_CARRY_FOOD;
@@ -315,7 +348,7 @@ pub fn ant_step(
             if at_home(&frame) {
                 next = ANT_EXPLORE;
             } else {
-                match homeward(&senses, &frame, &mut rng) {
+                match homeward(&senses, &frame, &mut rng, home_score) {
                     Some(heading) => {
                         step = Some(heading);
                         next = ANT_RETURN_HOME;
@@ -382,6 +415,9 @@ fn load_frame_ant(lane: &mut LaneView<'_>, process: Ref64) -> Option<AntFrame> {
         deposit_amount: 0,
         sense_threshold: 0,
         delivered: 0,
+        score_epoch: u32::MAX,
+        food_score: 0,
+        home_score: 0,
         deposit: Ref64::NULL,
         terrain: Ref64::NULL,
         field_a: Ref64::NULL,

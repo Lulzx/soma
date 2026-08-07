@@ -134,10 +134,40 @@ produce more physical cohorts than the one-class control at width 32, while
 width one collapses cohort count and lane slots exactly to node count. Both
 controls still agree field-for-field with the reference accounting.
 
-This is not yet the complete persistent executive. The resident path currently
-executes the bounded search transition. Lane access journals, operation
-payloads, conflict validation, and canonical replay now share device-ready
-ABIs; handler evaluation and lane-local trace emission still need Metal
-lowering. Completion means the general lane program runs through that same
-no-round-trip graph, followed by I19 and trace comparison against the reference
+This is not yet the complete persistent executive. The resident path currently executes the bounded search transition. That
+transition now emits one pointer-free trace record per lane directly into its
+canonical `(epoch, lane, lane_sequence)` slot; the trace stays resident until
+the complete command graph finishes and is compared field-for-field with an
+independent oracle. Child publication is likewise derived from canonical lane
+position rather than an atomic completion-order append.
+
+Lane access journals, operation payloads, conflict validation, and canonical
+replay share device-ready ABIs. The resident frontier now also accepts a
+validated `EvaluatorProgram` keyed by user run class (1024+), double-buffers
+lane-private frames through an arbitrary number of evaluator dispatches in one
+command buffer, and emits `DeviceLaneAccess` plus `DeviceLaneOperation` records
+at graph completion. The first end-to-end operation subset is canonical object
+write: the host receives the final private frame bodies together with ordered
+read/write accesses and `OP_READ_OBJECT`/`OP_WRITE_OBJECT` records per lane, sufficient for snapshot
+validation and canonical host commit without observing an intermediate frame.
+Gather/aux bodies are deliberately rejected on this private-frame path.
+
+The CPU oracle interprets the same validated body and constructs the same
+commit ABI. `MetalResidentSearch` also implements `DeviceEpochBackend`: the
+normal speculative `Kernel` epoch selects installed user continuations, packs
+their private frame objects, executes the resident graph, checks the graph's
+emitted object-write access/operation against the independently constructed
+lane journal, and only then enters the existing disposable-validation plus
+canonical replay gate. Final frame bytes are published through the ordinary
+snapshot payload commit; a protocol mismatch falls back without changing the
 kernel.
+
+Tests compare CPU/Metal frames, operations, accesses, and every lane-local
+trace event, then vary cohort width 1 versus 32 for an explicit I19
+placement-neutrality check. A second end-to-end test runs real `Kernel` epochs
+through this backend and checks canonical frame publication plus I18 trace
+conformance and byte-identical I19 kernel/device traces. The older branching
+search remains as the dynamic frontier/placement stress case; expanding
+compiled handlers to allocation, mailbox, future, and child-publication
+operations is the remaining vocabulary work, not installation of a hardcoded
+search transition.

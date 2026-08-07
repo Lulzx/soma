@@ -288,6 +288,54 @@ impl Kernel {
 /// objects must not be kept alive by it. Marking therefore starts from the
 /// roots and propagates, rather than treating every descriptor as a root.
 impl Kernel {
+    /// Release a caller-declared set of short-lived resources and immediately
+    /// collect everything they made unreachable.
+    ///
+    /// This is the bounded-lifetime counterpart to [`Kernel::reclaim_unreachable`].
+    /// Batch executives commonly create an input, an auxiliary array, an
+    /// output, a collective, and its completion future for one dispatch.  A
+    /// reachability pass alone cannot collect those while the actor still owns
+    /// genesis capabilities for them; releasing the set one reference at a
+    /// time at call sites is also easy to get wrong on an error path.
+    ///
+    /// The operation validates the whole set before releasing anything, so an
+    /// accidental persistent reference (or duplicate stale reference) does not
+    /// leave a half-released batch.  The caller is responsible for declaring
+    /// only resources whose authority it is finished with.
+    pub fn reclaim_temporaries(
+        &mut self,
+        actor: Ref64,
+        temporaries: &[Ref64],
+    ) -> Result<Reclaimed, RuntimeError> {
+        let mut seen = std::collections::HashSet::new();
+        let unique: Vec<Ref64> = temporaries
+            .iter()
+            .copied()
+            .filter(|target| !target.is_null() && seen.insert(*target))
+            .collect();
+
+        let space = self
+            .capability_spaces
+            .get(&actor.key())
+            .ok_or(RuntimeError::Abi(crate::abi::AbiError::NoAuthority))?;
+        if unique
+            .iter()
+            .any(|target| space.for_target(*target).is_empty())
+        {
+            return Err(RuntimeError::Abi(crate::abi::AbiError::NoAuthority));
+        }
+
+        // Preserve caller order so authority-release traces remain
+        // deterministic; the set above is used only for duplicate detection.
+        for target in unique {
+            // The validation above makes this infallible unless the capability
+            // table is corrupted; keep propagation explicit rather than hiding
+            // such corruption behind a best-effort cleanup.
+            self.release_authority(actor, target)?;
+        }
+        Ok(self.reclaim_unreachable())
+    }
+
     /// Give up the authority `actor` holds over `target`.
     ///
     /// The counterpart to reachability: nothing can become unreachable while

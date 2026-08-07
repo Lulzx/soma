@@ -7,25 +7,14 @@
 //! lowers to exactly one `EvaluatorProgram`; validation remains centralized in
 //! the body IR.
 //!
-//! ```text
-//! field u32
-//! field u32
-//! local sum
-//! let one = const 1
-//! let zero = const 0
-//! set sum zero
-//! repeat 8
-//!   let old = get sum
-//!   let next = add old one
-//!   set sum next
-//! end
-//! let result = get sum
-//! store 1 result
-//! ```
+//! Reusable functions are pure expression macros. `fn NAME PARAM...` contains
+//! `let` expressions followed by one `return VALUE` and `end`; `call` expands
+//! the function at compile time. No call reaches a backend, recursion is
+//! rejected, and the expanded body is checked against the ordinary step bound.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use super::body::{BodyError, ElementLayout, EvaluatorProgram, FieldWidth, Op, Store};
+use super::body::{BodyError, ElementLayout, EvaluatorProgram, FieldWidth, Op, Store, MAX_STEPS};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SurfaceErrorKind {
@@ -33,7 +22,11 @@ pub enum SurfaceErrorKind {
     DuplicateName,
     UnknownValue,
     UnknownLocal,
+    UnknownFunction,
+    ArityMismatch,
+    RecursiveCall,
     InvalidInteger,
+    InvalidFloat,
     InvalidWidth,
     Body(BodyError),
 }
@@ -50,15 +43,34 @@ impl SurfaceError {
     }
 }
 
+#[derive(Clone, Debug)]
+struct SourceLine {
+    number: usize,
+    words: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct Function {
+    line: usize,
+    params: Vec<String>,
+    body: Vec<SourceLine>,
+    result: String,
+}
+
 /// Compile a named evaluator body.
 ///
 /// Declarations and statements are line-oriented. A comment begins with `#`.
 /// Values are immutable; locals are the explicit state carried by loops.
+/// Functions are compile-time-only, pure expression macros and may call an
+/// earlier or later function, but recursive call cycles are rejected.
 pub fn compile_evaluator(
     id: u32,
     name: impl Into<String>,
     source: &str,
 ) -> Result<EvaluatorProgram, SurfaceError> {
+    let lines = source_lines(source);
+    let (functions, main) = collect_functions(&lines)?;
+    validate_functions(&functions)?;
     let mut fields = Vec::new();
     let mut aux_fields = Vec::new();
     let mut locals: HashMap<String, u32> = HashMap::new();
@@ -66,13 +78,9 @@ pub fn compile_evaluator(
     let mut ops = Vec::new();
     let mut stores = Vec::new();
 
-    for (line_index, raw) in source.lines().enumerate() {
-        let line_number = line_index + 1;
-        let text = raw.split('#').next().unwrap_or_default().trim();
-        if text.is_empty() {
-            continue;
-        }
-        let words: Vec<_> = text.split_whitespace().collect();
+    for source_line in main {
+        let line_number = source_line.number;
+        let words: Vec<_> = source_line.words.iter().map(String::as_str).collect();
         match words.as_slice() {
             ["field", width] => fields.push(parse_width(width, line_number)?),
             ["aux", width] => aux_fields.push(parse_width(width, line_number)?),
@@ -86,16 +94,23 @@ pub fn compile_evaluator(
                 locals.insert((*local).to_string(), locals.len() as u32);
             }
             ["repeat", trips] => {
-                ops.push(Op::Repeat(parse_u32(trips, line_number)?));
+                push_op(
+                    &mut ops,
+                    Op::Repeat(parse_u32(trips, line_number)?),
+                    line_number,
+                )?;
             }
-            ["end"] => ops.push(Op::EndRepeat),
+            ["end"] => {
+                push_op(&mut ops, Op::EndRepeat, line_number)?;
+            }
             ["break_if", condition] => {
-                ops.push(Op::BreakIf(value(&values, condition, line_number)?));
+                let condition = value(&values, condition, line_number)?;
+                push_op(&mut ops, Op::BreakIf(condition), line_number)?;
             }
             ["set", local, input] => {
                 let local = local_id(&locals, local, line_number)?;
                 let input = value(&values, input, line_number)?;
-                ops.push(Op::Set(local, input));
+                push_op(&mut ops, Op::Set(local, input), line_number)?;
             }
             ["store", field, input] => stores.push(Store {
                 field: parse_u32(field, line_number)?,
@@ -108,9 +123,15 @@ pub fn compile_evaluator(
                         SurfaceErrorKind::DuplicateName,
                     ));
                 }
-                let op = parse_expression(rest, &values, &locals, line_number)?;
-                let index = ops.len() as u32;
-                ops.push(op);
+                let index = emit_expression(
+                    rest,
+                    &values,
+                    &locals,
+                    &functions,
+                    &mut ops,
+                    &mut Vec::new(),
+                    line_number,
+                )?;
                 values.insert((*result).to_string(), index);
             }
             _ => return Err(SurfaceError::at(line_number, SurfaceErrorKind::Syntax)),
@@ -130,6 +151,203 @@ pub fn compile_evaluator(
     .map_err(|error| SurfaceError::at(0, SurfaceErrorKind::Body(error)))
 }
 
+fn source_lines(source: &str) -> Vec<SourceLine> {
+    source
+        .lines()
+        .enumerate()
+        .filter_map(|(index, raw)| {
+            let text = raw.split('#').next().unwrap_or_default().trim();
+            (!text.is_empty()).then(|| SourceLine {
+                number: index + 1,
+                words: text.split_whitespace().map(str::to_string).collect(),
+            })
+        })
+        .collect()
+}
+
+fn collect_functions(
+    lines: &[SourceLine],
+) -> Result<(HashMap<String, Function>, Vec<SourceLine>), SurfaceError> {
+    let mut functions = HashMap::new();
+    let mut main = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = &lines[index];
+        if line.words.first().map(String::as_str) != Some("fn") {
+            main.push(line.clone());
+            index += 1;
+            continue;
+        }
+        if line.words.len() < 2 {
+            return Err(SurfaceError::at(line.number, SurfaceErrorKind::Syntax));
+        }
+        let function_name = line.words[1].clone();
+        if functions.contains_key(&function_name) {
+            return Err(SurfaceError::at(
+                line.number,
+                SurfaceErrorKind::DuplicateName,
+            ));
+        }
+        let params = line.words[2..].to_vec();
+        let mut seen = HashSet::new();
+        for param in &params {
+            if !seen.insert(param.clone()) {
+                return Err(SurfaceError::at(
+                    line.number,
+                    SurfaceErrorKind::DuplicateName,
+                ));
+            }
+        }
+
+        index += 1;
+        let mut body = Vec::new();
+        let mut result = None;
+        let mut closed = false;
+        while index < lines.len() {
+            let current = &lines[index];
+            match current.words.as_slice() {
+                words if words == ["end"] => {
+                    closed = true;
+                    index += 1;
+                    break;
+                }
+                words if words.len() == 2 && words[0] == "return" => {
+                    if result.is_some() {
+                        return Err(SurfaceError::at(current.number, SurfaceErrorKind::Syntax));
+                    }
+                    if !seen.contains(&words[1]) {
+                        return Err(SurfaceError::at(
+                            current.number,
+                            SurfaceErrorKind::UnknownValue,
+                        ));
+                    }
+                    result = Some(words[1].clone());
+                }
+                words if words.len() >= 4 && words[0] == "let" && words[2] == "=" => {
+                    if result.is_some() {
+                        return Err(SurfaceError::at(current.number, SurfaceErrorKind::Syntax));
+                    }
+                    if !seen.insert(words[1].clone()) {
+                        return Err(SurfaceError::at(
+                            current.number,
+                            SurfaceErrorKind::DuplicateName,
+                        ));
+                    }
+                    body.push(current.clone());
+                }
+                _ => return Err(SurfaceError::at(current.number, SurfaceErrorKind::Syntax)),
+            }
+            index += 1;
+        }
+        if !closed || result.is_none() {
+            return Err(SurfaceError::at(line.number, SurfaceErrorKind::Syntax));
+        }
+        functions.insert(
+            function_name,
+            Function {
+                line: line.number,
+                params,
+                body,
+                result: result.unwrap(),
+            },
+        );
+    }
+    Ok((functions, main))
+}
+
+fn validate_functions(functions: &HashMap<String, Function>) -> Result<(), SurfaceError> {
+    let mut ordered: Vec<_> = functions.iter().collect();
+    ordered.sort_by_key(|(_, function)| function.line);
+    for (name, function) in ordered {
+        let mut ops = Vec::new();
+        let mut values = HashMap::new();
+        for param in &function.params {
+            let index = push_op(&mut ops, Op::Const(0), function.line)?;
+            values.insert(param.clone(), index);
+        }
+        let mut call = vec!["call", name.as_str()];
+        call.extend(function.params.iter().map(String::as_str));
+        emit_expression(
+            &call,
+            &values,
+            &HashMap::new(),
+            functions,
+            &mut ops,
+            &mut Vec::new(),
+            function.line,
+        )?;
+    }
+    Ok(())
+}
+
+fn emit_expression(
+    words: &[&str],
+    values: &HashMap<String, u32>,
+    locals: &HashMap<String, u32>,
+    functions: &HashMap<String, Function>,
+    ops: &mut Vec<Op>,
+    call_stack: &mut Vec<String>,
+    line: usize,
+) -> Result<u32, SurfaceError> {
+    if let ["call", function_name, arguments @ ..] = words {
+        let function = functions
+            .get(*function_name)
+            .ok_or_else(|| SurfaceError::at(line, SurfaceErrorKind::UnknownFunction))?;
+        if arguments.len() != function.params.len() {
+            return Err(SurfaceError::at(line, SurfaceErrorKind::ArityMismatch));
+        }
+        if call_stack.iter().any(|active| active == function_name) {
+            return Err(SurfaceError::at(line, SurfaceErrorKind::RecursiveCall));
+        }
+        let mut function_values = HashMap::new();
+        for (param, argument) in function.params.iter().zip(arguments) {
+            function_values.insert(param.clone(), value(values, argument, line)?);
+        }
+        call_stack.push((*function_name).to_string());
+        for body_line in &function.body {
+            let body_words: Vec<_> = body_line.words.iter().map(String::as_str).collect();
+            let ["let", result, "=", rest @ ..] = body_words.as_slice() else {
+                call_stack.pop();
+                return Err(SurfaceError::at(body_line.number, SurfaceErrorKind::Syntax));
+            };
+            if function_values.contains_key(*result) {
+                call_stack.pop();
+                return Err(SurfaceError::at(
+                    body_line.number,
+                    SurfaceErrorKind::DuplicateName,
+                ));
+            }
+            let index = emit_expression(
+                rest,
+                &function_values,
+                &HashMap::new(),
+                functions,
+                ops,
+                call_stack,
+                body_line.number,
+            )?;
+            function_values.insert((*result).to_string(), index);
+        }
+        call_stack.pop();
+        return value(&function_values, &function.result, line);
+    }
+
+    let op = parse_expression(words, values, locals, line)?;
+    push_op(ops, op, line)
+}
+
+fn push_op(ops: &mut Vec<Op>, op: Op, line: usize) -> Result<u32, SurfaceError> {
+    if ops.len() as u64 >= MAX_STEPS {
+        return Err(SurfaceError::at(
+            line,
+            SurfaceErrorKind::Body(BodyError::Unbounded),
+        ));
+    }
+    let index = ops.len() as u32;
+    ops.push(op);
+    Ok(index)
+}
+
 fn parse_expression(
     words: &[&str],
     values: &HashMap<String, u32>,
@@ -144,10 +362,13 @@ fn parse_expression(
             Op::GatherAux(value(values, at, line)?, parse_u32(field, line)?)
         }
         ["const", constant] => Op::Const(parse_u64(constant, line)?),
+        ["fconst", constant] => Op::FConst(parse_f32_bits(constant, line)?),
         ["get", local] => Op::Get(local_id(locals, local, line)?),
         ["add", a, b] => binary(values, a, b, line, Op::Add)?,
         ["sub", a, b] => binary(values, a, b, line, Op::Sub)?,
         ["mul", a, b] => binary(values, a, b, line, Op::Mul)?,
+        ["fadd", a, b] => binary(values, a, b, line, Op::FAdd)?,
+        ["fmul", a, b] => binary(values, a, b, line, Op::FMul)?,
         ["and", a, b] => binary(values, a, b, line, Op::And)?,
         ["or", a, b] => binary(values, a, b, line, Op::Or)?,
         ["xor", a, b] => binary(values, a, b, line, Op::Xor)?,
@@ -198,7 +419,19 @@ fn parse_width(text: &str, line: usize) -> Result<FieldWidth, SurfaceError> {
         "u16" => Ok(FieldWidth::U16),
         "u32" => Ok(FieldWidth::U32),
         "u64" => Ok(FieldWidth::U64),
+        "f32" => Ok(FieldWidth::F32),
         _ => Err(SurfaceError::at(line, SurfaceErrorKind::InvalidWidth)),
+    }
+}
+
+fn parse_f32_bits(text: &str, line: usize) -> Result<u32, SurfaceError> {
+    if let Some(hex) = text.strip_prefix("0x") {
+        u32::from_str_radix(hex, 16)
+            .map_err(|_| SurfaceError::at(line, SurfaceErrorKind::InvalidFloat))
+    } else {
+        text.parse::<f32>()
+            .map(f32::to_bits)
+            .map_err(|_| SurfaceError::at(line, SurfaceErrorKind::InvalidFloat))
     }
 }
 

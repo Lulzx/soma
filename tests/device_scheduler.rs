@@ -2,10 +2,14 @@ use soma::abi::cohorts::PartialCohortPolicy;
 use soma::abi::{Kind, Ref64, StateAccess};
 use soma::scheduler::admission::Candidate;
 use soma::scheduler::device::{
-    reference_device_schedule, reference_lane_conflicts, reference_resident_search,
-    DeviceLaneAccess, ResidentSearchConfig, DEVICE_DEFERRED, DEVICE_POLICY_DEFERRED, DEVICE_RUN,
-    DEVICE_SEND_TO_CPU,
+    reference_device_schedule, reference_lane_conflicts, DeviceLaneAccess, DEVICE_DEFERRED,
+    DEVICE_POLICY_DEFERRED, DEVICE_RUN, DEVICE_SEND_TO_CPU,
 };
+#[cfg(all(feature = "metal", target_os = "macos"))]
+use soma::scheduler::device::{
+    reference_resident_search, reference_resident_search_with_trace, ResidentSearchConfig,
+};
+#[cfg(all(feature = "metal", target_os = "macos"))]
 use soma::scheduler::device_ops::{DeviceLaneOperation, DeviceOperationJournal};
 
 fn candidate(
@@ -40,7 +44,19 @@ fn dynamic_search_stays_on_device_across_epochs() {
         cohort_width: 32,
     };
     let expected = reference_resident_search(config);
-    let actual = MetalResidentSearch::new().unwrap().run(config).unwrap();
+    let mut metal = MetalResidentSearch::new().unwrap();
+    let (traced_actual, trace) = metal.run_with_trace(config).unwrap();
+    let (traced_expected, expected_trace) = reference_resident_search_with_trace(config);
+    assert_eq!(traced_actual, traced_expected);
+    assert_eq!(trace, expected_trace);
+    assert_eq!(trace.len(), config.node_count().unwrap() as usize);
+    assert!(trace.iter().all(|event| event.lane_sequence == 0));
+    assert!(trace.windows(2).all(|pair| {
+        pair[0].epoch < pair[1].epoch
+            || (pair[0].epoch == pair[1].epoch && pair[0].lane < pair[1].lane)
+    }));
+
+    let actual = metal.run(config).unwrap();
     assert_eq!(actual, expected);
     assert_eq!(actual.nodes, config.node_count().unwrap());
     assert_eq!(actual.epochs, config.depth + 1);
@@ -96,6 +112,68 @@ fn journal_workload() -> Vec<DeviceLaneAccess> {
     ]
 }
 
+fn quadratic_lane_conflicts(
+    accesses: &[DeviceLaneAccess],
+    lane_count: u32,
+) -> Vec<soma::scheduler::device::DeviceLaneConflict> {
+    (0..lane_count)
+        .map(|lane| {
+            let other = accesses
+                .iter()
+                .filter(|access| access.lane == lane)
+                .flat_map(|access| {
+                    accesses.iter().filter_map(move |candidate| {
+                        (candidate.lane != lane
+                            && candidate.resource_kind == access.resource_kind
+                            && candidate.resource == access.resource
+                            && (access.mode == 2 || candidate.mode == 2))
+                            .then_some(candidate.lane)
+                    })
+                })
+                .min();
+            soma::scheduler::device::DeviceLaneConflict {
+                lane,
+                conflicts: u32::from(other.is_some()),
+                first_other_lane: other.unwrap_or(u32::MAX),
+                reserved: 0,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn sorted_lane_journal_validation_matches_the_pairwise_rule() {
+    let mut state = 0xA076_1D64_78BD_642Fu64;
+    for access_count in [0usize, 1, 2, 3, 17, 128, 1024] {
+        let lane_count = 37;
+        let mut accesses = Vec::with_capacity(access_count);
+        for ordinal in 0..access_count {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            accesses.push(DeviceLaneAccess::new(
+                ((state >> 7) % lane_count as u64) as u32,
+                ((state >> 19) % 5) as u32,
+                state.rotate_left(23) % 29,
+                if state & 3 == 0 { 2 } else { 1 },
+                ordinal as u32,
+            ));
+            // Exercise duplicate accesses and read-then-write aggregation in
+            // one lane without making physical record order significant.
+            if ordinal % 31 == 0 {
+                let mut duplicate = *accesses.last().unwrap();
+                duplicate.mode = 2;
+                duplicate.ordinal = duplicate.ordinal.wrapping_add(10_000);
+                accesses.push(duplicate);
+            }
+        }
+        let expected = quadratic_lane_conflicts(&accesses, lane_count);
+        assert_eq!(reference_lane_conflicts(&accesses, lane_count), expected);
+        accesses.reverse();
+        assert_eq!(reference_lane_conflicts(&accesses, lane_count), expected);
+    }
+}
+
 #[test]
 fn reference_lane_journal_validation_is_namespace_aware_and_order_independent() {
     let expected = reference_lane_conflicts(&journal_workload(), 7);
@@ -133,6 +211,45 @@ fn real_metal_lane_journal_validation_matches_the_reference() {
     assert_eq!(
         metal.validate_lane_journals(&[], 3).unwrap()[2].conflicts,
         0
+    );
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn grouped_metal_journal_validation_matches_irregular_access_sets() {
+    use soma::executives::metal_scheduler::MetalDeviceScheduler;
+
+    let lane_count = 73;
+    let mut state = 0xE703_7ED1_A0B4_28DBu64;
+    let mut accesses = Vec::new();
+    for ordinal in 0..4096u32 {
+        state = state
+            .wrapping_mul(2_862_933_555_777_941_757)
+            .wrapping_add(3_037_000_493);
+        let access = DeviceLaneAccess::new(
+            ((state >> 9) % lane_count as u64) as u32,
+            ((state >> 21) % 7) as u32,
+            state.rotate_left(17) % 113,
+            if state & 7 < 3 { 2 } else { 1 },
+            ordinal,
+        );
+        accesses.push(access);
+        if ordinal % 43 == 0 {
+            let mut duplicate = access;
+            duplicate.mode = 2;
+            accesses.push(duplicate);
+        }
+    }
+    let expected = quadratic_lane_conflicts(&accesses, lane_count);
+    let mut metal = MetalDeviceScheduler::new().unwrap();
+    assert_eq!(
+        metal.validate_lane_journals(&accesses, lane_count).unwrap(),
+        expected
+    );
+    accesses.reverse();
+    assert_eq!(
+        metal.validate_lane_journals(&accesses, lane_count).unwrap(),
+        expected
     );
 }
 
@@ -298,5 +415,162 @@ fn sorted_mutable_admission_matches_the_set_rule() {
             reference_device_schedule(&candidates, 9, policy),
             "policy={policy:?}"
         );
+    }
+}
+
+fn resident_frame_fixture() -> (
+    soma::compiler::body::EvaluatorProgram,
+    Vec<soma::scheduler::device::ResidentFrameBinding>,
+    Vec<u8>,
+) {
+    let program = soma::compiler::surface::compile_evaluator(
+        44_001,
+        "resident-private-frame",
+        "field u64\nlet x = load 0\nlet three = const 3\nlet product = mul x three\nlet one = const 1\nlet result = add product one\nstore 0 result\n",
+    )
+    .unwrap();
+    let bindings = (0..9u64)
+        .map(|lane| soma::scheduler::device::ResidentFrameBinding {
+            continuation: 100 + lane,
+            process: 200 + lane,
+            frame: 300 + lane,
+            actor: 400 + lane,
+            target: 500 + lane,
+        })
+        .collect::<Vec<_>>();
+    let frames = (1..=9u64).flat_map(u64::to_le_bytes).collect();
+    (program, bindings, frames)
+}
+
+#[test]
+fn resident_frame_graph_cpu_oracle_emits_commit_abi_and_canonical_trace() {
+    use soma::scheduler::device::{reference_resident_frame_graph, ResidentFrameGraphConfig};
+    use soma::scheduler::device_ops::OP_WRITE_OBJECT;
+    let (program, bindings, frames) = resident_frame_fixture();
+    let result = reference_resident_frame_graph(
+        &program,
+        ResidentFrameGraphConfig {
+            run_class: 2048,
+            epochs: 4,
+            cohort_width: 1,
+        },
+        &bindings,
+        &frames,
+    )
+    .unwrap();
+    let values = result
+        .frames
+        .chunks_exact(8)
+        .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        values,
+        (1..=9u64).map(|value| 81 * value + 40).collect::<Vec<_>>()
+    );
+    assert_eq!(result.trace.len(), bindings.len() * 4);
+    assert_eq!(result.accesses.len(), bindings.len() * 2);
+    assert!(result
+        .operations
+        .iter()
+        .all(|journal| journal.operations.len() == 2
+            && journal.operations[1].opcode == OP_WRITE_OBJECT));
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn compiled_resident_frame_handler_matches_cpu_i19_and_trace() {
+    use soma::executives::metal_scheduler::MetalResidentSearch;
+    use soma::scheduler::device::{reference_resident_frame_graph, ResidentFrameGraphConfig};
+    let (program, bindings, frames) = resident_frame_fixture();
+    let mut metal = MetalResidentSearch::new().unwrap();
+    metal.install_frame_handler(2048, &program).unwrap();
+    let narrow = ResidentFrameGraphConfig {
+        run_class: 2048,
+        epochs: 5,
+        cohort_width: 1,
+    };
+    let wide = ResidentFrameGraphConfig {
+        cohort_width: 32,
+        ..narrow
+    };
+    let expected = reference_resident_frame_graph(&program, narrow, &bindings, &frames).unwrap();
+    let actual_narrow = metal.run_frame_graph(narrow, &bindings, &frames).unwrap();
+    let actual_wide = metal.run_frame_graph(wide, &bindings, &frames).unwrap();
+    assert_eq!(
+        actual_narrow, expected,
+        "Metal/CPU and trace correspondence"
+    );
+    assert_eq!(
+        actual_wide.frames, actual_narrow.frames,
+        "I19 cohort-width neutrality"
+    );
+    assert_eq!(actual_wide.operations, actual_narrow.operations);
+    assert_eq!(actual_wide.accesses, actual_narrow.accesses);
+    assert_eq!(actual_wide.trace, actual_narrow.trace);
+}
+
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn resident_frame_handler_is_a_canonical_kernel_epoch_executive() {
+    use soma::abi::{ProcessMode, StateAccess};
+    use soma::compiler::run_classes::DEFAULT_MAX_STEPS;
+    use soma::executives::metal_scheduler::MetalResidentSearch;
+    use soma::kernel::speculation::EpochExecutive;
+    use soma::kernel::{ContinuationSpec, Kernel, SYSTEM_PRINCIPAL};
+    use soma::semantics::order::conforms_traces;
+
+    const RUN_CLASS: u32 = 2048;
+    let (program, _, _) = resident_frame_fixture();
+    let build = || {
+        let mut kernel = Kernel::new();
+        kernel.install_frame_evaluator(RUN_CLASS, program.clone()).unwrap();
+        let mut continuations = Vec::new();
+        for value in 1..=9u64 {
+            let process = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+            let continuation = kernel.create_continuation(
+                SYSTEM_PRINCIPAL,
+                process,
+                ContinuationSpec::new(
+                    StateAccess::ReadOnly,
+                    RUN_CLASS,
+                    0,
+                    value.to_le_bytes().to_vec(),
+                    DEFAULT_MAX_STEPS,
+                ),
+            ).unwrap();
+            continuations.push((process, continuation));
+        }
+        (kernel, continuations)
+    };
+    let (mut reference, continuations) = build();
+    let (mut narrow, _) = build();
+    let (mut wide, _) = build();
+    narrow.configure_epoch_executive(EpochExecutive::Speculative { max_lanes: 16 });
+    wide.configure_epoch_executive(EpochExecutive::Speculative { max_lanes: 16 });
+    let mut narrow_backend = MetalResidentSearch::new().unwrap();
+    narrow_backend.install_frame_handler(RUN_CLASS, &program).unwrap();
+    narrow_backend.set_frame_cohort_width(1).unwrap();
+    let mut wide_backend = MetalResidentSearch::new().unwrap();
+    wide_backend.install_frame_handler(RUN_CLASS, &program).unwrap();
+    wide_backend.set_frame_cohort_width(32).unwrap();
+
+    reference.run_epoch();
+    narrow.run_epoch_with_device_backend(&mut narrow_backend);
+    wide.run_epoch_with_device_backend(&mut wide_backend);
+
+    assert!(conforms_traces(&reference.trace_snapshot(), &narrow.trace_snapshot()).is_empty());
+    assert!(conforms_traces(&reference.trace_snapshot(), &wide.trace_snapshot()).is_empty());
+    assert_eq!(narrow.trace_snapshot(), wide.trace_snapshot(), "I19 kernel trace neutrality");
+    assert_eq!(narrow_backend.last_frame_trace(), wide_backend.last_frame_trace());
+    assert_eq!(narrow.speculation_stats().device_evaluated_lanes, 9);
+    assert_eq!(wide.speculation_stats().device_evaluated_lanes, 9);
+    for (process, continuation) in continuations {
+        let reference_frame = reference.continuation_frame(continuation).unwrap();
+        let narrow_frame = narrow.continuation_frame(continuation).unwrap();
+        let wide_frame = wide.continuation_frame(continuation).unwrap();
+        let expected = reference.object_bytes(process, reference_frame).unwrap();
+        assert_eq!(narrow.object_bytes(process, narrow_frame).unwrap(), expected);
+        assert_eq!(wide.object_bytes(process, wide_frame).unwrap(), expected);
     }
 }

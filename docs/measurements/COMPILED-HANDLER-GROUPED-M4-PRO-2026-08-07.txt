@@ -1,0 +1,24 @@
+SOMA compiled-handler post-grouped-validation local capture
+Date: 2026-08-07
+Base revision: db14ab9 plus the grouped journal validator and benchmark extension
+Machine: Apple M4 Pro, aarch64 macOS, release profile, native+metal features
+Command: cargo run --release --all-features --example scheduler_migration_bench -- --handlers-only
+Non-isolated local run; raw samples follow.
+
+SOMA scheduler/migration benchmark
+arch=aarch64 os=macos release=true
+
+
+[compiled continuation handler: full epoch execute + journal + commit]
+reference-handler lanes=32	median_us=22.000	p10_us=20.917	p90_us=26.250	raw_ns=65042,26250,20917,23250,21250,22000,20667,22250,22833,21292,21584
+native-handler lanes=32	median_us=71.542	p10_us=65.042	p90_us=82.458	raw_ns=145292,77667,65167,73583,65042,67084,71542,82458,78042,66167,63250
+metal-handler lanes=32	median_us=628.084	p10_us=527.667	p90_us=1233.250	raw_ns=2973708,533417,674000,614750,692958,628084,527667,539000,521167,1233250,774958
+reference-handler lanes=256	median_us=153.084	p10_us=151.166	p90_us=159.458	raw_ns=159458,160291,155125,153500,152417,154208,153084,151166,151000,152750,152042
+native-handler lanes=256	median_us=346.625	p10_us=329.583	p90_us=413.750	raw_ns=419125,357208,348584,347167,342333,331417,329583,346625,329000,332958,413750
+metal-handler lanes=256	median_us=798.125	p10_us=767.208	p90_us=1324.250	raw_ns=966416,845083,798125,785166,785666,1467584,809625,784042,766167,767208,1324250
+reference-handler lanes=1024	median_us=583.042	p10_us=577.541	p90_us=583.875	raw_ns=689583,583792,583875,582542,577541,583042,577416
+native-handler lanes=1024	median_us=1245.500	p10_us=1240.417	p90_us=1279.417	raw_ns=1629750,1279417,1240667,1255042,1229583,1245500,1240417
+metal-handler lanes=1024	median_us=1918.583	p10_us=1767.250	p90_us=2002.625	raw_ns=1918583,1895708,1982708,1755583,2002625,1767250,2007042
+reference-handler lanes=8192	median_us=7959.250	p10_us=7955.042	p90_us=9046.875	raw_ns=7955042,9046875,7959250
+native-handler lanes=8192	median_us=18277.291	p10_us=18032.209	p90_us=18783.166	raw_ns=18783166,18277291,18032209
+metal-handler lanes=8192	median_us=19632.041	p10_us=17537.584	p90_us=20320.625	raw_ns=20320625,17537584,19632041

@@ -7,6 +7,8 @@
 
 pub mod authority;
 pub mod remote_batch;
+pub mod remote_channel;
+pub mod remote_future;
 pub mod remote_journal;
 
 use crate::abi::Ref64;

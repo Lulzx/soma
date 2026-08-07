@@ -322,6 +322,10 @@ pub struct Kernel {
     mailboxes: HashMap<u64, Mailbox>,
     /// Future waiters keyed by future slot.
     future_waiters: HashMap<u64, Vec<Ref64>>,
+    /// Opaque remotely-owned dependencies keyed by local continuation slot.
+    /// This is waiter identity only: canonical future/channel state remains on
+    /// the owner and no remote entity is installed as a local ABI reference.
+    remote_waiter_dependencies: HashMap<u64, Ref64>,
     channel_queues: HashMap<u64, ChannelQueue>,
     /// Per (sender, receiver) pair, the next `sender_sequence` value (§11).
     send_sequences: HashMap<(u64, u64), u64>,
@@ -380,6 +384,15 @@ impl Kernel {
         Kernel::with_scheduler(Scheduler::default())
     }
 
+    /// The epoch whose boundary external inputs will be committed at.
+    ///
+    /// Distributed bridges use this value to make remote observations at most
+    /// once per boundary, so network timing within an epoch cannot change which
+    /// continuations become runnable in that epoch.
+    pub fn current_epoch(&self) -> u32 {
+        self.epoch
+    }
+
     /// A kernel that bins runnable continuations by `mode` — the knob that
     /// selects between run-class cohorting and the persistent-FIFO baseline.
     pub fn with_mode(mode: SchedulingMode) -> Kernel {
@@ -420,6 +433,7 @@ impl Kernel {
             object_payloads: HashMap::new(),
             mailboxes: HashMap::new(),
             future_waiters: HashMap::new(),
+            remote_waiter_dependencies: HashMap::new(),
             channel_queues: HashMap::new(),
             send_sequences: HashMap::new(),
             supervision_queues: HashMap::new(),
@@ -2787,6 +2801,122 @@ impl Kernel {
         // The `ContinuationWaiting` trace is emitted once, by the commit phase
         // (§18 Phase G), so every await path produces exactly one event.
         Ok(AwaitOutcome::Registered)
+    }
+
+    /// Park a local continuation on a future whose canonical state is owned by
+    /// another node.
+    ///
+    /// This is the kernel half of the distributed future bridge. It stores no
+    /// future descriptor or value locally: only the scheduling dependency
+    /// needed to wake the continuation after an authoritative remote poll.
+    #[doc(hidden)]
+    pub fn register_remote_future_waiter(
+        &mut self,
+        cont: Ref64,
+        remote_entity: Ref64,
+        next_run_class: u32,
+    ) -> Result<(), RuntimeError> {
+        self.register_remote_waiter(cont, remote_entity, next_run_class)
+    }
+
+    /// Park a continuation on a remotely-owned channel without creating a
+    /// local shadow channel descriptor.
+    #[doc(hidden)]
+    pub fn register_remote_channel_waiter(
+        &mut self,
+        cont: Ref64,
+        remote_entity: Ref64,
+        next_run_class: u32,
+    ) -> Result<(), RuntimeError> {
+        self.register_remote_waiter(cont, remote_entity, next_run_class)
+    }
+
+    fn register_remote_waiter(
+        &mut self,
+        cont: Ref64,
+        remote_entity: Ref64,
+        next_run_class: u32,
+    ) -> Result<(), RuntimeError> {
+        let (process, status) = self
+            .continuations
+            .get(cont)
+            .map(|c| (c.process, c.status))?;
+        if status == crate::abi::continuations::ContinuationState::Waiting
+            && self.remote_waiter_dependencies.get(&cont.key()) == Some(&remote_entity)
+        {
+            return Ok(());
+        }
+
+        // A boundary registration may target a continuation which is still in
+        // a current/next bin. Remove it before changing status so I7 holds at
+        // the boundary and the stale entry can never execute.
+        self.scheduler.remove(cont);
+        {
+            let c = self.continuations.get_mut(cont)?;
+            c.run_class = next_run_class;
+            // A RemoteRef's entity is not live in this kernel's GenTables. It
+            // must not enter the ABI descriptor, where it would violate I1.
+            c.dependency = Ref64::NULL;
+        }
+        self.set_continuation_status(cont, crate::abi::continuations::ContinuationState::Waiting);
+        self.remote_waiter_dependencies
+            .insert(cont.key(), remote_entity);
+        // Parking removes runnable eligibility, so (as with local await commit)
+        // it has no runnable-bin Effect. The semantic transition is traced.
+        self.trace_about(
+            EventKind::ContinuationWaiting,
+            process,
+            cont,
+            next_run_class,
+            remote_entity,
+        );
+        Ok(())
+    }
+
+    /// Wake a channel continuation after an authoritative epoch-boundary
+    /// readiness observation. Stale and duplicate notifications are no-ops.
+    #[doc(hidden)]
+    pub fn wake_remote_channel_waiter(&mut self, cont: Ref64, remote_entity: Ref64) {
+        self.wake_remote_waiter(cont, remote_entity)
+    }
+
+    /// Wake a continuation after its remote owner authoritatively reports that
+    /// the dependency is resolved. Stale or duplicate notifications are no-ops.
+    #[doc(hidden)]
+    pub fn wake_remote_future_waiter(&mut self, cont: Ref64, remote_entity: Ref64) {
+        self.wake_remote_waiter(cont, remote_entity)
+    }
+
+    fn wake_remote_waiter(&mut self, cont: Ref64, remote_entity: Ref64) {
+        if self.remote_waiter_dependencies.get(&cont.key()) != Some(&remote_entity) {
+            return;
+        }
+        let Some((process, run_class, status)) = self
+            .continuations
+            .get(cont)
+            .ok()
+            .map(|c| (c.process, c.run_class, c.status))
+        else {
+            self.remote_waiter_dependencies.remove(&cont.key());
+            return;
+        };
+        if status != crate::abi::continuations::ContinuationState::Waiting {
+            self.remote_waiter_dependencies.remove(&cont.key());
+            return;
+        }
+        self.remote_waiter_dependencies.remove(&cont.key());
+        self.emit(crate::kernel::effects::Effect::Wake {
+            continuation: cont,
+            run_class,
+        });
+        self.trace_caused(
+            EventKind::ContinuationReady,
+            process,
+            cont,
+            run_class,
+            0,
+            remote_entity,
+        );
     }
 
     /// Single-assignment resolution of a future: publish the value, then wake

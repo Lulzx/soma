@@ -339,9 +339,13 @@ impl BatchBackend for MetalBatchBackend {
 
     fn install(&mut self, program: &EvaluatorProgram) -> Result<(), BackendError> {
         let source = program.metal_source();
+        // I20 requires strict operation boundaries. In particular, f32
+        // add/mul must not contract or reassociate into a different result.
+        let options = CompileOptions::new();
+        options.set_fast_math_enabled(false);
         let library = self
             .device
-            .new_library_with_source(&source, &CompileOptions::new())
+            .new_library_with_source(&source, &options)
             .map_err(|_| BackendError::UnsupportedEvaluator)?;
         let function = library
             .get_function(&program.metal_entry_point(), None)

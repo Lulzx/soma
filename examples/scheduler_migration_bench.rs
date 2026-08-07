@@ -19,6 +19,7 @@ use soma::executives::batch::{
 };
 use soma::experiments::backend_bench::{synthetic_inputs, synthetic_program};
 use soma::kernel::ownership::freeze;
+#[cfg(any(feature = "native", all(feature = "metal", target_os = "macos")))]
 use soma::kernel::speculation::EpochExecutive;
 use soma::kernel::{ContinuationSpec, Kernel, SYSTEM_PRINCIPAL};
 use soma::scheduler::admission::Candidate;
@@ -91,9 +92,15 @@ fn compiled_handler_benchmark() {
         backend
     };
 
-    for count in [32, 256, 1_024] {
+    for count in [32, 256, 1_024, 8_192] {
         let base = handler_kernel(&program, RUN_CLASS, count);
-        let repetitions = if count < 1_024 { 11 } else { 7 };
+        let repetitions = if count < 1_024 {
+            11
+        } else if count < 8_192 {
+            7
+        } else {
+            3
+        };
         let mut reference = Vec::with_capacity(repetitions);
         #[cfg(feature = "native")]
         let mut native_samples = Vec::with_capacity(repetitions);

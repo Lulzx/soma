@@ -59,6 +59,35 @@ distinct `Unavailable`, `NodeLost`, authority, protocol, and execution
 outcomes. A malformed operation arena is an explicit negative control and is
 rejected at the worker rather than reaching commit.
 
+`RemoteFutureService` is the first resource whose canonical state is owned by
+the node named in its `RemoteRef`, rather than replayed into coordinator state.
+It serves authorized `AWAIT` observations and single-assignment `RESOLVE`
+operations over TCP. Resolve requests are content-addressed and apply once;
+revocation is checked before retry lookup, and a different second value is
+rejected. Polls deliberately bypass the response ledger so a previously
+observed `Pending` value cannot hide a later resolution. The client keeps
+unavailable, lost, protocol, authority, and already-resolved outcomes distinct.
+`RemoteFutureBridge` now supplies that scheduler edge. It observes the owner at
+most once per logical epoch boundary, parks only a local continuation identity,
+and uses the normal runnable-bin wake effect when the authoritative state is
+resolved. No future descriptor or value is copied into the local kernel. The
+kernel keeps the opaque remote dependency in a private map (never in an ABI
+reference field), removes stale runnable entries before parking, and traces one
+`ContinuationWaiting`/`ContinuationReady` pair with the remote entity as cause.
+Duplicate registration, wake, and same-boundary polling are idempotent; tests
+check I1/I7 immediately around the transition.
+
+`RemoteChannelService` similarly owns a bounded FIFO and closed bit on the node
+named by `RemoteRef`. SEND, RECEIVE, and DESTROY grants are operation-specific;
+per-actor sequences, content-addressed mutation replay, authorization before
+replay, and Full/Empty/Closed outcomes preserve FIFO, back-pressure, drain, and
+close semantics. `RemoteChannelBridge` probes readiness once per epoch boundary
+and parks/wakes local send or receive continuations through the same private-map
+hooks without creating a shadow channel descriptor. TCP and kernel integration
+controls cover apply-once retry, revocation, competing operations, node
+unavailable/lost/protocol distinctions, and invariant legality before and after
+wake.
+
 This validator is wired directly into `Kernel::run_epoch_with_lane_validator`.
 A clean remote decision permits canonical coordinator commit. A conflict or
 transport error discards every speculative snapshot and takes the reference
