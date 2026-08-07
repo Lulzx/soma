@@ -1,8 +1,8 @@
 //! Metal lowering of the standalone resident synchronization ABI.
 //!
 //! The complete epoch loop, handler interpreter, canonical effect applier,
-//! park/wake/retry machinery, and quiescence test execute in one Metal command
-//! buffer. The host performs one readback after completion. This is a
+//! park/wake/retry machinery, governed fixed-range object mutations, and
+//! quiescence test execute in one Metal command buffer. The host performs one readback after completion. This is a
 //! standalone backend and deliberately does not claim `Kernel` integration.
 
 use std::collections::BTreeMap;
@@ -38,6 +38,10 @@ struct GpuConfig {
     invocation_capacity: u32,
     wake_capacity: u32,
     epoch_capacity: u32,
+    object_count: u32,
+    object_capability_count: u32,
+    object_stride: u32,
+    initial_epoch: u32,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -84,6 +88,23 @@ struct GpuMailbox {
 struct GpuMailEntry {
     sender: u64,
     value: u64,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GpuObject {
+    len: u32,
+    version: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GpuObjectCapability {
+    actor: u64,
+    offset: u64,
+    length: u64,
+    target: u32,
+    rights: u32,
+    object_version: u32,
+    valid_until_epoch: u32,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -142,14 +163,16 @@ struct GpuStatus {
 const SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
-struct Config { uint continuation_count, handler_count, instruction_count, future_count; uint mailbox_count, capability_count, max_epochs, max_effects; uint frame_stride, effect_capacity, trace_capacity, mailbox_stride; uint invocation_capacity,wake_capacity,epoch_capacity; };
+struct Config { uint continuation_count, handler_count, instruction_count, future_count; uint mailbox_count, capability_count, max_epochs, max_effects; uint frame_stride, effect_capacity, trace_capacity, mailbox_stride; uint invocation_capacity,wake_capacity,epoch_capacity,object_count; uint object_capability_count,object_stride,initial_epoch; };
 struct Cont { ulong id, actor; uint run_class, frame_len, state, last_epoch; uint previous_kind, pending_opcode, pending_target, reserved; ulong previous_value, previous_sender, pending_value; };
 struct Handler { uint run_class, instruction_offset, instruction_count, reserved; };
-struct Instruction { uint opcode, argument; ulong value; };
+struct Instruction { uint opcode, argument, target, reserved; ulong value; };
 struct Future { uint resolved, reserved; ulong value; };
 struct Mailbox { uint capacity, head, count, reserved; };
 struct MailEntry { ulong sender, value; };
 struct Capability { ulong actor; uint kind, target, rights, reserved; };
+struct Object { uint len,version; };
+struct ObjectCapability { ulong actor,offset,length; uint target,rights,object_version,valid_until_epoch; };
 struct EffectRecord { uint epoch, lane, ordinal, opcode; ulong continuation; uint target, outcome; ulong value, result_value, result_sender; uint run_class, reserved; };
 struct Trace { uint epoch, lane; ulong continuation; uint run_class, event, word; };
 struct Status { uint effect_count, trace_count, completed_count, epochs; uint quiescent,error,invocation_count,wake_count; uint epoch_count,ticket,reserved0,reserved1; };
@@ -158,12 +181,13 @@ struct Invocation { uint epoch,lane; ulong continuation; uint run_class,disposit
 struct Wake { uint epoch,lane,cause_opcode,target; ulong cause_continuation,continuation; uint run_class,ticket,ordinal,reserved; };
 struct EpochRecord { uint epoch,invocations,runnable_after,completed_after; };
 constant uint RUNNABLE=1, PARKED=2, COMPLETE=3;
-constant uint AWAIT=1, RESOLVE=2, SEND=3, RECEIVE=4, OBSERVE=10;
-constant uint OUT_RESOLVED=1, OUT_REGISTERED=2, OUT_SENT=3, OUT_RECEIVED=4, OUT_DENIED=5, OUT_INVALID=6, OUT_FULL=7, OUT_EMPTY=8, OUT_DOUBLE=9, OUT_PENDING=10;
-inline uint outcome_code(uint o) { if(o==OUT_RESOLVED||o==OUT_RECEIVED)return 2; if(o==OUT_REGISTERED)return 3; if(o==OUT_EMPTY||o==OUT_PENDING)return 1; if(o==OUT_INVALID)return 0x101; if(o==OUT_DENIED)return 0x104; if(o==OUT_FULL)return 0x10c; if(o==OUT_DOUBLE)return 0x111; return 0; }
-inline uint journal_opcode(uint op) { return op==OBSERVE?1:(op==AWAIT?11:(op==RESOLVE?10:(op==SEND?8:9))); }
+constant uint AWAIT=1, RESOLVE=2, SEND=3, RECEIVE=4, OBSERVE=10, OBJECT_READ=11, OBJECT_WRITE=12;
+constant uint OUT_RESOLVED=1, OUT_REGISTERED=2, OUT_SENT=3, OUT_RECEIVED=4, OUT_DENIED=5, OUT_INVALID=6, OUT_FULL=7, OUT_EMPTY=8, OUT_DOUBLE=9, OUT_PENDING=10, OUT_OBJECT_READ=11, OUT_OBJECT_WRITTEN=12;
+inline uint outcome_code(uint o) { if(o==OUT_RESOLVED||o==OUT_RECEIVED||o==OUT_OBJECT_READ)return 2; if(o==OUT_REGISTERED)return 3; if(o==OUT_EMPTY||o==OUT_PENDING)return 1; if(o==OUT_INVALID)return 0x101; if(o==OUT_DENIED)return 0x104; if(o==OUT_FULL)return 0x10c; if(o==OUT_DOUBLE)return 0x111; return 0; }
+inline uint journal_opcode(uint op) { return op==OBJECT_READ?2:(op==OBJECT_WRITE?7:(op==OBSERVE?1:(op==AWAIT?11:(op==RESOLVE?10:(op==SEND?8:9))))); }
 inline uint hash_frame(device uchar* f,uint n){uint h=2166136261u;for(uint i=0;i<n;i++)h=(h^uint(f[i]))*16777619u;return h;}
 inline bool allowed(device const Capability* caps,uint n,ulong actor,uint kind,uint target,uint right){for(uint i=0;i<n;i++){Capability c=caps[i];if(c.actor==actor&&c.kind==kind&&c.target==target&&(c.rights&right)!=0)return true;}return false;}
+inline bool object_allowed(device const ObjectCapability* caps,uint n,device const Object* objects,uint object_count,ulong actor,uint target,uint offset,uint right,uint epoch){if(target>=object_count)return false;ulong end=ulong(offset)+8;for(uint i=0;i<n;i++){ObjectCapability c=caps[i];if(c.actor==actor&&c.target==target&&(c.rights&right)!=0&&c.object_version==objects[target].version&&c.valid_until_epoch>=epoch&&ulong(offset)>=c.offset&&end>=ulong(offset)&&end<=c.offset+c.length)return true;}return false;}
 inline void add_trace(device Trace* traces,device Status* s,constant Config& cfg,uint epoch,uint lane,Cont c,uint event,uint word){if(s->trace_count>=cfg.trace_capacity){s->error=2;return;}Trace t={epoch,lane,c.id,c.run_class,event,word};traces[s->trace_count++]=t;}
 inline void add_wake(device Wake* wakes,device Status* s,constant Config& cfg,uint epoch,uint lane,uint cause,uint target,ulong cause_continuation,uint ordinal,Cont c){if(s->wake_count>=cfg.wake_capacity){s->error=8;return;}Wake w={epoch,lane,cause,target,cause_continuation,c.id,c.run_class,c.reserved,ordinal,0};wakes[s->wake_count++]=w;}
 inline void wake_future(device Cont* cs,uint n,uint target,ulong value,uint epoch,uint lane,ulong cause_continuation,uint ordinal,device Wake* wakes,device Status* s,constant Config& cfg){for(uint i=0;i<n;i++)if(cs[i].state==PARKED&&cs[i].pending_opcode==AWAIT&&cs[i].pending_target==target){add_wake(wakes,s,cfg,epoch,lane,10,target,cause_continuation,ordinal,cs[i]);cs[i].state=RUNNABLE;cs[i].last_epoch=epoch;cs[i].pending_opcode=0;cs[i].previous_kind=OUT_RESOLVED;cs[i].previous_value=value;}}
@@ -172,7 +196,7 @@ kernel void resident_sync(
  constant Config& cfg [[buffer(0)]], device Cont* cs [[buffer(1)]], device uchar* frames [[buffer(2)]],
  device const Handler* handlers [[buffer(3)]], device const Instruction* ins [[buffer(4)]], device Future* futures [[buffer(5)]],
  device Mailbox* mails [[buffer(6)]], device MailEntry* entries [[buffer(7)]], device const Capability* caps [[buffer(8)]],
- device EffectRecord* records [[buffer(9)]], device Trace* traces [[buffer(10)]], device ulong* completed [[buffer(11)]], device Status* status [[buffer(12)]], device Stage* stages [[buffer(13)]], device Invocation* invocations [[buffer(14)]], device Wake* wakes [[buffer(15)]], device EpochRecord* epoch_records [[buffer(16)]], uint gid [[thread_position_in_grid]]) {
+ device EffectRecord* records [[buffer(9)]], device Trace* traces [[buffer(10)]], device ulong* completed [[buffer(11)]], device Status* status [[buffer(12)]], device Stage* stages [[buffer(13)]], device Invocation* invocations [[buffer(14)]], device Wake* wakes [[buffer(15)]], device EpochRecord* epoch_records [[buffer(16)]], device Object* objects [[buffer(17)]], device uchar* object_bytes [[buffer(18)]], device const ObjectCapability* object_caps [[buffer(19)]], uint gid [[thread_position_in_grid]]) {
  if(gid!=0)return; Status s={0,0,0,0,0,0,0,0,0,0,0,0}; *status=s; if(cfg.continuation_count==0){status->quiescent=1;return;}
  for(uint epoch=0;epoch<cfg.max_epochs;epoch++){
   uint lane=0;
@@ -189,15 +213,15 @@ kernel void resident_sync(
    if(retry_opcode==0){c.previous_kind=0;c.previous_value=0;c.previous_sender=0;uint hi=0xffffffffu;for(uint h=0;h<cfg.handler_count;h++)if(handlers[h].run_class==c.run_class)hi=h;if(hi==0xffffffffu){status->error=3;return;}pc=handlers[hi].instruction_offset;end=pc+handlers[hi].instruction_count;}
    else{c.pending_opcode=0;c.pending_target=0;c.pending_value=0;}
    while(retry_opcode!=0||pc<end){
-    uint op,arg;ulong val;
-    if(retry_opcode!=0){op=retry_opcode;arg=retry_target;val=retry_value;retry_opcode=0;disposition=1;next_class=c.run_class;}
-    else{Instruction x=ins[pc++];op=x.opcode;arg=x.argument;val=x.value;
-     if(op==5||op==6){if(arg+8>c.frame_len||(op==6&&input_previous_kind!=OUT_RESOLVED&&input_previous_kind!=OUT_RECEIVED)){status->error=4;return;}ulong v=op==5?val:input_previous_value;for(uint bb=0;bb<8;bb++)frames[at*cfg.frame_stride+arg+bb]=uchar(v>>(bb*8));continue;}
-     if(op==7){if((input_previous_kind!=OUT_RESOLVED&&input_previous_kind!=OUT_RECEIVED)||input_previous_value!=val)pc+=arg;continue;}
+    uint op,arg,target;ulong val;
+    if(retry_opcode!=0){op=retry_opcode;arg=retry_target;target=retry_target;val=retry_value;retry_opcode=0;disposition=1;next_class=c.run_class;}
+    else{Instruction x=ins[pc++];op=x.opcode;arg=x.argument;target=(op==OBJECT_READ||op==OBJECT_WRITE)?x.target:x.argument;val=x.value;
+     if(op==5||op==6){if(arg+8>c.frame_len||(op==6&&input_previous_kind!=OUT_RESOLVED&&input_previous_kind!=OUT_RECEIVED&&input_previous_kind!=OUT_OBJECT_READ)){status->error=4;return;}ulong v=op==5?val:input_previous_value;for(uint bb=0;bb<8;bb++)frames[at*cfg.frame_stride+arg+bb]=uchar(v>>(bb*8));continue;}
+     if(op==7){if((input_previous_kind!=OUT_RESOLVED&&input_previous_kind!=OUT_RECEIVED&&input_previous_kind!=OUT_OBJECT_READ)||input_previous_value!=val)pc+=arg;continue;}
      if(op==8){disposition=1;next_class=arg;break;}if(op==9){disposition=2;next_class=0;break;}
     }
-    if(!((op>=1&&op<=4)||op==OBSERVE)||emitted>=cfg.max_effects||status->effect_count>=cfg.effect_capacity){status->error=5;return;}
-    EffectRecord r={epoch,lane,emitted,journal_opcode(op),c.id,arg,0,val,0,0,c.run_class,0};records[status->effect_count++]=r;emitted++;
+    if(!((op>=1&&op<=4)||op==OBSERVE||op==OBJECT_READ||op==OBJECT_WRITE)||emitted>=cfg.max_effects||status->effect_count>=cfg.effect_capacity){status->error=5;return;}
+    EffectRecord r={epoch,lane,emitted,journal_opcode(op),c.id,target,0,val,0,0,c.run_class,(op==OBJECT_READ||op==OBJECT_WRITE)?arg:0};records[status->effect_count++]=r;emitted++;
    }
    if(disposition==0){status->error=7;return;}
    Stage st={at,effect_start,emitted,disposition,next_class,status->invocation_count,0,0};stages[lane]=st;if(status->invocation_count>=cfg.invocation_capacity){status->error=9;return;}Invocation iv={epoch,lane,c.id,c.run_class,disposition,next_class};invocations[status->invocation_count++]=iv;cs[at]=c;
@@ -207,10 +231,14 @@ kernel void resident_sync(
   for(uint li=0;li<lane;li++){
    Stage st=stages[li];Cont c=cs[st.continuation_index];bool parked=false;
    for(uint ri=st.effect_offset;ri<st.effect_offset+st.effect_count;ri++){
-    EffectRecord r=records[ri];uint op=r.opcode==1?OBSERVE:(r.opcode==11?AWAIT:(r.opcode==10?RESOLVE:(r.opcode==8?SEND:RECEIVE)));uint arg=r.target;ulong val=r.value;
-    uint kind=(op<=2||op==OBSERVE)?2:3;uint right=(op==OBSERVE||op==AWAIT||op==RECEIVE)?1:2;uint outcome=0;ulong result_value=0,result_sender=0;
-    if(!allowed(caps,cfg.capability_count,c.actor,kind,arg,right))outcome=OUT_DENIED;
-    else if((kind==2&&arg>=cfg.future_count)||(kind==3&&arg>=cfg.mailbox_count))outcome=OUT_INVALID;
+    EffectRecord r=records[ri];uint op=r.opcode==2?OBJECT_READ:(r.opcode==7?OBJECT_WRITE:(r.opcode==1?OBSERVE:(r.opcode==11?AWAIT:(r.opcode==10?RESOLVE:(r.opcode==8?SEND:RECEIVE)))));uint arg=r.target;uint offset=r.reserved;ulong val=r.value;
+    uint kind=(op==OBJECT_READ||op==OBJECT_WRITE)?1:((op<=2||op==OBSERVE)?2:3);uint right=(op==OBJECT_READ||op==OBSERVE||op==AWAIT||op==RECEIVE)?1:2;uint outcome=0;ulong result_value=0,result_sender=0;
+    bool authorized=kind==1?object_allowed(object_caps,cfg.object_capability_count,objects,cfg.object_count,c.actor,arg,offset,right,cfg.initial_epoch+epoch):allowed(caps,cfg.capability_count,c.actor,kind,arg,right);
+    if(!authorized)outcome=OUT_DENIED;
+    else if((kind==1&&arg>=cfg.object_count)||(kind==2&&arg>=cfg.future_count)||(kind==3&&arg>=cfg.mailbox_count))outcome=OUT_INVALID;
+    else if(kind==1&&(ulong(offset)+8>objects[arg].len||ulong(offset)+8<ulong(offset)))outcome=OUT_INVALID;
+    else if(op==OBJECT_READ){uint base=arg*cfg.object_stride+offset;for(uint bb=0;bb<8;bb++)result_value|=ulong(object_bytes[base+bb])<<(bb*8);outcome=OUT_OBJECT_READ;}
+    else if(op==OBJECT_WRITE){uint base=arg*cfg.object_stride+offset;for(uint bb=0;bb<8;bb++)object_bytes[base+bb]=uchar(val>>(bb*8));result_value=val;outcome=OUT_OBJECT_WRITTEN;}
     else if(op==OBSERVE){if(futures[arg].resolved!=0){outcome=OUT_RESOLVED;result_value=futures[arg].value;}else outcome=OUT_PENDING;}
     else if(op==AWAIT){if(futures[arg].resolved!=0){outcome=OUT_RESOLVED;result_value=futures[arg].value;}else{outcome=OUT_REGISTERED;parked=true;c.pending_opcode=AWAIT;c.pending_target=arg;}}
     else if(op==RESOLVE){if(futures[arg].resolved!=0)outcome=OUT_DOUBLE;else{futures[arg].resolved=1;futures[arg].value=val;outcome=OUT_RESOLVED;result_value=val;wake_future(cs,cfg.continuation_count,arg,val,epoch,li,c.id,r.ordinal,wakes,status,cfg);}}
@@ -218,7 +246,7 @@ kernel void resident_sync(
     else{Mailbox m=mails[arg];if(m.count==0){outcome=OUT_EMPTY;parked=true;c.pending_opcode=RECEIVE;c.pending_target=arg;}else{uint slot=arg*cfg.mailbox_stride+m.head;MailEntry e=entries[slot];m.head=(m.head+1)%cfg.mailbox_stride;m.count--;mails[arg]=m;outcome=OUT_RECEIVED;result_value=e.value;result_sender=e.sender;c.pending_opcode=0;wake_one(cs,cfg.continuation_count,SEND,arg,epoch,li,9,c.id,r.ordinal,wakes,status,cfg);}}
     if(outcome==OUT_REGISTERED||outcome==OUT_FULL||outcome==OUT_EMPTY)c.reserved=++status->ticket;
     r.outcome=outcome;r.result_value=result_value;r.result_sender=result_sender;records[ri]=r;add_trace(traces,status,cfg,epoch,li,c,r.opcode,outcome_code(outcome));
-    if(outcome==OUT_RESOLVED||outcome==OUT_RECEIVED){c.previous_kind=outcome;c.previous_value=result_value;c.previous_sender=result_sender;}
+    if(outcome==OUT_RESOLVED||outcome==OUT_RECEIVED||outcome==OUT_OBJECT_READ){c.previous_kind=outcome;c.previous_value=result_value;c.previous_sender=result_sender;}
    }
    if(parked){c.state=PARKED;invocations[st.reserved0].disposition=3;invocations[st.reserved0].next_run_class=c.run_class;}else if(st.disposition==1){c.state=RUNNABLE;c.run_class=st.next_run_class;}else{c.state=COMPLETE;completed[status->completed_count++]=c.id;}cs[st.continuation_index]=c;
   }
@@ -342,6 +370,48 @@ impl MetalResidentSync {
                 reserved: 0,
             })
             .collect();
+        let object_stride = config.max_frame_bytes as usize;
+        if config
+            .objects
+            .iter()
+            .any(|object| object.bytes.len() > object_stride)
+        {
+            return Err(BackendError::InvalidInput);
+        }
+        let mut object_bytes = vec![
+            0u8;
+            config
+                .objects
+                .len()
+                .checked_mul(object_stride)
+                .ok_or(BackendError::InvalidInput)?
+        ];
+        let objects: Vec<GpuObject> = config
+            .objects
+            .iter()
+            .enumerate()
+            .map(|(index, object)| {
+                object_bytes[index * object_stride..index * object_stride + object.bytes.len()]
+                    .copy_from_slice(&object.bytes);
+                GpuObject {
+                    len: object.bytes.len() as u32,
+                    version: object.version,
+                }
+            })
+            .collect();
+        let object_capabilities: Vec<GpuObjectCapability> = config
+            .object_capabilities
+            .iter()
+            .map(|cap| GpuObjectCapability {
+                actor: cap.actor,
+                offset: cap.offset,
+                length: cap.length,
+                target: cap.target,
+                rights: cap.rights,
+                object_version: cap.object_version,
+                valid_until_epoch: cap.valid_until_epoch,
+            })
+            .collect();
         let cfg = GpuConfig {
             continuation_count: gpu_conts.len() as u32,
             handler_count: handlers.len() as u32,
@@ -358,6 +428,10 @@ impl MetalResidentSync {
             invocation_capacity: invocation_capacity as u32,
             wake_capacity: invocation_capacity as u32,
             epoch_capacity: config.max_epochs,
+            object_count: objects.len() as u32,
+            object_capability_count: object_capabilities.len() as u32,
+            object_stride: object_stride as u32,
+            initial_epoch: config.initial_epoch,
         };
         let cfg_b = self.buffer_from(std::slice::from_ref(&cfg));
         let cs_b = self.buffer_from(&gpu_conts);
@@ -381,6 +455,9 @@ impl MetalResidentSync {
         let invocations_b = self.zero_buffer::<ResidentInvocationRecord>(invocation_capacity);
         let wakes_b = self.zero_buffer::<ResidentWakeRecord>(invocation_capacity);
         let epochs_b = self.zero_buffer::<ResidentEpochRecord>(config.max_epochs as usize);
+        let objects_b = self.buffer_from(&objects);
+        let object_bytes_b = self.buffer_from(&object_bytes);
+        let object_caps_b = self.buffer_from(&object_capabilities);
         let command = self.queue.new_command_buffer();
         let encoder = command.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&self.pipeline);
@@ -402,6 +479,9 @@ impl MetalResidentSync {
             &invocations_b,
             &wakes_b,
             &epochs_b,
+            &objects_b,
+            &object_bytes_b,
+            &object_caps_b,
         ]
         .iter()
         .enumerate()
@@ -421,6 +501,7 @@ impl MetalResidentSync {
         // The only device-to-host read phase begins here.
         gpu_conts = read_vec(&cs_b, continuations.len());
         let final_frames: Vec<u8> = read_vec(&frames_b, frames.len());
+        let final_object_bytes: Vec<u8> = read_vec(&object_bytes_b, object_bytes.len());
         let final_futures: Vec<GpuFuture> = read_vec(&futures_b, futures.len());
         let final_mails: Vec<GpuMailbox> = read_vec(&mail_b, mailboxes.len());
         let final_entries: Vec<GpuMailEntry> = read_vec(&entries_b, entry_count);
@@ -446,6 +527,7 @@ impl MetalResidentSync {
             &continuations,
             &gpu_conts,
             &final_frames,
+            &final_object_bytes,
             &final_futures,
             &final_mails,
             &final_entries,
@@ -511,6 +593,25 @@ fn validate(
         || unique_ids.len() != continuations.len()
         || u32::try_from(continuations.len()).is_err()
         || u32::try_from(programs.len()).is_err()
+        || config
+            .initial_epoch
+            .checked_add(config.max_epochs)
+            .is_none()
+        || !object_storage_is_bounded(config)
+        || config
+            .objects
+            .iter()
+            .any(|object| object.bytes.len() > config.max_frame_bytes as usize)
+        || config.object_capabilities.iter().any(|cap| {
+            let Some(object) = config.objects.get(cap.target as usize) else {
+                return true;
+            };
+            cap.object_version != object.version
+                || cap
+                    .offset
+                    .checked_add(cap.length)
+                    .is_none_or(|end| end > object.bytes.len() as u64)
+        })
         || u32::try_from(config.futures.len()).is_err()
         || u32::try_from(config.mailbox_capacities.len()).is_err()
         || u32::try_from(config.capabilities.len()).is_err()
@@ -584,11 +685,22 @@ fn raw_outcome(r: &GpuEffectRecord) -> Result<ResidentOutcome, BackendError> {
         8 => ResidentOutcome::Empty,
         9 => ResidentOutcome::DoubleResolve,
         10 => ResidentOutcome::Pending,
+        11 => ResidentOutcome::ObjectRead(r.result_value),
+        12 => ResidentOutcome::ObjectWritten,
         _ => return Err(BackendError::ExecutionFailed),
     })
 }
 fn raw_effect(r: &GpuEffectRecord) -> Result<ResidentEffect, BackendError> {
     Ok(match r.opcode {
+        crate::scheduler::device_ops::OP_READ_OBJECT => ResidentEffect::ObjectRead {
+            target: r.target,
+            offset: r.reserved,
+        },
+        crate::scheduler::device_ops::OP_WRITE_OBJECT => ResidentEffect::ObjectWrite {
+            target: r.target,
+            offset: r.reserved,
+            value: r.value,
+        },
         crate::scheduler::device_ops::OP_OBSERVE_FUTURE => {
             ResidentEffect::FutureObserve { target: r.target }
         }
@@ -615,6 +727,7 @@ fn decode(
     specs: &[ResidentContinuation],
     cs: &[GpuContinuation],
     frames: &[u8],
+    object_bytes: &[u8],
     futures: &[GpuFuture],
     mails: &[GpuMailbox],
     entries: &[GpuMailEntry],
@@ -634,6 +747,14 @@ fn decode(
             frames[index * stride..index * stride + continuation.frame_len as usize].to_vec(),
         );
     }
+    result.object_values = config
+        .objects
+        .iter()
+        .enumerate()
+        .map(|(index, object)| {
+            object_bytes[index * stride..index * stride + object.bytes.len()].to_vec()
+        })
+        .collect();
     let mut journals: BTreeMap<(u32, u32), DeviceOperationJournal> = trace
         .iter()
         .filter(|entry| entry.event == 0)
@@ -645,13 +766,19 @@ fn decode(
         result.accesses.push(DeviceLaneAccess::new(
             record.lane,
             match effect {
+                ResidentEffect::ObjectRead { .. } | ResidentEffect::ObjectWrite { .. } => {
+                    RESOURCE_OBJECT
+                }
                 ResidentEffect::FutureObserve { .. }
                 | ResidentEffect::FutureAwait { .. }
                 | ResidentEffect::FutureResolve { .. } => RESOURCE_FUTURE,
                 _ => RESOURCE_MAILBOX,
             },
             u64::from(record.target),
-            if matches!(effect, ResidentEffect::FutureObserve { .. }) {
+            if matches!(
+                effect,
+                ResidentEffect::FutureObserve { .. } | ResidentEffect::ObjectRead { .. }
+            ) {
                 crate::scheduler::device::DEVICE_ACCESS_READ
             } else {
                 DEVICE_ACCESS_WRITE
@@ -663,30 +790,47 @@ fn decode(
             .find(|continuation| continuation.id == record.continuation)
             .ok_or(BackendError::ExecutionFailed)?
             .actor;
-        journals
+        let journal = journals
             .get_mut(&(record.epoch, record.lane))
-            .ok_or(BackendError::ExecutionFailed)?
-            .operations
-            .push(DeviceLaneOperation {
-                lane: record.lane,
-                ordinal: record.ordinal,
-                opcode: record.opcode,
-                actor,
-                target: u64::from(record.target),
-                value: record.value,
-                result_code: match outcome {
-                    ResidentOutcome::Resolved(_) | ResidentOutcome::Received { .. } => 2,
-                    ResidentOutcome::Registered => 3,
-                    ResidentOutcome::Empty | ResidentOutcome::Pending => 1,
-                    ResidentOutcome::InvalidTarget => 0x101,
-                    ResidentOutcome::CapabilityDenied => 0x104,
-                    ResidentOutcome::Full => 0x10c,
-                    ResidentOutcome::DoubleResolve => 0x111,
-                    ResidentOutcome::Sent => 0,
-                },
-                result_ref: record.result_value,
-                ..Default::default()
-            });
+            .ok_or(BackendError::ExecutionFailed)?;
+        let payload = match outcome {
+            ResidentOutcome::ObjectRead(value) => value.to_le_bytes().to_vec(),
+            ResidentOutcome::ObjectWritten => record.value.to_le_bytes().to_vec(),
+            _ => Vec::new(),
+        };
+        let (payload_offset, payload_len) = journal
+            .append_payload(&payload)
+            .ok_or(BackendError::ExecutionFailed)?;
+        journal.operations.push(DeviceLaneOperation {
+            lane: record.lane,
+            ordinal: record.ordinal,
+            opcode: record.opcode,
+            actor,
+            target: u64::from(record.target),
+            value: record.value,
+            auxiliary: u64::from(record.reserved),
+            payload_offset,
+            payload_len,
+            result_code: match outcome {
+                ResidentOutcome::ObjectRead(_)
+                | ResidentOutcome::Resolved(_)
+                | ResidentOutcome::Received { .. } => 2,
+                ResidentOutcome::ObjectWritten => 0,
+                ResidentOutcome::Registered => 3,
+                ResidentOutcome::Empty | ResidentOutcome::Pending => 1,
+                ResidentOutcome::InvalidTarget => 0x101,
+                ResidentOutcome::CapabilityDenied => 0x104,
+                ResidentOutcome::Full => 0x10c,
+                ResidentOutcome::DoubleResolve => 0x111,
+                ResidentOutcome::Sent => 0,
+            },
+            result_ref: if matches!(outcome, ResidentOutcome::ObjectWritten) {
+                0
+            } else {
+                record.result_value
+            },
+            ..Default::default()
+        });
         result.effects.push(ResidentEffectRecord {
             epoch: record.epoch,
             lane: record.lane,
@@ -777,6 +921,9 @@ mod tests {
             max_frame_bytes: 8,
             max_continuations: 2,
             cohort_width: width,
+            initial_epoch: 0,
+            objects: vec![],
+            object_capabilities: vec![],
             futures: vec![InitialFuture::Pending],
             mailbox_capacities: vec![],
             capabilities: vec![
@@ -807,26 +954,36 @@ mod tests {
                     ResidentInstruction {
                         opcode: HANDLER_IF_PREVIOUS_VALUE_NE_SKIP,
                         argument: 2,
+                        target: 0,
+                        reserved: 0,
                         value: 77,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_STORE_PREVIOUS_VALUE_U64,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_COMPLETE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_EFFECT_FUTURE_AWAIT,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_YIELD,
                         argument: 100,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                 ],
@@ -840,11 +997,15 @@ mod tests {
                     ResidentInstruction {
                         opcode: HANDLER_EFFECT_FUTURE_RESOLVE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 77,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_COMPLETE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                 ],
@@ -866,6 +1027,9 @@ mod tests {
             max_frame_bytes: 8,
             max_continuations: 4,
             cohort_width: width,
+            initial_epoch: 0,
+            objects: vec![],
+            object_capabilities: vec![],
             futures: vec![InitialFuture::Pending, InitialFuture::Resolved(44)],
             mailbox_capacities: vec![],
             capabilities: vec![
@@ -894,11 +1058,15 @@ mod tests {
                             ResidentInstruction {
                                 opcode: HANDLER_EFFECT_FUTURE_OBSERVE,
                                 argument: target,
+                                target: 0,
+                                reserved: 0,
                                 value: 0,
                             },
                             ResidentInstruction {
                                 opcode: HANDLER_COMPLETE,
                                 argument: 0,
+                                target: 0,
+                                reserved: 0,
                                 value: 0,
                             },
                         ],
@@ -969,6 +1137,9 @@ mod tests {
             max_frame_bytes: 8,
             max_continuations: 3,
             cohort_width: 32,
+            initial_epoch: 0,
+            objects: vec![],
+            object_capabilities: vec![],
             futures: vec![],
             mailbox_capacities: vec![1],
             capabilities: vec![
@@ -1005,26 +1176,36 @@ mod tests {
                     ResidentInstruction {
                         opcode: HANDLER_IF_PREVIOUS_VALUE_NE_SKIP,
                         argument: 2,
+                        target: 0,
+                        reserved: 0,
                         value: 55,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_STORE_PREVIOUS_VALUE_U64,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_COMPLETE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_EFFECT_MAILBOX_RECEIVE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_YIELD,
                         argument: 100,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                 ],
@@ -1038,11 +1219,15 @@ mod tests {
                     ResidentInstruction {
                         opcode: HANDLER_EFFECT_MAILBOX_SEND,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 55,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_COMPLETE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                 ],
@@ -1056,11 +1241,15 @@ mod tests {
                     ResidentInstruction {
                         opcode: HANDLER_EFFECT_MAILBOX_SEND,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 99,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_COMPLETE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                 ],
@@ -1089,6 +1278,9 @@ mod tests {
             max_frame_bytes: 8,
             max_continuations: 3,
             cohort_width: 32,
+            initial_epoch: 0,
+            objects: vec![],
+            object_capabilities: vec![],
             futures: vec![],
             mailbox_capacities: vec![2],
             capabilities: vec![
@@ -1127,11 +1319,15 @@ mod tests {
                         ResidentInstruction {
                             opcode: HANDLER_EFFECT_MAILBOX_RECEIVE,
                             argument: 0,
+                            target: 0,
+                            reserved: 0,
                             value: 0,
                         },
                         ResidentInstruction {
                             opcode: HANDLER_YIELD,
                             argument: run_class,
+                            target: 0,
+                            reserved: 0,
                             value: 0,
                         },
                     ],
@@ -1146,11 +1342,15 @@ mod tests {
                     ResidentInstruction {
                         opcode: HANDLER_EFFECT_MAILBOX_SEND,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 31,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_COMPLETE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                 ],
@@ -1180,6 +1380,9 @@ mod tests {
             max_frame_bytes: 8,
             max_continuations: 1,
             cohort_width: 1,
+            initial_epoch: 0,
+            objects: vec![],
+            object_capabilities: vec![],
             futures: vec![InitialFuture::Pending],
             mailbox_capacities: vec![1],
             capabilities: vec![cap(7, RESOURCE_FUTURE, 0, RIGHT_WRITE)],
@@ -1199,16 +1402,22 @@ mod tests {
                     ResidentInstruction {
                         opcode: HANDLER_EFFECT_FUTURE_RESOLVE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 5,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_EFFECT_MAILBOX_SEND,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 9,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_YIELD,
                         argument: 2,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                 ],
@@ -1222,21 +1431,29 @@ mod tests {
                     ResidentInstruction {
                         opcode: HANDLER_IF_PREVIOUS_VALUE_NE_SKIP,
                         argument: 2,
+                        target: 0,
+                        reserved: 0,
                         value: 5,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_STORE_PREVIOUS_VALUE_U64,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_COMPLETE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_COMPLETE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                 ],
@@ -1258,6 +1475,9 @@ mod tests {
             max_frame_bytes: 8,
             max_continuations: 1,
             cohort_width: 1,
+            initial_epoch: 0,
+            objects: vec![],
+            object_capabilities: vec![],
             futures: vec![],
             mailbox_capacities: vec![],
             capabilities: vec![cap(7, RESOURCE_FUTURE, 9, RIGHT_WRITE)],
@@ -1276,11 +1496,15 @@ mod tests {
                     ResidentInstruction {
                         opcode: HANDLER_EFFECT_FUTURE_RESOLVE,
                         argument: 9,
+                        target: 0,
+                        reserved: 0,
                         value: 1,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_COMPLETE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                 ],
@@ -1301,6 +1525,9 @@ mod tests {
             max_frame_bytes: 8,
             max_continuations: 1,
             cohort_width: 1,
+            initial_epoch: 0,
+            objects: vec![],
+            object_capabilities: vec![],
             futures: vec![],
             mailbox_capacities: vec![],
             capabilities: vec![],
@@ -1319,11 +1546,15 @@ mod tests {
                     ResidentInstruction {
                         opcode: HANDLER_STORE_PREVIOUS_VALUE_U64,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_COMPLETE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                 ],
@@ -1350,6 +1581,183 @@ mod tests {
         assert!(matches!(
             metal.run(&config, continuations, &programs),
             Err(BackendError::InvalidInput)
+        ));
+    }
+    #[test]
+    fn bounded_object_read_write_width_1_32_match_cpu_and_exact_journals() {
+        fn case(width: u32) -> (ResidentSyncResult, ResidentSyncResult) {
+            let metal = MetalResidentSync::new().unwrap();
+            let config = ResidentSyncConfig {
+                max_epochs: 1,
+                max_effects_per_step: 2,
+                max_frame_bytes: 16,
+                max_continuations: 1,
+                cohort_width: width,
+                initial_epoch: 7,
+                objects: vec![ResidentObject {
+                    version: 3,
+                    bytes: (0u8..16).collect(),
+                }],
+                object_capabilities: vec![ResidentObjectCapability {
+                    actor: 41,
+                    target: 0,
+                    offset: 0,
+                    length: 16,
+                    rights: RIGHT_READ | RIGHT_WRITE,
+                    object_version: 3,
+                    valid_until_epoch: 8,
+                }],
+                futures: vec![],
+                mailbox_capacities: vec![],
+                capabilities: vec![],
+            };
+            let continuations = vec![ResidentContinuation {
+                id: 9,
+                actor: 41,
+                run_class: 1200,
+                frame: vec![0; 8],
+            }];
+            let programs = BTreeMap::from([(
+                1200,
+                ResidentHandlerProgram {
+                    run_class: 1200,
+                    instructions: vec![
+                        ResidentInstruction {
+                            opcode: HANDLER_EFFECT_OBJECT_READ,
+                            argument: 4,
+                            target: 0,
+                            reserved: 0,
+                            value: 0,
+                        },
+                        ResidentInstruction {
+                            opcode: HANDLER_EFFECT_OBJECT_WRITE,
+                            argument: 8,
+                            target: 0,
+                            reserved: 0,
+                            value: 0x8877665544332211,
+                        },
+                        ResidentInstruction {
+                            opcode: HANDLER_COMPLETE,
+                            argument: 0,
+                            target: 0,
+                            reserved: 0,
+                            value: 0,
+                        },
+                    ],
+                },
+            )]);
+            let cpu = run_resident_sync(&config, continuations.clone(), &programs).unwrap();
+            let gpu = metal.run(&config, continuations, &programs).unwrap();
+            (cpu, gpu)
+        }
+        let (cpu1, gpu1) = case(1);
+        let (cpu32, gpu32) = case(32);
+        assert_eq!(gpu1, cpu1);
+        assert_eq!(gpu32, cpu32);
+        assert_eq!(gpu1, gpu32);
+        assert_eq!(
+            gpu1.effects[0].outcome,
+            ResidentOutcome::ObjectRead(0x0b0a090807060504)
+        );
+        assert_eq!(
+            &gpu1.object_values[0][8..16],
+            &0x8877665544332211u64.to_le_bytes()
+        );
+        let journal = &gpu1.operations[0];
+        assert_eq!(
+            journal
+                .operations
+                .iter()
+                .map(|op| (op.opcode, op.auxiliary, op.payload_len, op.result_ref))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    crate::scheduler::device_ops::OP_READ_OBJECT,
+                    4,
+                    8,
+                    0x0b0a090807060504
+                ),
+                (crate::scheduler::device_ops::OP_WRITE_OBJECT, 8, 8, 0)
+            ]
+        );
+        assert_eq!(
+            journal.payload,
+            [
+                0x0b0a090807060504u64.to_le_bytes(),
+                0x8877665544332211u64.to_le_bytes()
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn refuses_explicit_object_count_capability_and_arena_bounds_before_allocation() {
+        let metal = MetalResidentSync::new().unwrap();
+        let base = |objects, object_capabilities, max_frame_bytes| ResidentSyncConfig {
+            max_epochs: 1,
+            max_effects_per_step: 1,
+            max_frame_bytes,
+            max_continuations: 1,
+            cohort_width: 1,
+            initial_epoch: 0,
+            objects,
+            object_capabilities,
+            futures: vec![],
+            mailbox_capacities: vec![],
+            capabilities: vec![],
+        };
+        let assert_refused = |config: ResidentSyncConfig| {
+            let programs = BTreeMap::new();
+            assert!(run_resident_sync(&config, vec![], &programs).is_none());
+            assert!(matches!(
+                metal.run(&config, vec![], &programs),
+                Err(BackendError::InvalidInput)
+            ));
+        };
+        assert_refused(base(
+            vec![
+                ResidentObject {
+                    version: 1,
+                    bytes: vec![]
+                };
+                MAX_RESIDENT_OBJECTS + 1
+            ],
+            vec![],
+            1,
+        ));
+        assert_refused(base(
+            vec![ResidentObject {
+                version: 1,
+                bytes: vec![0],
+            }],
+            vec![
+                ResidentObjectCapability {
+                    actor: 1,
+                    target: 0,
+                    offset: 0,
+                    length: 1,
+                    rights: RIGHT_READ,
+                    object_version: 1,
+                    valid_until_epoch: 1,
+                };
+                MAX_RESIDENT_OBJECT_CAPABILITIES + 1
+            ],
+            1,
+        ));
+        let half = MAX_RESIDENT_OBJECT_ARENA_BYTES / 2 + 1;
+        assert_refused(base(
+            vec![
+                ResidentObject {
+                    version: 1,
+                    bytes: vec![0; half],
+                },
+                ResidentObject {
+                    version: 1,
+                    bytes: vec![0; half],
+                },
+            ],
+            vec![],
+            half as u32,
         ));
     }
 }

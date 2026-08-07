@@ -4,24 +4,40 @@
 //! are arbitrary bounded state machines: the executive gives a handler its
 //! private frame and the results of its previous effects, and the handler emits
 //! a bounded list of synchronization effects plus a scheduling disposition.
-//! Future and mailbox storage is owned by the executive and is only mutated by
-//! the canonical lane-order applier.  The module is the CPU oracle for a Metal
+//! Future, mailbox, and bounded object storage is owned by the executive and is
+//! only mutated by the canonical lane-order applier.  The module is the CPU oracle for a Metal
 //! implementation; it does not claim `Kernel` integration.
 
 use crate::scheduler::device::{DeviceLaneAccess, DEVICE_ACCESS_WRITE};
 use crate::scheduler::device_ops::{
     DeviceLaneOperation, DeviceOperationJournal, OP_AWAIT_FUTURE, OP_ENQUEUE_MESSAGE,
-    OP_RECEIVE_MESSAGE, OP_RESOLVE_FUTURE,
+    OP_READ_OBJECT, OP_RECEIVE_MESSAGE, OP_RESOLVE_FUTURE, OP_WRITE_OBJECT,
 };
 use std::collections::{BTreeMap, VecDeque};
 
+pub const RESOURCE_OBJECT: u32 = 1;
 pub const RESOURCE_FUTURE: u32 = 2;
 pub const RESOURCE_MAILBOX: u32 = 3;
 pub const RIGHT_READ: u32 = 1;
 pub const RIGHT_WRITE: u32 = 2;
+/// Hard device-plan bounds, checked before CPU cloning or Metal arena allocation.
+pub const MAX_RESIDENT_OBJECTS: usize = 4_096;
+pub const MAX_RESIDENT_OBJECT_CAPABILITIES: usize = 16_384;
+pub const MAX_RESIDENT_OBJECT_ARENA_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResidentEffect {
+    /// Exact bounded 8-byte little-endian object range read.
+    ObjectRead {
+        target: u32,
+        offset: u32,
+    },
+    /// Exact bounded 8-byte little-endian in-place object range mutation.
+    ObjectWrite {
+        target: u32,
+        offset: u32,
+        value: u64,
+    },
     /// Non-blocking governed LaneView::future_value observation.
     FutureObserve {
         target: u32,
@@ -44,6 +60,8 @@ pub enum ResidentEffect {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResidentOutcome {
+    ObjectRead(u64),
+    ObjectWritten,
     Resolved(u64),
     /// A non-blocking future observation found the cell pending.
     Pending,
@@ -73,7 +91,11 @@ pub enum ResidentDisposition {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResidentInstruction {
     pub opcode: u32,
+    /// Frame offset/skip/run class, or byte offset for object effects.
     pub argument: u32,
+    /// Dense resource index for effects.
+    pub target: u32,
+    pub reserved: u32,
     pub value: u64,
 }
 
@@ -90,6 +112,8 @@ pub const HANDLER_YIELD: u32 = 8;
 pub const HANDLER_COMPLETE: u32 = 9;
 /// Emit the explicit non-blocking `OP_OBSERVE_FUTURE` ABI record.
 pub const HANDLER_EFFECT_FUTURE_OBSERVE: u32 = 10;
+pub const HANDLER_EFFECT_OBJECT_READ: u32 = 11;
+pub const HANDLER_EFFECT_OBJECT_WRITE: u32 = 12;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResidentHandlerProgram {
@@ -106,7 +130,9 @@ pub struct HandlerOutput {
 
 fn previous_value(previous: &[ResidentOutcome]) -> Option<u64> {
     previous.iter().rev().find_map(|outcome| match *outcome {
-        ResidentOutcome::Resolved(value) | ResidentOutcome::Received { value, .. } => Some(value),
+        ResidentOutcome::Resolved(value)
+        | ResidentOutcome::ObjectRead(value)
+        | ResidentOutcome::Received { value, .. } => Some(value),
         _ => None,
     })
 }
@@ -145,7 +171,9 @@ pub(crate) fn validate_handler_program(
         }
         let instruction = program.instructions[pc];
         match instruction.opcode {
-            HANDLER_EFFECT_FUTURE_OBSERVE
+            HANDLER_EFFECT_OBJECT_READ
+            | HANDLER_EFFECT_OBJECT_WRITE
+            | HANDLER_EFFECT_FUTURE_OBSERVE
             | HANDLER_EFFECT_FUTURE_AWAIT
             | HANDLER_EFFECT_FUTURE_RESOLVE
             | HANDLER_EFFECT_MAILBOX_SEND
@@ -200,6 +228,15 @@ fn execute_program(
         let instruction = program.instructions[pc];
         pc += 1;
         match instruction.opcode {
+            HANDLER_EFFECT_OBJECT_READ => effects.push(ResidentEffect::ObjectRead {
+                target: instruction.target,
+                offset: instruction.argument,
+            }),
+            HANDLER_EFFECT_OBJECT_WRITE => effects.push(ResidentEffect::ObjectWrite {
+                target: instruction.target,
+                offset: instruction.argument,
+                value: instruction.value,
+            }),
             HANDLER_EFFECT_FUTURE_OBSERVE => effects.push(ResidentEffect::FutureObserve {
                 target: instruction.argument,
             }),
@@ -279,6 +316,21 @@ pub enum InitialFuture {
     Resolved(u64),
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResidentObject {
+    pub version: u32,
+    pub bytes: Vec<u8>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidentObjectCapability {
+    pub actor: u64,
+    pub target: u32,
+    pub offset: u64,
+    pub length: u64,
+    pub rights: u32,
+    pub object_version: u32,
+    pub valid_until_epoch: u32,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResidentSyncConfig {
     pub max_epochs: u32,
     pub max_effects_per_step: u32,
@@ -287,9 +339,29 @@ pub struct ResidentSyncConfig {
     /// Bounds all continuation, waiter, and wake tables.
     pub max_continuations: u32,
     pub cohort_width: u32,
+    pub initial_epoch: u32,
+    pub objects: Vec<ResidentObject>,
+    pub object_capabilities: Vec<ResidentObjectCapability>,
     pub futures: Vec<InitialFuture>,
     pub mailbox_capacities: Vec<u32>,
     pub capabilities: Vec<ResidentCapability>,
+}
+
+pub(crate) fn object_storage_is_bounded(config: &ResidentSyncConfig) -> bool {
+    if config.objects.len() > MAX_RESIDENT_OBJECTS
+        || config.object_capabilities.len() > MAX_RESIDENT_OBJECT_CAPABILITIES
+    {
+        return false;
+    }
+    let actual_bytes = config.objects.iter().try_fold(0usize, |total, object| {
+        total.checked_add(object.bytes.len())
+    });
+    let arena_bytes = config
+        .objects
+        .len()
+        .checked_mul(config.max_frame_bytes as usize);
+    actual_bytes.is_some_and(|bytes| bytes <= MAX_RESIDENT_OBJECT_ARENA_BYTES)
+        && arena_bytes.is_some_and(|bytes| bytes <= MAX_RESIDENT_OBJECT_ARENA_BYTES)
 }
 
 #[repr(C)]
@@ -365,6 +437,7 @@ pub struct ResidentSyncResult {
     pub epochs: u32,
     pub quiescent: bool,
     pub completed: Vec<u64>,
+    pub object_values: Vec<Vec<u8>>,
     pub future_values: Vec<Option<u64>>,
     pub mailboxes: Vec<Vec<(u64, u64)>>,
     pub final_continuations: Vec<ResidentFinalContinuation>,
@@ -395,6 +468,8 @@ struct Mail {
 
 fn opcode(e: ResidentEffect) -> u32 {
     match e {
+        ResidentEffect::ObjectRead { .. } => OP_READ_OBJECT,
+        ResidentEffect::ObjectWrite { .. } => OP_WRITE_OBJECT,
         ResidentEffect::FutureObserve { .. } => crate::scheduler::device_ops::OP_OBSERVE_FUTURE,
         ResidentEffect::FutureAwait { .. } => OP_AWAIT_FUTURE,
         ResidentEffect::FutureResolve { .. } => OP_RESOLVE_FUTURE,
@@ -404,7 +479,9 @@ fn opcode(e: ResidentEffect) -> u32 {
 }
 fn target(e: ResidentEffect) -> u32 {
     match e {
-        ResidentEffect::FutureObserve { target }
+        ResidentEffect::ObjectRead { target, .. }
+        | ResidentEffect::ObjectWrite { target, .. }
+        | ResidentEffect::FutureObserve { target }
         | ResidentEffect::FutureAwait { target }
         | ResidentEffect::FutureResolve { target, .. }
         | ResidentEffect::MailboxSend { target, .. }
@@ -413,6 +490,7 @@ fn target(e: ResidentEffect) -> u32 {
 }
 fn resource(e: ResidentEffect) -> u32 {
     match e {
+        ResidentEffect::ObjectRead { .. } | ResidentEffect::ObjectWrite { .. } => RESOURCE_OBJECT,
         ResidentEffect::FutureObserve { .. }
         | ResidentEffect::FutureAwait { .. }
         | ResidentEffect::FutureResolve { .. } => RESOURCE_FUTURE,
@@ -421,6 +499,8 @@ fn resource(e: ResidentEffect) -> u32 {
 }
 fn required_right(e: ResidentEffect) -> u32 {
     match e {
+        ResidentEffect::ObjectRead { .. } => RIGHT_READ,
+        ResidentEffect::ObjectWrite { .. } => RIGHT_WRITE,
         ResidentEffect::FutureObserve { .. }
         | ResidentEffect::FutureAwait { .. }
         | ResidentEffect::MailboxReceive { .. } => RIGHT_READ,
@@ -429,6 +509,8 @@ fn required_right(e: ResidentEffect) -> u32 {
 }
 fn outcome_code(o: ResidentOutcome) -> u32 {
     match o {
+        ResidentOutcome::ObjectRead(_) => 2,
+        ResidentOutcome::ObjectWritten => 0,
         ResidentOutcome::Resolved(_) => 2,
         ResidentOutcome::Pending => 1,
         ResidentOutcome::Registered => 3,
@@ -464,6 +546,25 @@ pub fn run_resident_sync(
         || config.max_effects_per_step == 0
         || config.max_frame_bytes == 0
         || config.max_continuations == 0
+        || config
+            .initial_epoch
+            .checked_add(config.max_epochs)
+            .is_none()
+        || !object_storage_is_bounded(config)
+        || config
+            .objects
+            .iter()
+            .any(|object| object.bytes.len() > config.max_frame_bytes as usize)
+        || config.object_capabilities.iter().any(|cap| {
+            let Some(object) = config.objects.get(cap.target as usize) else {
+                return true;
+            };
+            cap.object_version != object.version
+                || cap
+                    .offset
+                    .checked_add(cap.length)
+                    .is_none_or(|end| end > object.bytes.len() as u64)
+        })
         || continuations.len() > config.max_continuations as usize
         || continuations.iter().any(|continuation| {
             continuation.frame.len() > config.max_frame_bytes as usize
@@ -496,6 +597,7 @@ pub fn run_resident_sync(
             )
         })
         .collect();
+    let mut objects: Vec<Vec<u8>> = config.objects.iter().map(|o| o.bytes.clone()).collect();
     let mut fs: Vec<FutureCell> = config
         .futures
         .iter()
@@ -520,6 +622,21 @@ pub fn run_resident_sync(
     let allowed = |actor: u64, kind: u32, t: u32, right: u32| {
         config.capabilities.iter().any(|c| {
             c.actor == actor && c.resource_kind == kind && c.target == t && (c.rights & right) != 0
+        })
+    };
+    let object_allowed = |actor: u64, target: u32, offset: u32, right: u32, epoch: u32| {
+        let Some(object) = config.objects.get(target as usize) else {
+            return false;
+        };
+        let end = u64::from(offset).checked_add(8);
+        config.object_capabilities.iter().any(|c| {
+            c.actor == actor
+                && c.target == target
+                && (c.rights & right) != 0
+                && c.object_version == object.version
+                && c.valid_until_epoch >= epoch
+                && u64::from(offset) >= c.offset
+                && end.is_some_and(|end| end <= c.offset.saturating_add(c.length))
         })
     };
     let mut result = ResidentSyncResult::default();
@@ -594,10 +711,49 @@ pub fn run_resident_sync(
                 let t = target(e);
                 let kind = resource(e);
                 let right = required_right(e);
-                let outcome = if !allowed(actor, kind, t, right) {
+                let authorized = match e {
+                    ResidentEffect::ObjectRead { offset, .. }
+                    | ResidentEffect::ObjectWrite { offset, .. } => object_allowed(
+                        actor,
+                        t,
+                        offset,
+                        right,
+                        config.initial_epoch.saturating_add(epoch),
+                    ),
+                    _ => allowed(actor, kind, t, right),
+                };
+                let outcome = if !authorized {
                     ResidentOutcome::CapabilityDenied
                 } else {
                     match e {
+                        ResidentEffect::ObjectRead { target, offset } => {
+                            let start = offset as usize;
+                            objects
+                                .get(target as usize)
+                                .and_then(|bytes| bytes.get(start..start.checked_add(8)?))
+                                .map_or(ResidentOutcome::InvalidTarget, |bytes| {
+                                    ResidentOutcome::ObjectRead(u64::from_le_bytes(
+                                        bytes.try_into().unwrap(),
+                                    ))
+                                })
+                        }
+                        ResidentEffect::ObjectWrite {
+                            target,
+                            offset,
+                            value,
+                        } => {
+                            let start = offset as usize;
+                            match objects
+                                .get_mut(target as usize)
+                                .and_then(|bytes| bytes.get_mut(start..start.checked_add(8)?))
+                            {
+                                Some(bytes) => {
+                                    bytes.copy_from_slice(&value.to_le_bytes());
+                                    ResidentOutcome::ObjectWritten
+                                }
+                                None => ResidentOutcome::InvalidTarget,
+                            }
+                        }
                         ResidentEffect::FutureObserve { target } => match fs.get(target as usize) {
                             None => ResidentOutcome::InvalidTarget,
                             Some(f) => f
@@ -733,7 +889,10 @@ pub fn run_resident_sync(
                     lane,
                     kind,
                     u64::from(t),
-                    if matches!(e, ResidentEffect::FutureObserve { .. }) {
+                    if matches!(
+                        e,
+                        ResidentEffect::FutureObserve { .. } | ResidentEffect::ObjectRead { .. }
+                    ) {
                         crate::scheduler::device::DEVICE_ACCESS_READ
                     } else {
                         DEVICE_ACCESS_WRITE
@@ -741,10 +900,18 @@ pub fn run_resident_sync(
                     ord as u32,
                 ));
                 let (value, aux) = match e {
+                    ResidentEffect::ObjectWrite { offset, value, .. } => (value, u64::from(offset)),
+                    ResidentEffect::ObjectRead { offset, .. } => (0, u64::from(offset)),
                     ResidentEffect::FutureResolve { value, .. }
                     | ResidentEffect::MailboxSend { value, .. } => (value, 0),
                     _ => (0, 0),
                 };
+                let payload = match outcome {
+                    ResidentOutcome::ObjectRead(value) => value.to_le_bytes().to_vec(),
+                    ResidentOutcome::ObjectWritten => value.to_le_bytes().to_vec(),
+                    _ => Vec::new(),
+                };
+                let (payload_offset, payload_len) = journal.append_payload(&payload)?;
                 journal.operations.push(DeviceLaneOperation {
                     lane,
                     ordinal: ord as u32,
@@ -754,8 +921,10 @@ pub fn run_resident_sync(
                     value,
                     auxiliary: aux,
                     result_code: outcome_code(outcome),
+                    payload_offset,
+                    payload_len,
                     result_ref: match outcome {
-                        ResidentOutcome::Resolved(v) => v,
+                        ResidentOutcome::ObjectRead(v) | ResidentOutcome::Resolved(v) => v,
                         ResidentOutcome::Received { value, .. } => value,
                         _ => 0,
                     },
@@ -830,6 +999,7 @@ pub fn run_resident_sync(
         })
         .collect();
     result.frames = cs.into_iter().map(|(id, c)| (id, c.spec.frame)).collect();
+    result.object_values = objects;
     result.future_values = fs.into_iter().map(|f| f.value).collect();
     result.mailboxes = ms
         .into_iter()
@@ -856,6 +1026,9 @@ mod tests {
             max_frame_bytes: 8,
             max_continuations: 2,
             cohort_width: width,
+            initial_epoch: 0,
+            objects: vec![],
+            object_capabilities: vec![],
             futures: vec![InitialFuture::Pending],
             mailbox_capacities: vec![],
             capabilities: vec![
@@ -872,26 +1045,36 @@ mod tests {
                     ResidentInstruction {
                         opcode: HANDLER_IF_PREVIOUS_VALUE_NE_SKIP,
                         argument: 2,
+                        target: 0,
+                        reserved: 0,
                         value: 77,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_STORE_PREVIOUS_VALUE_U64,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_COMPLETE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_EFFECT_FUTURE_AWAIT,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_YIELD,
                         argument: 100,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                 ],
@@ -905,11 +1088,15 @@ mod tests {
                     ResidentInstruction {
                         opcode: HANDLER_EFFECT_FUTURE_RESOLVE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 77,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_COMPLETE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                 ],
@@ -955,6 +1142,9 @@ mod tests {
             max_frame_bytes: 8,
             max_continuations: 2,
             cohort_width: 32,
+            initial_epoch: 0,
+            objects: vec![],
+            object_capabilities: vec![],
             futures: vec![],
             mailbox_capacities: vec![1],
             capabilities: vec![
@@ -971,26 +1161,36 @@ mod tests {
                     ResidentInstruction {
                         opcode: HANDLER_IF_PREVIOUS_VALUE_NE_SKIP,
                         argument: 2,
+                        target: 0,
+                        reserved: 0,
                         value: 55,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_STORE_PREVIOUS_VALUE_U64,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_COMPLETE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_EFFECT_MAILBOX_RECEIVE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_YIELD,
                         argument: 100,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                 ],
@@ -1004,11 +1204,15 @@ mod tests {
                     ResidentInstruction {
                         opcode: HANDLER_EFFECT_MAILBOX_SEND,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 55,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_COMPLETE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                 ],
@@ -1061,6 +1265,9 @@ mod tests {
             max_frame_bytes: 8,
             max_continuations: 1,
             cohort_width: 1,
+            initial_epoch: 0,
+            objects: vec![],
+            object_capabilities: vec![],
             futures: vec![InitialFuture::Pending],
             mailbox_capacities: vec![],
             capabilities: vec![cap(7, RESOURCE_FUTURE, 0, RIGHT_WRITE)],
@@ -1076,26 +1283,36 @@ mod tests {
                     ResidentInstruction {
                         opcode: HANDLER_EFFECT_FUTURE_RESOLVE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 9,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_IF_PREVIOUS_VALUE_NE_SKIP,
                         argument: 2,
+                        target: 0,
+                        reserved: 0,
                         value: 9,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_STORE_IMMEDIATE_U64,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 99,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_COMPLETE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_YIELD,
                         argument: 2,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                 ],
@@ -1111,21 +1328,29 @@ mod tests {
                     ResidentInstruction {
                         opcode: HANDLER_IF_PREVIOUS_VALUE_NE_SKIP,
                         argument: 2,
+                        target: 0,
+                        reserved: 0,
                         value: 9,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_STORE_IMMEDIATE_U64,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 9,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_YIELD,
                         argument: 2,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_COMPLETE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                 ],
@@ -1156,16 +1381,22 @@ mod tests {
                 ResidentInstruction {
                     opcode: HANDLER_EFFECT_FUTURE_AWAIT,
                     argument: 0,
+                    target: 0,
+                    reserved: 0,
                     value: 0,
                 },
                 ResidentInstruction {
                     opcode: HANDLER_EFFECT_MAILBOX_RECEIVE,
                     argument: 0,
+                    target: 0,
+                    reserved: 0,
                     value: 0,
                 },
                 ResidentInstruction {
                     opcode: HANDLER_COMPLETE,
                     argument: 0,
+                    target: 0,
+                    reserved: 0,
                     value: 0,
                 },
             ],
@@ -1180,6 +1411,9 @@ mod tests {
             max_frame_bytes: 8,
             max_continuations: 4,
             cohort_width: width,
+            initial_epoch: 0,
+            objects: vec![],
+            object_capabilities: vec![],
             futures: vec![InitialFuture::Pending, InitialFuture::Resolved(44)],
             mailbox_capacities: vec![],
             capabilities: vec![
@@ -1200,11 +1434,15 @@ mod tests {
                         ResidentInstruction {
                             opcode: HANDLER_EFFECT_FUTURE_OBSERVE,
                             argument: target,
+                            target: 0,
+                            reserved: 0,
                             value: 0,
                         },
                         ResidentInstruction {
                             opcode: HANDLER_COMPLETE,
                             argument: 0,
+                            target: 0,
+                            reserved: 0,
                             value: 0,
                         },
                     ],
@@ -1317,6 +1555,9 @@ mod tests {
             max_frame_bytes: 8,
             max_continuations: 3,
             cohort_width: 1,
+            initial_epoch: 0,
+            objects: vec![],
+            object_capabilities: vec![],
             futures: vec![InitialFuture::Resolved(1)],
             mailbox_capacities: vec![0],
             capabilities: vec![
@@ -1334,21 +1575,29 @@ mod tests {
                     ResidentInstruction {
                         opcode: HANDLER_EFFECT_FUTURE_RESOLVE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 2,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_EFFECT_FUTURE_RESOLVE,
                         argument: 9,
+                        target: 0,
+                        reserved: 0,
                         value: 2,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_EFFECT_FUTURE_AWAIT,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_COMPLETE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                 ],
@@ -1362,11 +1611,15 @@ mod tests {
                     ResidentInstruction {
                         opcode: HANDLER_EFFECT_MAILBOX_RECEIVE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_COMPLETE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                 ],
@@ -1380,11 +1633,15 @@ mod tests {
                     ResidentInstruction {
                         opcode: HANDLER_EFFECT_MAILBOX_SEND,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 3,
                     },
                     ResidentInstruction {
                         opcode: HANDLER_COMPLETE,
                         argument: 0,
+                        target: 0,
+                        reserved: 0,
                         value: 0,
                     },
                 ],

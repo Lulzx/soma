@@ -33,16 +33,18 @@ horizons, validates explicit invocation/disposition/wake/epoch journals, and
 replays future/mailbox operations through ordinary governed Kernel methods,
 Phase G, admission, causal trace, and full Phase-H accounting before atomic
 publication. The bounded vocabulary now also includes nonblocking
-`FutureObserve`: pending and resolved values have exact future-read journals,
-CPU/Metal width-1/32 parity, and normal-Kernel trace equivalence; denied,
-expired, stale, or invalid shapes refuse atomically. An independent governed
-reference matches I18 and the complete scheduler/effect/admission/accounting
-state. This is a canonical commit slice, but only for local unsupervised,
-unique-run-class, all-complete programs with pre-existing stable authority and
-initially empty waiter/mailbox state. Allocation, object mutation, channels,
-supervision, device capability creation, admission deferral, parked final
-state, broader handler shapes, and the general canonical bridge remain to be
-integrated.
+`FutureObserve` and fixed eight-byte object range reads/in-place writes. Object
+state has exact version/range/horizon authority, operation payload/result
+journals, CPU/Metal width-1/32 parity, ordinary-Kernel authority-trace and final
+byte equivalence, explicit 4,096-object/16,384-capability/16-MiB arena bounds,
+and atomic stale/range/growth/conflict/malformed refusals. An independent
+governed reference matches I18 and the complete
+scheduler/effect/admission/accounting state. This is a canonical commit slice,
+but only for local unsupervised, unique-run-class, all-complete programs with
+pre-existing stable authority and initially empty waiter/mailbox state.
+Allocation/resizing, channels, supervision, device capability creation,
+admission deferral, parked final state, broader handler shapes, and the general
+canonical bridge remain to be integrated.
 
 ## G3 — Distributed ownership [in progress]
 
@@ -69,15 +71,22 @@ private node-qualified state, and retry exact retained work across two real
 runtimes/TCP; it is special dispatch, not general `LaneView`. Its bounded
 multiplexed response transport now authenticates configured peers and binds
 ordered outcomes to the exact session, issuer, owner, nonce, request digest,
-boundary, and response ordinal before any Kernel wake or fault. Owner-side
-process templates provide content-bound create/restart receipts, terminal
-lifecycle observation, bounded
-snapshot/WAL apply-once durability, and exact terminal recovery. Signed bounded
-lifecycle requests now cross TCP between two real runtimes, but responses are
-not mutually authenticated and live-state recovery remains explicitly refused.
-General remote `LaneView`, direct
-canonical remote park, object/mixed/result-frame dispatch, durable live process
-recovery, and a real multi-resource multi-kernel application remain gates.
+boundary, and response ordinal before any Kernel wake or fault. Atomic
+multi-frame staging, boundary-first refusal, exact temporary retry, mixed live
+revocation handling, per-waiter session-route binding, and transactional Kernel
+receipt application close the concrete partial-publication and stranded-waiter
+failures. A real two-owner integration combines authenticated channel retry and
+wake, future revocation fault, authoritative object mutation, and content-bound
+process/supervision receipts through their existing authorized transports, with
+exact no-shadow state and bounded apply-once
+ledgers. Owner-side process templates provide content-bound create/restart
+receipts, terminal lifecycle observation, bounded snapshot/WAL apply-once
+durability, and exact terminal recovery. Signed bounded lifecycle requests now
+cross TCP between two real runtimes, but responses are not mutually
+authenticated and live-state recovery remains explicitly refused. General
+remote `LaneView`, direct canonical remote park, Kernel object/mixed/result-frame
+dispatch, persisted lane replay state, and durable live process recovery remain
+gates.
 
 ## G4 — Bounded programming surface [complete]
 

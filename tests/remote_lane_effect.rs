@@ -4,6 +4,10 @@ use soma::distributed::remote_future::{
     RemoteFutureClient, RemoteFutureServer, RemoteFutureService,
 };
 use soma::distributed::remote_lane_effect::*;
+use soma::distributed::remote_lane_transport::{
+    RemoteLaneClientSession, RemoteLaneOwnerSession, RemoteLaneTransportClient,
+    RemoteLaneTransportError, RemoteLaneTransportServer,
+};
 use soma::distributed::{NodeId, RemoteRef};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
@@ -472,4 +476,211 @@ fn malformed_protocol_response_is_terminal_not_unbounded_retry() {
     assert_eq!(out[0].result, Err(RemoteLaneError::Protocol));
     assert_eq!(service.pending_len(), 0);
     assert_eq!(service.applied_len(), 1);
+}
+
+#[test]
+fn stage_many_is_atomic_and_refuses_effects_ahead_of_the_boundary() {
+    let owner = NodeId(2);
+    let actor = r(Kind::Process, 31);
+    let target = RemoteRef {
+        node: owner,
+        entity: r(Kind::Future, 32),
+    };
+    let authority = Arc::new(Mutex::new(RemoteAuthorityStore::new(owner, [31; 32])));
+    let grant = authority.lock().unwrap().issue(GrantSpec {
+        audience: owner,
+        actor,
+        target,
+        rights: Rights::RESOLVE | Rights::SEND,
+        object_version: 1,
+        valid_from_epoch: 0,
+        valid_until_epoch: 9,
+    });
+    let mut valid = RemoteLaneApi::new(2, 0, actor);
+    valid
+        .emit(
+            target,
+            grant,
+            RemoteLaneOperation::FutureResolve {
+                value: r(Kind::Object, 33),
+            },
+        )
+        .unwrap();
+    let valid = valid.finish().encode();
+    let mut invalid = RemoteLaneApi::new(2, 1, actor);
+    invalid
+        .emit(
+            target,
+            grant,
+            RemoteLaneOperation::MailboxSend {
+                sender_sequence: 0,
+                bytes: vec![1],
+            },
+        )
+        .unwrap();
+    let invalid = invalid.finish().encode();
+    let mut service = RemoteLaneEffectService::new(owner, authority);
+    service.register_target(target, 1).unwrap();
+    let mut exec = Exec {
+        calls: vec![],
+        block: false,
+    };
+    assert_eq!(
+        service.stage_many(&[&valid, &invalid], 2, &exec),
+        Err(RemoteLaneError::Unsupported)
+    );
+    assert_eq!(service.pending_len(), 0);
+    assert!(exec.calls.is_empty());
+
+    assert_eq!(
+        service.stage_many(&[&valid], 1, &exec),
+        Err(RemoteLaneError::InvalidEnvelope)
+    );
+    assert_eq!(service.pending_len(), 0);
+    assert!(service.apply_epoch(9, &mut exec).is_empty());
+    assert!(exec.calls.is_empty());
+}
+
+#[test]
+fn exact_retry_retires_revoked_effect_and_reapplies_live_effect_in_mixed_batch() {
+    let owner = NodeId(90);
+    let issuer = NodeId(91);
+    let actor = r(Kind::Process, 90);
+    let revoked_target = RemoteRef {
+        node: owner,
+        entity: r(Kind::Future, 91),
+    };
+    let live_target = RemoteRef {
+        node: owner,
+        entity: r(Kind::Future, 92),
+    };
+    let authority = Arc::new(Mutex::new(RemoteAuthorityStore::new(issuer, [90; 32])));
+    let issue = |target| {
+        authority.lock().unwrap().issue(GrantSpec {
+            audience: owner,
+            actor,
+            target,
+            rights: Rights::AWAIT | Rights::RESOLVE,
+            object_version: 1,
+            valid_from_epoch: 0,
+            valid_until_epoch: 4,
+        })
+    };
+    let revoked_grant = issue(revoked_target);
+    let live_grant = issue(live_target);
+
+    let revoked_future = Arc::new(Mutex::new(RemoteFutureService::new(
+        owner,
+        revoked_target,
+        1,
+        authority.clone(),
+    )));
+    let revoked_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let revoked_endpoint = revoked_listener.local_addr().unwrap();
+    let revoked_server = {
+        let future = revoked_future.clone();
+        std::thread::spawn(move || RemoteFutureServer::serve_n(revoked_listener, future, 1))
+    };
+    let live_future = Arc::new(Mutex::new(RemoteFutureService::new(
+        owner,
+        live_target,
+        1,
+        authority.clone(),
+    )));
+    let live_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let live_endpoint = live_listener.local_addr().unwrap();
+    let live_server = {
+        let future = live_future.clone();
+        std::thread::spawn(move || RemoteFutureServer::serve_n(live_listener, future, 3))
+    };
+
+    let mut router = RemoteLaneClientRouter::default();
+    router
+        .register_future(
+            revoked_target,
+            RemoteFutureClient::new(revoked_endpoint, revoked_grant, 0),
+        )
+        .unwrap();
+    router
+        .register_future(
+            live_target,
+            RemoteFutureClient::new(live_endpoint, live_grant, 0),
+        )
+        .unwrap();
+    let mut lane_service = RemoteLaneEffectService::new(owner, authority.clone());
+    lane_service.register_target(revoked_target, 1).unwrap();
+    lane_service.register_target(live_target, 1).unwrap();
+    let lane_service = Arc::new(Mutex::new(lane_service));
+    let lane_observe = lane_service.clone();
+    let lane_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let lane_endpoint = lane_listener.local_addr().unwrap();
+    let lane_server = std::thread::spawn(move || {
+        RemoteLaneTransportServer::serve_n(
+            lane_listener,
+            lane_service,
+            Arc::new(Mutex::new(router)),
+            RemoteLaneOwnerSession::new([90; 16], issuer, owner, [91; 32]),
+            2,
+        )
+    });
+
+    let mut api = RemoteLaneApi::new(0, 0, actor);
+    let revoked_id = api
+        .emit(
+            revoked_target,
+            revoked_grant,
+            RemoteLaneOperation::FutureAwait,
+        )
+        .unwrap();
+    let live_id = api
+        .emit(live_target, live_grant, RemoteLaneOperation::FutureAwait)
+        .unwrap();
+    let batch = api.finish();
+    let mut client = RemoteLaneTransportClient::new(
+        lane_endpoint,
+        RemoteLaneClientSession::new([90; 16], issuer, owner, [91; 32]),
+    );
+    let first = client.exchange(0, &[batch]).unwrap();
+    let nonce = first.nonce();
+    assert!(first
+        .outcomes()
+        .iter()
+        .all(|outcome| matches!(outcome.result, Ok(RemoteLaneApply::WouldBlock))));
+    assert_eq!(lane_observe.lock().unwrap().pending_len(), 2);
+
+    assert!(authority.lock().unwrap().revoke(revoked_grant.nonce));
+    RemoteFutureClient::new(live_endpoint, live_grant, 0)
+        .resolve(r(Kind::Object, 93))
+        .unwrap();
+    let retried = client.retry(nonce).unwrap();
+    assert_eq!(
+        retried
+            .outcomes()
+            .iter()
+            .map(|outcome| outcome.request_id)
+            .collect::<Vec<_>>(),
+        vec![revoked_id, live_id]
+    );
+    assert!(matches!(
+        retried.outcomes()[0].result,
+        Err(RemoteLaneError::Authority(_))
+    ));
+    assert!(matches!(
+        retried.outcomes()[1].result,
+        Ok(RemoteLaneApply::Applied(_))
+    ));
+    assert!(client.pending_nonces().is_empty());
+    assert!(matches!(
+        client.retry(nonce),
+        Err(RemoteLaneTransportError::Replay)
+    ));
+
+    let service = lane_observe.lock().unwrap();
+    assert_eq!(service.pending_len(), 0);
+    assert_eq!(service.applied_len(), 1);
+    drop(service);
+    assert_eq!(live_future.lock().unwrap().applied_resolutions(), 1);
+    lane_server.join().unwrap().unwrap();
+    revoked_server.join().unwrap().unwrap();
+    live_server.join().unwrap().unwrap();
 }

@@ -28,9 +28,9 @@ use super::remote_future::{
 use super::remote_lane_effect::{
     KernelRemoteLaneEmission, RemoteLaneApply, RemoteLaneClientRouter, RemoteLaneEffectService,
     RemoteLaneError, RemoteLaneOperation, RemoteLaneOutcome, RemoteLaneProgram,
-    RemoteLaneRequestId,
+    RemoteLaneRequestId, RemoteLaneValue,
 };
-use super::remote_lane_transport::VerifiedRemoteLaneOutcomes;
+use super::remote_lane_transport::{RemoteLaneClientSession, VerifiedRemoteLaneOutcomes};
 use super::remote_mailbox_ingress::{
     RemoteMailboxApplyOutcome, RemoteMailboxError, RemoteMailboxIngress, RemoteMailboxServer,
 };
@@ -136,13 +136,36 @@ struct OwnedProcessService {
 
 #[derive(Clone, Copy)]
 enum RemoteLaneWaitKind {
-    Future,
-    Channel,
+    FutureAwait,
+    ChannelSend,
+    ChannelReceive,
 }
+#[derive(Clone)]
 struct RemoteLaneWaitReceipt {
     continuation: Ref64,
     target: RemoteRef,
     kind: RemoteLaneWaitKind,
+    session_binding: Option<([u8; 16], NodeId, NodeId)>,
+}
+
+fn valid_remote_lane_shape(
+    kind: RemoteLaneWaitKind,
+    result: &Result<RemoteLaneApply, RemoteLaneError>,
+) -> bool {
+    match result {
+        Err(_) | Ok(RemoteLaneApply::WouldBlock) => true,
+        Ok(RemoteLaneApply::Applied(value)) => matches!(
+            (kind, value),
+            (RemoteLaneWaitKind::FutureAwait, RemoteLaneValue::Ref(_))
+                | (RemoteLaneWaitKind::ChannelReceive, RemoteLaneValue::Ref(_))
+                | (RemoteLaneWaitKind::ChannelSend, RemoteLaneValue::Unit)
+        ),
+        Ok(RemoteLaneApply::Closed) => matches!(
+            kind,
+            RemoteLaneWaitKind::ChannelSend | RemoteLaneWaitKind::ChannelReceive
+        ),
+        Ok(RemoteLaneApply::Lost) => true,
+    }
 }
 
 struct OwnedMailboxIngress {
@@ -228,6 +251,37 @@ impl RemoteNodeRuntime {
     pub fn pending_outbound_remote_lane(&self) -> Vec<KernelRemoteLaneEmission> {
         self.outbound_remote_lane.clone()
     }
+    /// Bind an emitted waiter to the exact authenticated transport session that
+    /// will carry it. This must be called before exchanging the containing batch.
+    /// Repeating the same binding is harmless; changing it is refused.
+    pub fn bind_remote_lane_waiter_session(
+        &mut self,
+        request_id: RemoteLaneRequestId,
+        session: &RemoteLaneClientSession,
+    ) -> Result<(), RemoteNodeRuntimeError> {
+        let receipt = self
+            .remote_lane_waiters
+            .get_mut(&request_id)
+            .ok_or(RemoteNodeRuntimeError::UnknownResource)?;
+        if session.issuer != self.node {
+            return Err(RemoteNodeRuntimeError::WrongNode);
+        }
+        if session.owner != receipt.target.node {
+            return Err(RemoteNodeRuntimeError::WrongOwner);
+        }
+        let binding = (session.session_id, session.issuer, session.owner);
+        if receipt
+            .session_binding
+            .is_some_and(|existing| existing != binding)
+        {
+            return Err(RemoteNodeRuntimeError::Lane(
+                RemoteLaneError::InvalidEnvelope,
+            ));
+        }
+        receipt.session_binding = Some(binding);
+        Ok(())
+    }
+
     /// Accept only outcomes authenticated and content-bound by the remote-lane
     /// session transport. Verification happens before this method can observe a
     /// receipt, and therefore before any continuation is woken or faulted.
@@ -235,55 +289,93 @@ impl RemoteNodeRuntime {
         &mut self,
         outcomes: VerifiedRemoteLaneOutcomes,
     ) -> Result<(), RemoteNodeRuntimeError> {
-        self.apply_remote_lane_outcomes(&outcomes.into_outcomes())
+        let binding = outcomes.routing_binding();
+        let (_, issuer, owner) = binding;
+        if issuer != self.node || outcomes.outcomes().iter().any(|o| o.target.node != owner) {
+            return Err(RemoteNodeRuntimeError::Lane(
+                RemoteLaneError::InvalidEnvelope,
+            ));
+        }
+        self.apply_remote_lane_outcomes(&outcomes.into_outcomes(), binding)
     }
 
     fn apply_remote_lane_outcomes(
         &mut self,
         outcomes: &[RemoteLaneOutcome],
+        session_binding: ([u8; 16], NodeId, NodeId),
     ) -> Result<(), RemoteNodeRuntimeError> {
+        let mut seen = std::collections::HashSet::new();
         for outcome in outcomes {
-            if !self.remote_lane_waiters.contains_key(&outcome.request_id) {
-                continue;
+            if !seen.insert(outcome.request_id) {
+                return Err(RemoteNodeRuntimeError::Lane(
+                    RemoteLaneError::InvalidEnvelope,
+                ));
             }
+            let Some(receipt) = self.remote_lane_waiters.get(&outcome.request_id) else {
+                // A verified batch may contain non-blocking operations for which the
+                // runtime intentionally has no waiter receipt.
+                continue;
+            };
+            if receipt.session_binding != Some(session_binding)
+                || outcome.target != receipt.target
+                || !valid_remote_lane_shape(receipt.kind, &outcome.result)
+            {
+                return Err(RemoteNodeRuntimeError::Lane(
+                    RemoteLaneError::InvalidEnvelope,
+                ));
+            }
+        }
+
+        // Kernel transitions are attempted on a clone. A later bad transition cannot
+        // partially consume waiters or outbox entries from the live runtime.
+        let mut kernel = self.kernel.clone();
+        let mut completed = Vec::new();
+        for outcome in outcomes {
             if matches!(
                 outcome.result,
                 Ok(RemoteLaneApply::WouldBlock) | Err(RemoteLaneError::NodeUnavailable)
             ) {
                 continue;
             }
-            let receipt = self
-                .remote_lane_waiters
-                .remove(&outcome.request_id)
-                .expect("checked");
+            let Some(receipt) = self.remote_lane_waiters.get(&outcome.request_id) else {
+                continue;
+            };
             if matches!(outcome.result, Ok(RemoteLaneApply::Applied(_))) {
-                self.kernel
+                kernel
                     .complete_remote_lane_program(receipt.continuation)
                     .map_err(RemoteNodeRuntimeError::Kernel)?;
             } else {
-                self.kernel
+                kernel
                     .fail_remote_lane_program(receipt.continuation)
                     .map_err(RemoteNodeRuntimeError::Kernel)?;
             }
+            match receipt.kind {
+                RemoteLaneWaitKind::FutureAwait => kernel.wake_remote_future_waiter(
+                    receipt.continuation,
+                    receipt.target.node.0,
+                    receipt.target.entity,
+                ),
+                RemoteLaneWaitKind::ChannelSend | RemoteLaneWaitKind::ChannelReceive => kernel
+                    .wake_remote_channel_waiter(
+                        receipt.continuation,
+                        receipt.target.node.0,
+                        receipt.target.entity,
+                    ),
+            }
+            completed.push(outcome.request_id);
+        }
+        if !completed.is_empty() {
+            self.kernel = kernel;
+        }
+        for request_id in completed {
+            self.remote_lane_waiters.remove(&request_id);
             self.outbound_remote_lane.retain(|emission| {
                 !emission
                     .batch
                     .effects()
                     .iter()
-                    .any(|effect| effect.request_id == outcome.request_id)
+                    .any(|effect| effect.request_id == request_id)
             });
-            match receipt.kind {
-                RemoteLaneWaitKind::Future => self.kernel.wake_remote_future_waiter(
-                    receipt.continuation,
-                    receipt.target.node.0,
-                    receipt.target.entity,
-                ),
-                RemoteLaneWaitKind::Channel => self.kernel.wake_remote_channel_waiter(
-                    receipt.continuation,
-                    receipt.target.node.0,
-                    receipt.target.entity,
-                ),
-            }
         }
         Ok(())
     }
@@ -309,16 +401,18 @@ impl RemoteNodeRuntime {
                 .any(|effect| effect.request_id == request_id)
         });
         match receipt.kind {
-            RemoteLaneWaitKind::Future => self.kernel.wake_remote_future_waiter(
+            RemoteLaneWaitKind::FutureAwait => self.kernel.wake_remote_future_waiter(
                 receipt.continuation,
                 receipt.target.node.0,
                 receipt.target.entity,
             ),
-            RemoteLaneWaitKind::Channel => self.kernel.wake_remote_channel_waiter(
-                receipt.continuation,
-                receipt.target.node.0,
-                receipt.target.entity,
-            ),
+            RemoteLaneWaitKind::ChannelSend | RemoteLaneWaitKind::ChannelReceive => {
+                self.kernel.wake_remote_channel_waiter(
+                    receipt.continuation,
+                    receipt.target.node.0,
+                    receipt.target.entity,
+                )
+            }
         }
         Ok(())
     }
@@ -787,14 +881,20 @@ impl RemoteNodeRuntime {
                 .effects()
                 .iter()
                 .filter_map(|effect| match effect.operation {
-                    RemoteLaneOperation::FutureAwait => {
-                        Some((effect.request_id, effect.target, RemoteLaneWaitKind::Future))
-                    }
-                    RemoteLaneOperation::ChannelSend { .. }
-                    | RemoteLaneOperation::ChannelReceive { .. } => Some((
+                    RemoteLaneOperation::FutureAwait => Some((
                         effect.request_id,
                         effect.target,
-                        RemoteLaneWaitKind::Channel,
+                        RemoteLaneWaitKind::FutureAwait,
+                    )),
+                    RemoteLaneOperation::ChannelSend { .. } => Some((
+                        effect.request_id,
+                        effect.target,
+                        RemoteLaneWaitKind::ChannelSend,
+                    )),
+                    RemoteLaneOperation::ChannelReceive { .. } => Some((
+                        effect.request_id,
+                        effect.target,
+                        RemoteLaneWaitKind::ChannelReceive,
                     )),
                     _ => None,
                 })
@@ -806,7 +906,7 @@ impl RemoteNodeRuntime {
             }
             if let Some((id, target, kind)) = waits.first().copied() {
                 match kind {
-                    RemoteLaneWaitKind::Future => self
+                    RemoteLaneWaitKind::FutureAwait => self
                         .kernel
                         .register_remote_future_waiter(
                             emission.continuation,
@@ -815,7 +915,7 @@ impl RemoteNodeRuntime {
                             emission.run_class,
                         )
                         .map_err(RemoteNodeRuntimeError::Kernel)?,
-                    RemoteLaneWaitKind::Channel => self
+                    RemoteLaneWaitKind::ChannelSend | RemoteLaneWaitKind::ChannelReceive => self
                         .kernel
                         .register_remote_channel_waiter(
                             emission.continuation,
@@ -831,6 +931,7 @@ impl RemoteNodeRuntime {
                         continuation: emission.continuation,
                         target,
                         kind,
+                        session_binding: None,
                     },
                 );
             }
@@ -986,5 +1087,31 @@ impl RemoteNodeRuntime {
             Some(owner) if owner == current => Ok(()),
             Some(_) => Err(RemoteNodeRuntimeError::WrongOwner),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{valid_remote_lane_shape, RemoteLaneWaitKind};
+    use crate::distributed::remote_lane_effect::{RemoteLaneApply, RemoteLaneValue};
+
+    #[test]
+    fn verified_terminal_shapes_accept_lost_but_not_future_closed() {
+        assert!(valid_remote_lane_shape(
+            RemoteLaneWaitKind::FutureAwait,
+            &Ok(RemoteLaneApply::Lost),
+        ));
+        assert!(!valid_remote_lane_shape(
+            RemoteLaneWaitKind::FutureAwait,
+            &Ok(RemoteLaneApply::Closed),
+        ));
+        assert!(valid_remote_lane_shape(
+            RemoteLaneWaitKind::ChannelReceive,
+            &Ok(RemoteLaneApply::Closed),
+        ));
+        assert!(!valid_remote_lane_shape(
+            RemoteLaneWaitKind::FutureAwait,
+            &Ok(RemoteLaneApply::Applied(RemoteLaneValue::Unit)),
+        ));
     }
 }

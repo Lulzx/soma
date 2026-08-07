@@ -2,14 +2,14 @@
 //!
 //! This deliberately narrow G2 slice supports local futures, initially empty
 //! local process mailboxes, exact live host-backed Object `Ref64` values, and
-//! all-complete graphs. Installed pointer-free bytecode executes once on Metal;
+//! governed fixed 8-byte object range reads/in-place writes on all-complete graphs. Installed pointer-free bytecode executes once on Metal;
 //! after final readback, validated journals are replayed through the ordinary
 //! governed Kernel operations on a clone and published atomically.
 //!
 //! The admitted subset is intentionally strict: local unsupervised processes,
 //! RunClassBins + RunPartial, unique initial run classes, no competing mutable
 //! continuation for one process, no foreign payloads, no initial waiters/mail,
-//! and no parked final result. This makes the resident lane set equal the
+//! no object growth/allocation, and no parked final result. This makes the resident lane set equal the
 //! canonical admission set; unsupported shapes refuse before submission.
 //!
 //! Exact invocation/applied-disposition, wake, and per-epoch records drive
@@ -22,9 +22,11 @@ use crate::abi::continuations::ContinuationState;
 use crate::abi::{EventKind, FutureState, Kind, Ref64, Rights};
 use crate::executives::resident_sync::{
     InitialFuture, ResidentCapability, ResidentEffect, ResidentHandlerProgram, ResidentInstruction,
-    ResidentSyncConfig, ResidentSyncResult, HANDLER_EFFECT_FUTURE_AWAIT,
-    HANDLER_EFFECT_FUTURE_OBSERVE, HANDLER_EFFECT_FUTURE_RESOLVE, HANDLER_EFFECT_MAILBOX_RECEIVE,
-    HANDLER_EFFECT_MAILBOX_SEND, RESOURCE_FUTURE, RESOURCE_MAILBOX, RIGHT_READ, RIGHT_WRITE,
+    ResidentObject, ResidentObjectCapability, ResidentSyncConfig, ResidentSyncResult,
+    HANDLER_EFFECT_FUTURE_AWAIT, HANDLER_EFFECT_FUTURE_OBSERVE, HANDLER_EFFECT_FUTURE_RESOLVE,
+    HANDLER_EFFECT_MAILBOX_RECEIVE, HANDLER_EFFECT_MAILBOX_SEND, HANDLER_EFFECT_OBJECT_READ,
+    HANDLER_EFFECT_OBJECT_WRITE, RESOURCE_FUTURE, RESOURCE_MAILBOX, RESOURCE_OBJECT, RIGHT_READ,
+    RIGHT_WRITE,
 };
 use crate::kernel::Kernel;
 use crate::scheduler::device::reference_lane_conflicts;
@@ -60,6 +62,22 @@ impl KernelResidentInstruction {
             value: value.to_u64(),
         }
     }
+    pub fn object_read(target: Ref64, offset: u32) -> Self {
+        Self {
+            opcode: HANDLER_EFFECT_OBJECT_READ,
+            argument: offset,
+            target,
+            value: 0,
+        }
+    }
+    pub fn object_write(target: Ref64, offset: u32, value: u64) -> Self {
+        Self {
+            opcode: HANDLER_EFFECT_OBJECT_WRITE,
+            argument: offset,
+            target,
+            value,
+        }
+    }
     pub fn plain(opcode: u32, argument: u32, value: u64) -> Self {
         Self {
             opcode,
@@ -84,6 +102,7 @@ pub struct KernelResidentSyncPlan {
     programs: BTreeMap<u32, ResidentHandlerProgram>,
     continuations_by_id: BTreeMap<u64, Ref64>,
     actors_by_id: BTreeMap<u64, Ref64>,
+    objects: Vec<Ref64>,
     futures: Vec<Ref64>,
     mailboxes: Vec<Ref64>,
     initial_epoch: u32,
@@ -496,6 +515,10 @@ impl KernelResidentSyncPlan {
         if max_epochs == 0 || max_effects == 0 || max_frame == 0 || width == 0 {
             return Err(KernelResidentSyncError::UnsupportedShape);
         }
+        let horizon = kernel
+            .epoch
+            .checked_add(max_epochs)
+            .ok_or(KernelResidentSyncError::UnsupportedShape)?;
         // This slice begins at a clean resident boundary. Initial waiter and
         // mailbox import is intentionally not claimed yet.
         if kernel.future_waiters.values().any(|w| !w.is_empty())
@@ -525,6 +548,48 @@ impl KernelResidentSyncPlan {
         {
             return Err(KernelResidentSyncError::UnsupportedShape);
         }
+        let mut objects: Vec<Ref64> = kernel
+            .resident_sync_programs
+            .values()
+            .flat_map(|program| program.instructions.iter())
+            .filter(|instruction| {
+                matches!(
+                    instruction.opcode,
+                    HANDLER_EFFECT_OBJECT_READ | HANDLER_EFFECT_OBJECT_WRITE
+                )
+            })
+            .map(|instruction| instruction.target)
+            .collect();
+        objects.sort_by_key(Ref64::to_u64);
+        objects.dedup();
+        if objects.len() > crate::executives::resident_sync::MAX_RESIDENT_OBJECTS
+            || objects
+                .len()
+                .checked_mul(max_frame as usize)
+                .is_none_or(|bytes| {
+                    bytes > crate::executives::resident_sync::MAX_RESIDENT_OBJECT_ARENA_BYTES
+                })
+        {
+            return Err(KernelResidentSyncError::UnsupportedShape);
+        }
+        if objects.iter().any(|object| {
+            object.kind != Kind::Object
+                || kernel.objects.get(*object).is_err()
+                || kernel.object_payloads.get(&object.key()).is_none_or(|p| {
+                    let descriptor = kernel.objects.get(*object).ok();
+                    p.provenance() != "host"
+                        || p.len() > max_frame as usize
+                        || descriptor.is_none_or(|d| p.len() as u64 != d.byte_length)
+                })
+        }) {
+            return Err(KernelResidentSyncError::UnsupportedShape);
+        }
+        let object_index: HashMap<Ref64, u32> = objects
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (*r, i as u32))
+            .collect();
+
         let future_index: HashMap<Ref64, u32> = futures
             .iter()
             .enumerate()
@@ -542,13 +607,18 @@ impl KernelResidentSyncPlan {
             for instruction in &program.instructions {
                 let effect = matches!(
                     instruction.opcode,
-                    HANDLER_EFFECT_FUTURE_OBSERVE
+                    HANDLER_EFFECT_OBJECT_READ
+                        | HANDLER_EFFECT_OBJECT_WRITE
+                        | HANDLER_EFFECT_FUTURE_OBSERVE
                         | HANDLER_EFFECT_FUTURE_AWAIT
                         | HANDLER_EFFECT_FUTURE_RESOLVE
                         | HANDLER_EFFECT_MAILBOX_SEND
                         | HANDLER_EFFECT_MAILBOX_RECEIVE
                 );
                 let argument = match instruction.opcode {
+                    HANDLER_EFFECT_OBJECT_READ | HANDLER_EFFECT_OBJECT_WRITE => {
+                        instruction.argument
+                    }
                     HANDLER_EFFECT_FUTURE_OBSERVE
                     | HANDLER_EFFECT_FUTURE_AWAIT
                     | HANDLER_EFFECT_FUTURE_RESOLVE => *future_index
@@ -558,6 +628,20 @@ impl KernelResidentSyncPlan {
                         .get(&instruction.target)
                         .ok_or(KernelResidentSyncError::InvalidProgram)?,
                     _ => instruction.argument,
+                };
+                let packed_target = match instruction.opcode {
+                    HANDLER_EFFECT_OBJECT_READ | HANDLER_EFFECT_OBJECT_WRITE => *object_index
+                        .get(&instruction.target)
+                        .ok_or(KernelResidentSyncError::InvalidProgram)?,
+                    HANDLER_EFFECT_FUTURE_OBSERVE
+                    | HANDLER_EFFECT_FUTURE_AWAIT
+                    | HANDLER_EFFECT_FUTURE_RESOLVE => *future_index
+                        .get(&instruction.target)
+                        .ok_or(KernelResidentSyncError::InvalidProgram)?,
+                    HANDLER_EFFECT_MAILBOX_SEND | HANDLER_EFFECT_MAILBOX_RECEIVE => *mailbox_index
+                        .get(&instruction.target)
+                        .ok_or(KernelResidentSyncError::InvalidProgram)?,
+                    _ => 0,
                 };
                 if effect && instruction.target.is_null() {
                     return Err(KernelResidentSyncError::InvalidProgram);
@@ -582,9 +666,12 @@ impl KernelResidentSyncPlan {
                 packed.push(ResidentInstruction {
                     opcode: instruction.opcode,
                     argument,
+                    target: packed_target,
+                    reserved: 0,
                     value: if matches!(
                         instruction.opcode,
-                        HANDLER_EFFECT_FUTURE_OBSERVE
+                        HANDLER_EFFECT_OBJECT_READ
+                            | HANDLER_EFFECT_FUTURE_OBSERVE
                             | HANDLER_EFFECT_FUTURE_AWAIT
                             | HANDLER_EFFECT_MAILBOX_RECEIVE
                     ) {
@@ -674,7 +761,7 @@ impl KernelResidentSyncPlan {
                 return Err(KernelResidentSyncError::UnsupportedShape);
             };
             for (_, cap) in space.iter().filter(|(reference, c)| {
-                c.valid_until_epoch >= kernel.epoch.saturating_add(max_epochs)
+                c.valid_until_epoch >= horizon
                     && Kernel::capability_chain_is_live(space, *reference)
             }) {
                 if let Some(&target) = future_index.get(&cap.target) {
@@ -741,11 +828,51 @@ impl KernelResidentSyncPlan {
                 }
             }
         }
+        let mut object_capabilities = Vec::new();
+        for actor in actors_by_id.values() {
+            let space = kernel
+                .capability_spaces
+                .get(&actor.key())
+                .ok_or(KernelResidentSyncError::UnsupportedShape)?;
+            for (reference, cap) in space.iter() {
+                let Some(&target) = object_index.get(&cap.target) else {
+                    continue;
+                };
+                let object = kernel
+                    .objects
+                    .get(cap.target)
+                    .map_err(|_| KernelResidentSyncError::UnsupportedShape)?;
+                let rights = cap.rights & (Rights::READ | Rights::WRITE);
+                if rights != 0
+                    && cap.valid_until_epoch >= horizon
+                    && cap.object_version == object.version
+                    && Kernel::capability_chain_is_live(space, reference)
+                {
+                    if object_capabilities.len()
+                        >= crate::executives::resident_sync::MAX_RESIDENT_OBJECT_CAPABILITIES
+                    {
+                        return Err(KernelResidentSyncError::UnsupportedShape);
+                    }
+                    object_capabilities.push(ResidentObjectCapability {
+                        actor: actor.to_u64(),
+                        target,
+                        offset: cap.offset,
+                        length: cap.length,
+                        rights: (((rights & Rights::READ != 0) as u32) * RIGHT_READ)
+                            | (((rights & Rights::WRITE != 0) as u32) * RIGHT_WRITE),
+                        object_version: cap.object_version,
+                        valid_until_epoch: cap.valid_until_epoch,
+                    });
+                }
+            }
+        }
         // Reject statically unauthorized effect shapes before submit.
         for c in &continuations {
             let p = &packed_programs[&c.run_class];
             for i in &p.instructions {
                 let (kind, right) = match i.opcode {
+                    HANDLER_EFFECT_OBJECT_READ => (RESOURCE_OBJECT, RIGHT_READ),
+                    HANDLER_EFFECT_OBJECT_WRITE => (RESOURCE_OBJECT, RIGHT_WRITE),
                     HANDLER_EFFECT_FUTURE_OBSERVE | HANDLER_EFFECT_FUTURE_AWAIT => {
                         (RESOURCE_FUTURE, RIGHT_READ)
                     }
@@ -754,12 +881,31 @@ impl KernelResidentSyncPlan {
                     HANDLER_EFFECT_MAILBOX_SEND => (RESOURCE_MAILBOX, RIGHT_WRITE),
                     _ => continue,
                 };
-                if !capabilities.iter().any(|x| {
-                    x.actor == c.actor
-                        && x.resource_kind == kind
-                        && x.target == i.argument
-                        && (x.rights & right) != 0
-                }) {
+                let authorized = if kind == RESOURCE_OBJECT {
+                    let object = kernel
+                        .objects
+                        .get(objects[i.target as usize])
+                        .map_err(|_| KernelResidentSyncError::UnsupportedShape)?;
+                    let end = u64::from(i.argument)
+                        .checked_add(8)
+                        .ok_or(KernelResidentSyncError::UnsupportedShape)?;
+                    end <= object.byte_length
+                        && object_capabilities.iter().any(|x| {
+                            x.actor == c.actor && x.target == i.target && (x.rights & right) != 0
+                            && u64::from(i.argument) >= x.offset
+                            && end <= x.offset.saturating_add(x.length)
+                            // Ordinary Kernel object methods currently govern full-object access.
+                            && x.offset == 0 && x.length >= object.byte_length
+                        })
+                } else {
+                    capabilities.iter().any(|x| {
+                        x.actor == c.actor
+                            && x.resource_kind == kind
+                            && x.target == i.target
+                            && (x.rights & right) != 0
+                    })
+                };
+                if !authorized {
                     return Err(KernelResidentSyncError::UnsupportedShape);
                 }
                 if i.opcode == HANDLER_EFFECT_MAILBOX_SEND {
@@ -777,7 +923,7 @@ impl KernelResidentSyncPlan {
                         space.for_target(value).into_iter().any(|(reference, cap)| {
                             cap.target == value
                                 && cap.rights & Rights::TRANSFER != 0
-                                && cap.valid_until_epoch >= kernel.epoch.saturating_add(max_epochs)
+                                && cap.valid_until_epoch >= horizon
                                 && cap.object_version == object.version
                                 && cap.offset == 0
                                 && cap.length >= object.byte_length
@@ -830,6 +976,18 @@ impl KernelResidentSyncPlan {
                 max_continuations: (continuations.len() as u32)
                     .max(capacities.iter().copied().max().unwrap_or(0)),
                 cohort_width: width,
+                initial_epoch: kernel.epoch,
+                objects: objects
+                    .iter()
+                    .map(|reference| {
+                        let descriptor = kernel.objects.get(*reference).expect("validated object");
+                        ResidentObject {
+                            version: descriptor.version,
+                            bytes: kernel.object_payloads[&reference.key()].as_slice().to_vec(),
+                        }
+                    })
+                    .collect(),
+                object_capabilities,
                 futures: initial_futures,
                 mailbox_capacities: capacities,
                 capabilities,
@@ -838,6 +996,7 @@ impl KernelResidentSyncPlan {
             programs: packed_programs,
             continuations_by_id,
             actors_by_id,
+            objects,
             futures,
             mailboxes,
             initial_epoch: kernel.epoch,
@@ -858,6 +1017,10 @@ impl KernelResidentSyncPlan {
 
     fn translate_target(&self, e: ResidentEffect) -> Option<Ref64> {
         match e {
+            ResidentEffect::ObjectRead { target, .. }
+            | ResidentEffect::ObjectWrite { target, .. } => {
+                self.objects.get(target as usize).copied()
+            }
             ResidentEffect::FutureObserve { target }
             | ResidentEffect::FutureAwait { target }
             | ResidentEffect::FutureResolve { target, .. } => {
@@ -880,6 +1043,7 @@ impl KernelResidentSyncPlan {
         }
         if result.frames.len() != self.continuations.len()
             || result.final_continuations.len() != self.continuations.len()
+            || result.object_values.len() != self.objects.len()
             || result.future_values.len() != self.futures.len()
             || result.mailboxes.len() != self.mailboxes.len()
         {
@@ -1063,16 +1227,40 @@ impl KernelResidentSyncPlan {
         let operations: Vec<_> = result
             .operations
             .iter()
-            .flat_map(|journal| journal.operations.iter())
+            .flat_map(|journal| {
+                journal
+                    .operations
+                    .iter()
+                    .map(|operation| (operation, journal.payload(*operation)))
+            })
             .collect();
-        for ((effect, access), operation) in
+        for ((effect, access), (operation, payload)) in
             result.effects.iter().zip(&result.accesses).zip(operations)
         {
-            let (kind, target, opcode, value) = match effect.effect {
+            let (kind, target, opcode, value, auxiliary) = match effect.effect {
+                ResidentEffect::ObjectRead { target, offset } => (
+                    RESOURCE_OBJECT,
+                    target,
+                    crate::scheduler::device_ops::OP_READ_OBJECT,
+                    0,
+                    u64::from(offset),
+                ),
+                ResidentEffect::ObjectWrite {
+                    target,
+                    offset,
+                    value,
+                } => (
+                    RESOURCE_OBJECT,
+                    target,
+                    crate::scheduler::device_ops::OP_WRITE_OBJECT,
+                    value,
+                    u64::from(offset),
+                ),
                 ResidentEffect::FutureObserve { target } => (
                     RESOURCE_FUTURE,
                     target,
                     crate::scheduler::device_ops::OP_OBSERVE_FUTURE,
+                    0,
                     0,
                 ),
                 ResidentEffect::FutureAwait { target } => (
@@ -1080,39 +1268,83 @@ impl KernelResidentSyncPlan {
                     target,
                     crate::scheduler::device_ops::OP_AWAIT_FUTURE,
                     0,
+                    0,
                 ),
                 ResidentEffect::FutureResolve { target, value } => (
                     RESOURCE_FUTURE,
                     target,
                     crate::scheduler::device_ops::OP_RESOLVE_FUTURE,
                     value,
+                    0,
                 ),
                 ResidentEffect::MailboxSend { target, value } => (
                     RESOURCE_MAILBOX,
                     target,
                     crate::scheduler::device_ops::OP_ENQUEUE_MESSAGE,
                     value,
+                    0,
                 ),
                 ResidentEffect::MailboxReceive { target } => (
                     RESOURCE_MAILBOX,
                     target,
                     crate::scheduler::device_ops::OP_RECEIVE_MESSAGE,
                     0,
+                    0,
                 ),
+            };
+            let (expected_code, expected_ref) = match effect.outcome {
+                crate::executives::resident_sync::ResidentOutcome::ObjectRead(read) => (2, read),
+                crate::executives::resident_sync::ResidentOutcome::ObjectWritten => (0, 0),
+                crate::executives::resident_sync::ResidentOutcome::Resolved(reference) => {
+                    (2, reference)
+                }
+                crate::executives::resident_sync::ResidentOutcome::Pending
+                | crate::executives::resident_sync::ResidentOutcome::Empty => (1, 0),
+                crate::executives::resident_sync::ResidentOutcome::Registered => (3, 0),
+                crate::executives::resident_sync::ResidentOutcome::Sent => (0, 0),
+                crate::executives::resident_sync::ResidentOutcome::Received { value, .. } => {
+                    (2, value)
+                }
+                crate::executives::resident_sync::ResidentOutcome::CapabilityDenied => (0x104, 0),
+                crate::executives::resident_sync::ResidentOutcome::InvalidTarget => (0x101, 0),
+                crate::executives::resident_sync::ResidentOutcome::Full => (0x10c, 0),
+                crate::executives::resident_sync::ResidentOutcome::DoubleResolve => (0x111, 0),
+            };
+            let expected_mode = if matches!(
+                effect.effect,
+                ResidentEffect::ObjectRead { .. } | ResidentEffect::FutureObserve { .. }
+            ) {
+                crate::scheduler::device::DEVICE_ACCESS_READ
+            } else {
+                crate::scheduler::device::DEVICE_ACCESS_WRITE
             };
             if access.lane != effect.lane
                 || access.ordinal != effect.ordinal
                 || access.resource_kind != kind
                 || access.resource != u64::from(target)
+                || access.mode != expected_mode
                 || operation.lane != effect.lane
                 || operation.ordinal != effect.ordinal
                 || operation.opcode != opcode
                 || operation.actor != self.actors_by_id[&effect.continuation].to_u64()
                 || operation.target != u64::from(target)
                 || operation.value != value
+                || operation.auxiliary != auxiliary
+                || operation.flags != 0
+                || operation.result_aux != 0
+                || operation.result_code != expected_code
+                || operation.result_ref != expected_ref
+                || (kind == RESOURCE_OBJECT && operation.payload_len != 8)
+                || match effect.outcome {
+                    crate::executives::resident_sync::ResidentOutcome::ObjectRead(read) => {
+                        payload != Some(read.to_le_bytes().as_slice())
+                    }
+                    crate::executives::resident_sync::ResidentOutcome::ObjectWritten => {
+                        payload != Some(value.to_le_bytes().as_slice())
+                    }
+                    _ => operation.payload_len != 0 || payload != Some(&[]),
+                }
             {
-                #[cfg(test)]
-                eprintln!("journal mismatch effect={effect:?} access={access:?} operation={operation:?} expected={kind}/{target}/{opcode}/{value}");
                 return Err(KernelResidentSyncError::InvalidDeviceResult);
             }
         }
@@ -1124,6 +1356,7 @@ impl KernelResidentSyncPlan {
             .map(|a| {
                 let mut x = *a;
                 x.resource = match a.resource_kind {
+                    RESOURCE_OBJECT => self.objects.get(a.resource as usize),
                     RESOURCE_FUTURE => self.futures.get(a.resource as usize),
                     RESOURCE_MAILBOX => self.mailboxes.get(a.resource as usize),
                     _ => None,
@@ -1135,6 +1368,17 @@ impl KernelResidentSyncPlan {
             .collect::<Result<_, _>>()?;
         let lane_count = translated.iter().map(|a| a.lane).max().map_or(0, |x| x + 1);
         let _conflicts = reference_lane_conflicts(&translated, lane_count);
+        let object_accesses: Vec<_> = translated
+            .iter()
+            .copied()
+            .filter(|access| access.resource_kind == RESOURCE_OBJECT)
+            .collect();
+        if reference_lane_conflicts(&object_accesses, lane_count)
+            .iter()
+            .any(|conflict| conflict.conflicts != 0)
+        {
+            return Err(KernelResidentSyncError::InvalidDeviceResult);
+        }
         for journal in &result.operations {
             for op in &journal.operations {
                 let actor = Ref64::from_u64(op.actor);
@@ -1142,6 +1386,10 @@ impl KernelResidentSyncPlan {
                     return Err(KernelResidentSyncError::InvalidDeviceResult);
                 }
                 let target = match op.opcode {
+                    crate::scheduler::device_ops::OP_READ_OBJECT
+                    | crate::scheduler::device_ops::OP_WRITE_OBJECT => {
+                        self.objects.get(op.target as usize)
+                    }
                     crate::scheduler::device_ops::OP_OBSERVE_FUTURE
                     | crate::scheduler::device_ops::OP_AWAIT_FUTURE
                     | crate::scheduler::device_ops::OP_RESOLVE_FUTURE => {
@@ -1275,6 +1523,46 @@ impl KernelResidentSyncPlan {
                         .translate_target(effect.effect)
                         .ok_or(KernelResidentSyncError::InvalidDeviceResult)?;
                     match effect.effect {
+                        ResidentEffect::ObjectRead { offset, .. } => {
+                            let bytes = k
+                                .object_bytes(actor, target)
+                                .map_err(|_| KernelResidentSyncError::InvalidDeviceResult)?;
+                            let start = offset as usize;
+                            let actual = bytes
+                                .get(
+                                    start
+                                        ..start
+                                            .checked_add(8)
+                                            .ok_or(KernelResidentSyncError::InvalidDeviceResult)?,
+                                )
+                                .ok_or(KernelResidentSyncError::InvalidDeviceResult)?;
+                            match effect.outcome {
+                                crate::executives::resident_sync::ResidentOutcome::ObjectRead(
+                                    expected,
+                                ) if actual == expected.to_le_bytes() => {}
+                                _ => return Err(KernelResidentSyncError::InvalidDeviceResult),
+                            }
+                        }
+                        ResidentEffect::ObjectWrite { offset, value, .. } => {
+                            let bytes = k
+                                .object_bytes_mut(actor, target)
+                                .map_err(|_| KernelResidentSyncError::InvalidDeviceResult)?;
+                            let start = offset as usize;
+                            let actual = bytes
+                                .get_mut(
+                                    start
+                                        ..start
+                                            .checked_add(8)
+                                            .ok_or(KernelResidentSyncError::InvalidDeviceResult)?,
+                                )
+                                .ok_or(KernelResidentSyncError::InvalidDeviceResult)?;
+                            if effect.outcome
+                                != crate::executives::resident_sync::ResidentOutcome::ObjectWritten
+                            {
+                                return Err(KernelResidentSyncError::InvalidDeviceResult);
+                            }
+                            actual.copy_from_slice(&value.to_le_bytes());
+                        }
                         ResidentEffect::FutureObserve { .. } => {
                             let observed = k
                                 .observe_future(actor, target)
@@ -1406,6 +1694,15 @@ impl KernelResidentSyncPlan {
                 return Err(KernelResidentSyncError::InvalidDeviceResult);
             }
             payload.as_mut_slice().copy_from_slice(frame);
+        }
+        for (index, object) in self.objects.iter().enumerate() {
+            let actual = k
+                .object_payloads
+                .get(&object.key())
+                .ok_or(KernelResidentSyncError::InvalidDeviceResult)?;
+            if actual.as_slice() != r.object_values[index] {
+                return Err(KernelResidentSyncError::InvalidDeviceResult);
+            }
         }
         for (index, future) in self.futures.iter().enumerate() {
             if k.future_value(*future).map(|reference| reference.to_u64()) != r.future_values[index]
@@ -2244,5 +2541,272 @@ mod tests {
             reference.mailbox_len(receiver),
             bridged.mailbox_len(receiver)
         );
+    }
+
+    fn object_setup(width: u32) -> (Kernel, KernelResidentSyncPlan, Ref64, Ref64) {
+        let mut k = Kernel::new();
+        let process = k.create_process(Ref64::NULL, ProcessMode::Pure);
+        let object = k.create_object(process, ObjectKind::RawBytes, (0u8..16).collect());
+        let run_class = 1700;
+        k.install_resident_sync_program(KernelResidentProgram {
+            run_class,
+            instructions: vec![
+                KernelResidentInstruction::object_read(object, 4),
+                KernelResidentInstruction::object_write(object, 8, 0x8877665544332211),
+                KernelResidentInstruction::plain(HANDLER_COMPLETE, 0, 0),
+            ],
+        })
+        .unwrap();
+        let continuation = k
+            .create_continuation(
+                process,
+                process,
+                ContinuationSpec::new(StateAccess::ReadOnly, run_class, 0, vec![0; 8], 4),
+            )
+            .unwrap();
+        let plan = k.plan_resident_sync(1, 2, 16, width).unwrap();
+        let _ = continuation;
+        (k, plan, object, process)
+    }
+
+    #[test]
+    fn governed_object_read_write_replays_through_kernel_and_widths_match() {
+        let (base1, plan1, object, process) = object_setup(1);
+        let mut bridged1 = base1.clone();
+        bridged1.run_resident_sync_cpu_reference(plan1).unwrap();
+        let (base32, plan32, object32, _) = object_setup(32);
+        let mut bridged32 = base32.clone();
+        bridged32.run_resident_sync_cpu_reference(plan32).unwrap();
+        assert_eq!(
+            bridged1.object_payloads[&object.key()].as_slice(),
+            bridged32.object_payloads[&object32.key()].as_slice()
+        );
+        assert_eq!(
+            &bridged1.object_payloads[&object.key()].as_slice()[8..16],
+            &0x8877665544332211u64.to_le_bytes()
+        );
+
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            let (metal_base1, metal_plan1, metal_object1, _) = object_setup(1);
+            let mut metal1 = metal_base1;
+            metal1.run_resident_sync_metal(metal_plan1).unwrap();
+            assert_eq!(
+                KernelResidentSyncPlan::fingerprint(&metal1),
+                KernelResidentSyncPlan::fingerprint(&bridged1)
+            );
+            let (metal_base32, metal_plan32, metal_object32, _) = object_setup(32);
+            let mut metal32 = metal_base32;
+            metal32.run_resident_sync_metal(metal_plan32).unwrap();
+            assert_eq!(
+                KernelResidentSyncPlan::fingerprint(&metal32),
+                KernelResidentSyncPlan::fingerprint(&bridged32)
+            );
+            assert_eq!(
+                metal1.object_payloads[&metal_object1.key()].as_slice(),
+                metal32.object_payloads[&metal_object32.key()].as_slice()
+            );
+        }
+
+        // Independent normal governed Kernel methods reach the same object state
+        // and emit the same ordered object authority decisions/effect.
+        let mut ordinary = base1.clone();
+        let trace_start = ordinary.trace.len();
+        ordinary.current_lane = 1;
+        ordinary.lane_sequence = 0;
+        assert_eq!(
+            &ordinary.object_bytes(process, object).unwrap()[4..12],
+            &(4u8..12).collect::<Vec<_>>()
+        );
+        ordinary.object_bytes_mut(process, object).unwrap()[8..16]
+            .copy_from_slice(&0x8877665544332211u64.to_le_bytes());
+        assert_eq!(
+            ordinary.object_payloads[&object.key()].as_slice(),
+            bridged1.object_payloads[&object.key()].as_slice()
+        );
+        let authority = |kernel: &Kernel, start: usize| {
+            kernel.trace[start..]
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.event_kind,
+                        EventKind::AuthorityGranted | EventKind::AuthorityEffect
+                    ) && event.subject == object
+                })
+                .map(|event| {
+                    (
+                        event.event_kind,
+                        event.process,
+                        event.subject,
+                        event.run_class,
+                        event.auxiliary,
+                        event.causal,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            authority(&ordinary, trace_start),
+            authority(&bridged1, base1.trace.len())
+        );
+        assert_eq!(bridged1.admission_log.len(), base1.admission_log.len() + 1);
+        assert_eq!(bridged1.accounting.steps, base1.accounting.steps + 1);
+        assert_eq!(bridged1.accounting.epochs, base1.accounting.epochs + 1);
+    }
+
+    #[test]
+    fn object_plan_rejects_stale_version_range_horizon_and_grow() {
+        let (mut k, plan, object, _) = object_setup(1);
+        k.objects.get_mut(object).unwrap().version =
+            k.objects.get(object).unwrap().version.wrapping_add(1);
+        assert_eq!(
+            k.run_resident_sync_cpu_reference(plan),
+            Err(KernelResidentSyncError::StalePlan)
+        );
+
+        let (mut payload_stale, payload_plan, object, _) = object_setup(1);
+        payload_stale
+            .object_payloads
+            .get_mut(&object.key())
+            .unwrap()
+            .as_mut_slice()[0] ^= 1;
+        let mutated = payload_stale.object_payloads[&object.key()]
+            .as_slice()
+            .to_vec();
+        assert_eq!(
+            payload_stale.run_resident_sync_cpu_reference(payload_plan),
+            Err(KernelResidentSyncError::StalePlan)
+        );
+        assert_eq!(
+            payload_stale.object_payloads[&object.key()].as_slice(),
+            mutated
+        );
+
+        let (mut denied, _, object, actor) = object_setup(1);
+        let cap = denied
+            .find_capability(actor, object, Rights::READ | Rights::WRITE)
+            .unwrap();
+        denied
+            .capability_spaces
+            .get_mut(&actor.key())
+            .unwrap()
+            .get_mut(cap)
+            .unwrap()
+            .length = 7;
+        assert!(matches!(
+            denied.plan_resident_sync(1, 2, 16, 1),
+            Err(KernelResidentSyncError::UnsupportedShape)
+        ));
+
+        let (mut rights_denied, _, object, actor) = object_setup(1);
+        let cap = rights_denied
+            .find_capability(actor, object, Rights::READ | Rights::WRITE)
+            .unwrap();
+        rights_denied
+            .capability_spaces
+            .get_mut(&actor.key())
+            .unwrap()
+            .get_mut(cap)
+            .unwrap()
+            .rights = Rights::READ;
+        assert!(matches!(
+            rights_denied.plan_resident_sync(1, 2, 16, 1),
+            Err(KernelResidentSyncError::UnsupportedShape)
+        ));
+
+        let (mut invalid, _, _, _) = object_setup(1);
+        invalid
+            .resident_sync_programs
+            .get_mut(&1700)
+            .unwrap()
+            .instructions[0]
+            .target = Ref64::NULL;
+        assert!(matches!(
+            invalid.plan_resident_sync(1, 2, 16, 1),
+            Err(KernelResidentSyncError::UnsupportedShape)
+        ));
+
+        let (mut overflow, _, _, _) = object_setup(1);
+        overflow.epoch = u32::MAX;
+        assert!(matches!(
+            overflow.plan_resident_sync(1, 2, 16, 1),
+            Err(KernelResidentSyncError::UnsupportedShape)
+        ));
+
+        let (mut expired, _, object, actor) = object_setup(1);
+        let cap = expired
+            .find_capability(actor, object, Rights::READ | Rights::WRITE)
+            .unwrap();
+        expired
+            .capability_spaces
+            .get_mut(&actor.key())
+            .unwrap()
+            .get_mut(cap)
+            .unwrap()
+            .valid_until_epoch = expired.epoch;
+        assert!(matches!(
+            expired.plan_resident_sync(1, 2, 16, 1),
+            Err(KernelResidentSyncError::UnsupportedShape)
+        ));
+
+        let (mut grow, _, object, _) = object_setup(1);
+        grow.object_payloads
+            .get_mut(&object.key())
+            .unwrap()
+            .as_mut_vec()
+            .unwrap()
+            .push(99);
+        assert!(matches!(
+            grow.plan_resident_sync(1, 2, 16, 1),
+            Err(KernelResidentSyncError::UnsupportedShape)
+        ));
+    }
+
+    #[test]
+    fn conflicting_object_writes_and_malformed_result_refuse_atomically() {
+        let (mut k, _, object, process) = object_setup(1);
+        let run_class = 1701;
+        k.install_resident_sync_program(KernelResidentProgram {
+            run_class,
+            instructions: vec![
+                KernelResidentInstruction::object_write(object, 0, 99),
+                KernelResidentInstruction::plain(HANDLER_COMPLETE, 0, 0),
+            ],
+        })
+        .unwrap();
+        k.create_continuation(
+            process,
+            process,
+            ContinuationSpec::new(StateAccess::ReadOnly, run_class, 0, vec![0; 8], 2),
+        )
+        .unwrap();
+        let plan = k.plan_resident_sync(1, 2, 16, 1).unwrap();
+        let result = crate::executives::resident_sync::run_resident_sync(
+            &plan.config,
+            plan.continuations.clone(),
+            &plan.programs,
+        )
+        .unwrap();
+        let before = k.object_payloads[&object.key()].as_slice().to_vec();
+        assert_eq!(
+            plan.validate_and_import(&mut k, result),
+            Err(KernelResidentSyncError::InvalidDeviceResult)
+        );
+        assert_eq!(k.object_payloads[&object.key()].as_slice(), before);
+
+        let (mut k, plan, object, _) = object_setup(1);
+        let mut malformed = crate::executives::resident_sync::run_resident_sync(
+            &plan.config,
+            plan.continuations.clone(),
+            &plan.programs,
+        )
+        .unwrap();
+        malformed.operations[0].payload[0] ^= 1;
+        let before = k.object_payloads[&object.key()].as_slice().to_vec();
+        assert_eq!(
+            plan.validate_and_import(&mut k, malformed),
+            Err(KernelResidentSyncError::InvalidDeviceResult)
+        );
+        assert_eq!(k.object_payloads[&object.key()].as_slice(), before);
     }
 }

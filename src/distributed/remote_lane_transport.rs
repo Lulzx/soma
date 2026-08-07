@@ -50,6 +50,9 @@ pub enum RemoteLaneTransportError {
 }
 
 #[derive(Clone)]
+/// A session is process-incarnation scoped. Callers must provision a fresh
+/// unpredictable `session_id` after either peer restarts; transport replay
+/// tables are bounded in-memory state, not durable exactly-once storage.
 pub struct RemoteLaneClientSession {
     pub session_id: [u8; 16],
     pub issuer: NodeId,
@@ -67,6 +70,9 @@ impl RemoteLaneClientSession {
     }
 }
 
+/// In-memory replay state is scoped to this owner process. After either peer
+/// restarts, provision a fresh unpredictable `session_id` (and preferably key);
+/// reusing a session across restart is unsupported and provides no durable replay.
 pub struct RemoteLaneOwnerSession {
     pub session_id: [u8; 16],
     pub issuer: NodeId,
@@ -228,8 +234,12 @@ fn encode_response(
 
 /// Outcomes which passed peer authentication and exact outstanding-request checks.
 /// Fields are intentionally private so callers cannot fabricate a Kernel receipt.
+#[derive(Debug, PartialEq, Eq)]
 pub struct VerifiedRemoteLaneOutcomes {
     nonce: u64,
+    session_id: [u8; 16],
+    issuer: NodeId,
+    owner: NodeId,
     outcomes: Vec<RemoteLaneOutcome>,
 }
 impl VerifiedRemoteLaneOutcomes {
@@ -238,6 +248,9 @@ impl VerifiedRemoteLaneOutcomes {
     }
     pub fn outcomes(&self) -> &[RemoteLaneOutcome] {
         &self.outcomes
+    }
+    pub(crate) fn routing_binding(&self) -> ([u8; 16], NodeId, NodeId) {
+        (self.session_id, self.issuer, self.owner)
     }
     pub(crate) fn into_outcomes(self) -> Vec<RemoteLaneOutcome> {
         self.outcomes
@@ -296,8 +309,7 @@ impl RemoteLaneTransportClient {
             return Err(RemoteLaneTransportError::Capacity);
         }
         let nonce = self.next_nonce;
-        self.next_nonce = self
-            .next_nonce
+        let next_nonce = nonce
             .checked_add(1)
             .ok_or(RemoteLaneTransportError::Protocol)?;
         let frames: Vec<_> = batches.iter().map(RemoteLaneEffectBatch::encode).collect();
@@ -323,6 +335,7 @@ impl RemoteLaneTransportClient {
             .into_iter()
             .map(|e| (e.request_id, e.target))
             .collect();
+        self.next_nonce = next_nonce;
         self.pending_bytes += wire.len();
         self.pending.insert(
             nonce,
@@ -452,7 +465,11 @@ impl RemoteLaneTransportClient {
                 return Err(RemoteLaneTransportError::Protocol);
             }
             let error = decode_transport_error(detail);
-            if let Some(p) = self.pending.remove(&nonce) {
+            if retryable_transport_error(error) {
+                if let Some(p) = self.pending.get_mut(&nonce) {
+                    p.last_response_ordinal = ordinal;
+                }
+            } else if let Some(p) = self.pending.remove(&nonce) {
                 self.pending_bytes -= p.wire.len();
             }
             return Err(error);
@@ -493,7 +510,13 @@ impl RemoteLaneTransportClient {
         } else if let Some(p) = self.pending.get_mut(&nonce) {
             p.last_response_ordinal = ordinal;
         }
-        Ok(VerifiedRemoteLaneOutcomes { nonce, outcomes })
+        Ok(VerifiedRemoteLaneOutcomes {
+            nonce,
+            session_id: self.session.session_id,
+            issuer: self.session.issuer,
+            owner: self.session.owner,
+            outcomes,
+        })
     }
 }
 
@@ -531,12 +554,8 @@ impl RemoteLaneTransportServer {
                         }
                         true
                     } else {
-                        positions.insert(req.nonce, req.digest);
                         false
                     };
-                    if let Some(cached) = terminal.get(&req.nonce) {
-                        return Ok(cached.clone());
-                    }
                     let batches: Vec<_> = req
                         .frames
                         .iter()
@@ -551,6 +570,71 @@ impl RemoteLaneTransportServer {
                     {
                         return Err(RemoteLaneTransportError::WrongOwner);
                     }
+                    if exact_retry {
+                        // A retry may mix a now-revoked effect with other effects which are
+                        // still staged.  Retire the authority failures and retry every live
+                        // effect while holding the service/router transaction; cached
+                        // WouldBlock outcomes must not strand the live work.
+                        let mut exec = router
+                            .lock()
+                            .map_err(|_| RemoteLaneTransportError::Protocol)?;
+                        let mut svc = service
+                            .lock()
+                            .map_err(|_| RemoteLaneTransportError::Protocol)?;
+                        let authority_outcomes: Vec<_> = batches
+                            .iter()
+                            .flat_map(|b| b.effects())
+                            .filter_map(|effect| {
+                                svc.authorization_error(effect)
+                                    .map(|error| RemoteLaneOutcome {
+                                        request_id: effect.request_id,
+                                        target: effect.target,
+                                        result: Err(error),
+                                    })
+                            })
+                            .collect();
+                        if !authority_outcomes.is_empty() {
+                            svc.finalize_authority_outcomes(&authority_outcomes);
+                            let applied = svc.apply_epoch(req.boundary, &mut *exec);
+                            drop(svc);
+                            drop(exec);
+                            for outcome in applied.into_iter().chain(authority_outcomes) {
+                                outcome_cache.insert(outcome.request_id, outcome);
+                            }
+                            let mut requested: Vec<_> =
+                                batches.iter().flat_map(|b| b.effects().iter()).collect();
+                            requested.sort_by_key(|e| (e.epoch, e.lane, e.ordinal, e.request_id));
+                            let outcomes: Vec<_> = requested
+                                .into_iter()
+                                .map(|effect| {
+                                    outcome_cache
+                                        .get(&effect.request_id)
+                                        .cloned()
+                                        .ok_or(RemoteLaneTransportError::Protocol)
+                                })
+                                .collect::<Result<_, _>>()?;
+                            response_ordinal = response_ordinal
+                                .checked_add(1)
+                                .ok_or(RemoteLaneTransportError::Protocol)?;
+                            let response =
+                                encode_response(&session, &req, response_ordinal, &outcomes)?;
+                            if outcomes.iter().all(|outcome| {
+                                !matches!(
+                                    outcome.result,
+                                    Ok(RemoteLaneApply::WouldBlock)
+                                        | Err(RemoteLaneError::NodeUnavailable)
+                                )
+                            }) {
+                                terminal.insert(req.nonce, response.clone());
+                            }
+                            return Ok(response);
+                        }
+                        drop(svc);
+                        drop(exec);
+                        if let Some(cached) = terminal.get(&req.nonce) {
+                            return Ok(cached.clone());
+                        }
+                    }
                     if !exact_retry
                         && closed.is_some_and(|epoch| {
                             batches
@@ -561,32 +645,57 @@ impl RemoteLaneTransportServer {
                     {
                         return Err(RemoteLaneTransportError::Late);
                     }
-                    if let std::collections::hash_map::Entry::Vacant(entry) =
-                        response_reservations.entry(req.nonce)
+                    if batches
+                        .iter()
+                        .flat_map(|b| b.effects())
+                        .any(|e| e.epoch > req.boundary)
                     {
-                        let reservation = batches.iter().flat_map(|b|b.effects()).try_fold(128usize,|sum,e| sum.checked_add(match &e.operation { super::remote_lane_effect::RemoteLaneOperation::ObjectRead{length,..}=>128+*length as usize,_=>256 })).ok_or(RemoteLaneTransportError::Capacity)?;
-                        if reservation > MAX_REMOTE_LANE_TRANSPORT_FRAME
-                            || reserved_response_bytes
+                        return Err(RemoteLaneTransportError::Lane(
+                            RemoteLaneError::InvalidEnvelope,
+                        ));
+                    }
+                    let reservation = batches
+                        .iter()
+                        .flat_map(|b| b.effects())
+                        .try_fold(128usize, |sum, e| {
+                            sum.checked_add(match &e.operation {
+                                super::remote_lane_effect::RemoteLaneOperation::ObjectRead {
+                                    length,
+                                    ..
+                                } => 128 + *length as usize,
+                                _ => 256,
+                            })
+                        })
+                        .ok_or(RemoteLaneTransportError::Capacity)?;
+                    if reservation > MAX_REMOTE_LANE_TRANSPORT_FRAME
+                        || (!response_reservations.contains_key(&req.nonce)
+                            && reserved_response_bytes
                                 .checked_add(reservation)
-                                .is_none_or(|n| n > MAX_REMOTE_LANE_TRANSPORT_REPLAY_BYTES)
-                        {
-                            return Err(RemoteLaneTransportError::Capacity);
-                        }
-                        reserved_response_bytes += reservation;
-                        entry.insert(reservation);
-                    }
+                                .is_none_or(|n| n > MAX_REMOTE_LANE_TRANSPORT_REPLAY_BYTES))
                     {
-                        let exec = router
-                            .lock()
-                            .map_err(|_| RemoteLaneTransportError::Protocol)?;
-                        let mut svc = service
-                            .lock()
-                            .map_err(|_| RemoteLaneTransportError::Protocol)?;
-                        for f in &req.frames {
-                            svc.stage(f, &*exec)
-                                .map_err(RemoteLaneTransportError::Lane)?
-                        }
+                        return Err(RemoteLaneTransportError::Capacity);
                     }
+                    // Validate the complete request against a shadow service.  Only after
+                    // every frame passes do we consume the nonce/reservation and publish it.
+                    let exec = router
+                        .lock()
+                        .map_err(|_| RemoteLaneTransportError::Protocol)?;
+                    let mut svc = service
+                        .lock()
+                        .map_err(|_| RemoteLaneTransportError::Protocol)?;
+                    let mut shadow = svc.clone();
+                    let frame_refs: Vec<&[u8]> = req.frames.iter().map(Vec::as_slice).collect();
+                    shadow
+                        .stage_many(&frame_refs, req.boundary, &*exec)
+                        .map_err(RemoteLaneTransportError::Lane)?;
+                    drop(exec);
+                    if !exact_retry {
+                        positions.insert(req.nonce, req.digest);
+                        reserved_response_bytes += reservation;
+                        response_reservations.insert(req.nonce, reservation);
+                    }
+                    *svc = shadow;
+                    drop(svc);
                     let applied = {
                         let mut exec = router
                             .lock()
@@ -641,7 +750,9 @@ impl RemoteLaneTransportServer {
                             .ok_or(RemoteLaneTransportError::Protocol)?;
                         let response =
                             encode_error_response(&session, &req, response_ordinal, error)?;
-                        if positions.get(&req.nonce) == Some(&req.digest) {
+                        if positions.get(&req.nonce) == Some(&req.digest)
+                            && !retryable_transport_error(error)
+                        {
                             terminal.insert(req.nonce, response.clone());
                         }
                         Ok(response)
@@ -741,6 +852,15 @@ fn decode_transport_error(bytes: &[u8]) -> RemoteLaneTransportError {
     } else {
         error
     }
+}
+
+fn retryable_transport_error(error: RemoteLaneTransportError) -> bool {
+    matches!(
+        error,
+        RemoteLaneTransportError::TemporaryUnavailable
+            | RemoteLaneTransportError::Timeout
+            | RemoteLaneTransportError::Lane(RemoteLaneError::NodeUnavailable)
+    )
 }
 
 fn round_trip(
@@ -1313,5 +1433,35 @@ mod tests {
         server.join().unwrap().unwrap();
         assert_eq!(service.lock().unwrap().applied_len(), 0);
         assert_eq!(service.lock().unwrap().pending_len(), 0);
+    }
+    #[test]
+    fn signed_retryable_errors_retain_exact_wire_and_advance_ordinal() {
+        let first = outcome(1, 1);
+        let (mut client, owner, request) = pair(vec![(first.request_id, first.target)]);
+        let original = client.pending.get(&3).unwrap().wire.clone();
+        for (ordinal, error) in [
+            (1, RemoteLaneTransportError::TemporaryUnavailable),
+            (2, RemoteLaneTransportError::Timeout),
+            (
+                3,
+                RemoteLaneTransportError::Lane(RemoteLaneError::NodeUnavailable),
+            ),
+        ] {
+            let response = encode_error_response(&owner, &request, ordinal, error).unwrap();
+            assert_eq!(
+                client.accept(AuthenticatedRemoteLaneResponse::from_wire(response)),
+                Err(error)
+            );
+            let pending = client.pending.get(&3).unwrap();
+            assert_eq!(pending.wire, original);
+            assert_eq!(pending.last_response_ordinal, ordinal);
+        }
+        let terminal =
+            encode_error_response(&owner, &request, 4, RemoteLaneTransportError::Protocol).unwrap();
+        assert_eq!(
+            client.accept(AuthenticatedRemoteLaneResponse::from_wire(terminal)),
+            Err(RemoteLaneTransportError::Protocol)
+        );
+        assert!(!client.pending.contains_key(&3));
     }
 }

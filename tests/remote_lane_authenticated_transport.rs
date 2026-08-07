@@ -84,22 +84,84 @@ fn signed_exact_response_wakes_a_real_worker_runtime_over_tcp_once() {
     let router = Arc::new(Mutex::new(router));
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = listener.local_addr().unwrap();
+    let correct_service = lane_service.clone();
+    let correct_router = router.clone();
     let server = std::thread::spawn(move || {
         RemoteLaneTransportServer::serve_n(
             listener,
-            lane_service,
-            router,
+            correct_service,
+            correct_router,
             RemoteLaneOwnerSession::new([3; 16], worker, owner, key),
             3,
+        )
+    });
+    // This is a genuinely authenticated second session on the same node route,
+    // not a forged response. Its matching deterministic request must still be
+    // unusable for a waiter explicitly bound to the first session.
+    let other_key = [0x6b; 32];
+    let other_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let other_endpoint = other_listener.local_addr().unwrap();
+    let other_server = std::thread::spawn(move || {
+        RemoteLaneTransportServer::serve_n(
+            other_listener,
+            lane_service,
+            router,
+            RemoteLaneOwnerSession::new([4; 16], worker, owner, other_key),
+            1,
         )
     });
 
     worker_runtime.run_epoch().unwrap();
     let emissions = worker_runtime.pending_outbound_remote_lane();
-    let mut client = RemoteLaneTransportClient::new(
-        endpoint,
-        RemoteLaneClientSession::new([3; 16], worker, owner, key),
+    let request_id = emissions[0].batch.effects()[0].request_id;
+    let session = RemoteLaneClientSession::new([3; 16], worker, owner, key);
+    worker_runtime
+        .bind_remote_lane_waiter_session(request_id, &session)
+        .unwrap();
+
+    let mut other_client = RemoteLaneTransportClient::new(
+        other_endpoint,
+        RemoteLaneClientSession::new([4; 16], worker, owner, other_key),
     );
+    let other_verified = other_client
+        .exchange(0, &[emissions[0].batch.clone()])
+        .unwrap();
+    let state_before = worker_runtime
+        .kernel()
+        .continuation_state(continuation)
+        .unwrap();
+    let trace_len_before = worker_runtime.kernel().trace_events().len();
+    let outbox_before: Vec<_> = worker_runtime
+        .pending_outbound_remote_lane()
+        .iter()
+        .flat_map(|emission| emission.batch.effects())
+        .map(|effect| effect.request_id)
+        .collect();
+    assert!(worker_runtime
+        .accept_authenticated_remote_lane_outcomes(other_verified)
+        .is_err());
+    assert_eq!(
+        worker_runtime
+            .kernel()
+            .continuation_state(continuation)
+            .unwrap(),
+        state_before
+    );
+    assert_eq!(
+        worker_runtime.kernel().trace_events().len(),
+        trace_len_before
+    );
+    assert_eq!(
+        worker_runtime
+            .pending_outbound_remote_lane()
+            .iter()
+            .flat_map(|emission| emission.batch.effects())
+            .map(|effect| effect.request_id)
+            .collect::<Vec<_>>(),
+        outbox_before
+    );
+
+    let mut client = RemoteLaneTransportClient::new(endpoint, session);
     let verified = client.exchange(0, &[emissions[0].batch.clone()]).unwrap();
     let nonce = verified.nonce();
     assert!(matches!(
@@ -141,6 +203,7 @@ fn signed_exact_response_wakes_a_real_worker_runtime_over_tcp_once() {
         Err(RemoteLaneTransportError::Replay)
     ));
     server.join().unwrap().unwrap();
+    other_server.join().unwrap().unwrap();
     assert_eq!(lane_observe.lock().unwrap().applied_len(), 1);
     owner_runtime.join_servers().unwrap();
 }

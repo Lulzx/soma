@@ -157,18 +157,34 @@ public raw-outcome acceptance boundary is removed.
 Client pending frames and owner replay positions are entry- and byte-bounded.
 The owner permanently reserves a conservative terminal-response budget before
 staging or applying an effect, so cache exhaustion cannot occur after canonical
-mutation. Exact ambiguous retries retain the same bytes, nonce, and digest;
-terminal responses and signed terminal errors replay byte-for-byte, while a
-changed digest under a used nonce is a collision. Tests cover a deliberately
-dropped terminal response with apply-once wake, MAC/body and binding tamper,
+mutation. Multi-frame staging validates on a service clone and publishes no
+position, reservation, or effect unless every frame and boundary check passes.
+Exact ambiguous retries retain the same bytes, nonce, and digest. Signed
+`TemporaryUnavailable`, `Timeout`, and node-unavailable replies retain that
+pending wire; terminal replies consume it. Retry rechecks live authority before
+cached success, retires revoked effects as ordered authenticated outcomes, and
+continues applying other live effects in the same batch. Runtime acceptance is
+transactional on a Kernel clone, validates operation-specific result shapes and
+exact waiter targets, and requires each waiter to have been pre-bound to the
+same authenticated session/issuer/owner route. Tests cover dropped responses,
+mixed revocation plus live completion, invalid second frames and future
+boundaries, session-route substitution, MAC/body and binding tamper,
 missing/reordered outcomes, replay, collision, pre-mutation capacity refusal,
 and exact signed lane-error classes.
 
-This authenticates configured peers, not a public-key identity or TLS channel.
-It also does not widen the Kernel path: v1 still emits exactly one future-await,
-channel-send, or channel-receive operation through special dispatch. General
-signed remote `LaneView`, direct canonical remote parking, and mixed/object
-Kernel result-frame dispatch remain open.
+An executable two-owner application now combines authenticated channel
+back-pressure/drop/retry/wake, a pending future plus authoritative object write,
+live grant revocation and worker fault, and content-bound process-lifecycle and
+supervision receipts through their existing authorized transports. It asserts exact resources, versions, queues, traces,
+non-shadow ownership, bounded ledgers, and apply-once nonces. This authenticates
+configured peers, not a public-key identity or TLS channel. Replay state remains
+process-incarnation scoped: either peer restart requires a fresh unpredictable
+session identifier/key. The v1 Kernel path still emits exactly one future-await,
+channel-send, or channel-receive operation through special dispatch; the object
+operation in the application is submitted through the bounded lane transport,
+not general Kernel `LaneView`. General signed remote `LaneView`, direct
+canonical remote parking, mixed/object Kernel result-frame dispatch, and durable
+live recovery remain open.
 
 ## Failure semantics
 

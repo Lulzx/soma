@@ -399,6 +399,7 @@ pub trait RemoteLaneExecutor {
 
 /// Owner-side boundary stage. It contains no resource descriptors: authoritative
 /// resource implementations remain behind `RemoteLaneExecutor`.
+#[derive(Clone)]
 pub struct RemoteLaneEffectService {
     node: NodeId,
     authorities: Vec<Arc<Mutex<RemoteAuthorityStore>>>,
@@ -468,18 +469,51 @@ impl RemoteLaneEffectService {
         }
         Err(RemoteLaneError::Authority(last))
     }
+    pub(crate) fn authorization_error(&self, effect: &RemoteLaneEffect) -> Option<RemoteLaneError> {
+        self.authorize(effect).err()
+    }
     /// Rejects unknown operation kinds and bad grants before anything is staged.
     pub fn stage(
         &mut self,
         frame: &[u8],
         executor: &dyn RemoteLaneExecutor,
     ) -> Result<(), RemoteLaneError> {
-        let mut batch = RemoteLaneEffectBatch::decode(frame)?;
-        batch.canonicalize();
+        self.stage_many(std::slice::from_ref(&frame), u32::MAX, executor)
+    }
+
+    /// Atomically validates and stages every frame in one bounded request.
+    /// No position, reservation, or effect is published unless all frames pass,
+    /// and an effect may never be staged ahead of the request boundary.
+    pub fn stage_many(
+        &mut self,
+        frames: &[&[u8]],
+        boundary: u32,
+        executor: &dyn RemoteLaneExecutor,
+    ) -> Result<(), RemoteLaneError> {
+        if frames.is_empty() {
+            return Err(RemoteLaneError::InvalidEnvelope);
+        }
+        let mut effects = Vec::new();
+        for frame in frames {
+            let mut batch = RemoteLaneEffectBatch::decode(frame)?;
+            batch.canonicalize();
+            effects.extend(batch.effects);
+        }
+        if effects.len() > MAX_REMOTE_LANE_EFFECTS {
+            return Err(RemoteLaneError::JournalFull);
+        }
+        effects.sort_by_key(|e| (e.epoch, e.lane, e.ordinal, e.request_id));
+
         let mut previous: Option<(u32, u32, u32)> = None;
-        for e in batch.effects() {
-            if !executor.supports(&e.operation) {
-                return Err(RemoteLaneError::Unsupported);
+        let mut proposed_positions = HashMap::new();
+        let mut proposed_ids: HashMap<RemoteLaneRequestId, RemoteLaneEffect> = HashMap::new();
+        for e in &effects {
+            if e.epoch > boundary || !executor.supports(&e.operation) {
+                return Err(if e.epoch > boundary {
+                    RemoteLaneError::InvalidEnvelope
+                } else {
+                    RemoteLaneError::Unsupported
+                });
             }
             self.authorize(e)?;
             if let Some((epoch, lane, ordinal)) = previous {
@@ -493,11 +527,16 @@ impl RemoteLaneEffectService {
                 return Err(RemoteLaneError::InvalidEnvelope);
             }
             previous = Some((e.epoch, e.lane, e.ordinal));
-            if let Some(id) = self.positions.get(&(e.epoch, e.lane, e.ordinal)) {
-                if *id != e.request_id {
-                    return Err(RemoteLaneError::InvalidEnvelope);
-                }
+            let position = (e.epoch, e.lane, e.ordinal);
+            if self
+                .positions
+                .get(&position)
+                .or_else(|| proposed_positions.get(&position))
+                .is_some_and(|id| *id != e.request_id)
+            {
+                return Err(RemoteLaneError::InvalidEnvelope);
             }
+            proposed_positions.insert(position, e.request_id);
             if self
                 .last_closed_epoch
                 .is_some_and(|closed| e.epoch <= closed)
@@ -509,10 +548,14 @@ impl RemoteLaneEffectService {
             {
                 return Err(RemoteLaneError::InvalidEnvelope);
             }
+            if let Some(existing) = proposed_ids.insert(e.request_id, e.clone()) {
+                if existing != *e {
+                    return Err(RemoteLaneError::InvalidEnvelope);
+                }
+            }
         }
-        let new_effects: Vec<_> = batch
-            .effects
-            .into_iter()
+        let new_effects: Vec<_> = proposed_ids
+            .into_values()
             .filter(|e| {
                 !self.staged.iter().any(|p| p.request_id == e.request_id)
                     && !self.ledger.contains_key(&e.request_id)
@@ -544,6 +587,7 @@ impl RemoteLaneEffectService {
         {
             return Err(RemoteLaneError::JournalFull);
         }
+
         self.reserved_ledger_bytes += reserve;
         for e in &new_effects {
             self.positions
@@ -602,6 +646,24 @@ impl RemoteLaneEffectService {
         }
         self.staged = keep;
         out
+    }
+    pub(crate) fn finalize_authority_outcomes(&mut self, outcomes: &[RemoteLaneOutcome]) {
+        let terminal: std::collections::HashSet<_> = outcomes
+            .iter()
+            .filter_map(|outcome| {
+                matches!(outcome.result, Err(RemoteLaneError::Authority(_)))
+                    .then_some(outcome.request_id)
+            })
+            .collect();
+        let released = self
+            .staged
+            .iter()
+            .filter(|effect| terminal.contains(&effect.request_id))
+            .map(|effect| outcome_reservation(&effect.operation))
+            .sum::<usize>();
+        self.staged
+            .retain(|effect| !terminal.contains(&effect.request_id));
+        self.reserved_ledger_bytes = self.reserved_ledger_bytes.saturating_sub(released);
     }
     pub fn pending_len(&self) -> usize {
         self.staged.len()

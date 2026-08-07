@@ -301,18 +301,24 @@ before atomically swapping the clone. An independent governed-Kernel fixture
 matches I18 trace order, resources, scheduler/effect/admission logs, counters,
 continuation fields, and accounting; CPU and width-1/32 Metal bridge results are
 exact. The same bounded ABI now carries `FutureObserve` as a nonblocking
-future-read operation. Pending and resolved observations produce exact
-`OP_OBSERVE_FUTURE` operations, accesses, outcomes, and trace words across the
-CPU oracle and Metal widths 1/32; normal governed `Kernel::observe_future`
-provides the independent trace reference. Capability-denied, expired, stale,
-and invalid-target plans/results refuse before publication with fingerprint,
-trace, accounting, admission, and effect logs unchanged. A domain-separated
-SHA-256 plan fingerprint covers all relevant public and private commit state.
+future-read operation and fixed eight-byte little-endian object range reads and
+in-place writes. Object operations use dense plan-local targets, versioned and
+range-qualified capability snapshots, exact `OP_READ_OBJECT`/`OP_WRITE_OBJECT`
+access and payload/result journals, and canonical replay through ordinary
+Kernel object methods. CPU and actual Metal widths 1/32 agree exactly, while an
+independent ordinary-Kernel reference agrees on final bytes and ordered
+authority traces. Plans and results refuse atomically on stale versions,
+expired/insufficient/range authority, invalid targets, growth, conflicts, and
+malformed operation records. Object count (4,096), capability count (16,384),
+each payload, and both actual and stride arena bytes (16 MiB) are checked before
+CPU cloning or Metal allocation. A domain-separated SHA-256 plan fingerprint
+covers the relevant public and private commit state.
 
 This closes canonical commit only for local unsupervised, unique-run-class,
-all-complete future/mailbox programs with initially empty waiters/mailboxes,
-stable pre-existing capabilities, host-backed Object payloads, RunClassBins,
-and RunPartial. Parked quiescence, supervision, allocation, foreign resources,
-device capability creation, admission deferral, multiple mutable continuations
-per process, and broader handler/effect shapes refuse. The general G2 executive
-therefore remains open.
+all-complete future/mailbox/fixed-range-object programs with initially empty
+waiters/mailboxes, stable pre-existing capabilities, host-backed object
+payloads, `RunClassBins`, and `RunPartial`. Parked quiescence, supervision,
+allocation or resizing, foreign resources, device capability creation,
+admission deferral, multiple mutable continuations per process, sub-full-range
+ordinary Kernel object authorization, and broader handler/effect shapes refuse.
+The general G2 executive therefore remains open.
