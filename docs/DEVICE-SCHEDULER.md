@@ -339,6 +339,9 @@ continuations are grouped by actor in a bounded Metal prepass and use the exact
 longest-waiting/identity winner; ordinary admission records, requeues, and
 serial-deferral accounting are reconstructed transactionally. CPU and actual
 Metal widths 1/32 agree across repeated contention, and winner tampering refuses
-atomically. Pre-existing waiter queues, supervision, channels, allocation or
-resizing, foreign resources, device capability creation, sub-full-range
-ordinary Kernel object authorization, and broader handler/effect shapes refuse. The general G2 executive therefore remains open.
+atomically. Bounded handlers also have wrapping little-endian frame-word add and
+frame-equality completion instructions, allowing private arithmetic state to
+drive multi-epoch completion identically on CPU and actual Metal. Pre-existing
+waiter queues, supervision, channels, allocation or resizing, foreign resources,
+device capability creation, sub-full-range ordinary Kernel object authorization,
+and general loop/gather or broader effect shapes still refuse. The general G2 executive therefore remains open.

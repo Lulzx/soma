@@ -114,6 +114,10 @@ pub const HANDLER_COMPLETE: u32 = 9;
 pub const HANDLER_EFFECT_FUTURE_OBSERVE: u32 = 10;
 pub const HANDLER_EFFECT_OBJECT_READ: u32 = 11;
 pub const HANDLER_EFFECT_OBJECT_WRITE: u32 = 12;
+/// Wrapping little-endian `u64` add in the continuation's private frame.
+pub const HANDLER_ADD_FRAME_IMMEDIATE_U64: u32 = 13;
+/// Complete when the little-endian frame word at `argument` equals `value`.
+pub const HANDLER_COMPLETE_IF_FRAME_U64_EQ: u32 = 14;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResidentHandlerProgram {
@@ -184,7 +188,10 @@ pub(crate) fn validate_handler_program(
                 }
                 pending.push((pc + 1, next_effects));
             }
-            HANDLER_STORE_IMMEDIATE_U64 | HANDLER_STORE_PREVIOUS_VALUE_U64 => {
+            HANDLER_STORE_IMMEDIATE_U64
+            | HANDLER_STORE_PREVIOUS_VALUE_U64
+            | HANDLER_ADD_FRAME_IMMEDIATE_U64
+            | HANDLER_COMPLETE_IF_FRAME_U64_EQ => {
                 if (instruction.argument as usize)
                     .checked_add(8)
                     .is_none_or(|end| end > max_frame_bytes as usize)
@@ -266,6 +273,22 @@ fn execute_program(
                     previous_value(previous)?
                 };
                 frame[at..end].copy_from_slice(&value.to_le_bytes());
+            }
+            HANDLER_ADD_FRAME_IMMEDIATE_U64 => {
+                let at = instruction.argument as usize;
+                let end = at.checked_add(8)?;
+                let word: [u8; 8] = frame.get(at..end)?.try_into().ok()?;
+                let value = u64::from_le_bytes(word).wrapping_add(instruction.value);
+                frame[at..end].copy_from_slice(&value.to_le_bytes());
+            }
+            HANDLER_COMPLETE_IF_FRAME_U64_EQ => {
+                let at = instruction.argument as usize;
+                let end = at.checked_add(8)?;
+                let word: [u8; 8] = frame.get(at..end)?.try_into().ok()?;
+                if u64::from_le_bytes(word) == instruction.value {
+                    disposition = Some(ResidentDisposition::Complete);
+                    break;
+                }
             }
             HANDLER_IF_PREVIOUS_VALUE_NE_SKIP => {
                 if previous_value(previous) != Some(instruction.value) {

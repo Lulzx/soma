@@ -26,10 +26,10 @@ use crate::abi::{EventKind, FutureState, Kind, Ref64, Rights};
 use crate::executives::resident_sync::{
     InitialFuture, ResidentCapability, ResidentEffect, ResidentHandlerProgram, ResidentInstruction,
     ResidentObject, ResidentObjectCapability, ResidentSyncConfig, ResidentSyncResult,
-    HANDLER_EFFECT_FUTURE_AWAIT, HANDLER_EFFECT_FUTURE_OBSERVE, HANDLER_EFFECT_FUTURE_RESOLVE,
-    HANDLER_EFFECT_MAILBOX_RECEIVE, HANDLER_EFFECT_MAILBOX_SEND, HANDLER_EFFECT_OBJECT_READ,
-    HANDLER_EFFECT_OBJECT_WRITE, RESOURCE_FUTURE, RESOURCE_MAILBOX, RESOURCE_OBJECT, RIGHT_READ,
-    RIGHT_WRITE,
+    HANDLER_ADD_FRAME_IMMEDIATE_U64, HANDLER_COMPLETE_IF_FRAME_U64_EQ, HANDLER_EFFECT_FUTURE_AWAIT,
+    HANDLER_EFFECT_FUTURE_OBSERVE, HANDLER_EFFECT_FUTURE_RESOLVE, HANDLER_EFFECT_MAILBOX_RECEIVE,
+    HANDLER_EFFECT_MAILBOX_SEND, HANDLER_EFFECT_OBJECT_READ, HANDLER_EFFECT_OBJECT_WRITE,
+    RESOURCE_FUTURE, RESOURCE_MAILBOX, RESOURCE_OBJECT, RIGHT_READ, RIGHT_WRITE,
 };
 use crate::kernel::Kernel;
 use crate::scheduler::device::reference_lane_conflicts;
@@ -80,6 +80,12 @@ impl KernelResidentInstruction {
             target,
             value,
         }
+    }
+    pub fn add_frame_immediate(offset: u32, value: u64) -> Self {
+        Self::plain(HANDLER_ADD_FRAME_IMMEDIATE_U64, offset, value)
+    }
+    pub fn complete_if_frame_eq(offset: u32, value: u64) -> Self {
+        Self::plain(HANDLER_COMPLETE_IF_FRAME_U64_EQ, offset, value)
     }
     pub fn plain(opcode: u32, argument: u32, value: u64) -> Self {
         Self {
@@ -3579,6 +3585,86 @@ mod tests {
             }
             assert!(crate::semantics::order::placement_neutral(&[&runs[0], &runs[1]]).is_empty());
         }
+    }
+
+    fn arithmetic_frame_setup(width: u32) -> (Kernel, KernelResidentSyncPlan, Ref64) {
+        let mut kernel = Kernel::new();
+        let process = kernel.create_process(Ref64::NULL, ProcessMode::Pure);
+        let run_class = 1750;
+        kernel
+            .install_resident_sync_program(KernelResidentProgram {
+                run_class,
+                instructions: vec![
+                    KernelResidentInstruction::add_frame_immediate(0, 1),
+                    KernelResidentInstruction::complete_if_frame_eq(0, 0),
+                    KernelResidentInstruction::plain(HANDLER_YIELD, run_class, 0),
+                ],
+            })
+            .unwrap();
+        let continuation = kernel
+            .create_continuation(
+                process,
+                process,
+                ContinuationSpec::new(
+                    StateAccess::ReadOnly,
+                    run_class,
+                    0,
+                    (u64::MAX - 4).to_le_bytes().to_vec(),
+                    6,
+                ),
+            )
+            .unwrap();
+        let plan = kernel.plan_resident_sync(5, 1, 8, width).unwrap();
+        (kernel, plan, continuation)
+    }
+
+    #[test]
+    fn bounded_frame_arithmetic_drives_cpu_resident_completion_width_1_32() {
+        let mut runs = Vec::new();
+        for width in [1, 32] {
+            let (mut kernel, plan, continuation) = arithmetic_frame_setup(width);
+            assert_eq!(kernel.run_resident_sync_cpu_reference(plan), Ok(5));
+            assert_eq!(
+                kernel.continuation_state(continuation),
+                Ok(ContinuationState::Completed)
+            );
+            let frame = kernel.continuation_frame(continuation).unwrap();
+            assert_eq!(
+                u64::from_le_bytes(
+                    kernel.object_payloads[&frame.key()].as_slice()[..8]
+                        .try_into()
+                        .unwrap()
+                ),
+                0
+            );
+            runs.push(kernel);
+        }
+        assert!(crate::semantics::order::placement_neutral(&[&runs[0], &runs[1]]).is_empty());
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn bounded_frame_arithmetic_actual_metal_width_1_32_matches_cpu() {
+        let mut runs = Vec::new();
+        for width in [1, 32] {
+            let (mut kernel, plan, continuation) = arithmetic_frame_setup(width);
+            assert_eq!(kernel.run_resident_sync_metal(plan), Ok(5));
+            assert_eq!(
+                kernel.continuation_state(continuation),
+                Ok(ContinuationState::Completed)
+            );
+            let frame = kernel.continuation_frame(continuation).unwrap();
+            assert_eq!(
+                u64::from_le_bytes(
+                    kernel.object_payloads[&frame.key()].as_slice()[..8]
+                        .try_into()
+                        .unwrap()
+                ),
+                0
+            );
+            runs.push(kernel);
+        }
+        assert!(crate::semantics::order::placement_neutral(&[&runs[0], &runs[1]]).is_empty());
     }
 
     fn object_setup(width: u32) -> (Kernel, KernelResidentSyncPlan, Ref64, Ref64) {
