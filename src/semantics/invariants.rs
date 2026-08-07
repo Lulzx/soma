@@ -1225,6 +1225,7 @@ fn supervision_integrity(kernel: &Kernel, out: &mut Vec<Violation>) {
                 crate::abi::ExitReason::Completed => ProcessState::Terminated,
                 crate::abi::ExitReason::Failed => ProcessState::Failed,
                 crate::abi::ExitReason::Cancelled => ProcessState::Cancelled,
+                crate::abi::ExitReason::NodeLost => ProcessState::Failed,
             };
             if child.supervisor.key() != *supervisor_key
                 || child.status != expected_status as u32

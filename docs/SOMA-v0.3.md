@@ -1609,8 +1609,10 @@ What is not done:
   use. Replicating revocation observations and connecting grants to every
   stateful remote operation remain.
 - **Node-loss integration.** The partition/loss semantics are fixed in
-  `docs/DISTRIBUTED.md`; discard of uncommitted journals and remote-supervisor
-  notices still need executable kernel integration.
+  `docs/DISTRIBUTED.md`. Process ownership, system-only idempotent loss
+  declaration, containment, rejected re-placement, `ProcessLost`, and distinct
+  remote-supervisor notices are executable. Coordinated multi-node epoch
+  journals still need transport integration.
 - **Escrowed channel payloads** assume the kernel can hold a `READ` root for an
   in-flight message. Across nodes, "the kernel" is plural.
 

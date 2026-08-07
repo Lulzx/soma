@@ -313,6 +313,9 @@ Implemented now:
   apply-once response ledger, revocation-before-replay ordering, remote
   placement accounting, ordered epoch multiplexing, and distinct
   unavailable/lost/protocol failures
+- Explicit process node ownership and epoch-boundary node-loss containment,
+  with system-only idempotent declaration, rejected placement on lost nodes,
+  `ProcessLost` traces, and distinct remote-supervisor notices
 
 Not implemented:
 

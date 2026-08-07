@@ -34,6 +34,9 @@ pub enum ExitReason {
     Completed = 1,
     Failed = 2,
     Cancelled = 3,
+    /// The process did not execute a fault; its owning node was declared lost
+    /// at an epoch boundary and its uncommitted work was discarded.
+    NodeLost = 4,
 }
 
 /// Kernel response when this process fails under a direct supervisor.
@@ -68,6 +71,9 @@ pub struct ProcessDescriptor {
     pub header: AbiHeader,
 
     pub id: Ref64,
+    /// Stable cluster node identity. Allocator partition remains a separate,
+    /// node-local part of `Ref64`.
+    pub node_id: u64,
     pub domain: Ref64,
     pub supervisor: Ref64,
     pub supervision_policy: SupervisionPolicy,
@@ -109,6 +115,7 @@ impl ProcessDescriptor {
         ProcessDescriptor {
             header: AbiHeader::new(2, std::mem::size_of::<ProcessDescriptor>() as u32),
             id: Ref64::NULL,
+            node_id: 0,
             domain: Ref64::NULL,
             supervisor: Ref64::NULL,
             supervision_policy: SupervisionPolicy::Notify,

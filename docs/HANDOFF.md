@@ -65,6 +65,10 @@ response ledger. `tests/remote_batch.rs` pins reference agreement, apply-once
 retry, revocation-before-cache, and unreachable-node failure semantics.
 Epoch evaluation multiplexes ordered cohort requests over one TCP session, and
 the accepted-then-dropped control distinguishes node loss from unavailability.
+Process descriptors now carry node ownership. `Kernel::declare_node_lost` is a
+system-only epoch-boundary decision that contains live work and reports
+`ExitReason::NodeLost` without fabricating `ProcessFailed`; see
+`tests/node_loss.rs`.
 
 Read §1 for the project state and §6 for the test discipline before changing
 the code.

@@ -62,6 +62,15 @@ Transport failure and process failure are different outcomes.
 The transport must make these states distinct on the wire; an empty payload or
 generic execution error cannot stand in for any of them.
 
+This boundary is executable in the kernel now. Every process descriptor records
+its owning node separately from allocator partition. Only the system principal
+may declare loss; declaration is monotonic and idempotent, rejects subsequent
+placement on that node, contains every live process owned there, emits
+`ProcessLost` rather than `ProcessFailed`, and delivers the distinct
+`ExitReason::NodeLost` to supervisors. A partition control leaves remote
+processes untouched until declaration. Existing supervision and semantic
+invariant suites pass unchanged.
+
 ## Completion evidence
 
 The backend is complete only when the two-node streaming graph and supervision

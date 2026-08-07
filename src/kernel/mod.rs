@@ -18,7 +18,7 @@ pub mod speculation;
 #[cfg(test)]
 mod trace_buffer_tests;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::abi::capabilities::CapabilityEntry;
 use crate::abi::cohorts::PartialCohortPolicy;
@@ -53,6 +53,7 @@ pub enum RuntimeError {
     InvalidContract,
     InvalidModule,
     AuthorityDenied,
+    NodeUnavailable,
 }
 
 /// Explicit principal used when the abstract machine itself performs an action.
@@ -327,6 +328,10 @@ pub struct Kernel {
     supervision_queues: HashMap<u64, SupervisionQueue>,
     restart_blueprints: HashMap<u64, RestartBlueprint>,
     module_evaluators: HashMap<u64, Vec<(u32, u32)>>,
+    /// Physical owner assigned to newly created processes.
+    local_node: u64,
+    /// Loss declarations are monotonic and idempotent.
+    lost_nodes: HashSet<u64>,
 
     scheduler: Scheduler,
 
@@ -416,6 +421,8 @@ impl Kernel {
             supervision_queues: HashMap::new(),
             restart_blueprints: HashMap::new(),
             module_evaluators: HashMap::new(),
+            local_node: 0,
+            lost_nodes: HashSet::new(),
             scheduler,
             allocation_partitions: 1,
             lane_order: crate::scheduler::lane_order::LaneOrder::Plan,
@@ -1670,6 +1677,24 @@ impl Kernel {
             .expect("the actor's domain has room for another process")
     }
 
+    /// Create a process whose durable state is owned by `node_id`.
+    pub fn create_process_on_node(
+        &mut self,
+        actor: Ref64,
+        mode: ProcessMode,
+        node_id: u64,
+    ) -> Result<Ref64, RuntimeError> {
+        let domain = if actor == SYSTEM_PRINCIPAL {
+            self.root_domain
+        } else {
+            self.processes
+                .get(actor)
+                .map(|process| process.domain)
+                .unwrap_or(self.root_domain)
+        };
+        self.allocate_process_on_node(actor, domain, mode, node_id)
+    }
+
     /// Create a process in the actor's own domain, reporting a domain that is
     /// full rather than aborting.
     pub fn try_create_process(
@@ -1711,6 +1736,19 @@ impl Kernel {
         domain: Ref64,
         mode: ProcessMode,
     ) -> Result<Ref64, RuntimeError> {
+        self.allocate_process_on_node(actor, domain, mode, self.local_node)
+    }
+
+    fn allocate_process_on_node(
+        &mut self,
+        actor: Ref64,
+        domain: Ref64,
+        mode: ProcessMode,
+        node_id: u64,
+    ) -> Result<Ref64, RuntimeError> {
+        if self.lost_nodes.contains(&node_id) {
+            return Err(RuntimeError::NodeUnavailable);
+        }
         let domain_descriptor = self.domains.get(domain)?;
         if domain_descriptor.max_processes != 0
             && domain_descriptor.processes_created >= domain_descriptor.max_processes
@@ -1735,6 +1773,7 @@ impl Kernel {
         {
             let process = self.processes.get_mut(r).expect("fresh process");
             process.id = r;
+            process.node_id = node_id;
             process.domain = domain;
             process.inbox = r;
             process.status = ProcessState::Created as u32;
@@ -1818,6 +1857,73 @@ impl Kernel {
             mode,
             SupervisionPolicy::Notify,
         )
+    }
+
+    pub fn create_supervised_process_on_node(
+        &mut self,
+        actor: Ref64,
+        supervisor: Ref64,
+        mode: ProcessMode,
+        node_id: u64,
+    ) -> Result<Ref64, RuntimeError> {
+        if actor != SYSTEM_PRINCIPAL && actor != supervisor {
+            return Err(RuntimeError::AuthorityDenied);
+        }
+        if matches!(
+            self.process_state(supervisor)?,
+            ProcessState::Failed | ProcessState::Terminated | ProcessState::Cancelled
+        ) {
+            return Err(RuntimeError::ProcessUnavailable);
+        }
+        let domain = self.processes.get(supervisor)?.domain;
+        let child = self.allocate_process_on_node(actor, domain, mode, node_id)?;
+        self.processes.get_mut(child)?.supervisor = supervisor;
+        Ok(child)
+    }
+
+    pub fn process_node(&self, process: Ref64) -> Result<u64, RuntimeError> {
+        Ok(self.processes.get(process)?.node_id)
+    }
+
+    /// Declare physical node loss at the coordinator's epoch boundary.
+    ///
+    /// This is not inferred from a timeout and is not a program `Fault`.
+    pub fn declare_node_lost(
+        &mut self,
+        actor: Ref64,
+        node_id: u64,
+    ) -> Result<Vec<Ref64>, RuntimeError> {
+        if actor != SYSTEM_PRINCIPAL {
+            return Err(RuntimeError::AuthorityDenied);
+        }
+        if !self.lost_nodes.insert(node_id) {
+            return Ok(Vec::new());
+        }
+        let mut lost: Vec<Ref64> = self
+            .processes
+            .iter()
+            .filter_map(|(process, descriptor)| {
+                (descriptor.node_id == node_id
+                    && !matches!(
+                        descriptor.status,
+                        value if value == ProcessState::Failed as u32
+                            || value == ProcessState::Terminated as u32
+                            || value == ProcessState::Cancelled as u32
+                    ))
+                .then_some(process)
+            })
+            .collect();
+        lost.sort_by_key(|process| process.to_u64());
+        for process in &lost {
+            if let Ok(descriptor) = self.processes.get_mut(*process) {
+                descriptor.status = ProcessState::Failed as u32;
+                descriptor.failure_count = descriptor.failure_count.wrapping_add(1);
+            }
+            self.contain_process_failure(*process, Ref64::NULL);
+            self.trace(EventKind::ProcessLost, *process, Ref64::NULL, 0, 0);
+            self.notify_supervisor(*process, ExitReason::NodeLost);
+        }
+        Ok(lost)
     }
 
     pub fn create_supervised_process_with_policy(
@@ -2005,6 +2111,7 @@ impl Kernel {
             descriptor.restart_of = failed;
             descriptor.restart_attempt = failed_descriptor.restart_attempt + 1;
             descriptor.restart_limit = failed_descriptor.restart_limit;
+            descriptor.node_id = failed_descriptor.node_id;
             descriptor.base_priority = failed_descriptor.base_priority;
             descriptor.compute_quota = failed_descriptor.compute_quota;
             descriptor.memory_quota = failed_descriptor.memory_quota;

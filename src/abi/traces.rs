@@ -138,6 +138,9 @@ pub enum EventKind {
     /// a poll that saw nothing was equally decided by the lane that had not yet
     /// run.
     FutureStateObserved = 39,
+    /// The process's owning node was explicitly declared lost. Distinct from
+    /// `ProcessFailed`: no continuation returned `Fault`.
+    ProcessLost = 40,
 }
 
 /// The lane an event was emitted from when it was not emitted from one: epoch
