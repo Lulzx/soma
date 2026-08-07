@@ -200,26 +200,39 @@ kernel void resident_sync(
  threadgroup uint selected[32];
  threadgroup uint cohort_count;
  threadgroup uint epoch_lanes;
+ threadgroup uint selection_class;
+ threadgroup uint selection_cursor;
+ threadgroup uint selection_class_active;
  threadgroup uint stop;
  if(tid==0){Status s={0,0,0,0,0,0,0,0,0,0,0,0};*status=s;stop=0;}
  evaluation_counts[tid]=0;
  threadgroup_barrier(mem_flags::mem_device|mem_flags::mem_threadgroup);
  if(cfg.continuation_count==0){if(tid==0)status->quiescent=1;return;}
  for(uint epoch=0;epoch<cfg.max_epochs;epoch++){
-  if(tid==0)epoch_lanes=0;
+  if(tid==0){epoch_lanes=0;selection_class_active=0;selection_cursor=0;}
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  // Select bounded same-run-class cohorts in canonical order. Selection and
-  // bookkeeping are lane-zero owned; every selected physical lane interprets
-  // exactly one independent continuation against the immutable epoch snapshot.
+  // Select bounded same-run-class cohorts in canonical (run_class,id) order.
+  // The host stores continuations in id order. Lane zero finds each next class
+  // once, then continues one forward scan across as many physical cohorts as
+  // necessary. Thus selection is bounded by O(H*N), rather than rescanning N
+  // candidates for every selected lane. last_epoch is published before worker
+  // evaluation, preserving the full-epoch snapshot and deferring wakes to the
+  // next epoch. No class sentinel is used, so run class zero is ordinary.
   while(true){
    if(tid==0){
-    cohort_count=0;uint run_class=0;
-    for(uint slot=0;slot<tpg.x;slot++){
-     uint at=0xffffffffu;
-     for(uint i=0;i<cfg.continuation_count;i++)if(cs[i].state==RUNNABLE&&cs[i].last_epoch!=epoch&&(at==0xffffffffu||cs[i].run_class<cs[at].run_class||(cs[i].run_class==cs[at].run_class&&cs[i].id<cs[at].id)))at=i;
-     if(at==0xffffffffu)break;
-     if(slot==0)run_class=cs[at].run_class;else if(cs[at].run_class!=run_class)break;
-     selected[slot]=at;cs[at].last_epoch=epoch;cohort_count++;
+    cohort_count=0;
+    while(cohort_count==0){
+     if(selection_class_active==0){
+      bool found=false;uint next_class=0;
+      for(uint i=0;i<cfg.continuation_count;i++)if(cs[i].state==RUNNABLE&&cs[i].last_epoch!=epoch&&(!found||cs[i].run_class<next_class)){next_class=cs[i].run_class;found=true;}
+      if(!found)break;
+      selection_class=next_class;selection_cursor=0;selection_class_active=1;
+     }
+     while(selection_cursor<cfg.continuation_count&&cohort_count<tpg.x){
+      uint at=selection_cursor++;
+      if(cs[at].state==RUNNABLE&&cs[at].last_epoch!=epoch&&cs[at].run_class==selection_class){selected[cohort_count++]=at;cs[at].last_epoch=epoch;}
+     }
+     if(selection_cursor==cfg.continuation_count)selection_class_active=0;
     }
    }
    threadgroup_barrier(mem_flags::mem_device|mem_flags::mem_threadgroup);
@@ -2078,7 +2091,7 @@ mod tests {
                 max_epochs: 4,
                 max_effects_per_step: 2,
                 max_frame_bytes: 16,
-                max_continuations: 80,
+                max_continuations: 256,
                 cohort_width: width,
                 initial_epoch: 4,
                 objects: vec![ResidentObject {
@@ -2102,7 +2115,7 @@ mod tests {
                     cap(2, RESOURCE_FUTURE, 1, RIGHT_READ),
                 ],
             };
-            let continuations = (1..=80u64)
+            let continuations = (1..=256u64)
                 .rev()
                 .map(|id| ResidentContinuation {
                     id,
@@ -2144,7 +2157,8 @@ mod tests {
             .unwrap();
         assert_eq!(gpu1, cpu1);
         assert_eq!(counts1.len(), 1);
-        assert!(counts1[0] > 80);
+        assert!(counts1[0] > 256);
+        assert_eq!(counts1.iter().sum::<u32>() as usize, gpu1.invocations.len());
 
         let (config32, continuations32, programs32) = make_input(32);
         let cpu32 = run_resident_sync(&config32, continuations32.clone(), &programs32).unwrap();
@@ -2155,6 +2169,10 @@ mod tests {
         assert_eq!(gpu32, gpu1);
         assert_eq!(counts32.iter().filter(|&&count| count != 0).count(), 32);
         assert!(counts32.iter().all(|&count| count > 0));
+        assert_eq!(
+            counts32.iter().sum::<u32>() as usize,
+            gpu32.invocations.len()
+        );
         assert!(gpu32
             .effects
             .iter()
