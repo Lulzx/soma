@@ -109,6 +109,43 @@ fn scheduler_benchmark() {
             }
         }
     }
+
+    println!("\n[scheduler negative control: cohort width one]");
+    let candidates = candidates(2_048, 16);
+    let repetitions = 11;
+    let mut cpu = Vec::with_capacity(repetitions);
+    for _ in 0..repetitions {
+        let started = Instant::now();
+        std::hint::black_box(soma::scheduler::device::reference_device_schedule(
+            &candidates,
+            1,
+            PartialCohortPolicy::RunPartial,
+        ));
+        cpu.push(started.elapsed());
+    }
+    summarize("cpu candidates=2048 classes=16 width=1", &cpu);
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    {
+        use soma::executives::metal_scheduler::MetalDeviceScheduler;
+        let mut metal = MetalDeviceScheduler::new().expect("Metal scheduler available");
+        for _ in 0..3 {
+            metal
+                .schedule(&candidates, 1, PartialCohortPolicy::RunPartial)
+                .unwrap();
+        }
+        let mut samples = Vec::with_capacity(repetitions);
+        for _ in 0..repetitions {
+            let started = Instant::now();
+            std::hint::black_box(
+                metal
+                    .schedule(&candidates, 1, PartialCohortPolicy::RunPartial)
+                    .unwrap(),
+            );
+            samples.push(started.elapsed());
+        }
+        summarize("metal candidates=2048 classes=16 width=1", &samples);
+    }
 }
 
 struct RemoteFixture {
