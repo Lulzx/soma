@@ -56,10 +56,12 @@ metadata tampering refuses atomically. This is still a bounded canonical commit
 slice: only local unsupervised programs with pre-existing stable authority and
 initially empty waiter queues are admitted. Existing mailbox entries are
 snapshotted exactly on CPU and Metal, allowing an ordinary enqueue wake followed
-by resident receive retry and completion. Pre-existing waiter queues,
-allocation/resizing, channels, supervision, device capability creation,
-admission deferral, multiple mutable continuations per process, broader handler
-shapes, and the general canonical bridge remain to be integrated.
+by resident receive retry and completion. Multiple mutable contenders now use
+bounded actor groups, deterministic longest-waiting/identity admission, and
+exact ordinary-Kernel deferral replay on CPU and Metal. Pre-existing waiter
+queues, allocation/resizing, channels, supervision, device capability creation,
+broader handler shapes, and the general canonical bridge remain to be
+integrated.
 
 ## G3 — Distributed ownership [in progress]
 

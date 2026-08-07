@@ -56,6 +56,12 @@ struct GpuContinuation {
     pending_opcode: u32,
     pending_target: u32,
     reserved: u32,
+    mutable_access: u32,
+    waiting_since: u32,
+    actor_next: u32,
+    actor_head: u32,
+    admitted: u32,
+    reserved2: u32,
     previous_value: u64,
     previous_sender: u64,
     pending_value: u64,
@@ -164,7 +170,7 @@ const SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 struct Config { uint continuation_count, handler_count, instruction_count, future_count; uint mailbox_count, capability_count, max_epochs, max_effects; uint frame_stride, effect_capacity, trace_capacity, mailbox_stride; uint invocation_capacity,wake_capacity,epoch_capacity,object_count; uint object_capability_count,object_stride,initial_epoch; };
-struct Cont { ulong id, actor; uint run_class, frame_len, state, last_epoch; uint previous_kind, pending_opcode, pending_target, reserved; ulong previous_value, previous_sender, pending_value; };
+struct Cont { ulong id, actor; uint run_class, frame_len, state, last_epoch; uint previous_kind, pending_opcode, pending_target, reserved; uint mutable_access,waiting_since,actor_next,actor_head,admitted,reserved2; ulong previous_value, previous_sender, pending_value; };
 struct Handler { uint run_class, instruction_offset, instruction_count, reserved; };
 struct Instruction { uint opcode, argument, target, reserved; ulong value; };
 struct Future { uint resolved, reserved; ulong value; };
@@ -209,8 +215,18 @@ kernel void resident_sync(
  threadgroup_barrier(mem_flags::mem_device|mem_flags::mem_threadgroup);
  if(cfg.continuation_count==0){if(tid==0)status->quiescent=1;return;}
  for(uint epoch=0;epoch<cfg.max_epochs;epoch++){
-  if(tid==0){epoch_lanes=0;selection_class_active=0;selection_cursor=0;}
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if(tid==0){
+   epoch_lanes=0;selection_class_active=0;selection_cursor=0;
+   for(uint i=0;i<cfg.continuation_count;i++)cs[i].admitted=cs[i].mutable_access==0?1:0;
+   for(uint i=0;i<cfg.continuation_count;i++)if(cs[i].actor_head!=0){
+    uint best=0xffffffffu;
+    for(uint at=i;at!=0xffffffffu;at=cs[at].actor_next)if(cs[at].state==RUNNABLE){
+     if(best==0xffffffffu||cs[at].waiting_since<cs[best].waiting_since||(cs[at].waiting_since==cs[best].waiting_since&&cs[at].id<cs[best].id))best=at;
+    }
+    if(best!=0xffffffffu)cs[best].admitted=1;
+   }
+  }
+  threadgroup_barrier(mem_flags::mem_device|mem_flags::mem_threadgroup);
   // Select bounded same-run-class cohorts in canonical (run_class,id) order.
   // The host stores continuations in id order. Lane zero finds each next class
   // once, then continues one forward scan across as many physical cohorts as
@@ -224,13 +240,13 @@ kernel void resident_sync(
     while(cohort_count==0){
      if(selection_class_active==0){
       bool found=false;uint next_class=0;
-      for(uint i=0;i<cfg.continuation_count;i++)if(cs[i].state==RUNNABLE&&cs[i].last_epoch!=epoch&&(!found||cs[i].run_class<next_class)){next_class=cs[i].run_class;found=true;}
+      for(uint i=0;i<cfg.continuation_count;i++)if(cs[i].state==RUNNABLE&&cs[i].admitted!=0&&cs[i].last_epoch!=epoch&&(!found||cs[i].run_class<next_class)){next_class=cs[i].run_class;found=true;}
       if(!found)break;
       selection_class=next_class;selection_cursor=0;selection_class_active=1;
      }
      while(selection_cursor<cfg.continuation_count&&cohort_count<tpg.x){
       uint at=selection_cursor++;
-      if(cs[at].state==RUNNABLE&&cs[at].last_epoch!=epoch&&cs[at].run_class==selection_class){selected[cohort_count++]=at;cs[at].last_epoch=epoch;}
+      if(cs[at].state==RUNNABLE&&cs[at].admitted!=0&&cs[at].last_epoch!=epoch&&cs[at].run_class==selection_class){selected[cohort_count++]=at;cs[at].last_epoch=epoch;cs[at].waiting_since=cfg.initial_epoch+epoch;}
      }
      if(selection_cursor==cfg.continuation_count)selection_class_active=0;
     }
@@ -464,9 +480,29 @@ impl MetalResidentSync {
                 frame_len: c.frame.len() as u32,
                 state: 1,
                 last_epoch: u32::MAX,
+                mutable_access: u32::from(c.mutable_access),
+                waiting_since: c.waiting_since,
+                actor_next: u32::MAX,
+                admitted: u32::from(!c.mutable_access),
                 ..Default::default()
             })
             .collect();
+        let mut mutable_groups: std::collections::BTreeMap<u64, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (index, continuation) in continuations.iter().enumerate() {
+            if continuation.mutable_access {
+                mutable_groups
+                    .entry(continuation.actor)
+                    .or_default()
+                    .push(index);
+            }
+        }
+        for indices in mutable_groups.values() {
+            gpu_conts[indices[0]].actor_head = 1;
+            for pair in indices.windows(2) {
+                gpu_conts[pair[0]].actor_next = pair[1] as u32;
+            }
+        }
         let stride = config.max_frame_bytes as usize;
         let mut frames = vec![0u8; frame_count];
         for (index, c) in continuations.iter().enumerate() {
@@ -1115,12 +1151,16 @@ mod tests {
                 id: 1,
                 actor: 10,
                 run_class: 100,
+                mutable_access: false,
+                waiting_since: 0,
                 frame: vec![0; 8],
             },
             ResidentContinuation {
                 id: 2,
                 actor: 20,
                 run_class: 200,
+                mutable_access: false,
+                waiting_since: 0,
                 frame: vec![],
             },
         ];
@@ -1224,6 +1264,8 @@ mod tests {
                 id,
                 actor,
                 run_class,
+                mutable_access: false,
+                waiting_since: 0,
                 frame: vec![],
             })
             .collect();
@@ -1348,18 +1390,24 @@ mod tests {
                 id: 1,
                 actor: 10,
                 run_class: 100,
+                mutable_access: false,
+                waiting_since: 0,
                 frame: vec![0; 8],
             },
             ResidentContinuation {
                 id: 2,
                 actor: 20,
                 run_class: 200,
+                mutable_access: false,
+                waiting_since: 0,
                 frame: vec![],
             },
             ResidentContinuation {
                 id: 3,
                 actor: 30,
                 run_class: 300,
+                mutable_access: false,
+                waiting_since: 0,
                 frame: vec![],
             },
         ];
@@ -1491,18 +1539,24 @@ mod tests {
                 id: 2,
                 actor: 20,
                 run_class: 100,
+                mutable_access: false,
+                waiting_since: 0,
                 frame: vec![],
             },
             ResidentContinuation {
                 id: 1,
                 actor: 10,
                 run_class: 200,
+                mutable_access: false,
+                waiting_since: 0,
                 frame: vec![],
             },
             ResidentContinuation {
                 id: 3,
                 actor: 30,
                 run_class: 300,
+                mutable_access: false,
+                waiting_since: 0,
                 frame: vec![],
             },
         ];
@@ -1589,6 +1643,8 @@ mod tests {
             id: 1,
             actor: 7,
             run_class: 1,
+            mutable_access: false,
+            waiting_since: 0,
             frame: vec![0; 8],
         }];
         let mut programs = BTreeMap::new();
@@ -1685,6 +1741,8 @@ mod tests {
             id: 1,
             actor: 7,
             run_class: 0,
+            mutable_access: false,
+            waiting_since: 0,
             frame: vec![],
         }];
         let programs = BTreeMap::from([(
@@ -1736,6 +1794,8 @@ mod tests {
             id: 1,
             actor: 1,
             run_class: 1,
+            mutable_access: false,
+            waiting_since: 0,
             frame: vec![0; 8],
         }];
         let programs = BTreeMap::from([(
@@ -1816,6 +1876,8 @@ mod tests {
                 id: 9,
                 actor: 41,
                 run_class: 1200,
+                mutable_access: false,
+                waiting_since: 0,
                 frame: vec![0; 8],
             }];
             let programs = BTreeMap::from([(
@@ -1983,6 +2045,8 @@ mod tests {
             id: 11,
             actor: 7,
             run_class: 1,
+            mutable_access: false,
+            waiting_since: 0,
             frame: vec![],
         }];
         let programs = BTreeMap::from([(
@@ -2048,18 +2112,24 @@ mod tests {
                 id: 1,
                 actor: 1,
                 run_class: 200,
+                mutable_access: false,
+                waiting_since: 0,
                 frame: vec![],
             },
             ResidentContinuation {
                 id: 9,
                 actor: 2,
                 run_class: 100,
+                mutable_access: false,
+                waiting_since: 0,
                 frame: vec![],
             },
             ResidentContinuation {
                 id: 5,
                 actor: 3,
                 run_class: 50,
+                mutable_access: false,
+                waiting_since: 0,
                 frame: vec![],
             },
         ];
@@ -2146,6 +2216,8 @@ mod tests {
                     id,
                     actor: if id % 3 == 0 { 1 } else { 2 },
                     run_class: if id % 2 == 0 { 10 } else { 20 },
+                    mutable_access: false,
+                    waiting_since: 0,
                     frame: vec![id as u8; (id as usize % 13) + 1],
                 })
                 .collect::<Vec<_>>();

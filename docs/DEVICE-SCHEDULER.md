@@ -334,8 +334,11 @@ stable pre-existing capabilities, host-backed object payloads,
 `RunClassBins`, and `RunPartial`. Existing mailbox entries are snapshotted as
 exact FIFO `(sender,payload)` pairs on both CPU and Metal, so an imported empty
 receive waiter can be woken by ordinary enqueue and then finish through a new
-resident plan without a host-side mailbox shadow. Pre-existing waiter queues,
-supervision, channels, allocation or resizing, foreign resources, device
-capability creation, admission deferral, multiple mutable continuations per
-process, sub-full-range ordinary Kernel object authorization, and broader
-handler/effect shapes refuse. The general G2 executive therefore remains open.
+resident plan without a host-side mailbox shadow. Competing mutable
+continuations are grouped by actor in a bounded Metal prepass and use the exact
+longest-waiting/identity winner; ordinary admission records, requeues, and
+serial-deferral accounting are reconstructed transactionally. CPU and actual
+Metal widths 1/32 agree across repeated contention, and winner tampering refuses
+atomically. Pre-existing waiter queues, supervision, channels, allocation or
+resizing, foreign resources, device capability creation, sub-full-range
+ordinary Kernel object authorization, and broader handler/effect shapes refuse. The general G2 executive therefore remains open.

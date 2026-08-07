@@ -1,18 +1,18 @@
 //! Kernel-owned bounded resident synchronization bridge.
 //!
-//! This deliberately narrow G2 slice supports local futures, initially empty
-//! local process mailboxes, exact live host-backed Object `Ref64` values, and
-//! governed fixed 8-byte object range reads/in-place writes on all-complete
-//! graphs. Installed pointer-free bytecode executes once on Metal;
-//! after final readback, validated journals are replayed through the ordinary
-//! governed Kernel operations on a clone and published atomically.
+//! This deliberately narrow G2 slice supports local futures, exact FIFO local
+//! process mailboxes, exact live host-backed Object `Ref64` values, and governed
+//! fixed 8-byte object range reads/in-place writes. Installed pointer-free
+//! bytecode executes once on Metal; after final readback, validated journals are
+//! replayed through ordinary governed Kernel operations on a clone and
+//! published atomically.
 //!
 //! The admitted subset is intentionally strict: local unsupervised processes,
-//! RunClassBins + RunPartial, no competing mutable continuation for one
-//! process, no foreign payloads, no initial waiters/mail, and no object
-//! growth/allocation. Canonical final future-await and mailbox parks are
-//! supported. This makes the resident lane set equal the canonical
-//! admission set; unsupported shapes refuse before submission.
+//! RunClassBins + RunPartial, no foreign payloads, no pre-existing waiter
+//! queues, and no object growth/allocation. Canonical final future-await and
+//! mailbox parks are supported. Competing mutable continuations use the exact
+//! longest-waiting/identity admission rule and ordinary canonical deferral
+//! replay; unsupported shapes refuse before submission.
 //!
 //! Exact invocation/applied-disposition, wake, and per-epoch records drive
 //! normal Phase-G effects, trace causality, Phase-H accounting, and admission
@@ -807,22 +807,12 @@ impl KernelResidentSyncPlan {
                 id,
                 actor: c.process.to_u64(),
                 run_class: c.run_class,
+                mutable_access: c.state_access == crate::abi::StateAccess::Mutable,
+                waiting_since: c.last_run_epoch.max(c.created_epoch),
                 frame,
             });
             continuations_by_id.insert(id, r);
             actors_by_id.insert(id, c.process);
-        }
-        let mut mutable_processes = std::collections::HashSet::new();
-        for continuation in continuations_by_id.values() {
-            let descriptor = kernel
-                .continuations
-                .get(*continuation)
-                .map_err(|_| KernelResidentSyncError::UnsupportedShape)?;
-            if descriptor.state_access == crate::abi::StateAccess::Mutable
-                && !mutable_processes.insert(descriptor.process)
-            {
-                return Err(KernelResidentSyncError::UnsupportedShape);
-            }
         }
         if kernel.scheduler.mode() != crate::scheduler::runnable_bins::SchedulingMode::RunClassBins
             || kernel.partial_policy != crate::abi::PartialCohortPolicy::RunPartial
@@ -1671,32 +1661,50 @@ impl KernelResidentSyncPlan {
                 .filter(|inv| inv.epoch == epoch_record.epoch)
                 .collect();
             invocations.sort_by_key(|inv| inv.lane);
-            let candidates: Vec<_> = invocations
+            let mut pending = k.scheduler.pending_entries();
+            pending.sort_by_key(|(bin, continuation)| (*bin, continuation.to_u64()));
+            let candidates: Vec<_> = pending
                 .iter()
-                .map(|inv| {
-                    let reference = self.continuations_by_id[&inv.continuation];
+                .map(|(bin, reference)| {
                     let descriptor = k
                         .continuations
-                        .get(reference)
+                        .get(*reference)
                         .map_err(|_| KernelResidentSyncError::StalePlan)?;
-                    if descriptor.status != ContinuationState::Runnable
-                        || descriptor.run_class != inv.run_class
-                    {
+                    if descriptor.status != ContinuationState::Runnable {
                         return Err(KernelResidentSyncError::InvalidDeviceResult);
                     }
                     Ok(crate::scheduler::admission::Candidate {
-                        bin: k.scheduler.bin_of(inv.run_class),
-                        continuation: reference,
+                        bin: *bin,
+                        continuation: *reference,
                         process: descriptor.process,
-                        run_class: inv.run_class,
+                        run_class: descriptor.run_class,
                         state_access: descriptor.state_access,
                         waiting_since: descriptor.last_run_epoch.max(descriptor.created_epoch),
                     })
                 })
                 .collect::<Result<_, _>>()?;
             let decision = crate::scheduler::admission::admit(&candidates);
-            if !decision.deferred().is_empty() {
+            let admitted: Vec<_> = decision
+                .bins()
+                .iter()
+                .flat_map(|(_, lanes)| lanes.iter().map(|(continuation, _)| *continuation))
+                .collect();
+            let invoked: Vec<_> = invocations
+                .iter()
+                .map(|invocation| self.continuations_by_id[&invocation.continuation])
+                .collect();
+            if admitted != invoked || epoch_record.invocations as usize != invoked.len() {
                 return Err(KernelResidentSyncError::InvalidDeviceResult);
+            }
+            for candidate in &candidates {
+                k.scheduler.remove(candidate.continuation);
+            }
+            for (run_class, continuation) in decision.deferred() {
+                k.emit(crate::kernel::effects::Effect::Requeue {
+                    continuation: *continuation,
+                    run_class: *run_class,
+                });
+                k.accounting.serial_deferrals += 1;
             }
             k.admission_counters.emit();
             k.admission_log
@@ -3015,29 +3023,137 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rejects_noncanonical_admission_shapes_before_submit() {
-        let mut k = Kernel::new();
-        let p = k.create_process(Ref64::NULL, ProcessMode::Serial);
-        for rc in [1300, 1301] {
-            k.install_resident_sync_program(KernelResidentProgram {
-                run_class: rc,
-                instructions: vec![KernelResidentInstruction::plain(HANDLER_COMPLETE, 0, 0)],
-            })
-            .unwrap();
-            k.create_continuation(
-                p,
-                p,
-                ContinuationSpec::new(StateAccess::Mutable, rc, 0, vec![0; 8], 2),
-            )
-            .unwrap();
+    fn mutable_admission_setup(width: u32) -> (Kernel, KernelResidentSyncPlan, Vec<Ref64>) {
+        let mut kernel = Kernel::new();
+        let process = kernel.create_process(Ref64::NULL, ProcessMode::Serial);
+        let future = kernel.create_future(process);
+        let value = kernel.create_object(process, ObjectKind::RawBytes, vec![1]);
+        kernel.resolve_future(process, future, value).unwrap();
+        let mut continuations = Vec::new();
+        for run_class in [1300, 1301] {
+            kernel
+                .install_resident_sync_program(KernelResidentProgram {
+                    run_class,
+                    instructions: vec![
+                        KernelResidentInstruction::plain(
+                            HANDLER_IF_PREVIOUS_VALUE_NE_SKIP,
+                            1,
+                            value.to_u64(),
+                        ),
+                        KernelResidentInstruction::plain(HANDLER_COMPLETE, 0, 0),
+                        KernelResidentInstruction::effect(
+                            HANDLER_EFFECT_FUTURE_OBSERVE,
+                            future,
+                            Ref64::NULL,
+                        ),
+                        KernelResidentInstruction::plain(HANDLER_YIELD, run_class, 0),
+                    ],
+                })
+                .unwrap();
+            continuations.push(
+                kernel
+                    .create_continuation(
+                        process,
+                        process,
+                        ContinuationSpec::new(StateAccess::Mutable, run_class, 0, vec![0; 8], 3),
+                    )
+                    .unwrap(),
+            );
         }
-        let before = KernelResidentSyncPlan::fingerprint(&k);
-        assert!(matches!(
-            k.plan_resident_sync(2, 1, 8, 1),
-            Err(KernelResidentSyncError::UnsupportedShape)
-        ));
-        assert_eq!(KernelResidentSyncPlan::fingerprint(&k), before);
+        let plan = kernel.plan_resident_sync(4, 1, 8, width).unwrap();
+        (kernel, plan, continuations)
+    }
+
+    #[test]
+    fn multiple_mutable_continuations_defer_fairly_and_replay_exact_admission() {
+        let mut runs = Vec::new();
+        for width in [1, 32] {
+            let (mut kernel, plan, continuations) = mutable_admission_setup(width);
+            assert_eq!(kernel.run_resident_sync_cpu_reference(plan), Ok(4));
+            for continuation in continuations {
+                assert_eq!(
+                    kernel.continuation_state(continuation),
+                    Ok(ContinuationState::Completed)
+                );
+            }
+            assert_eq!(kernel.admission_log.len(), 4);
+            assert_eq!(
+                kernel
+                    .admission_log
+                    .iter()
+                    .map(|record| record.candidates.len())
+                    .collect::<Vec<_>>(),
+                vec![2, 2, 1, 1]
+            );
+            assert_eq!(
+                kernel
+                    .admission_log
+                    .iter()
+                    .map(|record| record.decision.deferred().len())
+                    .collect::<Vec<_>>(),
+                vec![1, 1, 0, 0]
+            );
+            assert_eq!(kernel.accounting.serial_deferrals, 2);
+            assert!(crate::semantics::invariants::check(&kernel).is_empty());
+            runs.push(kernel);
+        }
+        assert!(crate::semantics::order::placement_neutral(&[&runs[0], &runs[1]]).is_empty());
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn multiple_mutable_continuations_actual_metal_width_1_32_match_cpu() {
+        let mut runs = Vec::new();
+        for width in [1, 32] {
+            let (mut kernel, plan, continuations) = mutable_admission_setup(width);
+            assert_eq!(kernel.run_resident_sync_metal(plan), Ok(4));
+            for continuation in continuations {
+                assert_eq!(
+                    kernel.continuation_state(continuation),
+                    Ok(ContinuationState::Completed)
+                );
+            }
+            assert_eq!(kernel.accounting.serial_deferrals, 2);
+            assert!(crate::semantics::invariants::check(&kernel).is_empty());
+            runs.push(kernel);
+        }
+        assert!(crate::semantics::order::placement_neutral(&[&runs[0], &runs[1]]).is_empty());
+    }
+
+    #[test]
+    fn mutable_admission_winner_tamper_refuses_atomically() {
+        let (kernel, plan, continuations) = mutable_admission_setup(1);
+        let mut result = crate::executives::resident_sync::run_resident_sync(
+            &plan.config,
+            plan.continuations.clone(),
+            &plan.programs,
+        )
+        .unwrap();
+        let first = result
+            .invocations
+            .iter_mut()
+            .find(|invocation| invocation.epoch == 0)
+            .unwrap();
+        first.continuation = continuations[1].to_u64();
+        first.run_class = 1301;
+        let mut candidate = kernel.clone();
+        let fingerprint = KernelResidentSyncPlan::fingerprint(&candidate);
+        let trace_len = candidate.trace_events().len();
+        let accounting = candidate.accounting;
+        let admission_len = candidate.admission_log.len();
+        let effect_len = candidate.effect_log.len();
+        assert_eq!(
+            plan.validate_and_import(&mut candidate, result),
+            Err(KernelResidentSyncError::InvalidDeviceResult)
+        );
+        assert_refusal_preserves_kernel(
+            &candidate,
+            fingerprint,
+            trace_len,
+            &accounting,
+            admission_len,
+            effect_len,
+        );
     }
 
     #[test]

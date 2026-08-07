@@ -301,6 +301,10 @@ pub struct ResidentContinuation {
     pub id: u64,
     pub actor: u64,
     pub run_class: u32,
+    /// Whether this continuation claims mutable access to its actor process.
+    pub mutable_access: bool,
+    /// Absolute epoch used by deterministic longest-waiting admission.
+    pub waiting_since: u32,
     pub frame: Vec<u8>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -652,9 +656,31 @@ pub fn run_resident_sync(
     let mut result = ResidentSyncResult::default();
     let mut waiter_order = 0u32;
     for epoch in 0..config.max_epochs {
+        let mut mutable_winners: BTreeMap<u64, (u32, u64)> = BTreeMap::new();
+        for continuation in cs
+            .values()
+            .filter(|c| c.runnable && !c.completed && c.spec.mutable_access)
+        {
+            let key = (continuation.spec.waiting_since, continuation.spec.id);
+            mutable_winners
+                .entry(continuation.spec.actor)
+                .and_modify(|winner| {
+                    if key < *winner {
+                        *winner = key;
+                    }
+                })
+                .or_insert(key);
+        }
         let mut lanes: Vec<u64> = cs
             .values()
-            .filter(|c| c.runnable && !c.completed)
+            .filter(|c| {
+                c.runnable
+                    && !c.completed
+                    && (!c.spec.mutable_access
+                        || mutable_winners
+                            .get(&c.spec.actor)
+                            .is_some_and(|winner| winner.1 == c.spec.id))
+            })
             .map(|c| c.spec.id)
             .collect();
         if lanes.is_empty() {
@@ -666,6 +692,7 @@ pub fn run_resident_sync(
         for (li, id) in lanes.iter().enumerate() {
             let c = cs.get_mut(id).unwrap();
             c.runnable = false;
+            c.spec.waiting_since = config.initial_epoch.saturating_add(epoch);
             let effects;
             let disposition;
             if let Some(retry) = c.pending.take() {
@@ -1120,12 +1147,16 @@ mod tests {
                     id: 1,
                     actor: 10,
                     run_class: 100,
+                    mutable_access: false,
+                    waiting_since: 0,
                     frame: vec![0; 8],
                 },
                 ResidentContinuation {
                     id: 2,
                     actor: 20,
                     run_class: 200,
+                    mutable_access: false,
+                    waiting_since: 0,
                     frame: vec![],
                 },
             ],
@@ -1237,12 +1268,16 @@ mod tests {
                     id: 1,
                     actor: 10,
                     run_class: 100,
+                    mutable_access: false,
+                    waiting_since: 0,
                     frame: vec![0; 8],
                 },
                 ResidentContinuation {
                     id: 2,
                     actor: 20,
                     run_class: 200,
+                    mutable_access: false,
+                    waiting_since: 0,
                     frame: vec![],
                 },
             ],
@@ -1375,6 +1410,8 @@ mod tests {
                 id: 1,
                 actor: 7,
                 run_class: 1,
+                mutable_access: false,
+                waiting_since: 0,
                 frame: vec![0; 8],
             }],
             &programs,
@@ -1470,24 +1507,32 @@ mod tests {
                     id: 1,
                     actor: 7,
                     run_class: 10,
+                    mutable_access: false,
+                    waiting_since: 0,
                     frame: vec![],
                 },
                 ResidentContinuation {
                     id: 2,
                     actor: 7,
                     run_class: 11,
+                    mutable_access: false,
+                    waiting_since: 0,
                     frame: vec![],
                 },
                 ResidentContinuation {
                     id: 3,
                     actor: 8,
                     run_class: 12,
+                    mutable_access: false,
+                    waiting_since: 0,
                     frame: vec![],
                 },
                 ResidentContinuation {
                     id: 4,
                     actor: 7,
                     run_class: 13,
+                    mutable_access: false,
+                    waiting_since: 0,
                     frame: vec![],
                 },
             ],
@@ -1669,18 +1714,24 @@ mod tests {
                     id: 4,
                     actor: 7,
                     run_class: 9,
+                    mutable_access: false,
+                    waiting_since: 0,
                     frame: vec![1],
                 },
                 ResidentContinuation {
                     id: 5,
                     actor: 7,
                     run_class: 10,
+                    mutable_access: false,
+                    waiting_since: 0,
                     frame: vec![],
                 },
                 ResidentContinuation {
                     id: 6,
                     actor: 7,
                     run_class: 11,
+                    mutable_access: false,
+                    waiting_since: 0,
                     frame: vec![],
                 },
             ],
