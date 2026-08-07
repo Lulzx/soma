@@ -1,0 +1,67 @@
+SOMA self-tuning discovery study
+hardware: Apple M4 Pro, 24 GiB
+os: macOS 26.6 (25G5028f)
+rust: 1.92.0
+command: cargo run --release --features native,metal --example self_tuning_report
+
+trials per configuration: 15
+configurations: 15
+observations: 675
+D1-D7 all hold: true
+scientific states equal: true
+deterministic preparation: 90 logical, 6 physical
+independent observations executed: 675
+
+workload 1: 8 ALU ops, 1 x 1024 elements
+cpu-native/1t/epoch                         0.020 ms  range [0.017, 0.027]
+cpu-native/1t/single                        0.021 ms  range [0.017, 0.036]
+cpu-reference/1t/epoch                      0.045 ms  range [0.043, 0.051]
+cpu-reference/1t/single                     0.046 ms  range [0.043, 0.051]
+cpu-native/8t/single                        0.074 ms  range [0.058, 0.204]
+cpu-native/8t/epoch                         0.075 ms  range [0.060, 0.094]
+cpu-reference/8t/epoch                      0.100 ms  range [0.081, 0.184]
+cpu-reference/8t/single                     0.114 ms  range [0.088, 0.150]
+metal/tg-32/warm-buffers/epoch              0.149 ms  range [0.132, 1.259]
+metal/tg-128/warm-buffers/epoch             0.149 ms  range [0.133, 1.285]
+metal/tg-64/warm-buffers/epoch              0.159 ms  range [0.130, 1.267]
+metal/tg-auto/fresh-buffers/epoch           0.173 ms  range [0.132, 1.196]
+metal/tg-256/warm-buffers/epoch             0.179 ms  range [0.131, 1.256]
+metal/tg-auto/warm-buffers/epoch            0.188 ms  range [0.121, 0.852]
+metal/tg-auto/warm-buffers/single           0.254 ms  range [0.133, 0.710]
+
+workload 2: 256 ALU ops, 16 x 8192 elements
+metal/tg-auto/warm-buffers/epoch            0.758 ms  range [0.689, 4.099]
+metal/tg-64/warm-buffers/epoch              0.775 ms  range [0.409, 4.912]
+metal/tg-256/warm-buffers/epoch             0.790 ms  range [0.385, 3.218]
+metal/tg-128/warm-buffers/epoch             1.605 ms  range [0.389, 4.025]
+cpu-native/8t/single                        1.651 ms  range [1.567, 1.716]
+cpu-native/8t/epoch                         1.654 ms  range [1.553, 1.708]
+cpu-native/1t/epoch                         2.298 ms  range [2.245, 2.389]
+cpu-native/1t/single                        2.347 ms  range [2.236, 2.497]
+metal/tg-auto/fresh-buffers/epoch           2.532 ms  range [0.486, 5.079]
+metal/tg-32/warm-buffers/epoch              2.738 ms  range [0.535, 3.750]
+metal/tg-auto/warm-buffers/single           4.703 ms  range [4.005, 7.271]
+cpu-reference/8t/epoch                      5.876 ms  range [4.871, 6.582]
+cpu-reference/8t/single                     7.509 ms  range [5.974, 8.359]
+cpu-reference/1t/single                    34.058 ms  range [33.766, 34.349]
+cpu-reference/1t/epoch                     34.081 ms  range [33.827, 34.422]
+
+workload 3: 2048 ALU ops, 8 x 131072 elements
+metal/tg-256/warm-buffers/epoch             4.585 ms  range [2.893, 7.703]
+metal/tg-128/warm-buffers/epoch             4.681 ms  range [2.651, 7.418]
+metal/tg-auto/fresh-buffers/epoch           6.338 ms  range [3.155, 14.315]
+metal/tg-auto/warm-buffers/epoch            6.450 ms  range [4.971, 7.747]
+metal/tg-64/warm-buffers/epoch              6.535 ms  range [2.701, 7.966]
+metal/tg-32/warm-buffers/epoch              6.566 ms  range [3.652, 7.528]
+metal/tg-auto/warm-buffers/single          14.107 ms  range [7.673, 18.894]
+cpu-native/8t/single                       56.537 ms  range [52.333, 85.848]
+cpu-native/8t/epoch                        59.386 ms  range [50.270, 63.156]
+cpu-reference/8t/epoch                    292.040 ms  range [273.510, 306.382]
+cpu-reference/8t/single                   305.556 ms  range [278.830, 324.068]
+cpu-native/1t/single                      365.238 ms  range [356.756, 389.383]
+cpu-native/1t/epoch                       365.995 ms  range [358.603, 371.994]
+cpu-reference/1t/single                  1947.282 ms  range [1918.787, 1990.551]
+cpu-reference/1t/epoch                   1950.773 ms  range [1928.656, 1989.359]
+
+All configurations produced the same output digest. Ratios against native CPU,
+not the scalar interpreter, are the placement result; see docs/SELF-TUNING.md.

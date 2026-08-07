@@ -75,6 +75,11 @@ impl NativeCpuBackend {
         self.threads
     }
 
+    /// Change execution parallelism without recompiling installed bodies.
+    pub fn set_threads(&mut self, threads: usize) {
+        self.threads = threads.max(1);
+    }
+
     fn compile(&mut self, program: &EvaluatorProgram) -> Result<NativeEvaluator, BackendError> {
         if program.binds_aux()
             || program.ops().iter().any(|op| {

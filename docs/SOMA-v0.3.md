@@ -1536,8 +1536,9 @@ iterations per lane.
 ### 4.19 Discovery searches the implementation
 
 The first real Discovery target is SOMA's own evaluator path. The experiment
-searches placement, CPU thread count, epoch command grouping, Metal scratch
-reuse, and threadgroup width across light, medium, and compute-heavy bodies.
+searches placement, interpreted and native-compiled CPU thread count, epoch
+command grouping, Metal scratch reuse, and threadgroup width across light,
+medium, and compute-heavy bodies.
 Evaluator construction and deterministic input preparation are content-addressed
 nodes shared across configuration hypotheses. Wall-clock trials are
 `Observation` nodes and therefore retain multiplicity even when their values

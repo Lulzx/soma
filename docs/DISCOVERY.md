@@ -48,7 +48,7 @@ observations, and a gathering body that must remain unfused.
 cargo run --release --example discovery_report
 cargo run --release --features metal --example discovery_report
 cargo run --release --example discovery_regime_map
-cargo run --release --features metal --example self_tuning_report
+cargo run --release --features native,metal --example self_tuning_report
 ```
 
 The report includes logical and physical work, cache and pending joins,
@@ -67,8 +67,8 @@ Crossover mapping and repeated release measurements, rather than structural
 ratios alone, are what the experiment is designed to establish.
 
 The first non-synthetic target is SOMA itself. `self_tuning_report` searches
-CPU thread count and epoch grouping plus Metal placement, command grouping,
-scratch-buffer reuse, and threadgroup width. Evaluator construction and input
+reference/native CPU thread count and epoch grouping plus Metal placement,
+command grouping, scratch-buffer reuse, and threadgroup width. Evaluator construction and input
 preparation are deterministic shared nodes; each wall-clock trial is an
 independent `Observation`. The acquisition phase runs once, records output
 digests and timings, and the literal and optimized executors replay those exact

@@ -354,16 +354,7 @@ pub fn capture_native(
             )
         })
         .collect();
-    let mut natives: BTreeMap<usize, NativeCpuBackend> = thread_counts
-        .iter()
-        .copied()
-        .map(|threads| {
-            Ok((
-                threads.max(1),
-                NativeCpuBackend::with(&refs)?.with_threads(threads),
-            ))
-        })
-        .collect::<Result<_, BackendError>>()?;
+    let mut native = NativeCpuBackend::with(&refs)?;
     let mut unused_accelerator = CpuReferenceBackend::with(&refs);
 
     capture_with(study, &configs, |workload, config| {
@@ -386,15 +377,13 @@ pub fn capture_native(
                 )
             }
             Placement::NativeCpu => {
-                let backend = natives
-                    .get_mut(&config.cpu_threads)
-                    .ok_or(BackendError::InvalidInput)?;
+                native.set_threads(config.cpu_threads);
                 measure_epoch_once(
                     program,
                     workload,
                     u32::MAX,
                     &mut unused_accelerator,
-                    backend,
+                    &mut native,
                     config.batched_epoch,
                 )
             }
@@ -429,16 +418,7 @@ pub fn capture_metal(
         })
         .collect();
     #[cfg(feature = "native")]
-    let mut native_backends: BTreeMap<usize, NativeCpuBackend> = thread_counts
-        .iter()
-        .copied()
-        .map(|threads| {
-            Ok((
-                threads.max(1),
-                NativeCpuBackend::with(&refs)?.with_threads(threads),
-            ))
-        })
-        .collect::<Result<_, BackendError>>()?;
+    let mut native = NativeCpuBackend::with(&refs)?;
     let fallback_threads = cpu_backends
         .keys()
         .next()
@@ -476,15 +456,13 @@ pub fn capture_metal(
             }
             #[cfg(feature = "native")]
             Placement::NativeCpu => {
-                let native = native_backends
-                    .get_mut(&config.cpu_threads)
-                    .ok_or(BackendError::InvalidInput)?;
+                native.set_threads(config.cpu_threads);
                 measure_epoch_once(
                     program,
                     workload,
                     u32::MAX,
                     &mut metal,
-                    native,
+                    &mut native,
                     config.batched_epoch,
                 )
             }
