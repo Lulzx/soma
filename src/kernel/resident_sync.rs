@@ -9,9 +9,9 @@
 //!
 //! The admitted subset is intentionally strict: local unsupervised processes,
 //! RunClassBins + RunPartial, no competing mutable continuation for one
-//! process, no foreign payloads, no initial waiters/mail, no object
-//! growth/allocation, and no final mailbox park (canonical final future-await
-//! parking is supported). This makes the resident lane set equal the canonical
+//! process, no foreign payloads, no initial waiters/mail, and no object
+//! growth/allocation. Canonical final future-await and mailbox parks are
+//! supported. This makes the resident lane set equal the canonical
 //! admission set; unsupported shapes refuse before submission.
 //!
 //! Exact invocation/applied-disposition, wake, and per-epoch records drive
@@ -1140,7 +1140,11 @@ impl KernelResidentSyncPlan {
                     || (!continuation.completed
                         && !matches!(
                             continuation.pending,
-                            Some(ResidentEffect::FutureAwait { .. })
+                            Some(
+                                ResidentEffect::FutureAwait { .. }
+                                    | ResidentEffect::MailboxSend { .. }
+                                    | ResidentEffect::MailboxReceive { .. }
+                            )
                         ))
                     || (continuation.completed && continuation.waiter_order != 0)
             })
@@ -1179,6 +1183,18 @@ impl KernelResidentSyncPlan {
                 .filter(|invocation| invocation.continuation == final_continuation.id)
                 .max_by_key(|invocation| (invocation.epoch, invocation.lane))
                 .ok_or(KernelResidentSyncError::InvalidDeviceResult)?;
+            let expected_outcome = match pending {
+                ResidentEffect::FutureAwait { .. } => {
+                    crate::executives::resident_sync::ResidentOutcome::Registered
+                }
+                ResidentEffect::MailboxSend { .. } => {
+                    crate::executives::resident_sync::ResidentOutcome::Full
+                }
+                ResidentEffect::MailboxReceive { .. } => {
+                    crate::executives::resident_sync::ResidentOutcome::Empty
+                }
+                _ => return Err(KernelResidentSyncError::InvalidDeviceResult),
+            };
             let matching = result
                 .effects
                 .iter()
@@ -1187,8 +1203,7 @@ impl KernelResidentSyncPlan {
                         && effect.lane == invocation.lane
                         && effect.continuation == final_continuation.id
                         && effect.effect == pending
-                        && effect.outcome
-                            == crate::executives::resident_sync::ResidentOutcome::Registered
+                        && effect.outcome == expected_outcome
                 })
                 .collect::<Vec<_>>();
             let last_ordinal = result
@@ -1941,6 +1956,8 @@ impl KernelResidentSyncPlan {
             }
         }
         let mut expected_future_waiters: BTreeMap<u64, Vec<(u32, Ref64)>> = BTreeMap::new();
+        let mut expected_full_waiters: BTreeMap<u64, Vec<(u32, Ref64)>> = BTreeMap::new();
+        let mut expected_recv_waiters: BTreeMap<u64, Vec<(u32, Ref64)>> = BTreeMap::new();
         for final_c in &r.final_continuations {
             let continuation = self.continuations_by_id[&final_c.id];
             let descriptor = k
@@ -1954,33 +1971,69 @@ impl KernelResidentSyncPlan {
                 if descriptor.status != ContinuationState::Completed {
                     return Err(KernelResidentSyncError::InvalidDeviceResult);
                 }
-            } else {
-                let Some(ResidentEffect::FutureAwait { target }) = final_c.pending else {
-                    return Err(KernelResidentSyncError::InvalidDeviceResult);
-                };
-                let future = self
-                    .futures
-                    .get(target as usize)
-                    .copied()
-                    .ok_or(KernelResidentSyncError::InvalidDeviceResult)?;
-                if descriptor.status != ContinuationState::Waiting
-                    || descriptor.dependency != future
-                    || k.future_value(future).is_some()
-                    || k.scheduler
-                        .pending_entries()
-                        .iter()
-                        .any(|(_, queued)| *queued == continuation)
-                {
-                    return Err(KernelResidentSyncError::InvalidDeviceResult);
-                }
-                expected_future_waiters
-                    .entry(future.key())
-                    .or_default()
-                    .push((final_c.waiter_order, continuation));
+                continue;
             }
+            let pending = final_c
+                .pending
+                .ok_or(KernelResidentSyncError::InvalidDeviceResult)?;
+            let (target, dependency, expected) = match pending {
+                ResidentEffect::FutureAwait { target } => {
+                    let future = self
+                        .futures
+                        .get(target as usize)
+                        .copied()
+                        .ok_or(KernelResidentSyncError::InvalidDeviceResult)?;
+                    if k.future_value(future).is_some() {
+                        return Err(KernelResidentSyncError::InvalidDeviceResult);
+                    }
+                    (future, future, &mut expected_future_waiters)
+                }
+                ResidentEffect::MailboxSend { target, .. } => {
+                    let mailbox = self
+                        .mailboxes
+                        .get(target as usize)
+                        .copied()
+                        .ok_or(KernelResidentSyncError::InvalidDeviceResult)?;
+                    (mailbox, Ref64::NULL, &mut expected_full_waiters)
+                }
+                ResidentEffect::MailboxReceive { target } => {
+                    let mailbox = self
+                        .mailboxes
+                        .get(target as usize)
+                        .copied()
+                        .ok_or(KernelResidentSyncError::InvalidDeviceResult)?;
+                    (mailbox, Ref64::NULL, &mut expected_recv_waiters)
+                }
+                _ => return Err(KernelResidentSyncError::InvalidDeviceResult),
+            };
+            if descriptor.status != ContinuationState::Waiting
+                || descriptor.dependency != dependency
+                || k.scheduler
+                    .pending_entries()
+                    .iter()
+                    .any(|(_, queued)| *queued == continuation)
+            {
+                return Err(KernelResidentSyncError::InvalidDeviceResult);
+            }
+            expected
+                .entry(target.key())
+                .or_default()
+                .push((final_c.waiter_order, continuation));
         }
-        for waiters in expected_future_waiters.values_mut() {
-            waiters.sort_by_key(|(order, _)| *order);
+        fn ordered_waiters(waiters: BTreeMap<u64, Vec<(u32, Ref64)>>) -> BTreeMap<u64, Vec<Ref64>> {
+            waiters
+                .into_iter()
+                .map(|(target, mut waiters)| {
+                    waiters.sort_by_key(|(order, _)| *order);
+                    (
+                        target,
+                        waiters
+                            .into_iter()
+                            .map(|(_, continuation)| continuation)
+                            .collect(),
+                    )
+                })
+                .collect()
         }
         let actual_future_waiters: BTreeMap<u64, Vec<Ref64>> = k
             .future_waiters
@@ -1988,19 +2041,22 @@ impl KernelResidentSyncPlan {
             .filter(|(_, waiters)| !waiters.is_empty())
             .map(|(future, waiters)| (*future, waiters.clone()))
             .collect();
-        let expected_future_waiters: BTreeMap<u64, Vec<Ref64>> = expected_future_waiters
-            .into_iter()
-            .map(|(future, waiters)| {
-                (
-                    future,
-                    waiters
-                        .into_iter()
-                        .map(|(_, continuation)| continuation)
-                        .collect(),
-                )
-            })
+        let actual_full_waiters: BTreeMap<u64, Vec<Ref64>> = k
+            .mailboxes
+            .iter()
+            .filter(|(_, mailbox)| !mailbox.full_waiters.is_empty())
+            .map(|(mailbox, state)| (*mailbox, state.full_waiters.iter().copied().collect()))
             .collect();
-        if actual_future_waiters != expected_future_waiters {
+        let actual_recv_waiters: BTreeMap<u64, Vec<Ref64>> = k
+            .mailboxes
+            .iter()
+            .filter(|(_, mailbox)| !mailbox.recv_waiters.is_empty())
+            .map(|(mailbox, state)| (*mailbox, state.recv_waiters.iter().copied().collect()))
+            .collect();
+        if actual_future_waiters != ordered_waiters(expected_future_waiters)
+            || actual_full_waiters != ordered_waiters(expected_full_waiters)
+            || actual_recv_waiters != ordered_waiters(expected_recv_waiters)
+        {
             return Err(KernelResidentSyncError::InvalidDeviceResult);
         }
         Ok(())
@@ -3117,6 +3173,231 @@ mod tests {
             reference.mailbox_len(receiver),
             bridged.mailbox_len(receiver)
         );
+    }
+
+    fn final_mailbox_receive_setup(
+        width: u32,
+    ) -> (Kernel, KernelResidentSyncPlan, Ref64, Ref64, Ref64) {
+        let mut kernel = Kernel::new();
+        let receiver = kernel.create_process(Ref64::NULL, ProcessMode::Pure);
+        let sender = kernel.create_process(Ref64::NULL, ProcessMode::Pure);
+        let payload = kernel.create_object(sender, ObjectKind::MessagePayload, vec![9]);
+        kernel
+            .grant_capability(receiver, sender, receiver, Rights::SEND, 0, 0)
+            .unwrap();
+        let run_class = 1600;
+        kernel
+            .install_resident_sync_program(KernelResidentProgram {
+                run_class,
+                instructions: vec![
+                    KernelResidentInstruction::plain(
+                        HANDLER_IF_PREVIOUS_VALUE_NE_SKIP,
+                        1,
+                        payload.to_u64(),
+                    ),
+                    KernelResidentInstruction::plain(HANDLER_COMPLETE, 0, 0),
+                    KernelResidentInstruction::effect(
+                        HANDLER_EFFECT_MAILBOX_RECEIVE,
+                        receiver,
+                        Ref64::NULL,
+                    ),
+                    KernelResidentInstruction::plain(HANDLER_YIELD, run_class, 0),
+                ],
+            })
+            .unwrap();
+        let continuation = kernel
+            .create_continuation(
+                receiver,
+                receiver,
+                ContinuationSpec::new(StateAccess::ReadOnly, run_class, 0, vec![0; 8], 4),
+            )
+            .unwrap();
+        let plan = kernel.plan_resident_sync(1, 1, 8, width).unwrap();
+        (kernel, plan, continuation, sender, payload)
+    }
+
+    fn final_mailbox_send_setup(width: u32) -> (Kernel, KernelResidentSyncPlan, Ref64, Ref64) {
+        let mut kernel = Kernel::new();
+        let receiver = kernel.create_process(Ref64::NULL, ProcessMode::Pure);
+        let sender = kernel.create_process(Ref64::NULL, ProcessMode::Pure);
+        let payload = kernel.create_object(sender, ObjectKind::MessagePayload, vec![7]);
+        kernel
+            .grant_capability(receiver, sender, receiver, Rights::SEND, 0, 0)
+            .unwrap();
+        let run_class = 1610;
+        kernel
+            .install_resident_sync_program(KernelResidentProgram {
+                run_class,
+                instructions: vec![
+                    KernelResidentInstruction::effect(
+                        HANDLER_EFFECT_MAILBOX_SEND,
+                        receiver,
+                        payload,
+                    ),
+                    KernelResidentInstruction::plain(HANDLER_YIELD, run_class, 0),
+                ],
+            })
+            .unwrap();
+        let continuation = kernel
+            .create_continuation(
+                sender,
+                sender,
+                ContinuationSpec::new(StateAccess::ReadOnly, run_class, 0, vec![], 10),
+            )
+            .unwrap();
+        let plan = kernel.plan_resident_sync(9, 1, 8, width).unwrap();
+        (kernel, plan, continuation, receiver)
+    }
+
+    #[test]
+    fn final_mailbox_parks_publish_exact_waiters_and_receive_can_resume() {
+        let mut receive_runs = Vec::new();
+        let mut send_runs = Vec::new();
+        for width in [1, 32] {
+            let (mut receive, plan, continuation, sender, payload) =
+                final_mailbox_receive_setup(width);
+            assert_eq!(receive.run_resident_sync_cpu_reference(plan), Ok(1));
+            assert_eq!(
+                receive.continuation_state(continuation),
+                Ok(ContinuationState::Waiting)
+            );
+            let mailbox = receive.continuations.get(continuation).unwrap().process;
+            assert_eq!(receive.mailbox_recv_waiter_count(mailbox), 1);
+            assert_eq!(receive.mailbox_full_waiter_count(mailbox), 0);
+            receive
+                .enqueue_message(sender, mailbox, payload, Ref64::NULL)
+                .unwrap();
+            assert_eq!(
+                receive.continuation_state(continuation),
+                Ok(ContinuationState::Runnable)
+            );
+            assert_eq!(receive.mailbox_recv_waiter_count(mailbox), 0);
+            assert!(crate::semantics::invariants::check(&receive).is_empty());
+            receive_runs.push(receive);
+
+            let (mut send, plan, parked, mailbox) = final_mailbox_send_setup(width);
+            assert_eq!(send.run_resident_sync_cpu_reference(plan), Ok(9));
+            assert_eq!(
+                send.continuation_state(parked),
+                Ok(ContinuationState::Waiting)
+            );
+            assert_eq!(send.mailbox_full_waiter_count(mailbox), 1);
+            assert_eq!(send.mailbox_first_full_waiter(mailbox), Some(parked));
+            assert_eq!(send.mailbox_recv_waiter_count(mailbox), 0);
+            let receiver_continuation = send
+                .create_continuation(
+                    mailbox,
+                    mailbox,
+                    ContinuationSpec::new(StateAccess::ReadOnly, 1610, 0, vec![], 1),
+                )
+                .unwrap();
+            assert!(send
+                .receive_message(mailbox, receiver_continuation)
+                .unwrap()
+                .is_some());
+            assert_eq!(send.mailbox_full_waiter_count(mailbox), 0);
+            assert_eq!(
+                send.continuation_state(parked),
+                Ok(ContinuationState::Runnable)
+            );
+            assert!(crate::semantics::invariants::check(&send).is_empty());
+            send_runs.push(send);
+        }
+        assert!(
+            crate::semantics::order::placement_neutral(&[&receive_runs[0], &receive_runs[1],])
+                .is_empty()
+        );
+        assert!(
+            crate::semantics::order::placement_neutral(&[&send_runs[0], &send_runs[1],]).is_empty()
+        );
+    }
+
+    #[test]
+    fn final_mailbox_park_metadata_tamper_refuses_atomically() {
+        let (kernel, plan, continuation, _, _) = final_mailbox_receive_setup(1);
+        let result = crate::executives::resident_sync::run_resident_sync(
+            &plan.config,
+            plan.continuations.clone(),
+            &plan.programs,
+        )
+        .unwrap();
+        for case in 0..4 {
+            let mut malformed = result.clone();
+            match case {
+                0 => {
+                    malformed
+                        .final_continuations
+                        .iter_mut()
+                        .find(|final_c| final_c.id == continuation.to_u64())
+                        .unwrap()
+                        .waiter_order += 1
+                }
+                1 => {
+                    malformed
+                        .final_continuations
+                        .iter_mut()
+                        .find(|final_c| final_c.id == continuation.to_u64())
+                        .unwrap()
+                        .pending = Some(ResidentEffect::MailboxReceive { target: u32::MAX })
+                }
+                2 => {
+                    malformed.effects[0].outcome =
+                        crate::executives::resident_sync::ResidentOutcome::Sent
+                }
+                3 => malformed.invocations[0].disposition = 2,
+                _ => unreachable!(),
+            }
+            let mut candidate = kernel.clone();
+            let fingerprint = KernelResidentSyncPlan::fingerprint(&candidate);
+            let trace_len = candidate.trace_events().len();
+            let accounting = candidate.accounting;
+            let admission_len = candidate.admission_log.len();
+            let effect_len = candidate.effect_log.len();
+            assert_eq!(
+                plan.clone().validate_and_import(&mut candidate, malformed),
+                Err(KernelResidentSyncError::InvalidDeviceResult)
+            );
+            assert_refusal_preserves_kernel(
+                &candidate,
+                fingerprint,
+                trace_len,
+                &accounting,
+                admission_len,
+                effect_len,
+            );
+        }
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn final_mailbox_parks_actual_metal_width_1_32_match_cpu() {
+        for receive in [true, false] {
+            let mut runs = Vec::new();
+            for width in [1, 32] {
+                if receive {
+                    let (mut kernel, plan, continuation, _, _) = final_mailbox_receive_setup(width);
+                    assert_eq!(kernel.run_resident_sync_metal(plan), Ok(1));
+                    assert_eq!(
+                        kernel.continuation_state(continuation),
+                        Ok(ContinuationState::Waiting)
+                    );
+                    runs.push(kernel);
+                } else {
+                    let (mut kernel, plan, continuation, mailbox) = final_mailbox_send_setup(width);
+                    assert_eq!(kernel.run_resident_sync_metal(plan), Ok(9));
+                    assert_eq!(
+                        kernel.continuation_state(continuation),
+                        Ok(ContinuationState::Waiting)
+                    );
+                    assert_eq!(
+                        kernel.mailbox_first_full_waiter(mailbox),
+                        Some(continuation)
+                    );
+                    runs.push(kernel);
+                }
+            }
+            assert!(crate::semantics::order::placement_neutral(&[&runs[0], &runs[1]]).is_empty());
+        }
     }
 
     fn object_setup(width: u32) -> (Kernel, KernelResidentSyncPlan, Ref64, Ref64) {

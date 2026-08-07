@@ -314,20 +314,27 @@ each payload, and both actual and stride arena bytes (16 MiB) are checked before
 CPU cloning or Metal allocation. A domain-separated SHA-256 plan fingerprint
 covers the relevant public and private commit state.
 
-A quiescent graph may now publish a final local pending-future await rather
-than treating every park as deadlock. Final pending metadata is tied to the last
-registered effect, canonical ticket order, target, disposition, and next class;
-replay reconstructs the ordinary Kernel waiter/dependency state transactionally.
-An ordinary resolution wakes that imported waiter, and a newly planned bounded
-resident step observes settlement and completes. CPU and actual Metal widths
-1/32 produce the same canonical parked state; tampered ticket/target/outcome or
-disposition refuses atomically.
+A quiescent graph may publish a final local pending future await, full mailbox
+send, or empty mailbox receive rather than treating every park as deadlock.
+Final pending metadata is tied to the last matching blocking effect, its exact
+outcome (`Registered`, `Full`, or `Empty`), canonical global ticket order,
+target/value, disposition, and next class. Replay reconstructs the ordinary
+Kernel future waiter, mailbox full-waiter, or mailbox receive-waiter queue on a
+clone and compares every nonempty queue exactly before publication. Ordinary
+future resolution, mailbox receive, and mailbox enqueue wake the imported
+waiters in FIFO order. CPU and actual Metal widths 1/32 produce the same
+canonical parked state; tampered ticket/target/value/outcome or disposition
+refuses atomically.
 
-This closes canonical commit only for local unsupervised, unique-run-class,
-completed-or-future-parked future/mailbox/fixed-range-object programs with
-initially empty waiters/mailboxes, stable pre-existing capabilities, host-backed
-object payloads, `RunClassBins`, and `RunPartial`. Final mailbox parking,
-supervision, allocation or resizing, foreign resources, device capability
-creation, admission deferral, multiple mutable continuations per process,
-sub-full-range ordinary Kernel object authorization, and broader handler/effect
-shapes refuse. The general G2 executive therefore remains open.
+Shared installed run classes now form exact canonical cohorts rather than being
+refused, while the per-process mutable-admission exclusion remains. This closes
+canonical commit only for local unsupervised, completed-or-locally-parked
+future/mailbox/fixed-range-object programs with initially empty
+waiters/mailboxes, stable pre-existing capabilities, host-backed object
+payloads, `RunClassBins`, and `RunPartial`. Initial nonempty mailboxes remain
+unsupported, so an imported receive waiter can be woken by ordinary enqueue but
+a new resident plan is still refused until that queued mail is consumed.
+Supervision, channels, allocation or resizing, foreign resources, device
+capability creation, admission deferral, multiple mutable continuations per
+process, sub-full-range ordinary Kernel object authorization, and broader
+handler/effect shapes refuse. The general G2 executive therefore remains open.

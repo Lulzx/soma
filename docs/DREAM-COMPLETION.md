@@ -24,31 +24,40 @@ Current evidence: resident admission/frontiers/search, canonical lane trace
 positions, grouped conflict validation, and canonical replay exist. Installed
 validated frame evaluators run through a no-round-trip Metal graph with private
 double-buffered frames and exact object/future journals. A separate real
-one-command-buffer synchronization backend now executes bounded pointer-free
+one-command-buffer synchronization backend executes bounded pointer-free
 handlers with device-owned futures and mailboxes, canonical two-phase effects,
 park/wake/retry/rebin/quiescence, FIFO waiters, exact journals/traces, and
-width-1/32 CPU equivalence. A transactional all-complete Kernel bridge now maps exact live local
-references, checks strong plan fingerprints, step budgets and capability
-horizons, validates explicit invocation/disposition/wake/epoch journals, and
-replays future/mailbox operations through ordinary governed Kernel methods,
-Phase G, admission, causal trace, and full Phase-H accounting before atomic
-publication. The bounded vocabulary now also includes nonblocking
-`FutureObserve` and fixed eight-byte object range reads/in-place writes. Object
-state has exact version/range/horizon authority, operation payload/result
-journals, CPU/Metal width-1/32 parity, ordinary-Kernel authority-trace and final
-byte equivalence, explicit 4,096-object/16,384-capability/16-MiB arena bounds,
-and atomic stale/range/growth/conflict/malformed refusals. An independent
-governed reference matches I18 and the complete
-scheduler/effect/admission/accounting state. A final pending local future await
-may now publish exact canonical waiter/dependency/ticket state, wake under an
-ordinary resolution, and complete in a subsequent bounded resident plan; CPU
-and Metal widths 1/32 agree and metadata tampering refuses atomically. This is a
-canonical commit slice, but only for local unsupervised, unique-run-class,
-completed-or-future-parked programs with pre-existing stable authority and
-initially empty waiter/mailbox state. Allocation/resizing, channels,
-supervision, device capability creation, admission deferral, final mailbox
-parking, broader handler shapes, and the general canonical bridge remain to be
-integrated.
+width-1/32 CPU equivalence. Handler evaluation is now physically parallel
+within one bounded Metal threadgroup, while lane zero retains deterministic
+compaction and canonical effect application; non-vacuous worker counters show
+all 32 lanes evaluate state-rich irregular work. Its selector is bounded by the
+number of live classes rather than rescanning every continuation per lane.
+
+A transactional Kernel bridge maps exact live local references, checks strong
+plan fingerprints, step budgets and capability horizons, validates explicit
+invocation/disposition/wake/epoch journals, groups shared run classes into exact
+canonical cohorts, and replays future/mailbox operations through ordinary
+governed Kernel methods, Phase G, admission, causal trace, and full Phase-H
+accounting before atomic publication. The bounded vocabulary includes
+nonblocking `FutureObserve` and fixed eight-byte object range reads/in-place
+writes. Object state has exact version/range/horizon authority, operation
+payload/result journals, CPU/Metal width-1/32 parity, ordinary-Kernel
+authority-trace and final byte equivalence, explicit
+4,096-object/16,384-capability/16-MiB arena bounds, and atomic
+stale/range/growth/conflict/malformed refusals. An independent governed
+reference matches I18 and the complete scheduler/effect/admission/accounting
+state.
+
+Final pending local future awaits, full mailbox sends, and empty mailbox
+receives may publish exact canonical pending/disposition/ticket state and exact
+ordinary-Kernel waiter queues. Ordinary resolution, receive, or enqueue wakes
+the imported waiter in FIFO order; CPU and actual Metal widths 1/32 agree, and
+metadata tampering refuses atomically. This is still a bounded canonical commit
+slice: only local unsupervised programs with pre-existing stable authority and
+initially empty waiter/mailbox state are admitted. Initial nonempty mailboxes,
+allocation/resizing, channels, supervision, device capability creation,
+admission deferral, multiple mutable continuations per process, broader handler
+shapes, and the general canonical bridge remain to be integrated.
 
 ## G3 — Distributed ownership [in progress]
 
