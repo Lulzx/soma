@@ -144,7 +144,7 @@ pub const FIFO_BIN: u32 = 0;
 
 /// All runnable bins, keyed by run-class id. Run-class grouping is implicit:
 /// each bin belongs to exactly one run class.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Scheduler {
     bins: std::collections::HashMap<u32, DoubleBin>,
     mode: SchedulingMode,

@@ -14,6 +14,7 @@ pub mod payload;
 pub mod raw;
 pub mod reclaim;
 pub mod retention;
+pub mod speculation;
 #[cfg(test)]
 mod trace_buffer_tests;
 
@@ -64,7 +65,7 @@ impl From<AbiError> for RuntimeError {
 }
 
 /// A bounded, ordered mailbox belonging to one process (§11).
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Mailbox {
     /// In-flight messages, oldest first. Ordered per sender–receiver pair via
     /// `sender_sequence`.
@@ -90,13 +91,13 @@ impl Mailbox {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct EscrowMessage {
     descriptor: MessageDescriptor,
     payload_authority: CapabilityEntry,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ChannelQueue {
     entries: VecDeque<EscrowMessage>,
     send_waiters: VecDeque<Ref64>,
@@ -105,7 +106,7 @@ struct ChannelQueue {
 }
 
 /// Reliable kernel control queue for direct-child exit notifications.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct SupervisionQueue {
     pub notices: VecDeque<SupervisionNotice>,
     pub waiters: VecDeque<Ref64>,
@@ -241,7 +242,7 @@ pub struct TraceSnapshotRow {
 /// let kernel = soma::kernel::Kernel::new();
 /// let _ = kernel.objects;
 /// ```
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Kernel {
     epoch: u32,
     logical_time: u64,
@@ -358,6 +359,11 @@ pub struct Kernel {
     trace_counters: retention::LogCounters,
     effect_counters: retention::LogCounters,
     admission_counters: retention::LogCounters,
+    /// Phase-F implementation and its cumulative validation measurements.
+    epoch_executive: speculation::EpochExecutive,
+    speculation_stats: speculation::SpeculationStats,
+    /// Present only while an isolated speculative handler is running.
+    speculation_journal: Option<speculation::LaneJournal>,
 }
 
 impl Kernel {
@@ -422,6 +428,9 @@ impl Kernel {
             trace_counters: retention::LogCounters::default(),
             effect_counters: retention::LogCounters::default(),
             admission_counters: retention::LogCounters::default(),
+            epoch_executive: speculation::EpochExecutive::default(),
+            speculation_stats: speculation::SpeculationStats::default(),
+            speculation_journal: None,
         };
         let root = kernel.domains.alloc(DomainDescriptor::new(Ref64::NULL, 0));
         kernel.domains.get_mut(root).expect("fresh root domain").id = root;
@@ -462,6 +471,52 @@ impl Kernel {
 
     pub fn lane_order(&self) -> crate::scheduler::lane_order::LaneOrder {
         self.lane_order
+    }
+
+    /// Select the normative reference loop or the optimistic concurrent loop.
+    pub fn configure_epoch_executive(&mut self, executive: speculation::EpochExecutive) {
+        self.epoch_executive = executive;
+    }
+
+    pub fn epoch_executive(&self) -> speculation::EpochExecutive {
+        self.epoch_executive
+    }
+
+    pub fn speculation_stats(&self) -> speculation::SpeculationStats {
+        self.speculation_stats
+    }
+
+    pub(crate) fn begin_speculative_recording(&mut self) {
+        self.speculation_journal = Some(speculation::LaneJournal::default());
+    }
+
+    pub(crate) fn finish_speculative_recording(&mut self) -> speculation::LaneJournal {
+        self.speculation_journal.take().unwrap_or_default()
+    }
+
+    pub(crate) fn record_speculative_read(&mut self, resource: speculation::Resource) {
+        if let Some(journal) = &mut self.speculation_journal {
+            journal.read(resource);
+        }
+    }
+
+    pub(crate) fn record_speculative_write(&mut self, resource: speculation::Resource) {
+        if let Some(journal) = &mut self.speculation_journal {
+            journal.write(resource);
+        }
+    }
+
+    pub(crate) fn record_speculative_object_mutation(&mut self, object: Ref64) {
+        if let Some(journal) = &mut self.speculation_journal {
+            journal.write(speculation::Resource::Object(object));
+            journal.mutated_objects.insert(object);
+        }
+    }
+
+    pub(crate) fn mark_speculation_unsupported(&mut self) {
+        if let Some(journal) = &mut self.speculation_journal {
+            journal.unsupported = true;
+        }
     }
 
     pub fn set_allocation_partitions(&mut self, partitions: u8) {

@@ -15,7 +15,7 @@ struct Slot<T> {
 
 /// One allocator's slots. Partitions never share a slot space, which is what
 /// lets two of them allocate at the same time without agreeing on anything.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Partition<T> {
     slots: Vec<Slot<T>>,
     free: Vec<u32>,
@@ -51,7 +51,7 @@ impl<T> Partition<T> {
 /// differently name their entities differently and behave identically, which
 /// is why I18 compares up to a correspondence between names (v0.3 §2.6) rather
 /// than comparing references.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct GenTable<T> {
     kind: Kind,
     partitions: Vec<Partition<T>>,

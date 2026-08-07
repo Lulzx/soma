@@ -42,7 +42,7 @@ use crate::table::GenTable;
 /// `Ref64` is a heap allocation per key. `examples/memory_profile` prices a
 /// published batch at about 1.3KB against 32 bytes of payload, and three
 /// capabilities with two index entries each is a large part of that.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum Bucket {
     One(Ref64),
     Many(Vec<Ref64>),
@@ -75,7 +75,7 @@ impl Bucket {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct CapabilitySpace {
     table: GenTable<CapabilityEntry>,
     by_target: HashMap<u64, Bucket>,

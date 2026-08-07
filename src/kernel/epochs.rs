@@ -11,12 +11,31 @@
 
 use crate::abi::cohorts::PartialCohortPolicy;
 use crate::abi::continuations::ContinuationState;
-use crate::abi::Ref64;
+use crate::abi::{ProcessState, Ref64, StepKind, StepResult, TraceEvent};
 use crate::executives::cpu_scalar;
 use crate::kernel::commit;
+use crate::kernel::payload::Payload;
+use crate::kernel::speculation::{EpochExecutive, LaneJournal, Resource};
 use crate::kernel::Kernel;
 use crate::scheduler::admission::{admit, AdmissionRecord, Candidate};
 use crate::scheduler::cohorts::{build_cohorts, CohortPlan};
+
+#[derive(Clone, Copy, Debug)]
+struct EvaluatedStep {
+    result: StepResult,
+    executed: bool,
+}
+
+#[derive(Debug)]
+struct SpeculativeLane {
+    lane: u32,
+    continuation: Ref64,
+    process: Ref64,
+    evaluated: EvaluatedStep,
+    journal: LaneJournal,
+    payloads: Vec<(Ref64, Vec<u8>)>,
+    trace: Vec<TraceEvent>,
+}
 
 impl Kernel {
     /// Run one epoch. Returns the number of continuation steps executed.
@@ -190,16 +209,12 @@ impl Kernel {
         }
         self.lane_order.arrange(&mut lanes, self.epoch);
 
-        let mut steps = 0;
-        for (lane_number, cont) in lanes {
-            let process = match self.continuations.get(cont) {
-                Ok(c) => c.process,
-                Err(_) => continue,
-            };
-            self.enter_lane(lane_number);
-            steps += self.execute_cont(cont, process);
-            self.leave_lane();
-        }
+        let steps = match self.epoch_executive {
+            EpochExecutive::Speculative { max_lanes } => self
+                .execute_lanes_speculatively(&lanes, max_lanes)
+                .unwrap_or_else(|| self.execute_lanes_reference(&lanes)),
+            EpochExecutive::Reference => self.execute_lanes_reference(&lanes),
+        };
 
         // Phase G: Commit. Every lane of the epoch has finished; apply what
         // they produced, in plan order.
@@ -266,6 +281,13 @@ impl Kernel {
     /// Execute a single continuation: enforce the step budget, dispatch to the
     /// interpreter, and commit the result.
     fn execute_cont(&mut self, cont: Ref64, process: Ref64) -> usize {
+        let Some(evaluated) = self.evaluate_cont(cont, process) else {
+            return 0;
+        };
+        self.commit_evaluated(cont, process, evaluated)
+    }
+
+    fn evaluate_cont(&mut self, cont: Ref64, process: Ref64) -> Option<EvaluatedStep> {
         if self
             .continuations
             .get(cont)
@@ -273,7 +295,7 @@ impl Kernel {
             .ok()
             != Some(ContinuationState::Runnable)
         {
-            return 0;
+            return None;
         }
         // `frame` joins the three because the step needs it and no longer has a
         // way to look it up: `LaneView` stopped offering the continuation table
@@ -291,9 +313,10 @@ impl Kernel {
         // re-enqueued by a commit. Faulting after the commit would leave a
         // faulted continuation sitting live in a runnable bin.
         if remaining == 0 {
-            let over = crate::abi::StepResult::fault(process, run_class);
-            let _ = commit::apply_step_result(self, cont, process, over);
-            return 0;
+            return Some(EvaluatedStep {
+                result: crate::abi::StepResult::fault(process, run_class),
+                executed: false,
+            });
         }
 
         // Authority is checked again at resume, not captured when the
@@ -305,9 +328,10 @@ impl Kernel {
                 .authorize(process, crate::abi::Rights::AWAIT, dependency)
                 .is_err()
         {
-            let denied = crate::abi::StepResult::fault(process, run_class);
-            let _ = commit::apply_step_result(self, cont, process, denied);
-            return 0;
+            return Some(EvaluatedStep {
+                result: crate::abi::StepResult::fault(process, run_class),
+                executed: false,
+            });
         }
 
         self.trace(
@@ -336,12 +360,159 @@ impl Kernel {
         if let Ok(descriptor) = self.processes.get_mut(process) {
             descriptor.active_continuation = Ref64::NULL;
         }
-        let consumed = commit::apply_step_result(self, cont, process, result);
+        Some(EvaluatedStep {
+            result,
+            executed: true,
+        })
+    }
 
-        if let Ok(c) = self.continuations.get_mut(cont) {
-            c.remaining_steps = c.remaining_steps.saturating_sub(consumed as u32);
+    fn commit_evaluated(
+        &mut self,
+        cont: Ref64,
+        process: Ref64,
+        evaluated: EvaluatedStep,
+    ) -> usize {
+        let consumed = commit::apply_step_result(self, cont, process, evaluated.result);
+        if evaluated.executed {
+            if let Ok(c) = self.continuations.get_mut(cont) {
+                c.remaining_steps = c.remaining_steps.saturating_sub(consumed as u32);
+            }
+            consumed
+        } else {
+            0
+        }
+    }
+
+    fn execute_lanes_reference(&mut self, lanes: &[(u32, Ref64)]) -> usize {
+        let mut steps = 0;
+        for &(lane, cont) in lanes {
+            let process = match self.continuations.get(cont) {
+                Ok(c) => c.process,
+                Err(_) => continue,
+            };
+            self.enter_lane(lane);
+            steps += self.execute_cont(cont, process);
+            self.leave_lane();
+        }
+        steps
+    }
+
+    fn execute_lanes_speculatively(
+        &mut self,
+        lanes: &[(u32, Ref64)],
+        max_lanes: usize,
+    ) -> Option<usize> {
+        if lanes.len() < 2 || lanes.len() > max_lanes.max(1) {
+            return None;
         }
 
-        consumed
+        self.speculation_stats.attempted_epochs += 1;
+        self.speculation_stats.speculative_lanes += lanes.len() as u64;
+
+        // Each worker receives the exact same pre-Phase-F state. Cloning is
+        // intentionally outside the timed handler threads: it is isolation,
+        // not work whose completion order may affect a lane.
+        let snapshots: Vec<_> = lanes.iter().map(|_| self.clone()).collect();
+        let outcomes = std::thread::scope(|scope| {
+            let handles: Vec<_> = snapshots
+                .into_iter()
+                .zip(lanes.iter().copied())
+                .map(|(mut snapshot, (lane, continuation))| {
+                    scope.spawn(move || {
+                        let process = snapshot.continuations.get(continuation).ok()?.process;
+                        let process_descriptor = snapshot.processes.get(process).ok()?.clone();
+                        snapshot.enter_lane(lane);
+                        snapshot.begin_speculative_recording();
+                        snapshot.record_speculative_write(Resource::Process(process));
+                        if !process_descriptor.supervisor.is_null() {
+                            snapshot.record_speculative_write(Resource::Process(
+                                process_descriptor.supervisor,
+                            ));
+                        }
+                        if process_descriptor.status == ProcessState::CancelPending as u32 {
+                            snapshot.mark_speculation_unsupported();
+                        }
+                        let evaluated = snapshot.evaluate_cont(continuation, process)?;
+                        let mut journal = snapshot.finish_speculative_recording();
+                        if evaluated.result.kind == StepKind::Fault {
+                            journal.unsupported = true;
+                        }
+                        let payloads = journal
+                            .mutated_objects
+                            .iter()
+                            .filter_map(|object| {
+                                snapshot
+                                    .object_payloads
+                                    .get(&object.key())
+                                    .map(|payload| (*object, payload.as_slice().to_vec()))
+                            })
+                            .collect();
+                        Some(SpeculativeLane {
+                            lane,
+                            continuation,
+                            process,
+                            evaluated,
+                            journal,
+                            payloads,
+                            trace: std::mem::take(&mut snapshot.lane_trace),
+                        })
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().ok().flatten())
+                .collect::<Option<Vec<_>>>()
+        });
+
+        let Some(mut outcomes) = outcomes else {
+            self.speculation_stats.fallback_epochs += 1;
+            self.speculation_stats.unsupported_fallbacks += 1;
+            return None;
+        };
+
+        if outcomes.iter().any(|outcome| outcome.journal.unsupported) {
+            self.speculation_stats.fallback_epochs += 1;
+            self.speculation_stats.unsupported_fallbacks += 1;
+            return None;
+        }
+        for left in 0..outcomes.len() {
+            for right in left + 1..outcomes.len() {
+                if outcomes[left]
+                    .journal
+                    .conflicts_with(&outcomes[right].journal)
+                {
+                    self.speculation_stats.fallback_epochs += 1;
+                    self.speculation_stats.conflict_fallbacks += 1;
+                    return None;
+                }
+            }
+        }
+
+        // Execution order is deliberately discarded here. Lane number is the
+        // canonical position assigned by the epoch plan.
+        outcomes.sort_by_key(|outcome| outcome.lane);
+        let mut steps = 0;
+        for outcome in outcomes {
+            self.enter_lane(outcome.lane);
+            for _ in &outcome.trace {
+                self.trace_counters.emit();
+            }
+            self.lane_sequence = outcome.trace.len() as u32;
+            self.lane_trace = outcome.trace;
+            for (object, bytes) in outcome.payloads {
+                self.object_payloads
+                    .insert(object.key(), Payload::Host(bytes));
+            }
+            steps += self.commit_evaluated(
+                outcome.continuation,
+                outcome.process,
+                outcome.evaluated,
+            );
+            self.leave_lane();
+        }
+        self.speculation_stats.committed_epochs += 1;
+        self.speculation_stats.committed_lanes += lanes.len() as u64;
+        Some(steps)
     }
 }

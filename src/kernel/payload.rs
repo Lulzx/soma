@@ -38,6 +38,15 @@ pub enum Payload {
     Foreign(Box<dyn ForeignPayload>),
 }
 
+impl Clone for Payload {
+    fn clone(&self) -> Self {
+        // A speculative snapshot owns its bytes. Foreign payloads deliberately
+        // become host payloads: the executive must never share writable device
+        // storage between lanes, and semantic code only observes the bytes.
+        Payload::Host(self.as_slice().to_vec())
+    }
+}
+
 impl Payload {
     pub fn as_slice(&self) -> &[u8] {
         match self {

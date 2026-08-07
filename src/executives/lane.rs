@@ -164,6 +164,9 @@ impl<'a> LaneView<'a> {
         actor: Ref64,
         future: Ref64,
     ) -> Result<Option<Ref64>, RuntimeError> {
+        self.kernel.record_speculative_read(
+            crate::kernel::speculation::Resource::Future(future),
+        );
         self.kernel.observe_future(actor, future)
     }
 
@@ -172,11 +175,15 @@ impl<'a> LaneView<'a> {
     /// artefact — and it is why a concurrent lane needs a lane-local trace
     /// buffer, which §4.2's position scheme already anticipates.
     pub fn object_bytes(&mut self, actor: Ref64, obj: Ref64) -> Result<&[u8], RuntimeError> {
+        self.kernel
+            .record_speculative_read(crate::kernel::speculation::Resource::Object(obj));
         self.kernel.object_bytes(actor, obj)
     }
 
     /// A convenience over `object_bytes`, and `&mut` for the same reason.
     pub fn read_u64_object(&mut self, actor: Ref64, obj: Ref64) -> Option<u64> {
+        self.kernel
+            .record_speculative_read(crate::kernel::speculation::Resource::Object(obj));
         self.kernel.read_u64_object(actor, obj)
     }
 
@@ -195,6 +202,7 @@ impl<'a> LaneView<'a> {
         actor: Ref64,
         mode: ProcessMode,
     ) -> Result<Ref64, RuntimeError> {
+        self.kernel.mark_speculation_unsupported();
         self.kernel.try_create_process(actor, mode)
     }
 
@@ -204,14 +212,17 @@ impl<'a> LaneView<'a> {
         process: Ref64,
         spec: ContinuationSpec,
     ) -> Result<Ref64, RuntimeError> {
+        self.kernel.mark_speculation_unsupported();
         self.kernel.create_continuation(actor, process, spec)
     }
 
     pub fn create_future(&mut self, actor: Ref64) -> Ref64 {
+        self.kernel.mark_speculation_unsupported();
         self.kernel.create_future(actor)
     }
 
     pub fn create_object(&mut self, actor: Ref64, kind: ObjectKind, bytes: Vec<u8>) -> Ref64 {
+        self.kernel.mark_speculation_unsupported();
         self.kernel.create_object(actor, kind, bytes)
     }
 
@@ -222,6 +233,7 @@ impl<'a> LaneView<'a> {
         actor: Ref64,
         obj: Ref64,
     ) -> Result<&mut Vec<u8>, RuntimeError> {
+        self.kernel.record_speculative_object_mutation(obj);
         self.kernel.host_payload_mut(actor, obj)
     }
 
@@ -230,6 +242,7 @@ impl<'a> LaneView<'a> {
         actor: Ref64,
         obj: Ref64,
     ) -> Result<&mut [u8], RuntimeError> {
+        self.kernel.record_speculative_object_mutation(obj);
         self.kernel.object_bytes_mut(actor, obj)
     }
 
@@ -242,6 +255,7 @@ impl<'a> LaneView<'a> {
         payload: Ref64,
         sender_cont: Ref64,
     ) -> Result<(), RuntimeError> {
+        self.kernel.mark_speculation_unsupported();
         self.kernel.enqueue_message(actor, receiver, payload, sender_cont)
     }
 
@@ -250,6 +264,7 @@ impl<'a> LaneView<'a> {
         actor: Ref64,
         cont: Ref64,
     ) -> Result<Option<crate::abi::MessageDescriptor>, RuntimeError> {
+        self.kernel.mark_speculation_unsupported();
         self.kernel.receive_message(actor, cont)
     }
 
@@ -259,6 +274,10 @@ impl<'a> LaneView<'a> {
         future: Ref64,
         value: Ref64,
     ) -> Result<(), RuntimeError> {
+        self.kernel.mark_speculation_unsupported();
+        self.kernel.record_speculative_write(
+            crate::kernel::speculation::Resource::Future(future),
+        );
         self.kernel.resolve_future(actor, future, value)
     }
 
@@ -269,6 +288,10 @@ impl<'a> LaneView<'a> {
         future: Ref64,
         next_run_class: u32,
     ) -> Result<crate::kernel::AwaitOutcome, RuntimeError> {
+        self.kernel.mark_speculation_unsupported();
+        self.kernel.record_speculative_write(
+            crate::kernel::speculation::Resource::Future(future),
+        );
         self.kernel.await_future(actor, cont, future, next_run_class)
     }
 }
