@@ -521,15 +521,19 @@ impl Kernel {
                 .enumerate()
                 .flat_map(|(lane, outcome)| outcome.journal.device_accesses(lane as u32))
                 .collect();
-            let conflicts = match validator.validate_lane_journals(&accesses, outcomes.len() as u32)
-            {
-                Ok(conflicts) if conflicts.len() == outcomes.len() => conflicts,
-                _ => {
-                    self.speculation_stats.fallback_epochs += 1;
-                    self.speculation_stats.unsupported_fallbacks += 1;
-                    return None;
-                }
-            };
+            let operations: Vec<_> = outcomes
+                .iter()
+                .map(|outcome| &outcome.device_operations)
+                .collect();
+            let conflicts =
+                match validator.validate_epoch(&accesses, outcomes.len() as u32, &operations) {
+                    Ok(conflicts) if conflicts.len() == outcomes.len() => conflicts,
+                    _ => {
+                        self.speculation_stats.fallback_epochs += 1;
+                        self.speculation_stats.unsupported_fallbacks += 1;
+                        return None;
+                    }
+                };
             debug_assert_eq!(
                 conflicts,
                 reference_lane_conflicts(&accesses, outcomes.len() as u32)

@@ -20,6 +20,7 @@ use crate::scheduler::device::{
     reference_lane_conflicts, DeviceLaneAccess, DeviceLaneConflict, LaneConflictValidator,
     LaneValidationError, DEVICE_ACCESS_READ, DEVICE_ACCESS_WRITE,
 };
+use crate::scheduler::device_ops::{DeviceLaneOperation, DeviceOperationJournal, OP_AWAIT_FUTURE};
 
 const MAGIC: u32 = 0x534A_4E4C;
 const VERSION: u16 = 1;
@@ -56,16 +57,27 @@ struct WireRequest {
     lane_count: u32,
     grant: RemoteGrant,
     accesses: Vec<DeviceLaneAccess>,
+    operations: Vec<DeviceOperationJournal>,
 }
 
 impl WireRequest {
-    fn new(epoch: u32, lane_count: u32, grant: RemoteGrant, accesses: &[DeviceLaneAccess]) -> Self {
+    fn new(
+        epoch: u32,
+        lane_count: u32,
+        grant: RemoteGrant,
+        accesses: &[DeviceLaneAccess],
+        operations: &[&DeviceOperationJournal],
+    ) -> Self {
         let mut request = Self {
             id: RequestId([0; 32]),
             epoch,
             lane_count,
             grant,
             accesses: accesses.to_vec(),
+            operations: operations
+                .iter()
+                .map(|journal| (**journal).clone())
+                .collect(),
         };
         request.id = request.computed_id();
         request
@@ -79,6 +91,7 @@ impl WireRequest {
         put_u32(&mut bytes, self.epoch);
         put_u32(&mut bytes, self.lane_count);
         put_u32(&mut bytes, self.accesses.len() as u32);
+        put_u32(&mut bytes, self.operations.len() as u32);
         bytes.extend_from_slice(&self.grant.encode());
         for access in &self.accesses {
             put_u64(&mut bytes, access.resource);
@@ -86,6 +99,26 @@ impl WireRequest {
             put_u32(&mut bytes, access.resource_kind);
             put_u32(&mut bytes, access.mode);
             put_u32(&mut bytes, access.ordinal);
+        }
+        for journal in &self.operations {
+            put_u32(&mut bytes, journal.operations.len() as u32);
+            put_u32(&mut bytes, journal.payload.len() as u32);
+            for operation in &journal.operations {
+                put_u32(&mut bytes, operation.lane);
+                put_u32(&mut bytes, operation.ordinal);
+                put_u32(&mut bytes, operation.opcode);
+                put_u32(&mut bytes, operation.flags);
+                put_u64(&mut bytes, operation.actor);
+                put_u64(&mut bytes, operation.target);
+                put_u64(&mut bytes, operation.value);
+                put_u64(&mut bytes, operation.auxiliary);
+                put_u64(&mut bytes, operation.result_ref);
+                put_u32(&mut bytes, operation.payload_offset);
+                put_u32(&mut bytes, operation.payload_len);
+                put_u32(&mut bytes, operation.result_code);
+                put_u32(&mut bytes, operation.result_aux);
+            }
+            bytes.extend_from_slice(&journal.payload);
         }
         bytes
     }
@@ -114,7 +147,10 @@ impl WireRequest {
         let epoch = cursor.u32()?;
         let lane_count = cursor.u32()?;
         let count = cursor.u32()? as usize;
-        if count > MAX_FRAME / std::mem::size_of::<DeviceLaneAccess>() {
+        let journal_count = cursor.u32()? as usize;
+        if count > MAX_FRAME / std::mem::size_of::<DeviceLaneAccess>()
+            || journal_count > MAX_FRAME / 8
+        {
             return None;
         }
         let grant = RemoteGrant::decode(cursor.take(RemoteGrant::ENCODED_LEN)?)?;
@@ -133,6 +169,38 @@ impl WireRequest {
                 ordinal,
             ));
         }
+        let mut operations = Vec::with_capacity(journal_count);
+        for _ in 0..journal_count {
+            let operation_count = cursor.u32()? as usize;
+            let payload_len = cursor.u32()? as usize;
+            if operation_count > MAX_FRAME / std::mem::size_of::<DeviceLaneOperation>()
+                || payload_len > MAX_FRAME
+            {
+                return None;
+            }
+            let mut records = Vec::with_capacity(operation_count);
+            for _ in 0..operation_count {
+                records.push(DeviceLaneOperation {
+                    lane: cursor.u32()?,
+                    ordinal: cursor.u32()?,
+                    opcode: cursor.u32()?,
+                    flags: cursor.u32()?,
+                    actor: cursor.u64()?,
+                    target: cursor.u64()?,
+                    value: cursor.u64()?,
+                    auxiliary: cursor.u64()?,
+                    result_ref: cursor.u64()?,
+                    payload_offset: cursor.u32()?,
+                    payload_len: cursor.u32()?,
+                    result_code: cursor.u32()?,
+                    result_aux: cursor.u32()?,
+                });
+            }
+            operations.push(DeviceOperationJournal {
+                operations: records,
+                payload: cursor.take(payload_len)?.to_vec(),
+            });
+        }
         if !cursor.is_empty() {
             return None;
         }
@@ -142,6 +210,7 @@ impl WireRequest {
             lane_count,
             grant,
             accesses,
+            operations,
         };
         (request.computed_id() == id).then_some(request)
     }
@@ -206,6 +275,7 @@ pub struct RemoteJournalService {
     authority: Arc<Mutex<RemoteAuthorityStore>>,
     ledger: HashMap<RequestId, WireResponse>,
     applied_requests: u64,
+    operation_records: u64,
 }
 
 impl RemoteJournalService {
@@ -222,11 +292,16 @@ impl RemoteJournalService {
             authority,
             ledger: HashMap::new(),
             applied_requests: 0,
+            operation_records: 0,
         }
     }
 
     pub fn applied_requests(&self) -> u64 {
         self.applied_requests
+    }
+
+    pub fn operation_records(&self) -> u64 {
+        self.operation_records
     }
 
     fn handle(&mut self, frame: &[u8]) -> WireResponse {
@@ -262,9 +337,16 @@ impl RemoteJournalService {
         let valid = request.accesses.iter().all(|access| {
             access.lane < request.lane_count
                 && matches!(access.mode, DEVICE_ACCESS_READ | DEVICE_ACCESS_WRITE)
-        });
+        }) && (request.operations.is_empty()
+            || request.operations.len() == request.lane_count as usize)
+            && request.operations.iter().all(valid_operation_journal);
         let response = if valid {
             self.applied_requests += 1;
+            self.operation_records += request
+                .operations
+                .iter()
+                .map(|journal| journal.operations.len() as u64)
+                .sum::<u64>();
             WireResponse {
                 id: request.id,
                 status: Status::Ok,
@@ -356,7 +438,33 @@ impl LaneConflictValidator for RemoteJournalValidator {
         {
             return Err(LaneValidationError::InvalidInput);
         }
-        let request = WireRequest::new(self.epoch, lane_count, self.grant, accesses);
+        self.round_trip(accesses, lane_count, &[])
+    }
+
+    fn validate_epoch(
+        &mut self,
+        accesses: &[DeviceLaneAccess],
+        lane_count: u32,
+        operations: &[&DeviceOperationJournal],
+    ) -> Result<Vec<DeviceLaneConflict>, LaneValidationError> {
+        self.round_trip(accesses, lane_count, operations)
+    }
+}
+
+impl RemoteJournalValidator {
+    fn round_trip(
+        &self,
+        accesses: &[DeviceLaneAccess],
+        lane_count: u32,
+        operations: &[&DeviceOperationJournal],
+    ) -> Result<Vec<DeviceLaneConflict>, LaneValidationError> {
+        if accesses.len() > u32::MAX as usize
+            || operations.len() > u32::MAX as usize
+            || accesses.iter().any(|access| access.lane >= lane_count)
+        {
+            return Err(LaneValidationError::InvalidInput);
+        }
+        let request = WireRequest::new(self.epoch, lane_count, self.grant, accesses, operations);
         let mut stream = TcpStream::connect_timeout(&self.endpoint, self.timeout)
             .map_err(|_| LaneValidationError::Unavailable)?;
         stream
@@ -379,6 +487,21 @@ impl LaneConflictValidator for RemoteJournalValidator {
             Status::ExecutionFailed => Err(LaneValidationError::ExecutionFailed),
         }
     }
+}
+
+fn valid_operation_journal(journal: &DeviceOperationJournal) -> bool {
+    let lane = journal.operations.first().map(|operation| operation.lane);
+    journal
+        .operations
+        .iter()
+        .enumerate()
+        .all(|(ordinal, operation)| {
+            operation.ordinal == ordinal as u32
+                && operation.opcode >= 1
+                && operation.opcode <= OP_AWAIT_FUTURE
+                && lane == Some(operation.lane)
+                && journal.payload(*operation).is_some()
+        })
 }
 
 fn write_frame(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {

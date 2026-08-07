@@ -14,6 +14,7 @@ use soma::experiments::dynamic_search::{build, ControlKnobs};
 use soma::kernel::speculation::EpochExecutive;
 use soma::kernel::{ContinuationSpec, Kernel, SYSTEM_PRINCIPAL};
 use soma::scheduler::device::{DeviceLaneAccess, LaneConflictValidator, LaneValidationError};
+use soma::scheduler::device_ops::{DeviceLaneOperation, DeviceOperationJournal};
 use soma::semantics::invariants::assert_legal;
 use soma::semantics::order::conforms_traces;
 
@@ -85,6 +86,7 @@ fn an_actual_epoch_can_use_an_authenticated_remote_commit_gate() {
 
     server.join().unwrap();
     assert_eq!(fixture.service.lock().unwrap().applied_requests(), 1);
+    assert!(fixture.service.lock().unwrap().operation_records() > 0);
     assert_eq!(remote.speculation_stats().committed_epochs, 1);
     assert!(conforms_traces(&reference.trace_snapshot(), &remote.trace_snapshot()).is_empty());
     assert_legal(&remote);
@@ -194,4 +196,31 @@ fn unavailable_and_accepted_then_lost_are_distinct() {
         Err(LaneValidationError::NodeLost)
     );
     dropper.join().unwrap();
+}
+
+#[test]
+fn malformed_operation_arena_is_rejected_by_the_worker() {
+    let fixture = fixture();
+    let endpoint = fixture.listener.local_addr().unwrap();
+    let service = fixture.service.clone();
+    let server = std::thread::spawn(move || {
+        RemoteJournalServer::serve_n(fixture.listener, service, 1).unwrap()
+    });
+    let mut validator = RemoteJournalValidator::new(endpoint, fixture.grant, 0);
+    let journal = DeviceOperationJournal {
+        operations: vec![DeviceLaneOperation {
+            lane: 0,
+            ordinal: 0,
+            opcode: 1,
+            payload_offset: 4,
+            payload_len: 8,
+            ..DeviceLaneOperation::default()
+        }],
+        payload: vec![0; 4],
+    };
+    assert_eq!(
+        validator.validate_epoch(&[], 1, &[&journal]),
+        Err(LaneValidationError::InvalidInput)
+    );
+    server.join().unwrap();
 }

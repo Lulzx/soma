@@ -9,6 +9,7 @@
 use crate::abi::cohorts::PartialCohortPolicy;
 use crate::abi::{Ref64, StateAccess};
 use crate::scheduler::admission::{admit, Candidate};
+use crate::scheduler::device_ops::DeviceOperationJournal;
 
 pub const DEVICE_DEFERRED: u32 = 0;
 pub const DEVICE_RUN: u32 = 1;
@@ -35,6 +36,19 @@ pub trait LaneConflictValidator {
         accesses: &[DeviceLaneAccess],
         lane_count: u32,
     ) -> Result<Vec<DeviceLaneConflict>, LaneValidationError>;
+
+    /// Validate the complete epoch boundary. Validators concerned only with
+    /// conflicts may use the default; remote validators can authenticate and
+    /// ledger the operation payloads before returning the same decision.
+    fn validate_epoch(
+        &mut self,
+        accesses: &[DeviceLaneAccess],
+        lane_count: u32,
+        operations: &[&DeviceOperationJournal],
+    ) -> Result<Vec<DeviceLaneConflict>, LaneValidationError> {
+        let _ = operations;
+        self.validate_lane_journals(accesses, lane_count)
+    }
 }
 
 #[derive(Default)]

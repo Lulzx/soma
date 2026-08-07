@@ -45,20 +45,29 @@ the client reports `NodeLost`, distinct from connection refusal.
 `RemoteJournalValidator` applies the same transport and authority rules to the
 stateful pre-commit boundary. The coordinator serializes the actual read/write
 sets emitted by `LaneView` into the fixed device/wire ABI and sends the complete
-epoch to an authenticated worker. The worker makes the namespace-aware conflict
-decision, content-addresses the request, and records the response. Exact retry
-applies once; authorization is checked before the response ledger, so revoking
-a grant denies a formerly cached request. The client preserves distinct
-`Unavailable`, `NodeLost`, authority, protocol, and execution outcomes.
+epoch to an authenticated worker. The same request carries every fixed-width
+operation record and its byte arena: governed reads, allocation, object/frame
+writes, messages, and future operations. The worker validates lane/ordinal
+order, opcode range, and every arena bound before making the namespace-aware
+conflict decision. The request identity covers all access, operation, result,
+and payload bytes, and the service counts the operation records it durably
+accepted into its in-memory response ledger.
+
+Exact retry applies once; authorization is checked before the response ledger,
+so revoking a grant denies a formerly cached request. The client preserves
+distinct `Unavailable`, `NodeLost`, authority, protocol, and execution
+outcomes. A malformed operation arena is an explicit negative control and is
+rejected at the worker rather than reaching commit.
 
 This validator is wired directly into `Kernel::run_epoch_with_lane_validator`.
 A clean remote decision permits canonical coordinator commit. A conflict or
 transport error discards every speculative snapshot and takes the reference
 path before an operation or payload escapes. Tests exercise both a disjoint
 epoch that commits with an I18-equivalent trace and two future writers that
-fall back. The worker currently receives access journals, not operation
-payloads; operation replay and authoritative queue/future state remain on the
-coordinator.
+fall back. The worker now receives the complete speculative operation payload,
+but operation replay and authoritative queue/future state remain on the
+coordinator. Node loss before that replay therefore discards the journal; the
+remote worker cannot make an operation visible by accepting its bytes.
 
 ## Failure semantics
 
@@ -99,17 +108,19 @@ source failure. The supervision control alternates nodes at every level, so all
 four supervisor/child edges are remote, and covers notify, escalation, and
 restart. Every run is legal, has the same outcome, and is I18-equivalent.
 
-This is a non-vacuous semantic placement test. Stateful access journals now
+This is a non-vacuous semantic placement test. Complete stateful journals now
 cross an authenticated remote boundary and gate real epoch commit, but one
 coordinator kernel still owns and replays the channel, future, and supervision
-operations. Sending those operation payloads to their owning nodes, then
-committing their acknowledgements in canonical order, remains before the full
-distributed exit criterion is satisfied.
+operations. Moving authoritative resource ownership to several kernels would
+be a stronger distributed machine; it is not required for this backend's
+speculative-execute/central-canonical-commit model and is not claimed here.
 
 ## Completion evidence
 
-The backend is complete only when the two-node streaming graph and supervision
-tree are I18-equivalent to their single-node runs, every process is remote from
-its supervisor in the non-vacuity control, revocation is observed at remote
-use, duplicate requests apply once, and killing a node mid-epoch produces the
-defined discard-and-notify result.
+The backend evidence is: the two-node streaming graph and supervision tree are
+I18-equivalent to their single-node runs; every process is remote from its
+supervisor in the non-vacuity control; evaluator and stateful journal requests
+are authenticated and duplicate-safe; revocation is observed before cached
+responses; full operation arenas are validated remotely; refusal and
+accepted-then-lost are distinct; and explicit node loss produces the defined
+discard-and-notify result rather than a program fault.
