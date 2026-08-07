@@ -1,0 +1,18 @@
+SOMA scheduler width negative control
+commit=e3c48a4
+command=cargo run --release --all-features --example scheduler_migration_bench
+machine=Apple M4 Pro (12-core CPU, 16-core GPU)
+os=macOS 26.6 (25G5028f)
+arch=aarch64
+metal=Metal 4
+release=true
+
+# Same candidate set: 2,048 candidates, 16 run classes. Only cohort width changes.
+cpu candidates=2048 classes=16 width=32	median_us=623.042	p10_us=613.458	p90_us=633.750	raw_ns=623042,626750,645125,613458,561375,618250,633750,623167,630750,618125,618333
+metal candidates=2048 classes=16 width=32	median_us=616.875	p10_us=612.458	p90_us=699.333	raw_ns=600834,615791,612458,616875,616416,655625,650917,659792,835666,614333,699333
+cpu candidates=2048 classes=16 width=1	median_us=608.041	p10_us=573.708	p90_us=646.667	raw_ns=608041,649875,619875,579208,635208,646667,624625,573708,596333,570084,607209
+metal candidates=2048 classes=16 width=1	median_us=560.541	p10_us=558.208	p90_us=656.917	raw_ns=568834,561458,656917,558750,563334,560291,558208,911375,556917,560541,559292
+
+Interpretation guard: this measures planning and placement only. Width one removes
+cohort aggregation but does not execute evaluator lanes, so its modest speedup is
+fewer placement writes, not evidence that scalar execution beats cohort execution.

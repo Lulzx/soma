@@ -1,7 +1,8 @@
 # Performance: what was measured, and what it cost
 
-This document covers nine commits, `cae41c5..c3621a0`. Read §1 before using any
-number in it, and §7 before deciding what to do next.
+This document began with nine commits, `cae41c5..c3621a0`, and now also records
+the device-scheduler and distributed-migration measurements in §8. Read §1
+before using any number in it, and §§7–8 before deciding what to do next.
 
 Everything here is about the *implementation*. No semantics changed except one
 new operation (`release_authority`, §5.2) and one new trace event kind
@@ -293,10 +294,10 @@ hypothetical.
 
 ## 7. What is still open
 
-- **The thesis is still unmeasured.** Whether continuation cohorting beats a
-  bulk schedule *on hardware* remains an analytical occupancy model over
-  simulated ticks (`regime_map`, `baseline_report`). This work made the machinery
-  underneath fast and honest enough to ask the question. It did not ask it.
+- **Evaluator-lane execution remains unmeasured.** §8 measures real-Metal
+  admission and placement, including the width-one negative control. Whether
+  continuation cohorting beats scalar evaluator execution *on hardware* still
+  requires the general LaneView lowering and canonical device-side commit.
 - **Asynchronous submission (§3.3) was not done.** It is worth 6.1× on its own
   and is subsumed by epoch batching wherever an epoch has several cohorts. It
   earns its cost only where epochs are narrow.
@@ -308,3 +309,92 @@ hypothetical.
 - **`kernel_overhead` and `growth_sweep` have only been pointed at the batch and
   epoch paths.** Channels, supervision, and the admission log have never been
   measured against accumulated state.
+
+---
+
+## 8. Device scheduling and remote migration (`0e46d2c`, `e3c48a4`)
+
+`examples/scheduler_migration_bench.rs` adds two measurements the earlier
+backend sweep could not provide:
+
+- complete admission plus deterministic bin/cohort placement on the CPU oracle
+  and the real Metal implementation, over candidate count and run-class count;
+- authenticated loopback execution on a remote worker, followed by a complete
+  Remote → CPU kernel publication path with migration accounting.
+
+These are release-mode wall-clock medians on the same 12-core CPU / 16-core GPU
+Apple M4 Pro. Scheduler cells use 31 trials through 128 candidates and 11 after
+that. Remote cells use 21 trials through 4,096 elements and 9 at 65,536. The
+files in `docs/measurements` retain every raw nanosecond sample, p10, p90,
+commit, command, OS and hardware context.
+
+### 8.1 Scheduler overhead
+
+The Metal number includes staging candidates into persistent shared buffers,
+one command-buffer submission and wait, device admission, and deterministic
+placement. It is not kernel time alone.
+
+| candidates | classes | CPU median | Metal median | Metal / CPU |
+|---:|---:|---:|---:|---:|
+| 32 | 1 | 0.542µs | 162.375µs | 300× |
+| 32 | 16 | 0.958µs | 176.375µs | 184× |
+| 128 | 1 | 3.625µs | 201.292µs | 55.5× |
+| 128 | 16 | 4.625µs | 229.583µs | 49.6× |
+| 512 | 1 | 43.167µs | 353.000µs | 8.18× |
+| 512 | 16 | 43.500µs | 339.959µs | 7.82× |
+| 2,048 | 1 | 561.959µs | 692.583µs | 1.23× |
+| 2,048 | 4 | 560.458µs | 623.084µs | 1.11× |
+| 2,048 | 16 | 605.167µs | 587.708µs | 0.97× |
+
+The observed crossover is therefore not “the GPU scheduler is faster.” Fixed
+submission and synchronization cost dominates small epochs. Only the largest,
+most partitioned cell crossed, by 2.9%; its p10–p90 ranges overlap, so it is
+parity rather than a robust win. The useful result is the shape: CPU planning
+grows from sub-microsecond to roughly 0.6ms, while Metal approaches it as the
+candidate set supplies enough parallel work. The present deterministic planner
+is deliberately quadratic; this is a baseline for the concurrent resident
+scheduler, not a performance endpoint.
+
+Two negative controls prevent stronger conclusions:
+
+| 2,048 candidates, 16 classes | CPU median | Metal median |
+|---|---:|---:|
+| cohort width 32 | 623.042µs | 616.875µs |
+| cohort width 1 | 608.041µs | 560.541µs |
+
+Width one is 2.4% faster on CPU and 9.1% faster on Metal. This benchmark only
+plans placements, so that is fewer placement writes; it says nothing about
+scalar versus cohorted evaluator execution. The one-class cells likewise show
+that the crossover does not appear merely by moving planning onto Metal.
+
+### 8.2 Authenticated remote execution and end-to-end migration
+
+The remote worker is a distinct service thread reached over framed TCP on
+loopback. Every request carries a signed grant and uses a new logical epoch so
+the response ledger cannot turn repeated trials into cache hits. The evaluator
+has two fields and 32 ALU operations per element.
+
+| elements | local backend | remote backend | remote / local | Remote → CPU full publication |
+|---:|---:|---:|---:|---:|
+| 64 | 5.333µs | 212.083µs | 39.8× | 164.917µs |
+| 4,096 | 317.375µs | 621.041µs | 1.96× | 922.667µs |
+| 65,536 | 5.099ms | 7.807ms | 1.53× | 13.232ms |
+
+At 64 elements the transport, framing, authority verification, service lock,
+and thread wakeup are the workload. By 65,536 elements, remote overhead is
+2.709ms over 5.099ms of local evaluation. That is a loopback process-boundary
+cost, not a network claim; LAN and multi-host measurements remain required.
+
+The full-publication column starts a fresh kernel, creates and publishes one
+remote collective, spills a second collective to CPU, publishes that result,
+and asserts exactly one remote execution, one CPU execution and one migration.
+At the two larger sizes it approximately equals one remote plus one local
+evaluation (0.923ms against 0.938ms, and 13.232ms against 12.906ms). The 64-item
+cell is fixed-cost noise: its full-path median is below the separately sampled
+remote median, and the raw percentile ranges overlap. It must not be read as a
+negative migration cost.
+
+The benchmark intentionally does not claim stateful distributed execution.
+Queue and channel journals are still coordinator-owned, and the worker is on
+loopback. Those are implementation boundaries for the next distributed slice,
+not hidden assumptions in these numbers.
