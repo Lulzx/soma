@@ -69,6 +69,10 @@ Process descriptors now carry node ownership. `Kernel::declare_node_lost` is a
 system-only epoch-boundary decision that contains live work and reports
 `ExitReason::NodeLost` without fabricating `ProcessFailed`; see
 `tests/node_loss.rs`.
+`tests/distributed_equivalence.rs` is the non-vacuity placement gate: the
+streaming graph has two remote channel edges and every supervision-tree edge is
+remote, with I18 equivalence under failure, escalation, and restart. The queues
+remain coordinator-owned; authenticated stateful journals are still pending.
 
 Read §1 for the project state and §6 for the test discipline before changing
 the code.

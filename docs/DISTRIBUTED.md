@@ -71,6 +71,21 @@ placement on that node, contains every live process owned there, emits
 processes untouched until declaration. Existing supervision and semantic
 invariant suites pass unchanged.
 
+## Placement equivalence
+
+The streaming graph and supervision tree now accept explicit node placement.
+`tests/distributed_equivalence.rs` runs each locally and across two nodes, then
+uses I18 rather than raw result equality alone. The streaming control places
+both channel peers away from the coordinator and covers normal completion plus
+source failure. The supervision control alternates nodes at every level, so all
+four supervisor/child edges are remote, and covers notify, escalation, and
+restart. Every run is legal, has the same outcome, and is I18-equivalent.
+
+This is a non-vacuous semantic placement test, not yet stateful message
+transport: one coordinator kernel still owns the channel and supervision
+queues. Those operations must next use authenticated remote journals before the
+full distributed exit criterion is satisfied.
+
 ## Completion evidence
 
 The backend is complete only when the two-node streaming graph and supervision

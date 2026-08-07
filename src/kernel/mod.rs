@@ -1933,6 +1933,23 @@ impl Kernel {
         mode: ProcessMode,
         policy: SupervisionPolicy,
     ) -> Result<Ref64, RuntimeError> {
+        self.create_supervised_process_with_policy_on_node(
+            actor,
+            supervisor,
+            mode,
+            policy,
+            self.local_node,
+        )
+    }
+
+    pub fn create_supervised_process_with_policy_on_node(
+        &mut self,
+        actor: Ref64,
+        supervisor: Ref64,
+        mode: ProcessMode,
+        policy: SupervisionPolicy,
+        node_id: u64,
+    ) -> Result<Ref64, RuntimeError> {
         if policy == SupervisionPolicy::Restart {
             return Err(RuntimeError::InvalidSupervisionPolicy);
         }
@@ -1946,7 +1963,7 @@ impl Kernel {
             return Err(RuntimeError::ProcessUnavailable);
         }
         let domain = self.processes.get(supervisor)?.domain;
-        let child = self.allocate_process(actor, domain, mode)?;
+        let child = self.allocate_process_on_node(actor, domain, mode, node_id)?;
         let descriptor = self.processes.get_mut(child)?;
         descriptor.supervisor = supervisor;
         descriptor.supervision_policy = policy;
@@ -1964,12 +1981,31 @@ impl Kernel {
         restart_limit: u32,
         entry: ContinuationSpec,
     ) -> Result<Ref64, RuntimeError> {
+        self.create_restartable_process_on_node(
+            actor,
+            supervisor,
+            mode,
+            restart_limit,
+            entry,
+            self.local_node,
+        )
+    }
+
+    pub fn create_restartable_process_on_node(
+        &mut self,
+        actor: Ref64,
+        supervisor: Ref64,
+        mode: ProcessMode,
+        restart_limit: u32,
+        entry: ContinuationSpec,
+        node_id: u64,
+    ) -> Result<Ref64, RuntimeError> {
         if restart_limit == 0
             || (mode == ProcessMode::Pure && entry.state_access == crate::abi::StateAccess::Mutable)
         {
             return Err(RuntimeError::InvalidSupervisionPolicy);
         }
-        let child = self.create_supervised_process(actor, supervisor, mode)?;
+        let child = self.create_supervised_process_on_node(actor, supervisor, mode, node_id)?;
         {
             let descriptor = self.processes.get_mut(child)?;
             descriptor.supervision_policy = SupervisionPolicy::Restart;

@@ -1621,6 +1621,13 @@ is I18-equivalent to the single-node run; a node killed mid-epoch produces a
 defined, tested outcome; and no test passes by routing all work to one node —
 the control is a run where every process is remote from its supervisor.
 
+The placement half of that exit criterion now passes. The streaming graph is
+I18-equivalent with both channel peers remote from its coordinator, and the
+supervision tree is I18-equivalent under notify, escalate, and restart with all
+four parent/child edges crossing nodes. This deliberately does not close C:
+coordinator-owned queues still implement stateful operations, so their
+authenticated remote-journal transport remains to be built.
+
 ---
 
 ## 6. D — performance

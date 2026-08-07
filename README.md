@@ -316,6 +316,9 @@ Implemented now:
 - Explicit process node ownership and epoch-boundary node-loss containment,
   with system-only idempotent declaration, rejected placement on lost nodes,
   `ProcessLost` traces, and distinct remote-supervisor notices
+- I18-equivalent two-node streaming and supervision placements, including
+  failure, escalation, restart, two remote channel edges, and a control where
+  every supervisor/child edge crosses nodes
 
 Not implemented:
 

@@ -44,6 +44,17 @@ pub struct TreeRun {
     pub outcome: TreeOutcome,
     pub trace: Vec<TraceSnapshotRow>,
     pub legal: bool,
+    /// Supervisor/child edges whose endpoints are on different nodes.
+    pub remote_edges: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TreePlacement {
+    pub root: u64,
+    pub left_branch: u64,
+    pub right_branch: u64,
+    pub left_worker: u64,
+    pub right_worker: u64,
 }
 
 fn worker_spec(budget: u32) -> ContinuationSpec {
@@ -52,20 +63,33 @@ fn worker_spec(budget: u32) -> ContinuationSpec {
     ContinuationSpec::new(StateAccess::ReadOnly, SEARCH_BRANCH, 0, frame, budget)
 }
 
-fn worker(kernel: &mut Kernel, supervisor: Ref64, policy: SupervisionPolicy, budget: u32) -> Ref64 {
+fn worker(
+    kernel: &mut Kernel,
+    supervisor: Ref64,
+    policy: SupervisionPolicy,
+    budget: u32,
+    node: u64,
+) -> Ref64 {
     if policy == SupervisionPolicy::Restart {
         return kernel
-            .create_restartable_process(
+            .create_restartable_process_on_node(
                 supervisor,
                 supervisor,
                 ProcessMode::Serial,
                 1,
                 worker_spec(budget),
+                node,
             )
             .expect("live branch may create restartable worker");
     }
     let process = kernel
-        .create_supervised_process_with_policy(supervisor, supervisor, ProcessMode::Serial, policy)
+        .create_supervised_process_with_policy_on_node(
+            supervisor,
+            supervisor,
+            ProcessMode::Serial,
+            policy,
+            node,
+        )
         .expect("live branch may create worker");
     kernel
         .create_continuation(process, process, worker_spec(budget))
@@ -74,13 +98,19 @@ fn worker(kernel: &mut Kernel, supervisor: Ref64, policy: SupervisionPolicy, bud
 }
 
 pub fn run(knobs: &TreeKnobs) -> TreeRun {
+    run_placed(knobs, TreePlacement::default())
+}
+
+pub fn run_placed(knobs: &TreeKnobs, placement: TreePlacement) -> TreeRun {
     let mut kernel = Kernel::new();
-    let root = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let root = kernel
+        .create_process_on_node(SYSTEM_PRINCIPAL, ProcessMode::Serial, placement.root)
+        .expect("root node is available");
     let left_branch = kernel
-        .create_supervised_process(root, root, ProcessMode::Serial)
+        .create_supervised_process_on_node(root, root, ProcessMode::Serial, placement.left_branch)
         .expect("live root may create branch");
     let right_branch = kernel
-        .create_supervised_process(root, root, ProcessMode::Serial)
+        .create_supervised_process_on_node(root, root, ProcessMode::Serial, placement.right_branch)
         .expect("live root may create branch");
     let left_worker = worker(
         &mut kernel,
@@ -91,12 +121,14 @@ pub fn run(knobs: &TreeKnobs) -> TreeRun {
         } else {
             DEFAULT_MAX_STEPS
         },
+        placement.left_worker,
     );
     let right_worker = worker(
         &mut kernel,
         right_branch,
         knobs.worker_policy,
         DEFAULT_MAX_STEPS,
+        placement.right_worker,
     );
     kernel.run_epoch();
 
@@ -123,10 +155,23 @@ pub fn run(knobs: &TreeKnobs) -> TreeRun {
             .filter(|event| event.event_kind == EventKind::ProcessRestarted)
             .count(),
     };
+    let edges = [
+        (root, left_branch),
+        (root, right_branch),
+        (left_branch, left_worker),
+        (right_branch, right_worker),
+    ];
+    let remote_edges = edges
+        .iter()
+        .filter(|(supervisor, child)| {
+            kernel.process_node(*supervisor).ok() != kernel.process_node(*child).ok()
+        })
+        .count();
     TreeRun {
         outcome,
         trace: kernel.trace_snapshot(),
         legal: crate::semantics::invariants::check(&kernel).is_empty(),
+        remote_edges,
     }
 }
 

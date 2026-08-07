@@ -35,6 +35,21 @@ pub struct StreamingGraphReport {
     pub source_failed: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StreamingPlacement {
+    pub coordinator: u64,
+    pub source: u64,
+    pub sink: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamingGraphRun {
+    pub report: StreamingGraphReport,
+    pub trace: Vec<crate::kernel::TraceSnapshotRow>,
+    pub remote_channel_edges: usize,
+    pub legal: bool,
+}
+
 impl StreamingGraphReport {
     pub fn ordered(&self) -> bool {
         self.delivered
@@ -46,10 +61,23 @@ impl StreamingGraphReport {
 
 /// Execute the graph to quiescence using only public machine transitions.
 pub fn run(config: StreamingGraphConfig) -> Result<StreamingGraphReport, RuntimeError> {
+    Ok(run_placed(config, StreamingPlacement::default())?.report)
+}
+
+pub fn run_placed(
+    config: StreamingGraphConfig,
+    placement: StreamingPlacement,
+) -> Result<StreamingGraphRun, RuntimeError> {
     let mut kernel = Kernel::new();
-    let coordinator = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
-    let source = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
-    let sink = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    let coordinator = kernel.create_process_on_node(
+        SYSTEM_PRINCIPAL,
+        ProcessMode::Serial,
+        placement.coordinator,
+    )?;
+    let source =
+        kernel.create_process_on_node(SYSTEM_PRINCIPAL, ProcessMode::Serial, placement.source)?;
+    let sink =
+        kernel.create_process_on_node(SYSTEM_PRINCIPAL, ProcessMode::Serial, placement.sink)?;
     let channel = kernel.create_channel(coordinator, config.channel_capacity);
     kernel.grant_capability(coordinator, source, channel, Rights::SEND, 0, 0)?;
     kernel.grant_capability(coordinator, sink, channel, Rights::RECEIVE, 0, 0)?;
@@ -98,12 +126,21 @@ pub fn run(config: StreamingGraphConfig) -> Result<StreamingGraphReport, Runtime
     }
     assert_legal(&kernel);
 
-    Ok(StreamingGraphReport {
+    let report = StreamingGraphReport {
         attempted_records: config.records,
         committed_records: committed,
         delivered,
         backpressure_events,
         source_failed,
+    };
+    let remote_channel_edges =
+        usize::from(kernel.process_node(coordinator)? != kernel.process_node(source)?)
+            + usize::from(kernel.process_node(coordinator)? != kernel.process_node(sink)?);
+    Ok(StreamingGraphRun {
+        report,
+        trace: kernel.trace_snapshot(),
+        remote_channel_edges,
+        legal: crate::semantics::invariants::check(&kernel).is_empty(),
     })
 }
 
