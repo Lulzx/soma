@@ -28,12 +28,15 @@ use crate::kernel::{Kernel, SYSTEM_PRINCIPAL};
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use crate::executives::metal::{MetalBatchBackend, MetalTuning};
+#[cfg(feature = "native")]
+use crate::executives::native::NativeCpuBackend;
 
 const REPLAY_EVALUATOR: u32 = 20_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Placement {
     Cpu,
+    NativeCpu,
     Metal,
 }
 
@@ -51,7 +54,16 @@ impl ExecutionConfig {
     pub fn label(&self) -> String {
         match self.placement {
             Placement::Cpu => format!(
-                "cpu/{}t/{}",
+                "cpu-reference/{}t/{}",
+                self.cpu_threads,
+                if self.batched_epoch {
+                    "epoch"
+                } else {
+                    "single"
+                }
+            ),
+            Placement::NativeCpu => format!(
+                "cpu-native/{}t/{}",
                 self.cpu_threads,
                 if self.batched_epoch {
                     "epoch"
@@ -115,9 +127,8 @@ impl Default for TuningStudy {
                     elements_per_cohort: 131_072,
                 },
             ],
-            // The default hardware matrix has eleven candidates, so eleven
-            // trials complete one full rotation through acquisition order.
-            trials: 11,
+            // Reference CPU (4), native CPU (4), and Metal (7).
+            trials: 15,
         }
     }
 }
@@ -188,9 +199,31 @@ pub fn cpu_configurations(thread_counts: &[usize]) -> Vec<ExecutionConfig> {
     configs
 }
 
+#[cfg(feature = "native")]
+fn append_native_configurations(configs: &mut Vec<ExecutionConfig>, thread_counts: &[usize]) {
+    let threads: std::collections::BTreeSet<_> = thread_counts
+        .iter()
+        .map(|threads| (*threads).max(1))
+        .collect();
+    for threads in threads {
+        for batched_epoch in [false, true] {
+            configs.push(ExecutionConfig {
+                id: configs.len() as u32 + 1,
+                placement: Placement::NativeCpu,
+                batched_epoch,
+                cpu_threads: threads,
+                threadgroup_width: None,
+                reuse_scratch_buffers: true,
+            });
+        }
+    }
+}
+
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn hardware_configurations(thread_counts: &[usize]) -> Vec<ExecutionConfig> {
     let mut configs = cpu_configurations(thread_counts);
+    #[cfg(feature = "native")]
+    append_native_configurations(&mut configs, thread_counts);
     let mut push_metal = |batched_epoch, threadgroup_width, reuse_scratch_buffers| {
         configs.push(ExecutionConfig {
             id: configs.len() as u32 + 1,
@@ -298,6 +331,78 @@ pub fn capture_cpu(
     })
 }
 
+#[cfg(feature = "native")]
+pub fn capture_native(
+    study: &TuningStudy,
+    thread_counts: &[usize],
+) -> Result<CapturedStudy, BackendError> {
+    let mut configs = cpu_configurations(thread_counts);
+    append_native_configurations(&mut configs, thread_counts);
+    let programs: Vec<_> = study
+        .workloads
+        .iter()
+        .map(|workload| synthetic_program(21_000 + workload.id, 2, workload.alu_ops))
+        .collect();
+    let refs: Vec<_> = programs.iter().collect();
+    let mut references: BTreeMap<usize, CpuReferenceBackend> = thread_counts
+        .iter()
+        .copied()
+        .map(|threads| {
+            (
+                threads.max(1),
+                CpuReferenceBackend::with(&refs).with_threads(threads),
+            )
+        })
+        .collect();
+    let mut natives: BTreeMap<usize, NativeCpuBackend> = thread_counts
+        .iter()
+        .copied()
+        .map(|threads| {
+            Ok((
+                threads.max(1),
+                NativeCpuBackend::with(&refs)?.with_threads(threads),
+            ))
+        })
+        .collect::<Result<_, BackendError>>()?;
+    let mut unused_accelerator = CpuReferenceBackend::with(&refs);
+
+    capture_with(study, &configs, |workload, config| {
+        let program = programs
+            .iter()
+            .find(|program| program.id() == 21_000 + workload.id)
+            .ok_or(BackendError::InvalidInput)?;
+        match config.placement {
+            Placement::Cpu => {
+                let backend = references
+                    .get_mut(&config.cpu_threads)
+                    .ok_or(BackendError::InvalidInput)?;
+                measure_epoch_once(
+                    program,
+                    workload,
+                    u32::MAX,
+                    &mut unused_accelerator,
+                    backend,
+                    config.batched_epoch,
+                )
+            }
+            Placement::NativeCpu => {
+                let backend = natives
+                    .get_mut(&config.cpu_threads)
+                    .ok_or(BackendError::InvalidInput)?;
+                measure_epoch_once(
+                    program,
+                    workload,
+                    u32::MAX,
+                    &mut unused_accelerator,
+                    backend,
+                    config.batched_epoch,
+                )
+            }
+            Placement::Metal => Err(BackendError::UnsupportedEvaluator),
+        }
+    })
+}
+
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub fn capture_metal(
     study: &TuningStudy,
@@ -323,6 +428,17 @@ pub fn capture_metal(
             )
         })
         .collect();
+    #[cfg(feature = "native")]
+    let mut native_backends: BTreeMap<usize, NativeCpuBackend> = thread_counts
+        .iter()
+        .copied()
+        .map(|threads| {
+            Ok((
+                threads.max(1),
+                NativeCpuBackend::with(&refs)?.with_threads(threads),
+            ))
+        })
+        .collect::<Result<_, BackendError>>()?;
     let fallback_threads = cpu_backends
         .keys()
         .next()
@@ -358,6 +474,22 @@ pub fn capture_metal(
                     .ok_or(BackendError::InvalidInput)?;
                 measure_epoch_once(program, workload, 1, &mut metal, cpu, config.batched_epoch)
             }
+            #[cfg(feature = "native")]
+            Placement::NativeCpu => {
+                let native = native_backends
+                    .get_mut(&config.cpu_threads)
+                    .ok_or(BackendError::InvalidInput)?;
+                measure_epoch_once(
+                    program,
+                    workload,
+                    u32::MAX,
+                    &mut metal,
+                    native,
+                    config.batched_epoch,
+                )
+            }
+            #[cfg(not(feature = "native"))]
+            Placement::NativeCpu => Err(BackendError::UnsupportedEvaluator),
         }
     })
 }
@@ -394,6 +526,14 @@ pub fn run_cpu(
     thread_counts: &[usize],
 ) -> Result<SelfTuningReport, DiscoveryError> {
     replay(capture_cpu(study, thread_counts).map_err(DiscoveryError::Backend)?)
+}
+
+#[cfg(feature = "native")]
+pub fn run_native(
+    study: &TuningStudy,
+    thread_counts: &[usize],
+) -> Result<SelfTuningReport, DiscoveryError> {
+    replay(capture_native(study, thread_counts).map_err(DiscoveryError::Backend)?)
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]

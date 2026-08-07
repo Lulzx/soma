@@ -124,6 +124,20 @@ fn real_cpu_search_produces_equivalent_scientific_state() {
     assert_eq!(report.rankings[0].configs.len(), 4);
 }
 
+#[cfg(feature = "native")]
+#[test]
+fn real_native_search_is_compared_to_the_reference_oracle() {
+    use soma::experiments::self_tuning::{run_native, Placement};
+
+    let report = run_native(&tiny_study(2), &[1, 2]).unwrap();
+    assert!(report.invariants.all_hold());
+    assert!(report
+        .captured
+        .configs
+        .iter()
+        .any(|config| config.placement == Placement::NativeCpu));
+}
+
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn real_metal_search_shares_compilation_and_preserves_outputs() {
