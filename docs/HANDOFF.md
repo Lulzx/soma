@@ -1,11 +1,28 @@
 # SOMA engineering handoff
 
+## Discovery execution model
+
+`src/discovery` is now the first application-level execution model above SOMA.
+It implements deterministic trace replay, SHA-256 semantic node identities,
+pending/ready deduplication, transitive hypothesis interest and cancellation,
+pointwise-only batch fusion, D1-D7 checks, synthetic discovery search, regime
+mapping, and CPU/Metal reports. It deliberately changes no SOMA ABI entity.
+Start with [DISCOVERY.md](DISCOVERY.md), `tests/discovery_*`, and
+`examples/discovery_report.rs`.
+
+The default implementation trace compresses 2,184 logical requests to 910
+physical evaluator realizations and 12 dispatches with identical terminal
+scientific state. Local release smoke runs showed a modest CPU improvement and
+a larger Metal improvement, but do not quote a single run or structural
+compression as a performance result. The concurrent lane executive remains
+separate work, as §4.17's narrowed `LaneView` comments state.
+
 Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
 Repository: https://github.com/Lulzx/soma. The default semantic core is
-dependency-free. There are 382 tests (seven of which need the `metal` feature),
-six compile-fail doc tests, and no Clippy warnings. The optional `metal`
+dependency-free. There are 403 default tests, seven additional tests behind the
+`metal` feature, seven compile-fail doc tests, and no Clippy warnings. The optional `metal`
 feature adds the `metal-rs` implementation dependency on macOS.
 
 ```sh
