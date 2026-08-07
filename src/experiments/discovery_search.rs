@@ -10,6 +10,11 @@ use crate::discovery::{
 };
 use crate::executives::batch::{BatchBackend, CpuReferenceBackend};
 
+pub const DUPLICATION_RATES: [f32; 4] = [0.0, 0.25, 0.5, 0.75];
+pub const PRUNING_RATES: [f32; 3] = [0.0, 0.25, 0.5];
+pub const EVALUATOR_CLASSES: [u32; 3] = [1, 4, 16];
+pub const BATCH_SIZES: [u32; 3] = [1, 64, 1_024];
+
 #[derive(Clone, Copy, Debug)]
 pub struct DiscoveryKnobs {
     pub branching_factor: u32,
@@ -222,10 +227,10 @@ pub struct RegimePoint {
 
 pub fn regime_map(base: DiscoveryKnobs) -> Result<Vec<RegimePoint>, DiscoveryError> {
     let mut points = Vec::new();
-    for duplicate_rate in [0.0, 0.25, 0.5, 0.75] {
-        for rejection_rate in [0.0, 0.25, 0.5] {
-            for evaluator_classes in [1, 4, 16] {
-                for elements_per_experiment in [1, 64, 1024] {
+    for duplicate_rate in DUPLICATION_RATES {
+        for rejection_rate in PRUNING_RATES {
+            for evaluator_classes in EVALUATOR_CLASSES {
+                for elements_per_experiment in BATCH_SIZES {
                     let knobs = DiscoveryKnobs {
                         duplicate_rate,
                         rejection_rate,
