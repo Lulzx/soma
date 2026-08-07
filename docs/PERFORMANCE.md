@@ -395,6 +395,14 @@ set. This control prevents attributing the read-only scaling result to all
 scheduler traffic. The subsequent scheduler slice adds the grouped,
 deterministic mutable-claim sort; this row remains its before measurement.
 
+After that sort, the all-mutable/same-process Metal median is 398.084µs at
+2,048 and 580.042µs at 8,192. Candidate count grows 4× while device time grows
+1.46×, rather than the 16× signature of the removed comparison scan. CPU is
+still decisively better—11.166µs and 43.834µs—because it groups claims directly
+and only one lane survives. The runtime should therefore keep this adversary on
+CPU even though the resident device path is no longer quadratic. Raw trials are
+in `docs/measurements/SCHEDULER-MUTABLE-M4-PRO-2026-08-07.txt`.
+
 The post-sort width-one control is 615.417µs CPU and 268.250µs Metal. As before,
 it measures placement writes rather than evaluator-lane throughput. Full raw
 trials and machine metadata are in

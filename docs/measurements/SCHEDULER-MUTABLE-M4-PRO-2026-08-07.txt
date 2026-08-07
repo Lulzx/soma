@@ -1,0 +1,21 @@
+SOMA sorted mutable-admission follow-up
+commit=79fb4e4
+algorithm_commit=5b6d8ce
+command=cargo run --release --all-features --example scheduler_migration_bench -- --scheduler-only
+machine=Apple M4 Pro (12-core CPU, 16-core GPU)
+os=macOS 26.6 (25G5028f)
+arch=aarch64
+metal=Metal 4
+release=true
+
+[all mutable claims share one process]
+cpu candidates=2048 classes=16 contested_mutable=true	median_us=11.166	p10_us=11.041	p90_us=11.666	raw_ns=16542,11666,11292,11125,11041,11125,11167,11166,11167,11041,11083
+metal candidates=2048 classes=16 contested_mutable=true	median_us=398.084	p10_us=352.500	p90_us=412.625	raw_ns=398084,395541,406000,412625,404792,400375,461250,386958,355042,345750,352500
+cpu candidates=8192 classes=16 contested_mutable=true	median_us=43.834	p10_us=43.792	p90_us=46.542	raw_ns=46542,44500,72208,43833,43834,43625,43792
+metal candidates=8192 classes=16 contested_mutable=true	median_us=580.042	p10_us=556.958	p90_us=611.875	raw_ns=572750,580042,613875,611875,604209,553083,556958
+
+[same-run read-only sanity cells]
+cpu candidates=8192 classes=1	median_us=9154.250	p10_us=8995.250	p90_us=9252.291	raw_ns=9045291,9154250,9252291,8655583,9275250,8995250,9211542
+metal candidates=8192 classes=1	median_us=912.666	p10_us=878.667	p90_us=1113.250	raw_ns=1113250,1161458,873625,878667,1058583,912666,886250
+cpu candidates=8192 classes=16	median_us=9014.375	p10_us=8902.125	p90_us=9162.000	raw_ns=8902125,9162000,8866250,9018917,9014375,9002875,9196666
+metal candidates=8192 classes=16	median_us=965.417	p10_us=947.042	p90_us=1221.500	raw_ns=965417,950208,938916,947042,1746291,987500,1221500
