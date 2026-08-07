@@ -401,6 +401,7 @@ impl Kernel {
         // nothing between that read and the one above can change it — which is
         // why §4.17 could take the read away without changing a run.
         let frame_evaluator = self.frame_evaluators.get(&run_class).cloned();
+        let frame_effect = self.frame_evaluator_effects.get(&run_class).copied();
         let result = {
             let mut lane = crate::executives::lane::LaneView::new(self, frame);
             if let Some(program) = frame_evaluator {
@@ -411,12 +412,38 @@ impl Kernel {
                     Ok(input) if input.len() == program.stride() as usize => {
                         let mut output = input.clone();
                         program.evaluate_at(&input, 1, 0, &mut output);
-                        match lane.host_payload_mut(process, frame) {
+                        let frame_written = match lane.host_payload_mut(process, frame) {
                             Ok(payload) => {
-                                *payload = output;
-                                StepResult::complete()
+                                *payload = output.clone();
+                                true
                             }
-                            Err(_) => StepResult::fault(process, run_class),
+                            Err(_) => false,
+                        };
+                        let effect_result = match frame_effect {
+                            Some(crate::kernel::FrameEvaluatorEffect::ResolveFuture {
+                                future_offset,
+                                value_offset,
+                            }) => {
+                                let read_ref = |offset: u32| {
+                                    output
+                                        .get(offset as usize..offset as usize + 8)
+                                        .and_then(|bytes| bytes.try_into().ok())
+                                        .map(u64::from_le_bytes)
+                                        .map(Ref64::from_u64)
+                                };
+                                match (read_ref(future_offset), read_ref(value_offset)) {
+                                    (Some(future), Some(value)) => {
+                                        lane.resolve_future(process, future, value).map(|_| ())
+                                    }
+                                    _ => Err(crate::kernel::RuntimeError::InvalidModule),
+                                }
+                            }
+                            None => Ok(()),
+                        };
+                        if frame_written && effect_result.is_ok() {
+                            StepResult::complete()
+                        } else {
+                            StepResult::fault(process, run_class)
                         }
                     }
                     _ => StepResult::fault(process, run_class),
@@ -541,6 +568,29 @@ impl Kernel {
                 object: frame,
                 growable: true,
             });
+            if let Some(crate::kernel::FrameEvaluatorEffect::ResolveFuture {
+                future_offset,
+                value_offset,
+            }) = self.frame_evaluator_effects.get(&input.run_class).copied()
+            {
+                let read_ref = |offset: u32| {
+                    output_frame
+                        .get(offset as usize..offset as usize + 8)
+                        .and_then(|bytes| bytes.try_into().ok())
+                        .map(u64::from_le_bytes)
+                        .map(Ref64::from_u64)
+                };
+                let future = read_ref(future_offset)?;
+                let value = read_ref(value_offset)?;
+                journal.write(Resource::Future(future));
+                journal.read(Resource::Object(value));
+                journal.push(LaneOperation::ResolveFuture {
+                    actor: process,
+                    future,
+                    value,
+                    result: Ok(()),
+                });
+            }
             let device_operations = journal.device_operations(input.lane)?;
             outcomes.push(SpeculativeLane {
                 lane: input.lane,

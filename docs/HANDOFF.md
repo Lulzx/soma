@@ -51,8 +51,12 @@ placement field with the independent reference lowering. This is the planning
 phase. `MetalResidentSearch` additionally runs a dynamic branching workload to
 quiescence across several device-resident epochs in one command graph, with no
 intermediate host read, stable device-side run-class placement, exact cohort
-accounting, and CPU digest agreement. General lane execution and canonical
-commit still need device lowering. See `docs/DEVICE-SCHEDULER.md`.
+accounting, and CPU digest agreement. Newer standalone graphs add installed
+frame handlers, a competent generic persistent-worker control, and a bounded
+future/mailbox executive whose CPU oracle and one-command-buffer Metal lowering
+match exact frames, resources, journals, trace, and width-1/32 results. These
+are not wired to normal `Kernel` Phase G; general lane execution and canonical
+commit still need integration. See `docs/DEVICE-SCHEDULER.md`.
 
 Distributed work starts in `distributed::authority`. `RemoteRef` separates
 cluster node identity from allocator partition, while signed `RemoteGrant`s
@@ -69,18 +73,21 @@ Process descriptors now carry node ownership. `Kernel::declare_node_lost` is a
 system-only epoch-boundary decision that contains live work and reports
 `ExitReason::NodeLost` without fabricating `ProcessFailed`; see
 `tests/node_loss.rs`.
-`tests/distributed_equivalence.rs` is the non-vacuity placement gate: the
-streaming graph has two remote channel edges and every supervision-tree edge is
-remote, with I18 equivalence under failure, escalation, and restart. The queues
-remain coordinator-owned; authenticated stateful journals are still pending.
+`tests/distributed_equivalence.rs` remains the coordinator-placement
+non-vacuity gate. Newer owner services keep future, bounded-channel, object, and
+terminal-supervision state on the named node; two real Kernel owner threads park
+and wake through future/channel bridges, and signed sequenced SEND commits into
+the real owner inbox using a node-qualified immutable envelope. These are still
+configured resource hooks, not generic remote `LaneView` execution or durable
+remote process lifecycle/recovery.
 
 Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
 Repository: https://github.com/Lulzx/soma. The default semantic core is
-dependency-free. There are 410 default tests, seven additional tests behind the
-`metal` feature, seven compile-fail doc tests, and no Clippy warnings. The optional `metal`
-feature adds the `metal-rs` implementation dependency on macOS.
+dependency-free. The optional `metal` feature adds the `metal-rs` implementation
+dependency on macOS. Use the current test runner and release-audit log rather
+than the historical test counts in older revisions.
 
 ```sh
 cargo test
@@ -427,16 +434,16 @@ Added in v0.3:
 ### Semantic boundary
 
 No entity or invariant named by `SOMA-v0.2.md` remains absent, and v0.3 §1–§3
-are implemented and checked, as are §4.1, §4.2 and §4.4. A device-resident
-scheduler, a distributed implementation, and hardware performance results remain
-beyond conformance — scoped in v0.3 §4–§6, and not guarantees silently claimed
-by the current machine. In particular, admission is order-independent, the
-trace's order is reconstructible from position, and bin entries are applied
-rather than performed — but *execution* is still not reorderable. The applier
-runs at the end of each lane, and everything other than bin entry (mailboxes,
-futures, capability spaces, the object tables) is still written as the step
-runs, so what a lane observes depends on when it ran. Canonical commit is what
-would change that, and it is not done.
+are implemented and checked. Since this original handoff, the repository has
+added speculative isolated lane execution with whole-epoch conflict validation
+and canonical replay, real-Metal resident scheduler/evaluator slices,
+authenticated remote execution/resource ownership prototypes, and hardware
+measurements. Those are executable milestones, not completion of the broader
+GPU-OS claim: the normal `Kernel` Metal path still round-trips each epoch and
+commits canonical tables on the host, remote services are not yet a runtime of
+multiple owning kernels, and the end-to-end scalar ant result is negative. See
+`DREAM-COMPLETION.md` for the current gates rather than treating this historical
+boundary as current status.
 
 ---
 

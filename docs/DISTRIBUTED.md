@@ -88,15 +88,61 @@ controls cover apply-once retry, revocation, competing operations, node
 unavailable/lost/protocol distinctions, and invariant legality before and after
 wake.
 
+`RemoteObjectService` extends owner-side canonical state to growable bytes.
+Reads and optimistic versioned replace/append writes use live READ/WRITE grants;
+successful writes are content-addressed and apply once, but authorization is
+rechecked before replay. Competing writers cannot both commit one version, a
+stale version cannot overwrite newer bytes, frames are bounded, and tests prove
+that the client kernel's object table never gains a shadow descriptor.
+
+`RemoteSupervisionService` publishes one immutable terminal outcome at the
+child-owner, including failure count, owner epoch, and restart lineage. A
+supervisor observes only at an epoch boundary. Its bridge retains the remote
+receipt privately, wakes an already registered local supervision waiter, and
+supports notify/escalate without putting the foreign child reference into an
+ordinary `SupervisionNotice` or ABI field; I1/I15 are checked before delivery,
+after wake, and after receipt consumption. Cross-node restart remains explicitly
+owner-orchestrated because replacement identity and state cannot be fabricated
+by the observing kernel.
+
+`RemoteNodeRuntime` is the first narrow composition of those pieces around real
+kernel epoch loops. In its future-only smoke, two runtimes bind to different
+owner threads: a producer continuation completes on the owner kernel, a
+configured post-continuation hook performs an apply-once TCP resolution, and a
+consumer parked in the other kernel wakes at its next authoritative boundary
+and executes exactly once. The canonical future service is adjacent to, not a
+descriptor inside, the owner kernel; both kernels prove zero local future
+copies and remain invariant-legal. The server registry has explicit shutdown
+rather than guessed request counts. The runtime now also registers owner-side bounded channel services, scheduling
+bridges, and configured post-continuation send/receive hooks. Two owner threads
+exercise capacity-one back-pressure, operation-specific grants, duplicate-safe
+send, park/wake/receive, owner loss, and exact local terminal outcomes while
+both kernels retain zero channel descriptors. This removes the single coordinator from those future/channel smokes. Signed,
+sequenced mailbox ingress now stages at the transport thread and commits only
+on the owner runtime thread into the real `Kernel` inbox. The local descriptor
+uses `SYSTEM_PRINCIPAL`; a single immutable payload envelope retains the
+node-qualified remote actor, remote sequence, bytes, and optional transferable
+grant, and its transferred capability targets that same local payload. Live
+authorization precedes replay, back-pressure remains staged, urgent/normal FIFO
+is canonical, exact retries apply once, and two issuer nodes with identical
+actor bits cannot alias. Remote future/channel waiter receipts are likewise
+matched privately by `(node, entity)`, so a stale wake from a colliding node is
+a no-op and no foreign reference enters an ABI dependency field. These are
+executable owner-boundary slices, but they are not yet a generic remote
+`LaneView`: effects are configured hooks, endpoints are resource-specific, and
+remote process creation/restart, persistence, and recovery remain open.
+
 This validator is wired directly into `Kernel::run_epoch_with_lane_validator`.
 A clean remote decision permits canonical coordinator commit. A conflict or
 transport error discards every speculative snapshot and takes the reference
 path before an operation or payload escapes. Tests exercise both a disjoint
 epoch that commits with an I18-equivalent trace and two future writers that
-fall back. The worker now receives the complete speculative operation payload,
-but operation replay and authoritative queue/future state remain on the
-coordinator. Node loss before that replay therefore discards the journal; the
-remote worker cannot make an operation visible by accepting its bytes.
+fall back. The worker now receives the complete speculative operation payload, but in
+this *remote-journal path* operation replay and canonical application resources
+remain on the coordinator. Node loss before replay therefore discards the
+journal; the worker cannot make an operation visible merely by accepting its
+bytes. This is distinct from the owner-side future/channel/object services
+above, whose state is intentionally remote.
 
 ## Failure semantics
 
@@ -138,11 +184,12 @@ four supervisor/child edges are remote, and covers notify, escalation, and
 restart. Every run is legal, has the same outcome, and is I18-equivalent.
 
 This is a non-vacuous semantic placement test. Complete stateful journals now
-cross an authenticated remote boundary and gate real epoch commit, but one
-coordinator kernel still owns and replays the channel, future, and supervision
-operations. Moving authoritative resource ownership to several kernels would
-be a stronger distributed machine; it is not required for this backend's
-speculative-execute/central-canonical-commit model and is not claimed here.
+cross an authenticated remote boundary and gate real epoch commit, but that
+legacy placement control still uses one coordinator kernel for canonical
+application replay. The newer owner-side services demonstrate remote canonical
+resources, not a runtime of multiple owning kernels. The narrow
+speculative-execute/central-commit backend does not require that stronger
+machine; the GPU-OS completion gate explicitly does, and it remains open.
 
 ## Completion evidence
 

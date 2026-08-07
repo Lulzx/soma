@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{types, AbiParam, Block, InstBuilder, MemFlags, UserFuncName, Value};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -627,21 +627,30 @@ fn lower_op(
         Op::Add(a, b) => builder.ins().iadd(values[a as usize], values[b as usize]),
         Op::Sub(a, b) => builder.ins().isub(values[a as usize], values[b as usize]),
         Op::Mul(a, b) => builder.ins().imul(values[a as usize], values[b as usize]),
-        Op::FAdd(a, b) | Op::FMul(a, b) => {
-            let left_bits = canonical_f32_value(builder, values[a as usize]);
-            let right_bits = canonical_f32_value(builder, values[b as usize]);
-            let left32 = builder.ins().ireduce(types::I32, left_bits);
-            let right32 = builder.ins().ireduce(types::I32, right_bits);
-            let left = builder.ins().bitcast(types::F32, MemFlags::new(), left32);
-            let right = builder.ins().bitcast(types::F32, MemFlags::new(), right32);
-            let result = if matches!(op, Op::FAdd(_, _)) {
-                builder.ins().fadd(left, right)
-            } else {
-                builder.ins().fmul(left, right)
+        Op::FAdd(a, b) | Op::FSub(a, b) | Op::FMul(a, b) | Op::FDiv(a, b) => {
+            let (left, right) = float_operands(builder, values[a as usize], values[b as usize]);
+            let result = match op {
+                Op::FAdd(_, _) => builder.ins().fadd(left, right),
+                Op::FSub(_, _) => builder.ins().fsub(left, right),
+                Op::FMul(_, _) => builder.ins().fmul(left, right),
+                Op::FDiv(_, _) => builder.ins().fdiv(left, right),
+                _ => unreachable!(),
             };
             let raw32 = builder.ins().bitcast(types::I32, MemFlags::new(), result);
             let raw = builder.ins().uextend(types::I64, raw32);
             canonical_f32_value(builder, raw)
+        }
+        Op::FCmpEq(a, b) | Op::FCmpLt(a, b) => {
+            let (left, right) = float_operands(builder, values[a as usize], values[b as usize]);
+            let condition = if matches!(op, Op::FCmpEq(_, _)) {
+                FloatCC::Equal
+            } else {
+                FloatCC::LessThan
+            };
+            let compared = builder.ins().fcmp(condition, left, right);
+            let one = builder.ins().iconst(types::I64, 1);
+            let zero = builder.ins().iconst(types::I64, 0);
+            builder.ins().select(compared, one, zero)
         }
         Op::And(a, b) => builder.ins().band(values[a as usize], values[b as usize]),
         Op::Or(a, b) => builder.ins().bor(values[a as usize], values[b as usize]),
@@ -676,6 +685,16 @@ fn lower_op(
                 .ins()
                 .select(condition, values[yes as usize], values[no as usize])
         }
+        Op::FSelect(condition, yes, no) => {
+            let condition = builder
+                .ins()
+                .icmp_imm(IntCC::NotEqual, values[condition as usize], 0);
+            let selected =
+                builder
+                    .ins()
+                    .select(condition, values[yes as usize], values[no as usize]);
+            canonical_f32_value(builder, selected)
+        }
         Op::Get(local) => builder.use_var(locals[local as usize]),
         Op::Set(local, value) => {
             let value = values[value as usize];
@@ -687,6 +706,17 @@ fn lower_op(
         }
     };
     Ok(value)
+}
+
+fn float_operands(builder: &mut FunctionBuilder<'_>, left: Value, right: Value) -> (Value, Value) {
+    let left = canonical_f32_value(builder, left);
+    let right = canonical_f32_value(builder, right);
+    let left = builder.ins().ireduce(types::I32, left);
+    let right = builder.ins().ireduce(types::I32, right);
+    (
+        builder.ins().bitcast(types::F32, MemFlags::new(), left),
+        builder.ins().bitcast(types::F32, MemFlags::new(), right),
+    )
 }
 
 fn canonical_f32_value(builder: &mut FunctionBuilder<'_>, raw: Value) -> Value {

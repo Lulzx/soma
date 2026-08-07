@@ -1,0 +1,38 @@
+SOMA resident dynamic grouped-vs-generic exploratory benchmark
+Date: 2026-08-07
+Base revision: fcaf6cb plus current resident dynamic working changes
+Machine: Apple M4 Pro, aarch64 macOS, release profile, non-isolated local run
+Command: cargo run --release --features metal --example resident_dynamic_bench
+
+Workload: 8 bounded steps; two classes; 32 useful ALU rounds per specialized
+handler; the competent generic handler contains both counted bodies and uses a
+head break_if so each lane skips irrelevant work. Six samples alternate grouped
+and generic order. All paths compare exact final frames and canonical trace to
+a CPU class-bucket-per-level oracle. One-class, 8-submit level-sync, and 8-batch
+low-arrival are real device controls. Times are microseconds.
+
+Important negative conclusion: the final 16K sample has a descriptive grouped
+advantage, but independent release runs produced grouped/generic median ratios
+1.061, 0.890, 1.233, and 0.768 (direction changes). The effect is not
+reproducible and is not G5 evidence. CPU/Metal clocks, cold state, and local
+contention were not isolated. Raw final alternating sample follows.
+
+lanes,sample,first,cpu_bucket_us,grouped_us,generic_ungrouped_us,device_one_class_us,multisubmit_level_us,low_arrival_us,grouped_submits,generic_submits,level_submits,arrival_submits,exact
+1024,0,grouped,2084,3233,677,546,3058,6533,1,1,8,8,true
+1024,1,generic,2109,3116,1042,524,2362,6566,1,1,8,8,true
+1024,2,grouped,1971,1031,1757,1660,2358,7637,1,1,8,8,true
+1024,3,generic,1980,885,688,506,3465,7500,1,1,8,8,true
+1024,4,grouped,1999,783,653,493,2304,6248,1,1,8,8,true
+1024,5,generic,2119,729,975,481,2436,5300,1,1,8,8,true
+4096,0,grouped,7833,1406,1022,1914,3099,7888,1,1,8,8,true
+4096,1,generic,7664,1069,1821,861,3955,6010,1,1,8,8,true
+4096,2,grouped,7895,1413,1025,1245,3579,7747,1,1,8,8,true
+4096,3,generic,7983,1129,2142,728,4310,5384,1,1,8,8,true
+4096,4,grouped,7913,1095,991,768,3599,8065,1,1,8,8,true
+4096,5,generic,7741,1066,1193,729,4288,5528,1,1,8,8,true
+16384,0,grouped,31375,2795,2738,3814,6370,9393,1,1,8,8,true
+16384,1,generic,31572,2967,4251,4071,6371,9536,1,1,8,8,true
+16384,2,grouped,31243,4989,2374,2291,4797,10671,1,1,8,8,true
+16384,3,generic,31254,2476,4523,1981,4818,10219,1,1,8,8,true
+16384,4,grouped,31480,6042,3406,3767,5364,9859,1,1,8,8,true
+16384,5,generic,31318,2911,4411,1921,4963,10060,1,1,8,8,true

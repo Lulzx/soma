@@ -1,0 +1,34 @@
+SOMA ant collective end-to-end wall benchmark
+Date: 2026-08-07
+Base revision: fcaf6cb plus ant collective benchmark/current working changes
+Machine: Apple M4 Pro, aarch64 macOS, release profile, non-isolated local run
+Commands:
+  cargo run --release --features metal --example ant_collective_bench -- 3
+  target/release/examples/ant_collective_bench --full 2
+
+Order rotates host-reference, CPU-collective, and real Metal-collective. Wall
+includes backend construction, fresh colony setup, all persistent ant/colony/world
+steps, and exact final observation. backend_ns is only independent host sensing
+or the physical collective backend call; host_ns=wall-setup-backend. Exact-world
+comparison covers all persistent object bytes (frames, deposits, summaries, terrain,
+and both fields), ant views, accounting, and pending count. No speedup is claimed. Raw samples:
+
+SOMA ant collective wall benchmark: ants=256 epochs=40 trials=3
+host-reference   median_ms=35.066 wall_ns=37773541,35066042,34910500 setup_ns=761333,521583,553125 backend_ns=121414,107873,107457 host_ns=36890794,34436586,34249918
+cpu-collective   median_ms=49.277 wall_ns=49999333,49277416,47904125 setup_ns=547708,532416,489209 backend_ns=3979833,3840335,3728791 host_ns=45471792,44904665,43686125
+metal-collective median_ms=57.226 wall_ns=91088000,55779958,57226250 setup_ns=35130417,2767500,3318000 backend_ns=10259793,8303044,9018207 host_ns=45697790,44709414,44890043
+identical_world=true
+
+SOMA ant collective wall benchmark: ants=10000 epochs=260 trials=3
+host-reference   median_ms=28273.677 wall_ns=32936541584,28273677375,25545440625 setup_ns=34845125,21996791,20718208 backend_ns=47707917,39874921,33173331 host_ns=32853988542,28211805663,25491549086
+cpu-collective   median_ms=36714.613 wall_ns=36714612667,37632739625,34349115209 setup_ns=30502292,33239417,20639709 backend_ns=1340029625,1327109958,1045945422 host_ns=35344080750,36272390250,33282530078
+metal-collective median_ms=34742.018 wall_ns=31422877292,37101245083,34742018167 setup_ns=46883042,20507292,20941125 backend_ns=127934628,141401966,125312011 host_ns=31248059622,36939335825,34595765031
+identical_world=true
+
+Full-run medians (descriptive only; non-isolated n=3): Metal physical-backend
+call is 10.4x faster than CPU collective (0.128s vs 1.327s), but it is 3.2x
+slower than the independent host sensing loop (0.128s vs 0.040s). Full Metal
+wall is 1.23x host-reference wall (34.742s vs 28.274s), not a speedup. Its
+remaining host work is 99.6% of wall time. Metal wall is 0.95x CPU-collective
+wall in this sample, but the raw ranges overlap substantially; no full-wall
+backend ordering is claimed from three non-isolated samples.

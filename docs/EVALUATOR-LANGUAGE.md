@@ -66,6 +66,7 @@ end
 field u8|u16|u32|u64|f32
 aux u8|u16|u32|u64|f32
 local NAME
+local f32 NAME
 
 let NAME = call FUNCTION [ARGUMENT ...]
 let NAME = load FIELD
@@ -76,7 +77,9 @@ let NAME = const INTEGER
 let NAME = fconst FLOAT_OR_0xBITS
 let NAME = get LOCAL
 let NAME = add|sub|mul|and|or|xor|shl|shr A B
-let NAME = fadd|fmul A B
+let NAME = fadd|fsub|fmul|fdiv A B
+let NAME = feq|flt A B
+let NAME = fselect INTEGER_CONDITION FLOAT_YES FLOAT_NO
 let NAME = eq|lt A B
 let NAME = select CONDITION YES NO
 
@@ -105,22 +108,30 @@ bound frozen auxiliary array. Dynamic indices clamp to the final element.
 Integer arithmetic wraps at 64 bits, integer stores truncate to the destination
 field width, and shifts mask their amount to six bits. Binary32 values are
 stored as four little-endian IEEE-754 bytes. `fconst` accepts a decimal value
-or an exact `0x` bit pattern; `fadd` and `fmul` round each operation to f32,
+or an exact `0x` bit pattern; `fadd`, `fsub`, `fmul`, and `fdiv` round each operation to f32,
 canonicalize every NaN to `0x7fc00000`, and canonicalize both signed zeros and
 all subnormal inputs/results to `+0` (the explicit flush-to-zero boundary needed
-for Apple GPU equivalence). Metal fast math is disabled, and the Cranelift lowering uses distinct
-strict f32 instructions. Float-producing stores repeat the canonicalization,
+for Apple GPU equivalence). Metal fast math is disabled, and the Cranelift lowering uses distinct strict
+f32 instructions. Float-producing stores repeat the canonicalization,
 so loaded non-canonical NaNs cannot leak through an output field. These are
 language semantics shared by every backend, not backend-specific conveniences.
 
 Validation tracks integer versus f32 values. Integer operations and control
 conditions reject floats, float operations reject integers, gather indices are
 integers, and a store must match the destination field kind. Existing untyped
-locals remain integer locals. The intentionally bounded first f32 slice is
-`fconst`, `fadd`, `fmul`, loads/gathers, and stores. Float subtraction,
-division, comparisons, float select, and float locals are not yet admitted;
-they remain explicit follow-up work rather than silently inheriting host or GPU
-semantics.
+locals remain integer locals. The bounded f32 surface is `fconst`, arithmetic,
+ordered `feq`/`flt`,
+`fselect`, loads/gathers, and stores. Division by zero follows IEEE binary32 and
+is total: nonzero/zero produces signed infinity and zero/zero produces the
+canonical NaN. Comparisons involving NaN are false; comparison results and
+`fselect` conditions are ordinary integer booleans.
+
+Locals are explicitly typed without changing existing source: `local NAME`
+remains an integer local initialized to integer zero, while `local f32 NAME` is
+a binary32 local initialized to canonical `+0`. `get` produces the declared
+kind and `set` must consume it, including across loop iterations. Programmatic
+IR construction uses `EvaluatorProgram::bound_typed` and `LocalKind`; the
+existing count-based constructors continue to create integer locals.
 
 ## Compilation and validation
 

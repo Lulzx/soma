@@ -481,6 +481,58 @@ impl RemoteChannelServer {
         }
         Ok(())
     }
+
+    /// Serve until the owning node runtime requests shutdown, without relying
+    /// on an exact request budget.
+    pub fn serve_until(
+        listener: TcpListener,
+        service: Arc<Mutex<RemoteChannelService>>,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<()> {
+        use std::sync::atomic::Ordering;
+        listener.set_nonblocking(true)?;
+        while !shutdown.load(Ordering::Acquire) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            stream.set_nonblocking(false)?;
+            stream.set_read_timeout(Some(Duration::from_millis(20)))?;
+            while !shutdown.load(Ordering::Acquire) {
+                let frame = match read_frame(&mut stream) {
+                    Ok(frame) => frame,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                        ) =>
+                    {
+                        break
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue
+                    }
+                    Err(error) => return Err(error),
+                };
+                let response = service
+                    .lock()
+                    .map_err(|_| std::io::Error::other("remote channel service poisoned"))?
+                    .handle(&frame)
+                    .encode();
+                write_frame(&mut stream, &response)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct RemoteChannelClient {
@@ -504,6 +556,10 @@ impl RemoteChannelClient {
     pub fn set_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout
     }
+    pub fn target(&self) -> RemoteRef {
+        self.grant.target
+    }
+
     pub fn send(
         &self,
         sender_sequence: u64,
@@ -630,6 +686,7 @@ pub struct RemoteChannelBridge {
     send_waiters: Vec<Ref64>,
     receive_waiters: Vec<Ref64>,
     last_epoch: Option<u32>,
+    contacted_owner: bool,
 }
 impl RemoteChannelBridge {
     pub fn new(
@@ -644,6 +701,7 @@ impl RemoteChannelBridge {
             send_waiters: Vec::new(),
             receive_waiters: Vec::new(),
             last_epoch: None,
+            contacted_owner: false,
         }
     }
     pub fn register(
@@ -661,7 +719,12 @@ impl RemoteChannelBridge {
             return Ok(());
         }
         kernel
-            .register_remote_channel_waiter(continuation, self.target.entity, next_run_class)
+            .register_remote_channel_waiter(
+                continuation,
+                self.target.node.0,
+                self.target.entity,
+                next_run_class,
+            )
             .map_err(RemoteChannelBridgeError::Kernel)?;
         waiters.push(continuation);
         Ok(())
@@ -676,22 +739,33 @@ impl RemoteChannelBridge {
         }
         self.send_client.set_epoch(epoch);
         self.receive_client.set_epoch(epoch);
-        let send = self
-            .send_client
-            .probe_send()
-            .map_err(RemoteChannelBridgeError::Remote)?;
-        let receive = self
-            .receive_client
-            .probe_receive()
-            .map_err(RemoteChannelBridgeError::Remote)?;
+        let send = self.send_client.probe_send().map_err(|error| {
+            RemoteChannelBridgeError::Remote(
+                if self.contacted_owner && error == RemoteChannelError::NodeUnavailable {
+                    RemoteChannelError::NodeLost
+                } else {
+                    error
+                },
+            )
+        })?;
+        self.contacted_owner = true;
+        let receive = self.receive_client.probe_receive().map_err(|error| {
+            RemoteChannelBridgeError::Remote(
+                if self.contacted_owner && error == RemoteChannelError::NodeUnavailable {
+                    RemoteChannelError::NodeLost
+                } else {
+                    error
+                },
+            )
+        })?;
         if matches!(send, Status::Ready | Status::Closed) {
             for w in self.send_waiters.drain(..) {
-                kernel.wake_remote_channel_waiter(w, self.target.entity)
+                kernel.wake_remote_channel_waiter(w, self.target.node.0, self.target.entity)
             }
         }
         if matches!(receive, Status::Ready | Status::Closed) {
             for w in self.receive_waiters.drain(..) {
-                kernel.wake_remote_channel_waiter(w, self.target.entity)
+                kernel.wake_remote_channel_waiter(w, self.target.node.0, self.target.entity)
             }
         }
         self.last_epoch = Some(epoch);

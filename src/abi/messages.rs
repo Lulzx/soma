@@ -3,6 +3,10 @@
 use super::refs::Ref64;
 use super::AbiHeader;
 
+/// A priority message is drained before normal traffic; FIFO order is retained
+/// within each priority class.
+pub const MESSAGE_FLAG_URGENT: u32 = 1 << 0;
+
 /// Message descriptor (§11). Phase-1 guarantees: at-most-once delivery, ordered
 /// delivery per sender–receiver pair, release on committed send, acquire on
 /// receive.

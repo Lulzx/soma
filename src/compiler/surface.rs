@@ -14,7 +14,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::body::{BodyError, ElementLayout, EvaluatorProgram, FieldWidth, Op, Store, MAX_STEPS};
+use super::body::{
+    BodyError, ElementLayout, EvaluatorProgram, FieldWidth, LocalKind, Op, Store, MAX_STEPS,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SurfaceErrorKind {
@@ -74,6 +76,7 @@ pub fn compile_evaluator(
     let mut fields = Vec::new();
     let mut aux_fields = Vec::new();
     let mut locals: HashMap<String, u32> = HashMap::new();
+    let mut local_kinds = Vec::new();
     let mut values: HashMap<String, u32> = HashMap::new();
     let mut ops = Vec::new();
     let mut stores = Vec::new();
@@ -92,6 +95,17 @@ pub fn compile_evaluator(
                     ));
                 }
                 locals.insert((*local).to_string(), locals.len() as u32);
+                local_kinds.push(LocalKind::Integer);
+            }
+            ["local", "f32", local] => {
+                if locals.contains_key(*local) || values.contains_key(*local) {
+                    return Err(SurfaceError::at(
+                        line_number,
+                        SurfaceErrorKind::DuplicateName,
+                    ));
+                }
+                locals.insert((*local).to_string(), locals.len() as u32);
+                local_kinds.push(LocalKind::F32);
             }
             ["repeat", trips] => {
                 push_op(
@@ -139,12 +153,12 @@ pub fn compile_evaluator(
     }
 
     let aux = (!aux_fields.is_empty()).then(|| ElementLayout::new(aux_fields));
-    EvaluatorProgram::bound(
+    EvaluatorProgram::bound_typed(
         id,
         name,
         ElementLayout::new(fields),
         aux,
-        locals.len() as u32,
+        local_kinds,
         ops,
         stores,
     )
@@ -368,7 +382,11 @@ fn parse_expression(
         ["sub", a, b] => binary(values, a, b, line, Op::Sub)?,
         ["mul", a, b] => binary(values, a, b, line, Op::Mul)?,
         ["fadd", a, b] => binary(values, a, b, line, Op::FAdd)?,
+        ["fsub", a, b] => binary(values, a, b, line, Op::FSub)?,
         ["fmul", a, b] => binary(values, a, b, line, Op::FMul)?,
+        ["fdiv", a, b] => binary(values, a, b, line, Op::FDiv)?,
+        ["feq", a, b] => binary(values, a, b, line, Op::FCmpEq)?,
+        ["flt", a, b] => binary(values, a, b, line, Op::FCmpLt)?,
         ["and", a, b] => binary(values, a, b, line, Op::And)?,
         ["or", a, b] => binary(values, a, b, line, Op::Or)?,
         ["xor", a, b] => binary(values, a, b, line, Op::Xor)?,
@@ -377,6 +395,11 @@ fn parse_expression(
         ["eq", a, b] => binary(values, a, b, line, Op::CmpEq)?,
         ["lt", a, b] => binary(values, a, b, line, Op::CmpLt)?,
         ["select", condition, yes, no] => Op::Select(
+            value(values, condition, line)?,
+            value(values, yes, line)?,
+            value(values, no, line)?,
+        ),
+        ["fselect", condition, yes, no] => Op::FSelect(
             value(values, condition, line)?,
             value(values, yes, line)?,
             value(values, no, line)?,

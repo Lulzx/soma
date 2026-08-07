@@ -168,6 +168,109 @@ placement-neutrality check. A second end-to-end test runs real `Kernel` epochs
 through this backend and checks canonical frame publication plus I18 trace
 conformance and byte-identical I19 kernel/device traces. The older branching
 search remains as the dynamic frontier/placement stress case; expanding
-compiled handlers to allocation, mailbox, future, and child-publication
+compiled handlers to allocation, mailbox, await, and child-publication
 operations is the remaining vocabulary work, not installation of a hardcoded
 search transition.
+
+
+### Resident future resolution
+
+The next exact effect subset is future resolution. A user frame handler may
+bind two validated u64 fields as the future and value references. Both the CPU
+continuation path and resident Metal path evaluate the private frame first,
+then emit the exact `OP_RESOLVE_FUTURE` record plus future-write/value-read
+accesses. Successful independent lanes pass disposable validation and resolve
+through canonical replay; two lanes targeting one future are rejected by the
+ordinary journal conflict rule and the whole epoch falls back before any
+resident result commits. Tests cover real-Kernel CPU/Metal I18, cohort-width
+I19, exact future values and frames, committed-device statistics, and the
+conflict/fallback path.
+
+
+### Standalone dynamic multi-handler graph
+
+`run_dynamic_frame_graph` is now a standalone no-intermediate-read smoke for two
+installed general evaluator handlers. A deterministic device pack pass compacts
+only active lanes of each run class, binds the resulting device count directly
+to the evaluator, and scatters by stable rank. Evaluator output drives
+Yield/Complete and the next run class; unknown classes are rejected in the same
+transition, including on the last bounded dispatch. Active/class state,
+per-lane trace slots, invocation counters, and quiescence stay resident for one
+command-buffer submission and one final host read. Width 1 and 32 select real
+Metal threadgroup widths, while counters prove inactive and wrong-class lanes
+do not logically invoke a handler. The initial stable pack is deliberately
+O(N^2); replacing it with a prefix scan is performance work, not a semantic
+requirement.
+
+This graph is not yet the normal multi-step `Kernel` executive. The ordinary
+`run_epoch_with_device_backend` path still invokes one frame step per epoch and
+per host submission. Therefore these results establish dynamic device frontier,
+rebin, quiescence, and trace correspondence only for the standalone graph; they
+do not claim general resident Kernel completion until final frames/status and
+journals are wired through one canonical Kernel commit.
+
+
+`examples/resident_dynamic_bench.rs` is an exploratory release harness. Its
+original O(N^2)-pack run was negative at every sampled scale. An audit found
+that several CPU-only repeat samples had been mislabeled as genuine controls;
+those labels are removed rather than used for any G5 conclusion.
+
+#### Atomic compaction and exploratory scaling
+
+Because installed resident handlers reject gather/aux and are pure element-wise,
+within-class physical order is not semantic. Packing now resets a device count
+and uses `atomic_fetch_add`; the rank is carried only to scatter that element
+back to its original lane. Trace slots remain keyed by original lane. Repeated
+width-1 and width-32 tests prove different atomic packing orders preserve exact
+frames, traces, and I19. If cross-lane reads are ever admitted, a stable
+partition must return.
+
+The benchmark labels were corrected after audit. `cpu_repeat` and
+`cpu_one_program` remain explicitly exploratory placeholders, not genuine
+sorted-bulk or device one-class controls. `resident_level_sync` is now a real
+16-submission Metal control, and `resident_low_arrival` is eight real resident
+batch submissions; dynamic initial classes are loaded from each input frame so
+multi-submit execution preserves device-produced rebin state.
+
+| lanes | CPU | CPU repeat | resident w1 | resident w32 | CPU one-program | resident level-sync | resident low-arrival |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 382 | 368 | 2689 | 847 | 311 | 4033 | 5221 |
+| 4096 | 1334 | 1329 | 1678 | 1494 | 1305 | 5496 | 6017 |
+| 16384 | 5305 | 5418 | 4658 | 4412 | 5091 | 9669 | 13655 |
+
+All rows remained exact with one resident submission. The 16K parity/crossover
+is a useful regime lead, but genuine CPU class buckets, a generic-device persistent worker, resident
+one-class nulls, and repeated raw/median samples are still required.
+
+
+`run_dynamic_ungrouped_frame_graph` supplies the same-device persistent-worker
+baseline: it atomically compacts all active lanes without class grouping and
+runs one generic installed handler. The correspondence test uses a competent
+generic body with two class-specific counted loops and `break_if` at each loop
+head, while grouped handlers contain only their relevant loop. Thus divergence
+cost is measured without forcing a branchless generic handler to do work it
+could skip. Generic and grouped Metal runs match exact final frames, trace, steps, and
+quiescence. The release harness now adds a genuine CPU class-bucket oracle,
+device one-class, eight-submit level-sync, low-arrival, six alternating samples,
+and submission counts. Its 16K grouped/generic direction reversed across
+independent runs (ratios 1.061, 0.890, 1.233, and 0.768), so the apparent
+crossover is not reproducible and is still not a G5 claim. Raw final samples
+are in `measurements/RESIDENT-DYNAMIC-M4-PRO-2026-08-07.txt`.
+
+### Resident synchronization ABI oracle
+
+`executives::resident_sync` defines the standalone CPU oracle and bounded,
+pointer-free handler bytecode for the next functional slice. Installed state
+machines emit future await/resolve and mailbox send/receive effects; an
+executive-owned resource table applies them in canonical lane order, parks and
+wakes continuations across logical epochs, and records exact
+operation/access/trace journals. `executives::metal_resident_sync` lowers that
+contract to one real command buffer with device-owned frames, effects,
+futures, mailboxes, FIFO waiter tickets, retry/rebin state, and quiescence. Its
+two device phases emit every sorted handler result before canonical table
+mutation; a single elected thread preserves deterministic application while
+real width-1/32 threadgroup shapes provide I19 controls. CPU and M4 Metal match
+exactly for future wake, successful mailbox delivery, authority and target
+refusals, frame bytes, resources, journals, trace, and completion. This remains
+a standalone backend: it is not wired to `Kernel` Phase G and therefore is not
+yet the general P1 path or performance evidence.

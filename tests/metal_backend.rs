@@ -425,3 +425,43 @@ fn an_epoch_publishes_exactly_what_running_its_collectives_one_at_a_time_does() 
         "an epoch completed its collectives in a different order"
     );
 }
+
+#[test]
+fn reinstalling_same_id_with_different_code_replaces_the_pipeline() {
+    use soma::compiler::surface::compile_evaluator;
+
+    let first = compile_evaluator(
+        49_900,
+        "install-first",
+        "field u32
+let x = load 0
+let two = const 2
+let y = mul x two
+store 0 y
+",
+    )
+    .unwrap();
+    let replacement = compile_evaluator(
+        49_900,
+        "install-replacement",
+        "field u32
+let x = load 0
+let three = const 3
+let y = add x three
+store 0 y
+",
+    )
+    .unwrap();
+    let input = 7u32.to_le_bytes();
+    let mut metal = MetalBatchBackend::with(&[&first]).unwrap();
+    assert_eq!(
+        metal.evaluate(first.id(), &input, 1, 4).unwrap(),
+        14u32.to_le_bytes()
+    );
+    metal.install(&replacement).unwrap();
+    assert_eq!(
+        metal.evaluate(replacement.id(), &input, 1, 4).unwrap(),
+        10u32.to_le_bytes(),
+        "an evaluator id must not make different generated code look idempotent",
+    );
+}

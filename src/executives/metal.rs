@@ -14,6 +14,8 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 
+use sha2::{Digest, Sha256};
+
 use metal::{
     Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLCommandBufferStatus,
     MTLResourceOptions, MTLSize,
@@ -98,6 +100,9 @@ pub struct MetalBatchBackend {
     /// Pipeline, element stride, and aux element stride (zero when the body
     /// binds one array).
     pipelines: HashMap<u32, (ComputePipelineState, u32, u32)>,
+    /// Exact generated-source identity for safe idempotent installation. An
+    /// evaluator id is a lookup key, not permission to reuse different code.
+    pipeline_fingerprints: HashMap<u32, [u8; 32]>,
     /// Grown to the largest batch seen and then reused.
     ///
     /// This looks like a fixed cost and is not one. `new_buffer` itself is
@@ -109,6 +114,11 @@ pub struct MetalBatchBackend {
     /// three quarters, not a per-call saving, and it moves the fitted
     /// per-element cost rather than the intercept.
     scratch: Option<(Buffer, Buffer, u64)>,
+    /// Grown and reused independently because the sensing grid is usually much
+    /// larger than the per-ant element array. It is rewritten every epoch, but
+    /// allocating fresh shared pages every epoch is not part of that semantic
+    /// transfer.
+    aux_scratch: Option<(Buffer, u64)>,
     tuning: MetalTuning,
 }
 
@@ -124,7 +134,9 @@ impl MetalBatchBackend {
             device,
             queue,
             pipelines: HashMap::new(),
+            pipeline_fingerprints: HashMap::new(),
             scratch: None,
+            aux_scratch: None,
             tuning,
         })
     }
@@ -166,6 +178,23 @@ impl MetalBatchBackend {
         }
         let (input, output, _) = self.scratch.as_ref().expect("just populated");
         (input.clone(), output.clone())
+    }
+
+    fn aux_scratch_for(&mut self, bytes: u64) -> Buffer {
+        if !self.tuning.reuse_scratch_buffers {
+            return self
+                .device
+                .new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+        }
+        let big_enough = matches!(&self.aux_scratch, Some((_, capacity)) if *capacity >= bytes);
+        if !big_enough {
+            self.aux_scratch = Some((
+                self.device
+                    .new_buffer(bytes, MTLResourceOptions::StorageModeShared),
+                bytes,
+            ));
+        }
+        self.aux_scratch.as_ref().expect("just populated").0.clone()
     }
 
     fn threadgroup_width(&self, pipeline: &ComputePipelineState, elements: u32) -> u64 {
@@ -250,6 +279,18 @@ impl MetalBatchBackend {
                 .new_buffer(required as u64, MTLResourceOptions::StorageModeShared),
         };
 
+        // Acquire mutable scratch before borrowing the command queue below.
+        let aux_buffer = (aux_required > 0).then(|| self.aux_scratch_for(aux_required as u64));
+        if let Some(buffer) = &aux_buffer {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    aux.bytes.as_ptr(),
+                    buffer.contents().cast::<u8>(),
+                    aux_required,
+                );
+            }
+        }
+
         let command = self.queue.new_command_buffer();
         let encoder = command.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&pipeline);
@@ -272,13 +313,8 @@ impl MetalBatchBackend {
         // Bound to a name so the allocation outlives the dispatch below. The
         // encoder holds a reference the driver honours, but the Rust binding is
         // what stops the buffer being released before `wait_until_completed`.
-        let _aux_buffer = if aux_required > 0 {
-            let buffer = self.device.new_buffer_with_data(
-                aux.bytes.as_ptr().cast::<c_void>(),
-                aux_required as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
-            encoder.set_buffer(4, Some(&buffer), 0);
+        if let Some(buffer) = &aux_buffer {
+            encoder.set_buffer(4, Some(buffer), 0);
             encoder.set_bytes(
                 5,
                 std::mem::size_of::<u32>() as u64,
@@ -289,10 +325,7 @@ impl MetalBatchBackend {
                 std::mem::size_of::<u32>() as u64,
                 (&aux.element_stride as *const u32).cast::<c_void>(),
             );
-            Some(buffer)
-        } else {
-            None
-        };
+        }
         encoder.dispatch_threads(
             MTLSize {
                 width: element_count as u64,
@@ -339,6 +372,10 @@ impl BatchBackend for MetalBatchBackend {
 
     fn install(&mut self, program: &EvaluatorProgram) -> Result<(), BackendError> {
         let source = program.metal_source();
+        let fingerprint: [u8; 32] = Sha256::digest(source.as_bytes()).into();
+        if self.pipeline_fingerprints.get(&program.id()) == Some(&fingerprint) {
+            return Ok(());
+        }
         // I20 requires strict operation boundaries. In particular, f32
         // add/mul must not contract or reassociate into a different result.
         let options = CompileOptions::new();
@@ -358,6 +395,7 @@ impl BatchBackend for MetalBatchBackend {
             program.id(),
             (pipeline, program.stride(), program.aux_stride()),
         );
+        self.pipeline_fingerprints.insert(program.id(), fingerprint);
         Ok(())
     }
 

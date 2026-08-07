@@ -243,6 +243,25 @@ pub struct TraceSnapshotRow {
 /// let kernel = soma::kernel::Kernel::new();
 /// let _ = kernel.objects;
 /// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameEvaluatorEffect {
+    ResolveFuture {
+        future_offset: u32,
+        value_offset: u32,
+    },
+}
+
+/// Kernel-private identity for a remotely-owned scheduling dependency.
+///
+/// `Ref64` alone is not globally unique: different nodes can legitimately use
+/// identical entity bits. Keeping the node beside the entity also makes an old
+/// owner's wake receipt unable to match a continuation re-parked on a new one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RemoteWaiterDependency {
+    node: u64,
+    entity: Ref64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Kernel {
     epoch: u32,
@@ -322,10 +341,11 @@ pub struct Kernel {
     mailboxes: HashMap<u64, Mailbox>,
     /// Future waiters keyed by future slot.
     future_waiters: HashMap<u64, Vec<Ref64>>,
-    /// Opaque remotely-owned dependencies keyed by local continuation slot.
-    /// This is waiter identity only: canonical future/channel state remains on
-    /// the owner and no remote entity is installed as a local ABI reference.
-    remote_waiter_dependencies: HashMap<u64, Ref64>,
+    /// Opaque, node-qualified remotely-owned dependencies keyed by local
+    /// continuation slot. This private receipt is waiter identity only:
+    /// canonical future/channel state remains on the owner and no remote
+    /// entity is installed as a local ABI reference.
+    remote_waiter_dependencies: HashMap<u64, RemoteWaiterDependency>,
     channel_queues: HashMap<u64, ChannelQueue>,
     /// Per (sender, receiver) pair, the next `sender_sequence` value (§11).
     send_sequences: HashMap<(u64, u64), u64>,
@@ -336,6 +356,7 @@ pub struct Kernel {
     /// batch backends. The frame is one element; the handler stores its result
     /// back into that private frame and completes.
     frame_evaluators: HashMap<u32, crate::compiler::body::EvaluatorProgram>,
+    pub(crate) frame_evaluator_effects: HashMap<u32, FrameEvaluatorEffect>,
     /// Physical owner assigned to newly created processes.
     local_node: u64,
     /// Loss declarations are monotonic and idempotent.
@@ -440,6 +461,7 @@ impl Kernel {
             restart_blueprints: HashMap::new(),
             module_evaluators: HashMap::new(),
             frame_evaluators: HashMap::new(),
+            frame_evaluator_effects: HashMap::new(),
             local_node: 0,
             lost_nodes: HashSet::new(),
             scheduler,
@@ -517,6 +539,30 @@ impl Kernel {
             return Err(RuntimeError::InvalidModule);
         }
         self.frame_evaluators.insert(run_class, program);
+        Ok(())
+    }
+
+    pub fn install_frame_future_resolve(
+        &mut self,
+        run_class: u32,
+        program: crate::compiler::body::EvaluatorProgram,
+        future_offset: u32,
+        value_offset: u32,
+    ) -> Result<(), RuntimeError> {
+        let stride = program.stride();
+        if future_offset.checked_add(8).is_none_or(|end| end > stride)
+            || value_offset.checked_add(8).is_none_or(|end| end > stride)
+        {
+            return Err(RuntimeError::InvalidModule);
+        }
+        self.install_frame_evaluator(run_class, program)?;
+        self.frame_evaluator_effects.insert(
+            run_class,
+            FrameEvaluatorEffect::ResolveFuture {
+                future_offset,
+                value_offset,
+            },
+        );
         Ok(())
     }
 
@@ -2109,6 +2155,48 @@ impl Kernel {
             .unwrap_or(0)
     }
 
+    /// Apply only the local scheduling consequence of an authority-checked
+    /// remote terminal receipt. The receipt itself remains in the distributed
+    /// bridge: foreign `Ref64`s must never enter ABI supervision queues, whose
+    /// references are required to resolve in this kernel's process table.
+    pub(crate) fn wake_remote_supervision(
+        &mut self,
+        supervisor: Ref64,
+        remote_child: Ref64,
+        reason: ExitReason,
+        policy: SupervisionPolicy,
+    ) -> Result<(), RuntimeError> {
+        if policy == SupervisionPolicy::Restart {
+            return Err(RuntimeError::InvalidSupervisionPolicy);
+        }
+        if matches!(
+            self.process_state(supervisor)?,
+            ProcessState::Failed | ProcessState::Terminated | ProcessState::Cancelled
+        ) {
+            return Err(RuntimeError::ProcessUnavailable);
+        }
+        let waiter = self
+            .supervision_queues
+            .get_mut(&supervisor.key())
+            .ok_or(RuntimeError::MissingMailbox)?
+            .waiters
+            .pop_front();
+        if let Some(waiter) = waiter {
+            self.wake_waiting_continuation(waiter);
+        }
+        self.trace(
+            EventKind::SupervisionNotified,
+            supervisor,
+            remote_child,
+            0,
+            reason as u32,
+        );
+        if reason == ExitReason::Failed && policy == SupervisionPolicy::Escalate {
+            self.fail_process_from_supervision(supervisor, remote_child);
+        }
+        Ok(())
+    }
+
     pub(super) fn notify_supervisor(&mut self, child: Ref64, reason: ExitReason) {
         let Some((supervisor, failure_count, policy)) =
             self.processes.get(child).ok().map(|process| {
@@ -2813,10 +2901,11 @@ impl Kernel {
     pub fn register_remote_future_waiter(
         &mut self,
         cont: Ref64,
+        remote_node: u64,
         remote_entity: Ref64,
         next_run_class: u32,
     ) -> Result<(), RuntimeError> {
-        self.register_remote_waiter(cont, remote_entity, next_run_class)
+        self.register_remote_waiter(cont, remote_node, remote_entity, next_run_class)
     }
 
     /// Park a continuation on a remotely-owned channel without creating a
@@ -2825,24 +2914,30 @@ impl Kernel {
     pub fn register_remote_channel_waiter(
         &mut self,
         cont: Ref64,
+        remote_node: u64,
         remote_entity: Ref64,
         next_run_class: u32,
     ) -> Result<(), RuntimeError> {
-        self.register_remote_waiter(cont, remote_entity, next_run_class)
+        self.register_remote_waiter(cont, remote_node, remote_entity, next_run_class)
     }
 
     fn register_remote_waiter(
         &mut self,
         cont: Ref64,
+        remote_node: u64,
         remote_entity: Ref64,
         next_run_class: u32,
     ) -> Result<(), RuntimeError> {
+        let dependency = RemoteWaiterDependency {
+            node: remote_node,
+            entity: remote_entity,
+        };
         let (process, status) = self
             .continuations
             .get(cont)
             .map(|c| (c.process, c.status))?;
         if status == crate::abi::continuations::ContinuationState::Waiting
-            && self.remote_waiter_dependencies.get(&cont.key()) == Some(&remote_entity)
+            && self.remote_waiter_dependencies.get(&cont.key()) == Some(&dependency)
         {
             return Ok(());
         }
@@ -2860,9 +2955,11 @@ impl Kernel {
         }
         self.set_continuation_status(cont, crate::abi::continuations::ContinuationState::Waiting);
         self.remote_waiter_dependencies
-            .insert(cont.key(), remote_entity);
-        // Parking removes runnable eligibility, so (as with local await commit)
-        // it has no runnable-bin Effect. The semantic transition is traced.
+            .insert(cont.key(), dependency);
+        // TraceEvent has no lossless node-u64 field, so the ABI trace keeps the
+        // entity while the kernel-private receipt above performs the globally
+        // unique match. Parking removes runnable eligibility, so (as with local
+        // await commit) it has no runnable-bin Effect.
         self.trace_about(
             EventKind::ContinuationWaiting,
             process,
@@ -2876,19 +2973,33 @@ impl Kernel {
     /// Wake a channel continuation after an authoritative epoch-boundary
     /// readiness observation. Stale and duplicate notifications are no-ops.
     #[doc(hidden)]
-    pub fn wake_remote_channel_waiter(&mut self, cont: Ref64, remote_entity: Ref64) {
-        self.wake_remote_waiter(cont, remote_entity)
+    pub fn wake_remote_channel_waiter(
+        &mut self,
+        cont: Ref64,
+        remote_node: u64,
+        remote_entity: Ref64,
+    ) {
+        self.wake_remote_waiter(cont, remote_node, remote_entity)
     }
 
     /// Wake a continuation after its remote owner authoritatively reports that
     /// the dependency is resolved. Stale or duplicate notifications are no-ops.
     #[doc(hidden)]
-    pub fn wake_remote_future_waiter(&mut self, cont: Ref64, remote_entity: Ref64) {
-        self.wake_remote_waiter(cont, remote_entity)
+    pub fn wake_remote_future_waiter(
+        &mut self,
+        cont: Ref64,
+        remote_node: u64,
+        remote_entity: Ref64,
+    ) {
+        self.wake_remote_waiter(cont, remote_node, remote_entity)
     }
 
-    fn wake_remote_waiter(&mut self, cont: Ref64, remote_entity: Ref64) {
-        if self.remote_waiter_dependencies.get(&cont.key()) != Some(&remote_entity) {
+    fn wake_remote_waiter(&mut self, cont: Ref64, remote_node: u64, remote_entity: Ref64) {
+        let dependency = RemoteWaiterDependency {
+            node: remote_node,
+            entity: remote_entity,
+        };
+        if self.remote_waiter_dependencies.get(&cont.key()) != Some(&dependency) {
             return;
         }
         let Some((process, run_class, status)) = self
@@ -3632,6 +3743,115 @@ impl Kernel {
         let version = object.version;
         let transferred = self.mint_object_read(receiver, payload, byte_length, version);
         self.push_message(sender, receiver, payload, transferred, sender_cont, false)
+    }
+
+    /// Commit one validated remote ingress directly into this process inbox.
+    ///
+    /// The node runtime calls this only on the kernel owner thread at an epoch
+    /// boundary. Remote identity and sequence remain inside the immutable
+    /// node-qualified envelope; the ABI sender is always `SYSTEM_PRINCIPAL`.
+    /// Payload storage and the receiver's read capability are created only
+    /// after capacity and liveness have been checked, so a refused ingress
+    /// leaves no resident object or capability behind.
+    pub fn ingest_remote_message(
+        &mut self,
+        receiver: Ref64,
+        value: Vec<u8>,
+        urgent: bool,
+    ) -> Result<(), RuntimeError> {
+        if matches!(
+            self.process_state(receiver)?,
+            ProcessState::Failed | ProcessState::Terminated | ProcessState::Cancelled
+        ) {
+            return Err(RuntimeError::ProcessUnavailable);
+        }
+        if self.mailbox_is_full(receiver)? {
+            return Err(RuntimeError::MailboxFull);
+        }
+
+        let payload = self.create_object(SYSTEM_PRINCIPAL, ObjectKind::MessagePayload, value);
+        let (payload_length, payload_version) = {
+            let object = self.objects.get(payload)?;
+            (object.byte_length, object.version)
+        };
+        let transferred =
+            self.mint_object_read(receiver, payload, payload_length, payload_version);
+        let sender = SYSTEM_PRINCIPAL;
+        let local_sequence = {
+            let next = self
+                .send_sequences
+                .entry((sender.key(), receiver.key()))
+                .or_insert(0);
+            let sequence = *next;
+            *next = next.wrapping_add(1);
+            sequence
+        };
+        let mut message = MessageDescriptor::new(sender, receiver, payload);
+        message.sender_sequence = local_sequence;
+        message.transferred_capability = transferred;
+        if urgent {
+            message.flags |= crate::abi::messages::MESSAGE_FLAG_URGENT;
+        }
+        message.logical_timestamp = self.clock_now();
+        let mut committed_sequence = local_sequence;
+
+        let waiter = {
+            let mailbox = self
+                .mailboxes
+                .get_mut(&receiver.key())
+                .ok_or(RuntimeError::MissingMailbox)?;
+            if urgent {
+                let position = mailbox
+                    .entries
+                    .iter()
+                    .position(|entry| entry.flags & crate::abi::messages::MESSAGE_FLAG_URGENT == 0)
+                    .unwrap_or(mailbox.entries.len());
+                mailbox.entries.insert(position, message);
+                // Priority insertion can move an as-yet undelivered message.
+                // Re-number this local ingress principal's queued suffix so I6
+                // remains true; the authenticated remote sequence stays in the
+                // immutable receipt and is never rewritten.
+                let held = mailbox
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.sender == sender)
+                    .count() as u64;
+                let next = self
+                    .send_sequences
+                    .get(&(sender.key(), receiver.key()))
+                    .copied()
+                    .unwrap_or(held);
+                let mut sequence = next.wrapping_sub(held);
+                for entry in &mut mailbox.entries {
+                    if entry.sender == sender {
+                        entry.sender_sequence = sequence;
+                        if entry.payload == payload {
+                            committed_sequence = sequence;
+                        }
+                        sequence = sequence.wrapping_add(1);
+                    }
+                }
+            } else {
+                mailbox.entries.push_back(message);
+            }
+            mailbox.recv_waiters.pop_front()
+        };
+        if let Some(waiter) = waiter {
+            let run_class = self.continuations.get(waiter)?.run_class;
+            self.emit(crate::kernel::effects::Effect::Wake {
+                continuation: waiter,
+                run_class,
+            });
+            self.trace_caused(
+                EventKind::MessageReceived,
+                receiver,
+                waiter,
+                run_class,
+                committed_sequence as u32,
+                sender,
+            );
+        }
+        Ok(())
     }
 
     fn mailbox_is_full(&self, receiver: Ref64) -> Result<bool, RuntimeError> {

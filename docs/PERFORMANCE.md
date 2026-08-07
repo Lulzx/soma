@@ -523,3 +523,62 @@ Raw samples and capture metadata are in
 `docs/measurements/ANT-WALL-M4-PRO-2026-08-07.txt`. Run the small repeatable
 control with `cargo run --release --example ant_wall_bench`; add `--full 3` for
 the published 10,000-ant world.
+
+## 11. End-to-end ant collective backend control
+
+`examples/ant_collective_bench.rs` runs three fresh, rotating-order versions of
+the same persistent colony: independent host sensing, the CPU collective, and
+the real Metal collective. Wall time includes backend construction, colony
+setup, all 10,000 ant/colony/world steps for 260 epochs, cleanup, and exact final
+observation. Equality covers every ant record, both full pheromone buffers,
+resource accounting, and pending work.
+
+On the M4 Pro, three non-isolated release trials produced these descriptive
+medians:
+
+| path | complete wall | sensing/backend calls |
+|---|---:|---:|
+| independent host sensing | 28.274 s | 0.040 s |
+| CPU collective | 36.715 s | 1.327 s |
+| Metal collective | 34.742 s | 0.128 s |
+
+The Metal calls are 10.4x faster than the CPU collective calls, but 3.2x slower
+than the specialized direct host loop. More importantly, Metal full wall is
+**1.23x host-reference wall**, not a speedup, and 99.6% of its wall time remains
+host-side. The CPU/Metal full-wall sample ranges overlap, so no ordering between
+those two is inferred from n=3. Exact worlds match in every run. This is useful
+migration accounting and a negative end-to-end result: accelerating only the
+sensing body does not meet the Phase-1 condition while frame packing, temporary
+collectives, behavior handlers, scheduling, journals, and commit remain host
+epoch work.
+
+Raw rotating-order samples and command metadata are frozen in
+`measurements/ANT-COLLECTIVE-WALL-M4-PRO-2026-08-07.txt`. The next qualifying
+measurement must move the irregular behavior pipeline into the resident graph
+and compare the complete application with persistent-worker and sorted-bulk
+controls.
+
+## 12. Resident grouped versus generic device worker
+
+`examples/resident_dynamic_bench.rs` now supplies the missing same-device
+functional controls for the standalone graph. Its generic worker is competent,
+not forced branchless work: one installed evaluator contains both class-specific
+counted bodies and each lane uses `break_if` at the irrelevant loop head. The
+grouped graph compacts the same active lanes into two specialized handlers. Both
+produce byte-identical frames and canonical trace against a genuine CPU
+class-bucket-per-level oracle. Device one-class, eight-submit level-sync, and
+eight-batch low-arrival controls are also executable.
+
+Atomic O(N) compaction moved the grouped path from clearly slower to a plausible
+crossover. In one six-sample alternating run at 16,384 lanes, the descriptive
+middle was roughly 2.94 ms grouped versus 3.83 ms generic. That is **not a
+qualifying win**: separate release runs changed the grouped/generic median ratio
+through 1.061, 0.890, 1.233, and 0.768, including reversals. The measurement was
+non-isolated, and the standalone graph does not enter `Kernel` Phase G or emit a
+complete multi-step journal. It proves the right baseline and reveals a regime
+to stabilize; it does not satisfy G5.
+
+Raw alternating samples and the cross-run warning are frozen in
+`measurements/RESIDENT-DYNAMIC-M4-PRO-2026-08-07.txt`. A qualifying capture must
+use the release-audit procedure, repeated randomized/alternating runs with a
+confidence summary, and the eventual one-submit canonical Kernel path.

@@ -1,10 +1,12 @@
 # SOMA v0.3
 
-**Status:** partially implemented. §1–§3 are specification and are
-machine-checked. §4's semantic obligations and the speculative concurrent CPU
-executive (§4.18) are implemented; a persistent device-resident executive is
-partially implemented through real Metal admission and placement. §5–§6 are
-scope.
+**Status:** active implementation. §1–§3 are specified and machine-checked.
+§4's semantic obligations, speculative concurrent CPU executive (§4.18), and
+several real-Metal resident slices are implemented; the general no-round-trip
+executive remains incomplete. §5 now has authenticated remote execution and
+owner-side resource prototypes, but not a multi-kernel backend. §6 contains
+real measurements, including negative end-to-end evidence. The stricter release
+gates are tracked in `DREAM-COMPLETION.md`.
 
 v0.2 closed the semantic core: every entity and invariant it named was
 implemented and checked. v0.3 is the first version whose work is not "finish the
@@ -19,12 +21,14 @@ did not depend on it are done; the rest is scoped below.
 | **0** | Carried debts on the critical path | **done** (§1) |
 | **S** | An equivalence a concurrent implementation can satisfy | **done** (§2) |
 | **A** | General evaluator bodies and a compiler | **done** (§3) |
-| **B** | Persistent device-resident scheduler | **in progress** (§4) — semantics, concurrent CPU executive, and Metal planning done; device execution/commit not |
-| **C** | Distributed / multi-node implementation | scope (§5) |
-| **D** | Performance work on real hardware | scope (§6) |
+| **B** | Persistent device-resident scheduler | **in progress** (§4) — real device admission, placement, fixed graphs, evaluator execution, journals, and host canonical replay; general resident effects/quiescence not done |
+| **C** | Distributed / multi-node implementation | **in progress** (§5) — authenticated remote execution and authoritative remote resource services; actual multi-kernel process execution not done |
+| **D** | Performance work on real hardware | **in progress** (§6) — hardware controls and end-to-end negative evidence; qualifying application win not done |
 
 Eight new clauses are now checked — I18 through I25 — and v0.2's only
-`[modelled]` clause is gone. The test suite went from 151 to 284.
+`[modelled]` clause is gone. The suite has continued to grow beyond its original 151 tests; CI runs the
+default, native, and all-feature build matrices rather than freezing a stale
+count in this document.
 
 ---
 
@@ -290,7 +294,8 @@ the contract's deliberate exclusions are described in
   whenever it runs and no lane can observe another lane's store. A body able to
   read the output array would make the published result depend on the schedule.
 - **Typed integer plus bounded binary32.** Integer semantics remain unchanged.
-  The first `f32` slice admits add and multiply only, disables Metal fast math,
+  The bounded `f32` slice admits arithmetic, ordered comparison, and selection,
+  disables Metal fast math,
   flushes subnormal inputs/results to positive zero, and canonicalizes NaNs and
   signed zero. That deliberately constrains every backend so I20 remains
   bit-identical rather than weakening to a tolerance.
@@ -1624,19 +1629,25 @@ is I18-equivalent to the single-node run; a node killed mid-epoch produces a
 defined, tested outcome; and no test passes by routing all work to one node —
 the control is a run where every process is remote from its supervisor.
 
-The placement half of that exit criterion now passes. The streaming graph is
+The placement half of that exit criterion passes. The streaming graph is
 I18-equivalent with both channel peers remote from its coordinator, and the
 supervision tree is I18-equivalent under notify, escalate, and restart with all
-four parent/child edges crossing nodes. This deliberately does not close C:
-coordinator-owned queues still implement stateful operations, so their
-authenticated remote-journal transport remains to be built.
+four parent/child edges crossing nodes. Later implementation added authenticated
+full-journal transport and authoritative owner-side future, bounded-channel,
+object, terminal-supervision, and real Kernel mailbox-ingress services, including
+two owner Kernel epoch loops. This still does not close C: generic remote
+`LaneView`, remote process lifecycle/recovery, durability, and a multi-resource
+application remain open; see `DREAM-COMPLETION.md`.
 
 ---
 
 ## 6. D — performance
 
-**Not started.** Blocked on A and B: there was nothing worth measuring until a
-real evaluator body ran under a real scheduler. A is now done.
+Hardware measurement is now executable, but the completion result is negative.
+The ant collective is slower end to end than its direct host control, and
+independent grouped-versus-generic resident runs reverse ordering despite exact
+outputs and competent controls. No reproducible G5 speedup has been established;
+raw captures and caveats are in `PERFORMANCE.md` and `DREAM-COMPLETION.md`.
 
 `HANDOFF.md` §4 is careful and should stay that way. Those figures are
 **structural bounds** computed from how continuations group, not hardware
@@ -1693,9 +1704,9 @@ Named so that nothing here is quietly assumed:
 - **Preemption.** §4.
 - **Loops and reductions in evaluator bodies.** A reduction is a new
   collective, not a new body.
-- **Complete floating-point bodies.** The deterministic `f32` add/multiply
-  subset is implemented; subtraction, division, comparisons, float select, and
-  float locals remain outside v0.3.
+- **Wider floating-point bodies.** Deterministic binary32 arithmetic,
+  comparison, selection, and explicitly typed float locals are implemented.
+  Wider and mixed precision remain outside v0.3.
 - **Relaxed-determinism and wall-clock contracts.** Both contradict clauses the
   model relies on.
 - **A general-purpose surface language.** v0.2 §7 item 1 says

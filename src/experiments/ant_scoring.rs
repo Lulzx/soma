@@ -33,10 +33,12 @@
 //! real Metal, which is I20; and the batch covers every cell of the grid on both
 //! trail channels, so every edge and corner exercises the bounds test.
 //!
-//! What is still not claimed is that the *simulation* runs on the GPU.
-//! `executives/ant_colony.rs` still senses on the host during a colony run —
-//! wiring the sensing collective into the ant step is a change to the
-//! executive, not to the language or the collective, and it is not made here.
+//! `prepare_colony_epoch` now wires this collective into durable ant frames
+//! before each ordinary kernel epoch, with an independent host-sensing mode as
+//! an exact-world control. That makes sensing real end-to-end offload, but it
+//! does **not** mean the whole simulation is resident: frame packing, collective
+//! orchestration, ant behavior, journals, and canonical commit remain host
+//! epoch work. The corresponding wall benchmark reports that distinction.
 //!
 //! # The body
 //!
@@ -464,12 +466,12 @@ pub enum ColonySensing<'a> {
 /// never consumed, and it is installed before `Kernel::run_epoch`: the ordinary
 /// ant continuation then uses it while retaining terrain, capability, deposit,
 /// and scheduling semantics.
-pub fn prepare_colony_epoch(
+pub fn prepare_colony_epoch_timed(
     kernel: &mut Kernel,
     colony: &AntColony,
     epoch: u32,
     mut sensing: ColonySensing<'_>,
-) -> Result<usize, BackendError> {
+) -> Result<(usize, std::time::Duration), BackendError> {
     let field_ref = colony.readable_field(epoch);
     let grid = kernel.object_bytes(colony.world, field_ref)?.to_vec();
     let mut frames = Vec::with_capacity(colony.ant_count());
@@ -492,11 +494,17 @@ pub fn prepare_colony_epoch(
         frames.push((handle.process, handle.continuation, frame));
     }
 
+    let mut backend_elapsed = std::time::Duration::ZERO;
     let directions = match &mut sensing {
-        ColonySensing::HostReference => sensors
-            .iter()
-            .map(|sensor| expected_direction(sensor, &grid))
-            .collect(),
+        ColonySensing::HostReference => {
+            let start = std::time::Instant::now();
+            let result = sensors
+                .iter()
+                .map(|sensor| expected_direction(sensor, &grid))
+                .collect();
+            backend_elapsed = start.elapsed();
+            result
+        }
         ColonySensing::Collective(backend) => {
             // Snapshot the mutable world buffers at the continuation boundary.
             // BatchEvaluate admits frozen inputs only; the world keeps owning
@@ -508,6 +516,9 @@ pub fn prepare_colony_epoch(
             // including failure paths: at 10k ants, retaining one such set per
             // epoch is hundreds of megabytes of input/output payload plus five
             // growing kernel tables over a 260-epoch run.
+            // Installation is idempotent. Metal caches an already-installed
+            // body, so retaining this boundary contract does not turn every
+            // epoch into a shader-compilation benchmark.
             let program = sensing_program();
             backend.install(&program)?;
             let mut temporaries = Vec::with_capacity(5);
@@ -535,8 +546,10 @@ pub fn prepare_colony_epoch(
                 temporaries.push(collective);
                 temporaries.push(completion);
 
+                // The reference is a spill target only.
                 let mut reference = CpuReferenceBackend::with(&[&program]);
                 let mut stats = PlacementStats::default();
+                let start = std::time::Instant::now();
                 let output = execute_with_spill(
                     kernel,
                     colony.world,
@@ -546,6 +559,7 @@ pub fn prepare_colony_epoch(
                     &mut reference,
                     &mut stats,
                 )?;
+                backend_elapsed += start.elapsed();
                 temporaries.push(output);
                 let published = kernel.object_bytes(colony.world, output)?.to_vec();
                 Ok(unpack_sensors(&published, sensors.len()))
@@ -587,5 +601,16 @@ pub fn prepare_colony_epoch(
         // boundary write just as the predator/control instrumentation does.
         let _ = process;
     }
-    Ok(directions.len() / 2)
+    Ok((directions.len() / 2, backend_elapsed))
+}
+
+/// Untimed compatibility entry point. Executives that report a wall breakdown
+/// use [`prepare_colony_epoch_timed`]; semantic callers need only the count.
+pub fn prepare_colony_epoch(
+    kernel: &mut Kernel,
+    colony: &AntColony,
+    epoch: u32,
+    sensing: ColonySensing<'_>,
+) -> Result<usize, BackendError> {
+    prepare_colony_epoch_timed(kernel, colony, epoch, sensing).map(|(count, _)| count)
 }

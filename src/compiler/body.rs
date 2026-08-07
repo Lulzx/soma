@@ -47,11 +47,11 @@
 //!   observe another lane's store. A body that could read the output array
 //!   would make the result depend on the schedule and take I19
 //!   (placement-neutrality) with it.
-//! - **Bounded deterministic f32.** Binary32 add/multiply are admitted with
-//!   fast math disabled and canonical NaN/zero results, so I20 remains a byte
-//!   invariant rather than weakening to a tolerance. Integer and float values
-//!   are statically separated. Other float operations remain unimplemented
-//!   until their exact cross-backend semantics are specified.
+//! - **Bounded deterministic f32.** Binary32 arithmetic, ordered comparison,
+//!   and selection are admitted with fast math disabled and canonical
+//!   NaN/zero/subnormal results, so I20 remains a byte invariant rather than
+//!   weakening to a tolerance. Integer and float values are statically
+//!   separated.
 //! - **Typed against a declared layout.** Reading or writing outside the
 //!   declared element is a validation error, not a runtime fault, so an
 //!   invalid body cannot reach a backend at all.
@@ -176,7 +176,15 @@ pub enum Op {
     /// canonicalizes every NaN to 0x7fc00000, and canonicalizes both zeros and
     /// all subnormals to +0. These rules are part of I20, not an optimization choice.
     FAdd(u32, u32),
+    FSub(u32, u32),
     FMul(u32, u32),
+    FDiv(u32, u32),
+    /// Ordered IEEE comparisons: every comparison involving NaN is false.
+    /// Results are integer booleans so they can drive ordinary control flow.
+    FCmpEq(u32, u32),
+    FCmpLt(u32, u32),
+    /// Integer condition with float arms and a float result.
+    FSelect(u32, u32, u32),
     And(u32, u32),
     Or(u32, u32),
     Xor(u32, u32),
@@ -275,7 +283,11 @@ impl Op {
             | Op::Sub(a, b)
             | Op::Mul(a, b)
             | Op::FAdd(a, b)
+            | Op::FSub(a, b)
             | Op::FMul(a, b)
+            | Op::FDiv(a, b)
+            | Op::FCmpEq(a, b)
+            | Op::FCmpLt(a, b)
             | Op::And(a, b)
             | Op::Or(a, b)
             | Op::Xor(a, b)
@@ -283,7 +295,7 @@ impl Op {
             | Op::Shr(a, b)
             | Op::CmpEq(a, b)
             | Op::CmpLt(a, b) => vec![a, b],
-            Op::Select(c, a, b) => vec![c, a, b],
+            Op::Select(c, a, b) | Op::FSelect(c, a, b) => vec![c, a, b],
         }
     }
 }
@@ -309,7 +321,7 @@ pub struct EvaluatorProgram {
     /// forcing it to share an element shape would have made the one workload
     /// this exists for -- ants indexing a trail grid -- inexpressible again.
     aux: Option<ElementLayout>,
-    locals: u32,
+    local_kinds: Vec<LocalKind>,
     ops: Vec<Op>,
     stores: Vec<Store>,
 }
@@ -358,6 +370,14 @@ pub enum BodyError {
     Syntax,
 }
 
+/// Type of a mutable evaluator local. Existing count-based constructors and
+/// `local NAME` source declarations create integer locals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalKind {
+    Integer,
+    F32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ValueKind {
     Integer,
@@ -369,6 +389,13 @@ fn field_kind(width: FieldWidth) -> ValueKind {
         ValueKind::Float
     } else {
         ValueKind::Integer
+    }
+}
+
+fn local_value_kind(kind: LocalKind) -> ValueKind {
+    match kind {
+        LocalKind::Integer => ValueKind::Integer,
+        LocalKind::F32 => ValueKind::Float,
     }
 }
 
@@ -413,12 +440,34 @@ impl EvaluatorProgram {
         ops: Vec<Op>,
         stores: Vec<Store>,
     ) -> Result<Self, BodyError> {
+        Self::bound_typed(
+            id,
+            name,
+            layout,
+            aux,
+            vec![LocalKind::Integer; locals as usize],
+            ops,
+            stores,
+        )
+    }
+
+    /// Typed-local form. Local zero initialization is represented by the raw
+    /// all-zero slot for both kinds, which is integer zero and canonical +0.0.
+    pub fn bound_typed(
+        id: u32,
+        name: impl Into<String>,
+        layout: ElementLayout,
+        aux: Option<ElementLayout>,
+        local_kinds: Vec<LocalKind>,
+        ops: Vec<Op>,
+        stores: Vec<Store>,
+    ) -> Result<Self, BodyError> {
         let program = Self {
             id,
             name: name.into(),
             layout,
             aux,
-            locals,
+            local_kinds,
             ops,
             stores,
         };
@@ -465,7 +514,7 @@ impl EvaluatorProgram {
                 }
             }
             if let Op::Get(local) | Op::Set(local, _) = op {
-                if *local >= self.locals {
+                if *local as usize >= self.local_kinds.len() {
                     return Err(BodyError::LocalOutOfRange);
                 }
             }
@@ -503,17 +552,26 @@ impl EvaluatorProgram {
                     field_kind(layout.width(field).ok_or(BodyError::FieldOutOfRange)?)
                 }
                 Op::FConst(_) => ValueKind::Float,
-                Op::FAdd(a, b) | Op::FMul(a, b) => {
+                Op::FAdd(a, b) | Op::FSub(a, b) | Op::FMul(a, b) | Op::FDiv(a, b) => {
                     require_kind(&kinds, a, ValueKind::Float)?;
                     require_kind(&kinds, b, ValueKind::Float)?;
                     ValueKind::Float
                 }
-                Op::Set(_, value) => {
-                    // Locals retain their historical integer-zero type. A
-                    // future float-local declaration can extend this without
-                    // making today's untyped `local` source ambiguous.
-                    require_kind(&kinds, value, ValueKind::Integer)?;
+                Op::FCmpEq(a, b) | Op::FCmpLt(a, b) => {
+                    require_kind(&kinds, a, ValueKind::Float)?;
+                    require_kind(&kinds, b, ValueKind::Float)?;
                     ValueKind::Integer
+                }
+                Op::FSelect(c, a, b) => {
+                    require_kind(&kinds, c, ValueKind::Integer)?;
+                    require_kind(&kinds, a, ValueKind::Float)?;
+                    require_kind(&kinds, b, ValueKind::Float)?;
+                    ValueKind::Float
+                }
+                Op::Set(local, value) => {
+                    let kind = local_value_kind(self.local_kinds[local as usize]);
+                    require_kind(&kinds, value, kind)?;
+                    kind
                 }
                 Op::Add(a, b)
                 | Op::Sub(a, b)
@@ -539,9 +597,8 @@ impl EvaluatorProgram {
                     require_kind(&kinds, c, ValueKind::Integer)?;
                     ValueKind::Integer
                 }
-                Op::Index | Op::Const(_) | Op::Get(_) | Op::Repeat(_) | Op::EndRepeat => {
-                    ValueKind::Integer
-                }
+                Op::Get(local) => local_value_kind(self.local_kinds[local as usize]),
+                Op::Index | Op::Const(_) | Op::Repeat(_) | Op::EndRepeat => ValueKind::Integer,
             };
             kinds.push(kind);
         }
@@ -671,7 +728,11 @@ impl EvaluatorProgram {
     }
 
     pub fn locals(&self) -> u32 {
-        self.locals
+        self.local_kinds.len() as u32
+    }
+
+    pub fn local_kinds(&self) -> &[LocalKind] {
+        &self.local_kinds
     }
 
     /// The second array's element layout, when this body names one.
@@ -779,7 +840,7 @@ impl EvaluatorProgram {
         // escape rule checked at validation is what makes that the only value
         // anything can read.
         let mut values: Vec<u64> = vec![0; self.ops.len()];
-        let mut locals: Vec<u64> = vec![0; self.locals as usize];
+        let mut locals: Vec<u64> = vec![0; self.local_kinds.len()];
         // (index of the `Repeat`, iterations still to run after this one).
         let mut loops: Vec<(usize, u32)> = Vec::new();
 
@@ -811,11 +872,29 @@ impl EvaluatorProgram {
                         + f32::from_bits(canonical_f32_bits(values[b as usize] as u32)))
                     .to_bits(),
                 )),
+                Op::FSub(a, b) => u64::from(canonical_f32_bits(
+                    (f32::from_bits(canonical_f32_bits(values[a as usize] as u32))
+                        - f32::from_bits(canonical_f32_bits(values[b as usize] as u32)))
+                    .to_bits(),
+                )),
                 Op::FMul(a, b) => u64::from(canonical_f32_bits(
                     (f32::from_bits(canonical_f32_bits(values[a as usize] as u32))
                         * f32::from_bits(canonical_f32_bits(values[b as usize] as u32)))
                     .to_bits(),
                 )),
+                Op::FDiv(a, b) => u64::from(canonical_f32_bits(
+                    (f32::from_bits(canonical_f32_bits(values[a as usize] as u32))
+                        / f32::from_bits(canonical_f32_bits(values[b as usize] as u32)))
+                    .to_bits(),
+                )),
+                Op::FCmpEq(a, b) => u64::from(
+                    f32::from_bits(canonical_f32_bits(values[a as usize] as u32))
+                        == f32::from_bits(canonical_f32_bits(values[b as usize] as u32)),
+                ),
+                Op::FCmpLt(a, b) => u64::from(
+                    f32::from_bits(canonical_f32_bits(values[a as usize] as u32))
+                        < f32::from_bits(canonical_f32_bits(values[b as usize] as u32)),
+                ),
                 Op::And(a, b) => values[a as usize] & values[b as usize],
                 Op::Or(a, b) => values[a as usize] | values[b as usize],
                 Op::Xor(a, b) => values[a as usize] ^ values[b as usize],
@@ -832,6 +911,11 @@ impl EvaluatorProgram {
                         values[b as usize]
                     }
                 }
+                Op::FSelect(c, a, b) => canonical_f32_bits(if values[c as usize] != 0 {
+                    values[a as usize] as u32
+                } else {
+                    values[b as usize] as u32
+                }) as u64,
                 Op::Get(local) => locals[local as usize],
                 Op::Set(local, value) => {
                     let value = values[value as usize];
@@ -950,6 +1034,7 @@ impl EvaluatorProgram {
         let mut ops = Vec::new();
         let mut stores = Vec::new();
         let mut locals = 0u32;
+        let mut float_locals = 0u32;
         let mut aux: Vec<FieldWidth> = Vec::new();
 
         for line in lines {
@@ -972,6 +1057,12 @@ impl EvaluatorProgram {
                         return Err(BodyError::Syntax);
                     }
                     locals = parts[1].parse().map_err(|_| BodyError::Syntax)?;
+                }
+                Some("floatlocals") => {
+                    if parts.len() != 2 {
+                        return Err(BodyError::Syntax);
+                    }
+                    float_locals = parts[1].parse().map_err(|_| BodyError::Syntax)?;
                 }
                 Some("op") => {
                     if parts.len() < 3 {
@@ -997,12 +1088,14 @@ impl EvaluatorProgram {
         }
 
         let aux = (!aux.is_empty()).then(|| ElementLayout::new(aux));
-        EvaluatorProgram::bound(
+        let mut local_kinds = vec![LocalKind::Integer; locals as usize];
+        local_kinds.extend(std::iter::repeat_n(LocalKind::F32, float_locals as usize));
+        EvaluatorProgram::bound_typed(
             id,
             name,
             ElementLayout::new(fields),
             aux,
-            locals,
+            local_kinds,
             ops,
             stores,
         )
@@ -1050,7 +1143,7 @@ impl EvaluatorProgram {
         for index in 0..self.ops.len() {
             let _ = writeln!(body, "    ulong v{index} = 0ul;");
         }
-        for local in 0..self.locals {
+        for local in 0..self.local_kinds.len() {
             let _ = writeln!(body, "    ulong l{local} = 0ul;");
         }
         // A gather needs two scratch values per instruction for the same reason
@@ -1131,9 +1224,17 @@ impl EvaluatorProgram {
                         Op::FAdd(a, b) => format!(
                             "ulong(soma_f32_bits(soma_f32_value(v{a}) + soma_f32_value(v{b})))"
                         ),
+                        Op::FSub(a, b) => format!(
+                            "ulong(soma_f32_bits(soma_f32_value(v{a}) - soma_f32_value(v{b})))"
+                        ),
                         Op::FMul(a, b) => format!(
                             "ulong(soma_f32_bits(soma_f32_value(v{a}) * soma_f32_value(v{b})))"
                         ),
+                        Op::FDiv(a, b) => format!(
+                            "ulong(soma_f32_bits(soma_f32_value(v{a}) / soma_f32_value(v{b})))"
+                        ),
+                        Op::FCmpEq(a, b) => format!("(soma_f32_value(v{a}) == soma_f32_value(v{b})) ? 1ul : 0ul"),
+                        Op::FCmpLt(a, b) => format!("(soma_f32_value(v{a}) < soma_f32_value(v{b})) ? 1ul : 0ul"),
                         Op::And(a, b) => format!("v{a} & v{b}"),
                         Op::Or(a, b) => format!("v{a} | v{b}"),
                         Op::Xor(a, b) => format!("v{a} ^ v{b}"),
@@ -1142,6 +1243,7 @@ impl EvaluatorProgram {
                         Op::CmpEq(a, b) => format!("(v{a} == v{b}) ? 1ul : 0ul"),
                         Op::CmpLt(a, b) => format!("(v{a} < v{b}) ? 1ul : 0ul"),
                         Op::Select(c, a, b) => format!("(v{c} != 0ul) ? v{a} : v{b}"),
+                        Op::FSelect(c, a, b) => format!("ulong(soma_f32_bits((v{c} != 0ul) ? soma_f32_value(v{a}) : soma_f32_value(v{b})))"),
                         Op::Get(local) => format!("l{local}"),
                         // Handled above.
                         Op::Gather(_, _)
@@ -1363,7 +1465,11 @@ fn parse_op(parts: &[&str]) -> Result<Op, BodyError> {
         "sub" => binary(Op::Sub),
         "mul" => binary(Op::Mul),
         "fadd" => binary(Op::FAdd),
+        "fsub" => binary(Op::FSub),
         "fmul" => binary(Op::FMul),
+        "fdiv" => binary(Op::FDiv),
+        "fcmpeq" => binary(Op::FCmpEq),
+        "fcmplt" => binary(Op::FCmpLt),
         "and" => binary(Op::And),
         "or" => binary(Op::Or),
         "xor" => binary(Op::Xor),
@@ -1372,6 +1478,7 @@ fn parse_op(parts: &[&str]) -> Result<Op, BodyError> {
         "cmpeq" => binary(Op::CmpEq),
         "cmplt" => binary(Op::CmpLt),
         "select" => Ok(Op::Select(number(1)?, number(2)?, number(3)?)),
+        "fselect" => Ok(Op::FSelect(number(1)?, number(2)?, number(3)?)),
         "get" => Ok(Op::Get(number(1)?)),
         "set" => binary(Op::Set),
         "repeat" => Ok(Op::Repeat(number(1)?)),

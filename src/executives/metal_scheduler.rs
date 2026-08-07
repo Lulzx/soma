@@ -16,11 +16,12 @@ use metal::{
 use crate::abi::cohorts::PartialCohortPolicy;
 use crate::scheduler::admission::Candidate;
 use crate::scheduler::device::{
-    reference_lane_conflicts, DeviceCandidate, DeviceEpochBackend, DeviceEvaluation, DeviceEvaluatorLane,
-    DeviceEvaluatorResult, DeviceLaneAccess, DeviceLaneConflict, DevicePlacement, DeviceSchedule,
-    LaneConflictValidator, LaneValidationError,
+    reference_lane_conflicts, DeviceCandidate, DeviceEpochBackend, DeviceEvaluation,
+    DeviceEvaluatorLane, DeviceEvaluatorResult, DeviceLaneAccess, DeviceLaneConflict,
+    DevicePlacement, DeviceSchedule, LaneConflictValidator, LaneValidationError,
 };
 use crate::scheduler::device::{
+    ResidentDynamicFrameConfig, ResidentDynamicFrameResult, ResidentDynamicTraceEvent,
     ResidentFrameBinding, ResidentFrameGraphConfig, ResidentFrameGraphResult,
     ResidentFrameTraceEvent, ResidentSearchConfig, ResidentSearchResult, ResidentTraceEvent,
 };
@@ -1395,7 +1396,7 @@ kernel void resident_finish(device State& state [[buffer(0)]], uint gid [[thread
     atomic_store_explicit(&state.current_count, atomic_load_explicit(&state.next_count, memory_order_relaxed), memory_order_relaxed);
 }
 
-struct FrameBinding { ulong continuation; ulong process; ulong frame; ulong actor; ulong target; };
+struct FrameBinding { ulong continuation; ulong process; ulong frame; ulong actor; ulong target; uint effect_opcode; uint reserved; ulong effect_target; ulong effect_value; };
 struct FrameTrace { uint epoch; uint lane; uint run_class; uint word; };
 struct FrameAccess { ulong resource; uint lane; uint resource_kind; uint mode; uint ordinal; };
 struct FrameOperation {
@@ -1417,6 +1418,80 @@ kernel void resident_frame_trace(
     trace[epoch * count + gid] = event;
 }
 
+inline uint dynamic_load_u32(device const uchar* bytes, uint at) {
+    uint value = 0u;
+    for (uint i = 0u; i < 4u; ++i) value |= uint(bytes[at + i]) << (i * 8u);
+    return value;
+}
+struct DynamicTrace { uint epoch; uint lane; uint run_class; uint step_kind; uint word; uint reserved0; uint reserved1; uint reserved2; };
+struct DynamicConfig { uint count; uint stride; uint max_steps; uint remaining_offset; uint next_class_offset; };
+
+kernel void resident_dynamic_reset_count(
+    device atomic_uint& packed_count [[buffer(0)]], uint gid [[thread_position_in_grid]]) {
+    if (gid == 0u) atomic_store_explicit(&packed_count, 0u, memory_order_relaxed);
+}
+
+// Handlers are validated pure element-wise bodies (no gather/aux). Physical
+// packed order is therefore non-semantic: ranks only pair each output with the
+// original lane for scatter, and trace position remains the original lane.
+kernel void resident_dynamic_pack(
+    device const uchar* frames [[buffer(0)]], device const uint* classes [[buffer(1)]],
+    device const uint* active [[buffer(2)]], device uchar* packed [[buffer(3)]],
+    device uint* ranks [[buffer(4)]], device atomic_uint& packed_count [[buffer(5)]],
+    constant DynamicConfig& config [[buffer(6)]], constant uint& target_class [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= config.count || active[gid] == 0u || (target_class != 0u && classes[gid] != target_class)) return;
+    uint rank = atomic_fetch_add_explicit(&packed_count, 1u, memory_order_relaxed);
+    ranks[gid] = rank;
+    for (uint at = 0u; at < config.stride; ++at)
+        packed[rank * config.stride + at] = frames[gid * config.stride + at];
+}
+
+kernel void resident_dynamic_transition(
+    device uchar* frames [[buffer(0)]], device const uchar* first [[buffer(1)]],
+    device const uchar* second [[buffer(2)]], device uint* classes [[buffer(3)]],
+    device uint* active [[buffer(4)]], device uint* sequences [[buffer(5)]],
+    device DynamicTrace* trace [[buffer(6)]], constant DynamicConfig& config [[buffer(7)]],
+    constant uint& epoch [[buffer(8)]], constant uint& first_class [[buffer(9)]],
+    constant uint& second_class [[buffer(10)]], device const uint* first_ranks [[buffer(11)]],
+    device const uint* second_ranks [[buffer(12)]], device atomic_uint* invocations [[buffer(13)]],
+    device atomic_uint& invalid_class [[buffer(14)]], uint gid [[thread_position_in_grid]]) {
+    if (gid >= config.count || active[gid] == 0u) return;
+    uint run_class = classes[gid];
+    device const uchar* selected;
+    uint selected_base;
+    if (run_class == first_class) {
+        selected = first; selected_base = first_ranks[gid] * config.stride;
+        atomic_fetch_add_explicit(&invocations[0], 1u, memory_order_relaxed);
+    } else if (run_class == second_class) {
+        selected = second; selected_base = second_ranks[gid] * config.stride;
+        atomic_fetch_add_explicit(&invocations[1], 1u, memory_order_relaxed);
+    } else {
+        atomic_store_explicit(&invalid_class, 1u, memory_order_relaxed);
+        active[gid] = 0u;
+        return;
+    }
+    uint base = gid * config.stride;
+    for (uint at = 0u; at < config.stride; ++at) frames[base + at] = selected[selected_base + at];
+    uint remaining = dynamic_load_u32(frames, base + config.remaining_offset);
+    uint next_class = dynamic_load_u32(frames, base + config.next_class_offset);
+    uint step_kind = remaining == 0u ? 1u : 2u;
+    if (remaining == 0u) {
+        active[gid] = 0u;
+    } else if (next_class != first_class && next_class != second_class) {
+        atomic_store_explicit(&invalid_class, 1u, memory_order_relaxed);
+        active[gid] = 0u;
+        step_kind = 6u;
+    } else {
+        classes[gid] = next_class;
+    }
+    uint word = 2166136261u;
+    for (uint at = 0u; at < config.stride; ++at) word = (word ^ uint(frames[base + at])) * 16777619u;
+    uint sequence = sequences[gid]++;
+    DynamicTrace event = {epoch, gid + 1u, run_class, step_kind, word, 0u, 0u, 0u};
+    trace[gid * config.max_steps + sequence] = event;
+}
+
 kernel void resident_frame_finish(
     device const FrameBinding* bindings [[buffer(0)]],
     device FrameAccess* accesses [[buffer(1)]],
@@ -1424,16 +1499,27 @@ kernel void resident_frame_finish(
     constant uint& count [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
     if (gid >= count) return;
     FrameBinding binding = bindings[gid];
+    uint access_base = gid * 4u;
+    uint operation_base = gid * 3u;
     FrameAccess read_access = {binding.target, gid, 1u, 1u, 0u};
     FrameAccess write_access = {binding.target, gid, 1u, 2u, 1u};
-    accesses[gid * 2u] = read_access;
-    accesses[gid * 2u + 1u] = write_access;
+    accesses[access_base] = read_access;
+    accesses[access_base + 1u] = write_access;
     FrameOperation read = {gid, 0u, 2u, 0u, binding.actor, binding.target,
                            0ul, 0ul, 0ul, 0u, 0u, 0u, 0u};
-    FrameOperation write = {gid, 1u, 7u, 0u, binding.actor, binding.target,
+    FrameOperation write = {gid, 1u, 7u, 1u, binding.actor, binding.target,
                             0ul, 0ul, 0ul, 0u, 0u, 0u, 0u};
-    operations[gid * 2u] = read;
-    operations[gid * 2u + 1u] = write;
+    operations[operation_base] = read;
+    operations[operation_base + 1u] = write;
+    if (binding.effect_opcode == 10u) {
+        FrameAccess future_write = {binding.effect_target, gid, 2u, 2u, 2u};
+        FrameAccess value_read = {binding.effect_value, gid, 1u, 1u, 3u};
+        accesses[access_base + 2u] = future_write;
+        accesses[access_base + 3u] = value_read;
+        FrameOperation resolve = {gid, 2u, 10u, 0u, binding.actor, binding.effect_target,
+                                  binding.effect_value, 0ul, 0ul, 0u, 0u, 0u, 0u};
+        operations[operation_base + 2u] = resolve;
+    }
 }
 "#;
 
@@ -1457,6 +1543,12 @@ struct ResidentConfig {
     cohort_width: u32,
 }
 
+struct ResidentFrameHandler {
+    pipeline: ComputePipelineState,
+    stride: u32,
+    resolve_fields: Option<(u32, u32)>,
+}
+
 /// A bounded multi-epoch command graph whose scheduler state never returns to
 /// the host between epochs.
 pub struct MetalResidentSearch {
@@ -1468,7 +1560,10 @@ pub struct MetalResidentSearch {
     finish: ComputePipelineState,
     frame_trace: ComputePipelineState,
     frame_finish: ComputePipelineState,
-    frame_handlers: HashMap<u32, (ComputePipelineState, u32)>,
+    dynamic_reset_count: ComputePipelineState,
+    dynamic_pack: ComputePipelineState,
+    dynamic_transition: ComputePipelineState,
+    frame_handlers: HashMap<u32, ResidentFrameHandler>,
     frame_cohort_width: u32,
     last_frame_graph: Option<ResidentFrameGraphResult>,
     last_frame_trace: Vec<ResidentFrameTraceEvent>,
@@ -1496,6 +1591,9 @@ impl MetalResidentSearch {
             finish: pipeline("resident_finish")?,
             frame_trace: pipeline("resident_frame_trace")?,
             frame_finish: pipeline("resident_frame_finish")?,
+            dynamic_reset_count: pipeline("resident_dynamic_reset_count")?,
+            dynamic_pack: pipeline("resident_dynamic_pack")?,
+            dynamic_transition: pipeline("resident_dynamic_transition")?,
             frame_handlers: HashMap::new(),
             frame_cohort_width: 32,
             last_frame_graph: None,
@@ -1546,9 +1644,346 @@ impl MetalResidentSearch {
             .device
             .new_compute_pipeline_state_with_function(&function)
             .map_err(|_| BackendError::UnsupportedEvaluator)?;
-        self.frame_handlers
-            .insert(run_class, (pipeline, program.stride()));
+        self.frame_handlers.insert(
+            run_class,
+            ResidentFrameHandler {
+                pipeline,
+                stride: program.stride(),
+                resolve_fields: None,
+            },
+        );
         Ok(())
+    }
+
+    pub fn install_frame_future_resolve_handler(
+        &mut self,
+        run_class: u32,
+        program: &EvaluatorProgram,
+        future_offset: u32,
+        value_offset: u32,
+    ) -> Result<(), BackendError> {
+        self.install_frame_handler(run_class, program)?;
+        if future_offset
+            .checked_add(8)
+            .is_none_or(|end| end > program.stride())
+            || value_offset
+                .checked_add(8)
+                .is_none_or(|end| end > program.stride())
+        {
+            self.frame_handlers.remove(&run_class);
+            return Err(BackendError::InvalidInput);
+        }
+        if let Some(handler) = self.frame_handlers.get_mut(&run_class) {
+            handler.resolve_fields = Some((future_offset, value_offset));
+        }
+        Ok(())
+    }
+
+    /// Execute two compiled handlers as a device-governed dynamic frontier.
+    /// All bounded dispatches are encoded before commit; active/class state and
+    /// quiescence remain device-resident until the single final read.
+    ///
+    /// This is presently a standalone graph result, not a `Kernel` epoch: it
+    /// does not synthesize lane journals or enter the kernel's canonical Phase
+    /// G commit. Callers must not describe the single Metal command-buffer
+    /// submission as a one-submit kernel commit.
+    pub fn run_dynamic_frame_graph(
+        &mut self,
+        config: ResidentDynamicFrameConfig,
+        input_frames: &[u8],
+        lane_count: u32,
+    ) -> Result<ResidentDynamicFrameResult, BackendError> {
+        self.run_dynamic_frame_graph_inner(config, input_frames, lane_count, None)
+    }
+
+    /// Persistent-worker control: compact all active lanes together and run one
+    /// generic installed handler without run-class grouping.
+    pub fn run_dynamic_ungrouped_frame_graph(
+        &mut self,
+        config: ResidentDynamicFrameConfig,
+        generic_run_class: u32,
+        input_frames: &[u8],
+        lane_count: u32,
+    ) -> Result<ResidentDynamicFrameResult, BackendError> {
+        self.run_dynamic_frame_graph_inner(
+            config,
+            input_frames,
+            lane_count,
+            Some(generic_run_class),
+        )
+    }
+
+    fn run_dynamic_frame_graph_inner(
+        &mut self,
+        config: ResidentDynamicFrameConfig,
+        input_frames: &[u8],
+        lane_count: u32,
+        generic_run_class: Option<u32>,
+    ) -> Result<ResidentDynamicFrameResult, BackendError> {
+        #[repr(C)]
+        struct Config {
+            count: u32,
+            stride: u32,
+            max_steps: u32,
+            remaining_offset: u32,
+            next_class_offset: u32,
+        }
+        let first = self
+            .frame_handlers
+            .get(&generic_run_class.unwrap_or(config.first_run_class))
+            .ok_or(BackendError::UnsupportedEvaluator)?;
+        let second = match generic_run_class {
+            Some(_) => first,
+            None => self
+                .frame_handlers
+                .get(&config.second_run_class)
+                .ok_or(BackendError::UnsupportedEvaluator)?,
+        };
+        if first.stride != second.stride
+            || lane_count == 0
+            || config.max_steps == 0
+            || config.cohort_width == 0
+        {
+            return Err(BackendError::InvalidInput);
+        }
+        let stride = first.stride;
+        let bytes = lane_count as usize * stride as usize;
+        if input_frames.len() != bytes
+            || config
+                .remaining_offset
+                .checked_add(4)
+                .is_none_or(|end| end > stride)
+            || config
+                .next_class_offset
+                .checked_add(4)
+                .is_none_or(|end| end > stride)
+        {
+            return Err(BackendError::InvalidInput);
+        }
+        let make = |size| {
+            self.device
+                .new_buffer(size as u64, MTLResourceOptions::StorageModeShared)
+        };
+        let frames = make(bytes);
+        let first_in = make(bytes);
+        let second_in = make(bytes);
+        let first_out = make(bytes);
+        let second_out = make(bytes);
+        let words = lane_count as usize * 4;
+        let classes = make(words);
+        let active = make(words);
+        let sequences = make(words);
+        let first_ranks = make(words);
+        let second_ranks = make(words);
+        let first_count = make(4);
+        let second_count = make(4);
+        let invocations = make(8);
+        let invalid_class = make(4);
+        let trace_slots = lane_count as usize * config.max_steps as usize;
+        let trace = make(trace_slots * std::mem::size_of::<ResidentDynamicTraceEvent>());
+        unsafe {
+            std::ptr::copy_nonoverlapping(input_frames.as_ptr(), frames.contents().cast(), bytes);
+            std::ptr::write_bytes(sequences.contents(), 0, words);
+            std::ptr::write_bytes(invocations.contents(), 0, 8);
+            std::ptr::write_bytes(invalid_class.contents(), 0, 4);
+            std::ptr::write_bytes(
+                trace.contents(),
+                0,
+                trace_slots * std::mem::size_of::<ResidentDynamicTraceEvent>(),
+            );
+            let cs = std::slice::from_raw_parts_mut(
+                classes.contents().cast::<u32>(),
+                lane_count as usize,
+            );
+            let ac = std::slice::from_raw_parts_mut(
+                active.contents().cast::<u32>(),
+                lane_count as usize,
+            );
+            for (lane, class) in cs.iter_mut().enumerate() {
+                let at = lane * stride as usize + config.next_class_offset as usize;
+                *class = u32::from_le_bytes(
+                    input_frames[at..at + 4]
+                        .try_into()
+                        .expect("validated dynamic class field"),
+                );
+                if *class != config.first_run_class && *class != config.second_run_class {
+                    return Err(BackendError::InvalidInput);
+                }
+            }
+            for (lane, is_active) in ac.iter_mut().enumerate() {
+                let at = lane * stride as usize + config.remaining_offset as usize;
+                let remaining = u32::from_le_bytes(
+                    input_frames[at..at + 4]
+                        .try_into()
+                        .expect("validated dynamic remaining field"),
+                );
+                *is_active = u32::from(remaining != 0);
+            }
+        }
+        let constants = Config {
+            count: lane_count,
+            stride,
+            max_steps: config.max_steps,
+            remaining_offset: config.remaining_offset,
+            next_class_offset: config.next_class_offset,
+        };
+        let command = self.queue.new_command_buffer();
+        for epoch in 0..config.max_steps {
+            let grouped_jobs = [
+                (
+                    first,
+                    config.first_run_class,
+                    &first_in,
+                    &first_out,
+                    &first_ranks,
+                    &first_count,
+                ),
+                (
+                    second,
+                    config.second_run_class,
+                    &second_in,
+                    &second_out,
+                    &second_ranks,
+                    &second_count,
+                ),
+            ];
+            let generic_jobs = [(
+                first,
+                0u32,
+                &first_in,
+                &first_out,
+                &first_ranks,
+                &first_count,
+            )];
+            let jobs: &[(
+                &ResidentFrameHandler,
+                u32,
+                &Buffer,
+                &Buffer,
+                &Buffer,
+                &Buffer,
+            )] = if generic_run_class.is_some() {
+                &generic_jobs
+            } else {
+                &grouped_jobs
+            };
+            for &(handler, target_class, packed, output, ranks, packed_count) in jobs {
+                let reset = command.new_compute_command_encoder();
+                reset.set_compute_pipeline_state(&self.dynamic_reset_count);
+                reset.set_buffer(0, Some(packed_count), 0);
+                dispatch(reset, &self.dynamic_reset_count, 1);
+                reset.end_encoding();
+
+                let pack = command.new_compute_command_encoder();
+                pack.set_compute_pipeline_state(&self.dynamic_pack);
+                pack.set_buffer(0, Some(&frames), 0);
+                pack.set_buffer(1, Some(&classes), 0);
+                pack.set_buffer(2, Some(&active), 0);
+                pack.set_buffer(3, Some(packed), 0);
+                pack.set_buffer(4, Some(ranks), 0);
+                pack.set_buffer(5, Some(packed_count), 0);
+                pack.set_bytes(
+                    6,
+                    std::mem::size_of::<Config>() as u64,
+                    (&constants as *const Config).cast(),
+                );
+                pack.set_bytes(7, 4, (&target_class as *const u32).cast());
+                let pack_width = u64::from(config.cohort_width.min(lane_count).max(1));
+                pack.dispatch_threads(
+                    MTLSize::new(u64::from(lane_count), 1, 1),
+                    MTLSize::new(pack_width, 1, 1),
+                );
+                pack.end_encoding();
+
+                let evaluate = command.new_compute_command_encoder();
+                evaluate.set_compute_pipeline_state(&handler.pipeline);
+                evaluate.set_buffer(0, Some(packed), 0);
+                evaluate.set_buffer(1, Some(output), 0);
+                evaluate.set_buffer(2, Some(packed_count), 0);
+                evaluate.set_bytes(3, 4, (&stride as *const u32).cast());
+                let eval_width = u64::from(config.cohort_width.min(lane_count).max(1))
+                    .min(handler.pipeline.max_total_threads_per_threadgroup());
+                evaluate.dispatch_threads(
+                    MTLSize::new(u64::from(lane_count), 1, 1),
+                    MTLSize::new(eval_width, 1, 1),
+                );
+                evaluate.end_encoding();
+            }
+            let (second_selected, second_rank_selected) = if generic_run_class.is_some() {
+                (&first_out, &first_ranks)
+            } else {
+                (&second_out, &second_ranks)
+            };
+            let encoder = command.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.dynamic_transition);
+            encoder.set_buffer(0, Some(&frames), 0);
+            encoder.set_buffer(1, Some(&first_out), 0);
+            encoder.set_buffer(2, Some(second_selected), 0);
+            encoder.set_buffer(3, Some(&classes), 0);
+            encoder.set_buffer(4, Some(&active), 0);
+            encoder.set_buffer(5, Some(&sequences), 0);
+            encoder.set_buffer(6, Some(&trace), 0);
+            encoder.set_bytes(
+                7,
+                std::mem::size_of::<Config>() as u64,
+                (&constants as *const Config).cast(),
+            );
+            encoder.set_bytes(8, 4, (&epoch as *const u32).cast());
+            encoder.set_bytes(9, 4, (&config.first_run_class as *const u32).cast());
+            encoder.set_bytes(10, 4, (&config.second_run_class as *const u32).cast());
+            encoder.set_buffer(11, Some(&first_ranks), 0);
+            encoder.set_buffer(12, Some(second_rank_selected), 0);
+            encoder.set_buffer(13, Some(&invocations), 0);
+            encoder.set_buffer(14, Some(&invalid_class), 0);
+            let width = u64::from(config.cohort_width.min(lane_count).max(1))
+                .min(self.dynamic_transition.max_total_threads_per_threadgroup());
+            encoder.dispatch_threads(
+                MTLSize::new(u64::from(lane_count), 1, 1),
+                MTLSize::new(width, 1, 1),
+            );
+            encoder.end_encoding();
+        }
+        command.commit();
+        command.wait_until_completed();
+        if command.status() != MTLCommandBufferStatus::Completed {
+            return Err(BackendError::ExecutionFailed);
+        }
+        let invalid = unsafe { *invalid_class.contents().cast::<u32>() };
+        if invalid != 0 {
+            return Err(BackendError::InvalidInput);
+        }
+        let handler_counts =
+            unsafe { std::slice::from_raw_parts(invocations.contents().cast::<u32>(), 2) };
+        let final_frames =
+            unsafe { std::slice::from_raw_parts(frames.contents().cast::<u8>(), bytes) }.to_vec();
+        let counts = unsafe {
+            std::slice::from_raw_parts(sequences.contents().cast::<u32>(), lane_count as usize)
+        };
+        let active_words = unsafe {
+            std::slice::from_raw_parts(active.contents().cast::<u32>(), lane_count as usize)
+        };
+        let slots = unsafe {
+            std::slice::from_raw_parts(
+                trace.contents().cast::<ResidentDynamicTraceEvent>(),
+                trace_slots,
+            )
+        };
+        let mut events = Vec::new();
+        for lane in 0..lane_count as usize {
+            events.extend_from_slice(
+                &slots[lane * config.max_steps as usize
+                    ..lane * config.max_steps as usize + counts[lane] as usize],
+            );
+        }
+        events.sort_by_key(|event| (event.epoch, event.lane));
+        Ok(ResidentDynamicFrameResult {
+            frames: final_frames,
+            trace: events,
+            steps: counts.iter().copied().sum(),
+            first_handler_invocations: handler_counts[0],
+            second_handler_invocations: handler_counts[1],
+            quiescent: active_words.iter().all(|active| *active == 0),
+        })
     }
 
     /// Run a fixed frontier through a compiled handler for several epochs in a
@@ -1562,17 +1997,19 @@ impl MetalResidentSearch {
         bindings: &[ResidentFrameBinding],
         input_frames: &[u8],
     ) -> Result<ResidentFrameGraphResult, BackendError> {
-        let (handler, stride) = self
+        let handler = self
             .frame_handlers
             .get(&config.run_class)
             .ok_or(BackendError::UnsupportedEvaluator)?;
+        let stride = handler.stride;
+        let pipeline = &handler.pipeline;
         let count: u32 = bindings
             .len()
             .try_into()
             .map_err(|_| BackendError::InvalidInput)?;
         let frame_bytes = bindings
             .len()
-            .checked_mul(*stride as usize)
+            .checked_mul(stride as usize)
             .ok_or(BackendError::InvalidInput)?;
         if config.cohort_width == 0 || input_frames.len() != frame_bytes {
             return Err(BackendError::InvalidInput);
@@ -1616,22 +2053,22 @@ impl MetalResidentSearch {
             MTLResourceOptions::StorageModeShared,
         );
         let access_buffer = self.device.new_buffer(
-            (bindings.len() * 2 * std::mem::size_of::<DeviceLaneAccess>()) as u64,
+            (bindings.len() * 4 * std::mem::size_of::<DeviceLaneAccess>()) as u64,
             MTLResourceOptions::StorageModeShared,
         );
         let operation_buffer = self.device.new_buffer(
-            (bindings.len() * 2 * std::mem::size_of::<DeviceLaneOperation>()) as u64,
+            (bindings.len() * 3 * std::mem::size_of::<DeviceLaneOperation>()) as u64,
             MTLResourceOptions::StorageModeShared,
         );
         let command = self.queue.new_command_buffer();
         for epoch in 0..config.epochs {
             let evaluate = command.new_compute_command_encoder();
-            evaluate.set_compute_pipeline_state(handler);
+            evaluate.set_compute_pipeline_state(pipeline);
             evaluate.set_buffer(0, Some(&frames[(epoch & 1) as usize]), 0);
             evaluate.set_buffer(1, Some(&frames[((epoch + 1) & 1) as usize]), 0);
             evaluate.set_bytes(2, 4, (&count as *const u32).cast());
-            evaluate.set_bytes(3, 4, (stride as *const u32).cast());
-            dispatch(evaluate, handler, count);
+            evaluate.set_bytes(3, 4, (&stride as *const u32).cast());
+            dispatch(evaluate, pipeline, count);
             evaluate.end_encoding();
 
             let trace = command.new_compute_command_encoder();
@@ -1639,7 +2076,7 @@ impl MetalResidentSearch {
             trace.set_buffer(0, Some(&frames[((epoch + 1) & 1) as usize]), 0);
             trace.set_buffer(1, Some(&trace_buffer), 0);
             trace.set_bytes(2, 4, (&count as *const u32).cast());
-            trace.set_bytes(3, 4, (stride as *const u32).cast());
+            trace.set_bytes(3, 4, (&stride as *const u32).cast());
             trace.set_bytes(4, 4, (&epoch as *const u32).cast());
             trace.set_bytes(5, 4, (&config.run_class as *const u32).cast());
             dispatch(trace, &self.frame_trace, count);
@@ -1663,26 +2100,29 @@ impl MetalResidentSearch {
             std::slice::from_raw_parts(frames[final_index].contents().cast::<u8>(), frame_bytes)
         }
         .to_vec();
-        let accesses = unsafe {
+        let access_records = unsafe {
             std::slice::from_raw_parts(
                 access_buffer.contents().cast::<DeviceLaneAccess>(),
-                bindings.len() * 2,
+                bindings.len() * 4,
             )
-        }
-        .to_vec();
+        };
         let operation_records = unsafe {
             std::slice::from_raw_parts(
                 operation_buffer.contents().cast::<DeviceLaneOperation>(),
-                bindings.len() * 2,
+                bindings.len() * 3,
             )
         };
-        let operations = operation_records
-            .chunks_exact(2)
-            .map(|records| DeviceOperationJournal {
-                operations: records.to_vec(),
+        let mut accesses = Vec::new();
+        let mut operations = Vec::with_capacity(bindings.len());
+        for (index, binding) in bindings.iter().enumerate() {
+            let access_count = if binding.effect_opcode == 10 { 4 } else { 2 };
+            accesses.extend_from_slice(&access_records[index * 4..index * 4 + access_count]);
+            let operation_count = if binding.effect_opcode == 10 { 3 } else { 2 };
+            operations.push(DeviceOperationJournal {
+                operations: operation_records[index * 3..index * 3 + operation_count].to_vec(),
                 payload: Vec::new(),
-            })
-            .collect();
+            });
+        }
         let trace = unsafe {
             std::slice::from_raw_parts(
                 trace_buffer.contents().cast::<ResidentFrameTraceEvent>(),
@@ -1843,7 +2283,6 @@ impl MetalResidentSearch {
     }
 }
 
-
 impl LaneConflictValidator for MetalResidentSearch {
     fn validate_lane_journals(
         &mut self,
@@ -1863,7 +2302,12 @@ impl LaneConflictValidator for MetalResidentSearch {
             .last_frame_graph
             .take()
             .ok_or(LaneValidationError::InvalidInput)?;
-        if graph.operations.len() != operations.len() || graph.accesses.len() != operations.len() * 2 {
+        let expected_accesses: usize = graph
+            .operations
+            .iter()
+            .map(|journal| if journal.operations.len() == 3 { 4 } else { 2 })
+            .sum();
+        if graph.operations.len() != operations.len() || graph.accesses.len() != expected_accesses {
             return Err(LaneValidationError::ProtocolError);
         }
         for (device, canonical) in graph.operations.iter().zip(operations) {
@@ -1871,7 +2315,14 @@ impl LaneConflictValidator for MetalResidentSearch {
                 return Err(LaneValidationError::ProtocolError);
             }
         }
-        if graph.accesses.iter().any(|emitted| !accesses.contains(emitted)) {
+        if graph.accesses.iter().any(|emitted| {
+            !accesses.iter().any(|canonical| {
+                canonical.resource == emitted.resource
+                    && canonical.lane == emitted.lane
+                    && canonical.resource_kind == emitted.resource_kind
+                    && canonical.mode == emitted.mode
+            })
+        }) {
             return Err(LaneValidationError::ProtocolError);
         }
         Ok(reference_lane_conflicts(accesses, lane_count))
@@ -1888,10 +2339,10 @@ impl DeviceEpochBackend for MetalResidentSearch {
             return Ok(DeviceEvaluation::default());
         }
         let run_class = lanes[0].run_class;
-        let stride = self
+        let (stride, effect) = self
             .frame_handlers
             .get(&run_class)
-            .map(|(_, stride)| *stride)
+            .map(|handler| (handler.stride, handler.resolve_fields))
             .ok_or(LaneValidationError::InvalidInput)?;
         if lanes.iter().any(|lane| {
             lane.run_class != run_class
@@ -1906,12 +2357,29 @@ impl DeviceEpochBackend for MetalResidentSearch {
             .map(|lane| {
                 let start = lane.frame_offset as usize;
                 packed.extend_from_slice(&frames[start..start + stride as usize]);
+                let (effect_opcode, effect_target, effect_value) = match effect {
+                    Some((future_offset, value_offset)) => {
+                        let read = |offset: u32| {
+                            u64::from_le_bytes(
+                                frames[start + offset as usize..start + offset as usize + 8]
+                                    .try_into()
+                                    .expect("validated effect field"),
+                            )
+                        };
+                        (10, read(future_offset), read(value_offset))
+                    }
+                    None => (0, 0, 0),
+                };
                 ResidentFrameBinding {
                     continuation: lane.continuation,
                     process: lane.process,
                     frame: lane.frame,
                     actor: lane.process,
                     target: lane.frame,
+                    effect_opcode,
+                    effect_target,
+                    effect_value,
+                    ..ResidentFrameBinding::default()
                 }
             })
             .collect::<Vec<_>>();

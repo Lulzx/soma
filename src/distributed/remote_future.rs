@@ -341,6 +341,59 @@ impl RemoteFutureServer {
         }
         Ok(())
     }
+
+    /// Serve until the owning node runtime requests shutdown. The listener and
+    /// accepted sockets are polled with short timeouts so joining cannot depend
+    /// on guessing an exact request count.
+    pub fn serve_until(
+        listener: TcpListener,
+        service: Arc<Mutex<RemoteFutureService>>,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<()> {
+        use std::sync::atomic::Ordering;
+        listener.set_nonblocking(true)?;
+        while !shutdown.load(Ordering::Acquire) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            stream.set_nonblocking(false)?;
+            stream.set_read_timeout(Some(Duration::from_millis(20)))?;
+            while !shutdown.load(Ordering::Acquire) {
+                let frame = match read_frame(&mut stream) {
+                    Ok(frame) => frame,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                        ) =>
+                    {
+                        break
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue
+                    }
+                    Err(error) => return Err(error),
+                };
+                let response = service
+                    .lock()
+                    .map_err(|_| std::io::Error::other("remote future service poisoned"))?
+                    .handle(&frame)
+                    .encode();
+                write_frame(&mut stream, &response)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct RemoteFutureClient {
@@ -363,6 +416,9 @@ impl RemoteFutureClient {
     }
     pub fn set_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout;
+    }
+    pub fn target(&self) -> RemoteRef {
+        self.grant.target
     }
     pub fn poll(&self) -> Result<RemoteFutureState, RemoteFutureError> {
         self.round_trip(WireRequest::new(POLL, self.epoch, self.grant, Ref64::NULL))
@@ -480,7 +536,12 @@ impl RemoteFutureBridge {
         {
             RemoteFutureState::Pending => {
                 kernel
-                    .register_remote_future_waiter(continuation, self.target.entity, next_run_class)
+                    .register_remote_future_waiter(
+                        continuation,
+                        self.target.node.0,
+                        self.target.entity,
+                        next_run_class,
+                    )
                     .map_err(RemoteFutureBridgeError::Kernel)?;
                 self.waiters.push(continuation);
                 Ok(RemoteAwaitOutcome::Registered)
@@ -507,7 +568,7 @@ impl RemoteFutureBridge {
             .map_err(RemoteFutureBridgeError::Remote)?;
         if matches!(state, RemoteFutureState::Resolved { .. }) {
             for waiter in self.waiters.drain(..) {
-                kernel.wake_remote_future_waiter(waiter, self.target.entity);
+                kernel.wake_remote_future_waiter(waiter, self.target.node.0, self.target.entity);
             }
         }
         Ok(state)

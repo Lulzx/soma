@@ -478,9 +478,15 @@ pub struct ResidentFrameBinding {
     pub frame: u64,
     pub actor: u64,
     pub target: u64,
+    /// Zero emits only private-frame read/write. `OP_RESOLVE_FUTURE` adds a
+    /// future write using `effect_target`/`effect_value`.
+    pub effect_opcode: u32,
+    pub reserved: u32,
+    pub effect_target: u64,
+    pub effect_value: u64,
 }
 
-const _: () = assert!(std::mem::size_of::<ResidentFrameBinding>() == 40);
+const _: () = assert!(std::mem::size_of::<ResidentFrameBinding>() == 64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResidentFrameGraphConfig {
@@ -496,6 +502,37 @@ pub struct ResidentFrameTraceEvent {
     pub lane: u32,
     pub run_class: u32,
     pub word: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidentDynamicFrameConfig {
+    pub first_run_class: u32,
+    pub second_run_class: u32,
+    pub max_steps: u32,
+    pub cohort_width: u32,
+    pub remaining_offset: u32,
+    pub next_class_offset: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResidentDynamicTraceEvent {
+    pub epoch: u32,
+    pub lane: u32,
+    pub run_class: u32,
+    pub step_kind: u32,
+    pub word: u32,
+    pub reserved: [u32; 3],
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResidentDynamicFrameResult {
+    pub frames: Vec<u8>,
+    pub trace: Vec<ResidentDynamicTraceEvent>,
+    pub steps: u32,
+    pub first_handler_invocations: u32,
+    pub second_handler_invocations: u32,
+    pub quiescent: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -562,17 +599,34 @@ pub fn reference_resident_frame_graph(
         .iter()
         .enumerate()
         .flat_map(|(lane, binding)| {
-            [
+            let mut lane_accesses = vec![
                 DeviceLaneAccess::new(lane as u32, 1, binding.target, DEVICE_ACCESS_READ, 0),
                 DeviceLaneAccess::new(lane as u32, 1, binding.target, DEVICE_ACCESS_WRITE, 1),
-            ]
+            ];
+            if binding.effect_opcode == crate::scheduler::device_ops::OP_RESOLVE_FUTURE {
+                lane_accesses.push(DeviceLaneAccess::new(
+                    lane as u32,
+                    2,
+                    binding.effect_target,
+                    DEVICE_ACCESS_WRITE,
+                    2,
+                ));
+                lane_accesses.push(DeviceLaneAccess::new(
+                    lane as u32,
+                    1,
+                    binding.effect_value,
+                    DEVICE_ACCESS_READ,
+                    3,
+                ));
+            }
+            lane_accesses
         })
         .collect();
     let operations = bindings
         .iter()
         .enumerate()
-        .map(|(lane, binding)| DeviceOperationJournal {
-            operations: vec![
+        .map(|(lane, binding)| {
+            let mut records = vec![
                 DeviceLaneOperation {
                     lane: lane as u32,
                     ordinal: 0,
@@ -585,12 +639,27 @@ pub fn reference_resident_frame_graph(
                     lane: lane as u32,
                     ordinal: 1,
                     opcode: OP_WRITE_OBJECT,
+                    flags: 1,
                     actor: binding.actor,
                     target: binding.target,
                     ..DeviceLaneOperation::default()
                 },
-            ],
-            payload: Vec::new(),
+            ];
+            if binding.effect_opcode == crate::scheduler::device_ops::OP_RESOLVE_FUTURE {
+                records.push(DeviceLaneOperation {
+                    lane: lane as u32,
+                    ordinal: 2,
+                    opcode: crate::scheduler::device_ops::OP_RESOLVE_FUTURE,
+                    actor: binding.actor,
+                    target: binding.effect_target,
+                    value: binding.effect_value,
+                    ..DeviceLaneOperation::default()
+                });
+            }
+            DeviceOperationJournal {
+                operations: records,
+                payload: Vec::new(),
+            }
         })
         .collect();
     Some(ResidentFrameGraphResult {
