@@ -26,7 +26,7 @@ use crate::scheduler::device_ops::{
 };
 
 use super::batch::BackendError;
-use crate::compiler::body::EvaluatorProgram;
+use crate::compiler::body::{EvaluatorProgram, Op};
 
 const SOURCE: &str = r#"
 #include <metal_stdlib>
@@ -368,7 +368,7 @@ pub struct MetalDeviceScheduler {
     journal_validation: ComputePipelineState,
     operation_validation: ComputePipelineState,
     evaluator: ComputePipelineState,
-    handler_pipelines: HashMap<u32, (ComputePipelineState, u32)>,
+    handler_pipelines: HashMap<u32, (ComputePipelineState, u32, bool)>,
     resident: Option<(Buffer, Buffer, Buffer, usize)>,
     journal_resident: Option<(Buffer, Buffer, usize, usize)>,
     operation_resident: Option<(Buffer, Buffer, Buffer, usize, usize)>,
@@ -475,8 +475,12 @@ impl MetalDeviceScheduler {
             .device
             .new_compute_pipeline_state_with_function(&function)
             .map_err(|_| BackendError::UnsupportedEvaluator)?;
+        let batchable = !program
+            .ops()
+            .iter()
+            .any(|op| matches!(op, Op::Index | Op::Gather(_, _) | Op::GatherAux(_, _)));
         self.handler_pipelines
-            .insert(run_class, (pipeline, program.stride()));
+            .insert(run_class, (pipeline, program.stride(), batchable));
         Ok(())
     }
 
@@ -976,7 +980,8 @@ impl DeviceEpochBackend for MetalDeviceScheduler {
             return Err(LaneValidationError::InvalidInput);
         }
         let run_class = lanes[0].run_class;
-        if let Some((pipeline, stride)) = self.handler_pipelines.get(&run_class).cloned() {
+        if let Some((pipeline, stride, batchable)) = self.handler_pipelines.get(&run_class).cloned()
+        {
             let packed = lanes.iter().enumerate().all(|(index, lane)| {
                 lane.run_class == run_class
                     && lane.frame_len == stride
@@ -986,7 +991,7 @@ impl DeviceEpochBackend for MetalDeviceScheduler {
             if !packed || required != Some(frames.len()) {
                 return Err(LaneValidationError::InvalidInput);
             }
-            let count = 1u32;
+            let count = if batchable { lanes.len() as u32 } else { 1 };
             let input = self.device.new_buffer(
                 frames.len().max(1) as u64,
                 MTLResourceOptions::StorageModeShared,
@@ -1003,15 +1008,20 @@ impl DeviceEpochBackend for MetalDeviceScheduler {
                 );
             }
             let command = self.queue.new_command_buffer();
-            // A frame is a private one-element array. Binding the whole epoch
-            // as one array would let `Gather` cross continuation boundaries.
-            // Separate encoders retain that isolation while sharing one GPU
-            // command-buffer submission and completion wait.
-            for lane in lanes {
+            // A pointwise body neither observes `Index` nor gathers, so packing
+            // frames cannot change a result and one dispatch is safe. Bodies
+            // that can observe array topology retain one private one-element
+            // binding per lane, sharing only the command-buffer submission.
+            let bindings: Vec<u32> = if batchable {
+                vec![0]
+            } else {
+                lanes.iter().map(|lane| lane.frame_offset).collect()
+            };
+            for offset in bindings {
                 let encoder = command.new_compute_command_encoder();
                 encoder.set_compute_pipeline_state(&pipeline);
-                encoder.set_buffer(0, Some(&input), u64::from(lane.frame_offset));
-                encoder.set_buffer(1, Some(&output), u64::from(lane.frame_offset));
+                encoder.set_buffer(0, Some(&input), u64::from(offset));
+                encoder.set_buffer(1, Some(&output), u64::from(offset));
                 encoder.set_bytes(
                     2,
                     std::mem::size_of::<u32>() as u64,

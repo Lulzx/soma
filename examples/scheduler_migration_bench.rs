@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use soma::abi::cohorts::PartialCohortPolicy;
 use soma::abi::{Kind, ObjectKind, ProcessMode, Ref64, Rights, StateAccess};
 use soma::compiler::examples;
+use soma::compiler::run_classes::DEFAULT_MAX_STEPS;
 use soma::distributed::authority::{GrantSpec, RemoteAuthorityStore};
 use soma::distributed::remote_batch::{RemoteBatchBackend, RemoteBatchServer, RemoteBatchService};
 use soma::distributed::{NodeId, RemoteRef};
@@ -18,7 +19,8 @@ use soma::executives::batch::{
 };
 use soma::experiments::backend_bench::{synthetic_inputs, synthetic_program};
 use soma::kernel::ownership::freeze;
-use soma::kernel::{Kernel, SYSTEM_PRINCIPAL};
+use soma::kernel::speculation::EpochExecutive;
+use soma::kernel::{ContinuationSpec, Kernel, SYSTEM_PRINCIPAL};
 use soma::scheduler::admission::Candidate;
 
 fn main() {
@@ -28,9 +30,115 @@ fn main() {
         std::env::consts::OS,
         !cfg!(debug_assertions)
     );
-    scheduler_benchmark();
-    if !std::env::args().any(|argument| argument == "--scheduler-only") {
+    let handlers_only = std::env::args().any(|argument| argument == "--handlers-only");
+    if !handlers_only {
+        scheduler_benchmark();
+    }
+    compiled_handler_benchmark();
+    if !handlers_only && !std::env::args().any(|argument| argument == "--scheduler-only") {
         remote_benchmark();
+    }
+}
+
+fn handler_kernel(
+    program: &soma::compiler::body::EvaluatorProgram,
+    run_class: u32,
+    count: u32,
+) -> Kernel {
+    let mut kernel = Kernel::new();
+    kernel
+        .install_frame_evaluator(run_class, program.clone())
+        .unwrap();
+    let frames = synthetic_inputs(count, program.stride());
+    for frame in frames.chunks_exact(program.stride() as usize) {
+        let process = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+        kernel
+            .create_continuation(
+                SYSTEM_PRINCIPAL,
+                process,
+                ContinuationSpec::new(
+                    StateAccess::ReadOnly,
+                    run_class,
+                    0,
+                    frame.to_vec(),
+                    DEFAULT_MAX_STEPS,
+                ),
+            )
+            .unwrap();
+    }
+    kernel
+}
+
+fn compiled_handler_benchmark() {
+    const RUN_CLASS: u32 = 1024;
+    let program = synthetic_program(46_000, 2, 64);
+    println!("\n[compiled continuation handler: full epoch execute + journal + commit]");
+
+    #[cfg(feature = "native")]
+    let mut native = {
+        let mut backend = soma::executives::native::NativeEpochBackend::new().unwrap();
+        backend
+            .install_frame_evaluator(RUN_CLASS, &program)
+            .unwrap();
+        backend
+    };
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    let mut metal = {
+        let mut backend = soma::executives::metal_scheduler::MetalDeviceScheduler::new().unwrap();
+        backend
+            .install_frame_evaluator(RUN_CLASS, &program)
+            .unwrap();
+        backend
+    };
+
+    for count in [32, 256, 1_024] {
+        let base = handler_kernel(&program, RUN_CLASS, count);
+        let repetitions = if count < 1_024 { 11 } else { 7 };
+        let mut reference = Vec::with_capacity(repetitions);
+        #[cfg(feature = "native")]
+        let mut native_samples = Vec::with_capacity(repetitions);
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        let mut metal_samples = Vec::with_capacity(repetitions);
+
+        for _ in 0..repetitions {
+            let mut kernel = base.clone();
+            let started = Instant::now();
+            assert_eq!(kernel.run_epoch(), count as usize);
+            reference.push(started.elapsed());
+
+            #[cfg(feature = "native")]
+            {
+                let mut kernel = base.clone();
+                kernel.configure_epoch_executive(EpochExecutive::Speculative {
+                    max_lanes: count as usize,
+                });
+                let started = Instant::now();
+                assert_eq!(
+                    kernel.run_epoch_with_device_backend(&mut native),
+                    count as usize
+                );
+                native_samples.push(started.elapsed());
+            }
+
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            {
+                let mut kernel = base.clone();
+                kernel.configure_epoch_executive(EpochExecutive::Speculative {
+                    max_lanes: count as usize,
+                });
+                let started = Instant::now();
+                assert_eq!(
+                    kernel.run_epoch_with_device_backend(&mut metal),
+                    count as usize
+                );
+                metal_samples.push(started.elapsed());
+            }
+        }
+        summarize(&format!("reference-handler lanes={count}"), &reference);
+        #[cfg(feature = "native")]
+        summarize(&format!("native-handler lanes={count}"), &native_samples);
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        summarize(&format!("metal-handler lanes={count}"), &metal_samples);
     }
 }
 

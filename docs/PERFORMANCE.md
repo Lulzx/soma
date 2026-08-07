@@ -1,7 +1,8 @@
 # Performance: what was measured, and what it cost
 
 This document began with nine commits, `cae41c5..c3621a0`, and now also records
-the device-scheduler and distributed-migration measurements in §8. Read §1
+the device-scheduler and distributed-migration measurements in §8 and compiled
+continuation-handler measurements in §9. Read §1
 before using any number in it, and §§7–8 before deciding what to do next.
 
 Everything here is about the *implementation*. No semantics changed except one
@@ -435,7 +436,42 @@ cell is fixed-cost noise: its full-path median is below the separately sampled
 remote median, and the raw percentile ranges overlap. It must not be read as a
 negative migration cost.
 
-The benchmark intentionally does not claim stateful distributed execution.
-Queue and channel journals are still coordinator-owned, and the worker is on
-loopback. Those are implementation boundaries for the next distributed slice,
-not hidden assumptions in these numbers.
+The benchmark intentionally does not price the later stateful remote-journal
+gate. Full operation and payload arenas, authentication, exact retry, and node
+loss are implemented there, but canonical queues/futures remain coordinator
+owned by design. This table measures evaluator transport and publication on
+loopback, not multi-host ownership transfer.
+
+---
+
+## 9. Compiled continuation handler migration
+
+The same harness now installs one 64-ALU evaluator program as a user run class
+and times a complete epoch through three placements. The fixture `Kernel` clone
+is outside the timer. Inside are handler execution, operation/access journal
+construction, backend validation, disposable replay validation, canonical
+replay, and commit. Native means Cranelift machine code; Metal means generated
+MSL on the real M4 Pro GPU.
+
+| lanes | reference | native | native / ref | Metal | Metal / ref |
+|---:|---:|---:|---:|---:|---:|
+| 32 | 28.125µs | 117.667µs | 4.18× | 3.201ms | 113.8× |
+| 256 | 162.417µs | 752.667µs | 4.63× | 10.003ms | 61.6× |
+| 1,024 | 623.084µs | 5.471ms | 8.78× | 35.931ms | 57.7× |
+
+This is an overhead result, not a speedup result. The body itself is too small
+to repay migration and the full journal gate dominates it. Pointwise handlers
+already use one safe batch: the compiler proves they contain no `Index`,
+`Gather`, or `GatherAux`. A topology-observing handler instead receives one
+private one-element frame binding per lane, because treating the epoch arena as
+one array would let a gather read a sibling continuation's frame. The
+`RUN_LENGTH` controls exercise that exact distinction on native and Metal.
+
+The Metal curve identifies the next concrete bottleneck: complete access
+validation still compares lane journals quadratically. The scheduler's own
+stable-sort result in §8.1 does not fix that separate kernel. Until journal
+validation is sorted/grouped as well, a placement policy should keep these
+small stateful handlers on the reference/native path and reserve Metal for
+large collective evaluator batches or resident search. Raw trials, including
+p10/p90 and every nanosecond sample, are in
+`docs/measurements/COMPILED-HANDLER-M4-PRO-2026-08-07.txt`.

@@ -58,7 +58,7 @@ pub struct NativeCpuBackend {
 /// epoch boundary as Metal rather than only through batch collectives.
 pub struct NativeEpochBackend {
     evaluator: NativeCpuBackend,
-    handlers: HashMap<u32, (u32, u32)>,
+    handlers: HashMap<u32, (u32, u32, bool)>,
 }
 
 impl NativeEpochBackend {
@@ -78,8 +78,12 @@ impl NativeEpochBackend {
             return Err(BackendError::InvalidInput);
         }
         self.evaluator.install(program)?;
+        let batchable = !program
+            .ops()
+            .iter()
+            .any(|op| matches!(op, Op::Index | Op::Gather(_, _) | Op::GatherAux(_, _)));
         self.handlers
-            .insert(run_class, (program.id(), program.stride()));
+            .insert(run_class, (program.id(), program.stride(), batchable));
         Ok(())
     }
 }
@@ -106,8 +110,11 @@ impl DeviceEpochBackend for NativeEpochBackend {
         if lanes.is_empty() {
             return Ok(DeviceEvaluation::default());
         }
+        if lanes.len() > u32::MAX as usize {
+            return Err(LaneValidationError::InvalidInput);
+        }
         let run_class = lanes[0].run_class;
-        let (program, stride) = self
+        let (program, stride, batchable) = self
             .handlers
             .get(&run_class)
             .copied()
@@ -120,22 +127,29 @@ impl DeviceEpochBackend for NativeEpochBackend {
         if !packed || lanes.len().checked_mul(stride as usize) != Some(frames.len()) {
             return Err(LaneValidationError::InvalidInput);
         }
-        let mut output = Vec::with_capacity(frames.len());
-        for lane in lanes {
-            let start = lane.frame_offset as usize;
-            let end = start
-                .checked_add(stride as usize)
-                .ok_or(LaneValidationError::InvalidInput)?;
-            let frame = frames
-                .get(start..end)
-                .ok_or(LaneValidationError::InvalidInput)?;
-            output.extend_from_slice(
-                &self
-                    .evaluator
-                    .evaluate(program, frame, 1, stride)
-                    .map_err(|_| LaneValidationError::ExecutionFailed)?,
-            );
-        }
+        let output = if batchable {
+            self.evaluator
+                .evaluate(program, frames, lanes.len() as u32, stride)
+                .map_err(|_| LaneValidationError::ExecutionFailed)?
+        } else {
+            let mut output = Vec::with_capacity(frames.len());
+            for lane in lanes {
+                let start = lane.frame_offset as usize;
+                let end = start
+                    .checked_add(stride as usize)
+                    .ok_or(LaneValidationError::InvalidInput)?;
+                let frame = frames
+                    .get(start..end)
+                    .ok_or(LaneValidationError::InvalidInput)?;
+                output.extend_from_slice(
+                    &self
+                        .evaluator
+                        .evaluate(program, frame, 1, stride)
+                        .map_err(|_| LaneValidationError::ExecutionFailed)?,
+                );
+            }
+            output
+        };
         let results = lanes
             .iter()
             .map(|lane| DeviceEvaluatorResult {

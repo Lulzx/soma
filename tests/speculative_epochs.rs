@@ -221,6 +221,67 @@ fn arbitrary_evaluator_program_runs_as_native_compiled_continuation_handler() {
     assert_legal(&native);
 }
 
+#[cfg(feature = "native")]
+#[test]
+fn an_uninstalled_native_handler_falls_back_without_partial_device_state() {
+    use soma::compiler::examples;
+    use soma::executives::native::NativeEpochBackend;
+
+    const RUN_CLASS: u32 = 1026;
+    let module = examples::module();
+    let program = module.program(examples::BITMIX).unwrap().clone();
+    let build = || {
+        let mut kernel = Kernel::new();
+        kernel
+            .install_frame_evaluator(RUN_CLASS, program.clone())
+            .unwrap();
+        for value in 1..=4u32 {
+            let process = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+            let mut frame = value.to_le_bytes().to_vec();
+            frame.extend_from_slice(&value.rotate_left(7).to_le_bytes());
+            kernel
+                .create_continuation(
+                    SYSTEM_PRINCIPAL,
+                    process,
+                    ContinuationSpec::new(
+                        StateAccess::ReadOnly,
+                        RUN_CLASS,
+                        0,
+                        frame,
+                        DEFAULT_MAX_STEPS,
+                    ),
+                )
+                .unwrap();
+        }
+        kernel
+    };
+    let mut reference = build();
+    let mut fallback = build();
+    fallback.configure_epoch_executive(EpochExecutive::Speculative { max_lanes: 8 });
+    let mut backend = NativeEpochBackend::new().unwrap();
+
+    reference.run_epoch();
+    fallback.run_epoch_with_device_backend(&mut backend);
+
+    assert_eq!(fallback.speculation_stats().device_evaluated_epochs, 0);
+    assert_eq!(fallback.speculation_stats().committed_epochs, 1);
+    assert!(conforms_traces(&reference.trace_snapshot(), &fallback.trace_snapshot()).is_empty());
+    assert_legal(&fallback);
+}
+
+#[test]
+fn user_frame_evaluators_cannot_shadow_machine_run_classes() {
+    let module = soma::compiler::examples::module();
+    let program = module
+        .program(soma::compiler::examples::BITMIX)
+        .unwrap()
+        .clone();
+    assert!(matches!(
+        Kernel::new().install_frame_evaluator(SEARCH_HEURISTIC, program),
+        Err(soma::kernel::RuntimeError::InvalidModule)
+    ));
+}
+
 fn two_leaves_in_one_process() -> Kernel {
     let mut kernel = Kernel::new();
     let process = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);

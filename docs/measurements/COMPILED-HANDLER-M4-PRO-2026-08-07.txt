@@ -1,0 +1,22 @@
+Command:
+cargo run --release --all-features --example scheduler_migration_bench -- --handlers-only
+
+Machine reported by harness: arch=aarch64 os=macos release=true
+
+[compiled continuation handler: full epoch execute + journal + commit]
+reference-handler lanes=32	median_us=28.125	p10_us=22.833	p90_us=57.333	raw_ns=48708,28125,26334,31708,27250,40750,22250,22833,23000,97125,57333
+native-handler lanes=32	median_us=117.667	p10_us=100.250	p90_us=204.709	raw_ns=196875,121500,113584,109125,176000,115708,100250,95000,117667,211875,204709
+metal-handler lanes=32	median_us=3201.458	p10_us=2300.875	p90_us=6034.416	raw_ns=7911916,6034416,3971042,3088000,2300875,2038750,2820458,3201458,4755125,3254333,2659125
+reference-handler lanes=256	median_us=162.417	p10_us=158.000	p90_us=513.208	raw_ns=608542,470875,159958,160667,513208,164917,163833,162417,158000,154708,161458
+native-handler lanes=256	median_us=752.667	p10_us=679.167	p90_us=1801.625	raw_ns=2389542,1801625,1596166,738792,1430583,697167,776292,752667,695000,679167,636292
+metal-handler lanes=256	median_us=10002.542	p10_us=8940.500	p90_us=13230.917	raw_ns=16015292,13230917,11969459,10729542,10218875,9864292,8868750,9148500,8940500,10002542,8990791
+reference-handler lanes=1024	median_us=623.084	p10_us=620.083	p90_us=644.209	raw_ns=673375,620083,644209,623084,622125,612208,631208
+native-handler lanes=1024	median_us=5470.583	p10_us=5297.250	p90_us=5960.291	raw_ns=6175750,5960291,5324000,5251042,5470583,5297250,5480750
+metal-handler lanes=1024	median_us=35930.958	p10_us=35744.958	p90_us=37019.792	raw_ns=35846667,35744958,37772500,36396542,33993875,37019792,35930958
+
+Scope: the fixture Kernel clone is outside the timer. The timer includes one
+complete epoch: evaluator execution, operation/access journal construction,
+backend validation, disposable replay validation, canonical replay and commit.
+The synthetic handler has two u32 fields and 64 ALU operations. It is pointwise,
+so native and Metal use the safe single-batch path. Index/gather bodies use
+isolated one-element frame bindings and are correctness controls, not this cell.
