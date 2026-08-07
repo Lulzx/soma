@@ -1557,6 +1557,12 @@ noisy acquisition, two executions over exactly the same observations. The
 protocol, negative controls, and M4 Pro measurements are in
 `docs/SELF-TUNING.md`.
 
+The resulting native CPU backend is not benchmark scaffolding. It lowers every
+validated evaluator-body operation to Cranelift machine code, including gathers
+and structured/divergent loops, and never substitutes the interpreter inside a
+native timing. I20-style agreement keeps the scalar interpreter as the
+definition.
+
 ## 5. C — distributed, trace-equivalent
 
 **Not started, and still the long pole.** Roughly the size of B and A combined.

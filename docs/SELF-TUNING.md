@@ -93,18 +93,14 @@ Across the final capture, 90 logical deterministic preparation requests became
 6 physical realizations, while all 675 observation samples executed. Literal
 and optimized terminal scientific states were identical and D1–D7 all held.
 
-## Native compiler boundary
+## Native compiler
 
-The current JIT compiles the full straight-line pointwise integer surface used
-by this experiment: packed u8/u16/u32/u64 loads and stores, index, locals,
-wrapping arithmetic, bitwise operations, masked shifts, comparisons, and
-select. It emits one native element loop and can split disjoint element ranges
-over OS threads.
-
-Gather, auxiliary-array, and loop bodies currently return
-UnsupportedEvaluator. They never fall back inside the native backend. Extending
-native lowering to those validated operations is part of the general-purpose
-evaluator compiler milestone.
+The JIT compiles the full validated evaluator language: packed u8/u16/u32/u64
+loads and stores, index, locals, wrapping arithmetic, bitwise operations,
+masked shifts, comparisons, select, input and auxiliary gathers, structured
+repeats, and divergent early exits. It emits a native element loop, lowers
+repeats to machine-code loops, and can split disjoint element ranges over OS
+threads. No evaluator instruction falls back to interpretation.
 
 ## Controls
 
@@ -116,5 +112,6 @@ evaluator compiler milestone.
 - Extreme Metal threadgroup requests are clamped and checked against reference
   bytes on real hardware.
 - Reference, native CPU, and Metal outputs share one digest per workload.
-- The native compiler declines unsupported bodies rather than interpreting
-  them, so native timing cannot silently include the reference backend.
+- The native compiler agrees with the reference on every built-in body,
+  including gathers, auxiliary sensing, uniform loops, divergent breaks, and a
+  nested-loop local-carry control.

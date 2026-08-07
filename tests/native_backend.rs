@@ -24,6 +24,8 @@ fn native_code_agrees_with_the_reference_on_every_supported_example() {
         examples::BITMIX,
         examples::NEIGHBOUR_MAX,
         examples::PERMUTE,
+        examples::WINDOW_SUM,
+        examples::RUN_LENGTH,
     ]
     .iter()
     .map(|id| module.program(*id).unwrap())
@@ -108,21 +110,6 @@ fn native_lowering_covers_the_straight_line_integer_language() {
 }
 
 #[test]
-fn unsupported_control_flow_and_gathers_are_declined() {
-    let module = examples::module();
-    for id in [examples::WINDOW_SUM, examples::RUN_LENGTH] {
-        let program = module.program(id).unwrap();
-        let mut native = NativeCpuBackend::new().unwrap();
-        assert_eq!(
-            native.install(program),
-            Err(BackendError::UnsupportedEvaluator),
-            "unsupported body {} was partially compiled",
-            program.name()
-        );
-    }
-}
-
-#[test]
 fn native_auxiliary_gathers_agree_with_the_reference() {
     use soma::experiments::ant_scoring::{self, Sensor};
 
@@ -157,6 +144,50 @@ fn native_auxiliary_gathers_agree_with_the_reference() {
         reference
             .evaluate_with_aux(program.id(), &input, 2, program.stride(), aux)
             .unwrap()
+    );
+    let empty_aux = AuxArray::new(&[], 0, 2);
+    assert_eq!(
+        native
+            .evaluate_with_aux(program.id(), &input, 2, program.stride(), empty_aux)
+            .unwrap(),
+        reference
+            .evaluate_with_aux(program.id(), &input, 2, program.stride(), empty_aux)
+            .unwrap()
+    );
+}
+
+#[test]
+fn native_nested_repeats_carry_locals_like_the_reference() {
+    let program = EvaluatorProgram::with_locals(
+        30_001,
+        "native_nested_repeats",
+        ElementLayout::new(vec![FieldWidth::U32, FieldWidth::U32]),
+        1,
+        vec![
+            Op::Const(1),
+            Op::Const(0),
+            Op::Set(0, 1),
+            Op::Repeat(3),
+            Op::Repeat(4),
+            Op::Get(0),
+            Op::Add(5, 0),
+            Op::Set(0, 6),
+            Op::EndRepeat,
+            Op::EndRepeat,
+            Op::Get(0),
+        ],
+        vec![Store {
+            field: 1,
+            value: 10,
+        }],
+    )
+    .unwrap();
+    let input = inputs();
+    let mut reference = CpuReferenceBackend::with(&[&program]);
+    let mut native = NativeCpuBackend::with(&[&program]).unwrap().with_threads(4);
+    assert_eq!(
+        native.evaluate(program.id(), &input, 257, 8).unwrap(),
+        reference.evaluate(program.id(), &input, 257, 8).unwrap()
     );
 }
 

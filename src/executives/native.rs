@@ -1,15 +1,15 @@
 //! Native CPU JIT backend for evaluator bodies.
 //!
 //! The scalar backend remains I20's definition. This backend lowers the
-//! evaluator language to Cranelift machine code and is checked byte-for-byte
-//! against that definition. Unsupported control-flow forms are declined rather
-//! than partly interpreted: `UnsupportedEvaluator` is an honest placement
-//! answer.
+//! full validated evaluator language to Cranelift machine code and is checked
+//! byte-for-byte against that definition. Pointwise arithmetic, gathers,
+//! auxiliary arrays, structured repeats, and divergent early exits all cross
+//! the same backend boundary; no instruction falls back to interpretation.
 
 use std::collections::HashMap;
 
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlags, UserFuncName, Value};
+use cranelift_codegen::ir::{types, AbiParam, Block, InstBuilder, MemFlags, UserFuncName, Value};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
@@ -95,14 +95,6 @@ impl NativeCpuBackend {
     }
 
     fn compile(&mut self, program: &EvaluatorProgram) -> Result<NativeEvaluator, BackendError> {
-        if program
-            .ops()
-            .iter()
-            .any(|op| matches!(op, Op::Repeat(_) | Op::EndRepeat | Op::BreakIf(_)))
-        {
-            return Err(BackendError::UnsupportedEvaluator);
-        }
-
         let pointer = self.module.target_config().pointer_type();
         let mut signature = self.module.make_signature();
         signature.params.extend([
@@ -177,11 +169,18 @@ impl NativeCpuBackend {
                 builder.def_var(local, zero);
                 locals.push(local);
             }
-            let mut values: Vec<Value> = Vec::with_capacity(program.ops().len());
-            for op in program.ops() {
-                let value = lower_op(&mut builder, program, *op, arrays, &values, &locals)?;
-                values.push(value);
-            }
+            let zero = builder.ins().iconst(types::I64, 0);
+            let mut values = vec![zero; program.ops().len()];
+            lower_ops(
+                &mut builder,
+                program,
+                arrays,
+                0,
+                program.ops().len(),
+                &mut values,
+                &locals,
+                None,
+            )?;
             for store in program.stores() {
                 let offset = program
                     .layout()
@@ -342,6 +341,101 @@ impl BatchBackend for NativeCpuBackend {
             ),
         ))
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_ops(
+    builder: &mut FunctionBuilder<'_>,
+    program: &EvaluatorProgram,
+    arrays: ArrayValues,
+    start: usize,
+    end: usize,
+    values: &mut [Value],
+    locals: &[cranelift_frontend::Variable],
+    break_target: Option<Block>,
+) -> Result<(), BackendError> {
+    let mut pc = start;
+    while pc < end {
+        match program.ops()[pc] {
+            Op::Repeat(trips) => {
+                let close =
+                    matching_end(program.ops(), pc).ok_or(BackendError::UnsupportedEvaluator)?;
+                if close >= end {
+                    return Err(BackendError::UnsupportedEvaluator);
+                }
+                let zero = builder.ins().iconst(types::I64, 0);
+                values[pc] = zero;
+                let counter = builder.declare_var(types::I32);
+                let initial = builder.ins().iconst(types::I32, i64::from(trips));
+                builder.def_var(counter, initial);
+                let header = builder.create_block();
+                let body = builder.create_block();
+                let exit = builder.create_block();
+                builder.ins().jump(header, &[]);
+
+                builder.switch_to_block(header);
+                let remaining = builder.use_var(counter);
+                let more = builder.ins().icmp_imm(IntCC::NotEqual, remaining, 0);
+                builder.ins().brif(more, body, &[], exit, &[]);
+
+                builder.switch_to_block(body);
+                lower_ops(
+                    builder,
+                    program,
+                    arrays,
+                    pc + 1,
+                    close,
+                    values,
+                    locals,
+                    Some(exit),
+                )?;
+                let remaining = builder.use_var(counter);
+                let next = builder.ins().iadd_imm(remaining, -1);
+                builder.def_var(counter, next);
+                builder.ins().jump(header, &[]);
+
+                builder.switch_to_block(exit);
+                let zero = builder.ins().iconst(types::I64, 0);
+                values[close] = zero;
+                pc = close + 1;
+            }
+            Op::BreakIf(condition) => {
+                let target = break_target.ok_or(BackendError::UnsupportedEvaluator)?;
+                let zero = builder.ins().iconst(types::I64, 0);
+                values[pc] = zero;
+                let leave = builder
+                    .ins()
+                    .icmp_imm(IntCC::NotEqual, values[condition as usize], 0);
+                let keep_going = builder.create_block();
+                builder.ins().brif(leave, target, &[], keep_going, &[]);
+                builder.switch_to_block(keep_going);
+                pc += 1;
+            }
+            Op::EndRepeat => return Err(BackendError::UnsupportedEvaluator),
+            op => {
+                values[pc] = lower_op(builder, program, op, arrays, values, locals)?;
+                pc += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn matching_end(ops: &[Op], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, op) in ops.iter().enumerate().skip(start) {
+        match op {
+            Op::Repeat(_) => depth += 1,
+            Op::EndRepeat => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn lower_op(

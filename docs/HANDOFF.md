@@ -30,6 +30,12 @@ either replays canonically or discards everything and invokes the reference
 loop. Start with [SPECULATIVE-EPOCHS.md](SPECULATIVE-EPOCHS.md),
 `kernel/speculation.rs`, and `tests/speculative_epochs.rs`.
 
+The optional `native` feature adds a Cranelift CPU backend for the complete
+validated evaluator-body language. The scalar interpreter remains I20's
+definition; `tests/native_backend.rs` covers all integer operations, packed
+field widths, gathers, auxiliary arrays, nested repeats, divergent exits, and
+threaded execution.
+
 Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
