@@ -250,12 +250,29 @@ generic body with two class-specific counted loops and `break_if` at each loop
 head, while grouped handlers contain only their relevant loop. Thus divergence
 cost is measured without forcing a branchless generic handler to do work it
 could skip. Generic and grouped Metal runs match exact final frames, trace, steps, and
-quiescence. The release harness now adds a genuine CPU class-bucket oracle,
-device one-class, eight-submit level-sync, low-arrival, six alternating samples,
-and submission counts. Its 16K grouped/generic direction reversed across
-independent runs (ratios 1.061, 0.890, 1.233, and 0.768), so the apparent
-crossover is not reproducible and is still not a G5 claim. Raw final samples
-are in `measurements/RESIDENT-DYNAMIC-M4-PRO-2026-08-07.txt`.
+quiescence. The harness adds a genuine CPU class-bucket oracle, device one-class,
+eight-submit level-sync, low-arrival, alternating samples, and submission counts.
+However, the first timing input put every lane in A and switched all lanes in
+lockstep, so it never exercised mixed-class SIMD divergence. Its reversing 16K
+ratios (1.061, 0.890, 1.233, 0.768) are only compaction/one-class noise controls.
+
+The corrected `resident_dynamic_stress` input alternates classes, interleaves
+four depths, and asserts both classes at every epoch. Across two independent
+processes and six recreated-backend AB/BA batches, all 66 exact primary samples
+exceed 20 ms. Call-position-stratified grouped/generic ratios have median 0.9050
+and a seeded bootstrap 95% interval [0.8568, 0.9482]. That is a narrow,
+reproducible grouped win over the competent generic device worker. It is not a
+G5 closure. A dedicated position-balanced 65,536-lane control confirms sorted
+16-submit execution is faster in all six batches: median grouped/sorted is
+1.1883 with bootstrap 95% interval [1.1031, 1.2384]. A coalesced-encoder barrier
+experiment stayed slower and was reverted. This also remains a standalone graph
+without canonical `Kernel` publication. Historical, corrected, and fair-sorted
+raw captures are in `measurements/RESIDENT-DYNAMIC-M4-PRO-2026-08-07.txt`,
+`measurements/RESIDENT-DYNAMIC-STRESS-M4-PRO-2026-08-07.txt`, and
+`measurements/RESIDENT-GROUPED-SORTED-FAIR-M4-PRO-2026-08-07.txt`. An irregular
+eight-host-queue frozen-chunk control overlaps calls but reverses across its two
+batches (1.0287, 0.9889); it is not persistent resident ingress. Its raw record
+is `measurements/RESIDENT-IRREGULAR-HOST-QUEUE-M4-PRO-2026-08-07.txt`.
 
 ### Resident synchronization ABI oracle
 
@@ -271,6 +288,24 @@ two device phases emit every sorted handler result before canonical table
 mutation; a single elected thread preserves deterministic application while
 real width-1/32 threadgroup shapes provide I19 controls. CPU and M4 Metal match
 exactly for future wake, successful mailbox delivery, authority and target
-refusals, frame bytes, resources, journals, trace, and completion. This remains
-a standalone backend: it is not wired to `Kernel` Phase G and therefore is not
-yet the general P1 path or performance evidence.
+refusals, frame bytes, resources, journals, trace, and completion.
+
+`kernel::resident_sync` now adds a transactional canonical commit bridge for a
+strict bounded subset. The device result includes applied disposition, causal
+wake, invocation, and per-epoch runnable/completion journals. After one Metal
+command buffer, the bridge validates those records and replays each operation
+through ordinary governed Kernel future/mailbox methods, `apply_step_result`,
+Phase-G effect application, admission, trace drain, and full Phase-H accounting
+before atomically swapping the clone. An independent governed-Kernel fixture
+matches I18 trace order, resources, scheduler/effect/admission logs, counters,
+continuation fields, and accounting; CPU and width-1/32 Metal bridge results are
+exact. A domain-separated SHA-256 plan fingerprint covers all relevant public
+and private commit state, and stale/invalid plans refuse without mutation.
+
+This closes canonical commit only for local unsupervised, unique-run-class,
+all-complete future/mailbox programs with initially empty waiters/mailboxes,
+stable pre-existing capabilities, host-backed Object payloads, RunClassBins,
+and RunPartial. Parked quiescence, supervision, allocation, foreign resources,
+device capability creation, admission deferral, multiple mutable continuations
+per process, and broader handler/effect shapes refuse. The general G2 executive
+therefore remains open.

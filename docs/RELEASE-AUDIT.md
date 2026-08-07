@@ -72,6 +72,13 @@ The first qualifying capture is
 `measurements/RELEASE-AUDIT-20260807T090150Z-full.log` for commit
 `8f48bb6cdea2eed19470c652107fd0dc15b9dc65`; its adjacent checksum verifies and
 the log records `tree_clean_at_start: yes`, `qualifying_release_evidence: yes`,
-and `result: PASS` on the physical 16-core Apple M4 Pro. Its resident benchmark
-ordering is still unstable and its ant Metal wall is slower, so the capture
-closes release provenance (G6), not the performance gate (G5).
+and `result: PASS` on the physical 16-core Apple M4 Pro. Its resident timing
+input was subsequently identified as lockstep/one-class rather than mixed-class,
+and its ant Metal wall is slower, so the capture closes release provenance (G6),
+not the performance gate (G5). A later uncommitted corrected stress capture
+shows a reproducible 0.9050 grouped/generic median ratio, but a separate fair
+AB/BA capture gives grouped/sorted median 1.1883 (bootstrap 95% [1.1031,
+1.2384]) and the path is not canonical Kernel execution. These are preserved in
+`measurements/RESIDENT-DYNAMIC-STRESS-M4-PRO-2026-08-07.txt` and
+`measurements/RESIDENT-GROUPED-SORTED-FAIR-M4-PRO-2026-08-07.txt` as
+non-release, partial/negative performance evidence only.

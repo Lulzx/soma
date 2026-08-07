@@ -560,25 +560,47 @@ controls.
 
 ## 12. Resident grouped versus generic device worker
 
-`examples/resident_dynamic_bench.rs` now supplies the missing same-device
-functional controls for the standalone graph. Its generic worker is competent,
-not forced branchless work: one installed evaluator contains both class-specific
-counted bodies and each lane uses `break_if` at the irrelevant loop head. The
-grouped graph compacts the same active lanes into two specialized handlers. Both
-produce byte-identical frames and canonical trace against a genuine CPU
-class-bucket-per-level oracle. Device one-class, eight-submit level-sync, and
-eight-batch low-arrival controls are also executable.
+`examples/resident_dynamic_bench.rs` supplies same-device functional controls
+for the standalone graph. Its generic worker body is competent—it contains both
+class-specific counted loops and uses `break_if` at each irrelevant loop head—and
+all paths match exact frames and trace against a CPU class-bucket oracle. The
+original release dataset nevertheless initialized every lane in A and switched
+all lanes in lockstep. Its reversing ratios (1.061, 0.890, 1.233, 0.768) remain
+honest one-class/compaction noise controls, not evidence about SIMD divergence.
 
-Atomic O(N) compaction moved the grouped path from clearly slower to a plausible
-crossover. In one six-sample alternating run at 16,384 lanes, the descriptive
-middle was roughly 2.94 ms grouped versus 3.83 ms generic. That is **not a
-qualifying win**: separate release runs changed the grouped/generic median ratio
-through 1.061, 0.890, 1.233, and 0.768, including reversals. The measurement was
-non-isolated, and the standalone graph does not enter `Kernel` Phase G or emit a
-complete multi-step journal. It proves the right baseline and reveals a regime
-to stabilize; it does not satisfy G5.
+`examples/resident_dynamic_stress.rs` is the corrected non-vacuous experiment.
+It interleaves A/B lanes at four bounded depths, asserts both classes at every
+epoch, uses 49,152 lanes, 16 steps, and 512 useful dependent ALU rounds per live
+lane/step, and compares the grouped one-submit graph with a one-submit generic
+worker whose irrelevant loop exits via `break_if`. CPU bucket work is measured
+once per batch, GPU pairs use balanced AB/BA order with equal cooldown, backends
+are recreated per batch, and two independent processes produce six batches.
+Every one of the 66 primary samples exceeds 20 ms and matches exact frames and
+canonical standalone trace.
 
-Raw alternating samples and the cross-run warning are frozen in
-`measurements/RESIDENT-DYNAMIC-M4-PRO-2026-08-07.txt`. A qualifying capture must
-use the release-audit procedure, repeated randomized/alternating runs with a
-confidence summary, and the eventual one-submit canonical Kernel path.
+The call-position-stratified grouped/generic ratios for the six batches are
+0.9464, 0.8012, 0.8742, 0.9114, 0.9239, and 0.8985. Their median is 0.9050
+(IQR 0.8803–0.9208); a seeded 20,000-draw within-stratum bootstrap gives a 95%
+interval of [0.8568, 0.9482]. This is reproducible evidence that grouping is
+about 9.5% faster than the competent generic worker in this narrow standalone
+regime.
+
+It does **not** close G5. A dedicated fair 65,536-lane grouped-versus-sorted
+AB/BA experiment confirms that the sorted 16-submit device control is faster:
+all six batch estimators favor sorted, with median grouped/sorted 1.1883 and a
+seeded bootstrap 95% interval [1.1031, 1.2384]. A resource-barrier coalesced
+encoder experiment remained slower and was reverted. The one-class null is
+2.60–3.44× faster, the eight-chunk control is sequential rather than a real
+asynchronous-arrival runtime, and this graph still does not publish through
+canonical `Kernel` Phase G. Raw captures are frozen in
+`measurements/RESIDENT-DYNAMIC-M4-PRO-2026-08-07.txt`,
+`measurements/RESIDENT-DYNAMIC-STRESS-M4-PRO-2026-08-07.txt`, and
+`measurements/RESIDENT-GROUPED-SORTED-FAIR-M4-PRO-2026-08-07.txt`.
+
+An additional eight-thread/eight-queue host-arrival control releases frozen
+chunks at irregular delays and proves overlapping calls plus exact combined
+frames/traces. Its two balanced batch ratios reverse (grouped/generic 1.0287
+and 0.9889), so it supplies no stable speedup. More importantly, it is eight
+independent host-submitted graphs—not live ingress into one persistent resident
+command buffer. Raw data and source hashes are in
+`measurements/RESIDENT-IRREGULAR-HOST-QUEUE-M4-PRO-2026-08-07.txt`.

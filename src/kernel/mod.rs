@@ -13,6 +13,7 @@ pub mod payload;
 #[doc(hidden)]
 pub mod raw;
 pub mod reclaim;
+pub mod resident_sync;
 pub mod retention;
 pub mod speculation;
 #[cfg(test)]
@@ -356,7 +357,15 @@ pub struct Kernel {
     /// batch backends. The frame is one element; the handler stores its result
     /// back into that private frame and completes.
     frame_evaluators: HashMap<u32, crate::compiler::body::EvaluatorProgram>,
+    resident_sync_programs: std::collections::BTreeMap<u32, resident_sync::KernelResidentProgram>,
     pub(crate) frame_evaluator_effects: HashMap<u32, FrameEvaluatorEffect>,
+    remote_lane_programs: HashMap<u32, crate::distributed::remote_lane_effect::RemoteLaneProgram>,
+    remote_lane_emissions: Vec<crate::distributed::remote_lane_effect::KernelRemoteLaneEmission>,
+    remote_lane_completed: HashSet<u64>,
+    remote_lane_failed: HashSet<u64>,
+    remote_lane_sequences: HashMap<(u64, u64, u64, bool), u64>,
+    remote_lane_outbox_base_entries: usize,
+    remote_lane_outbox_base_bytes: usize,
     /// Physical owner assigned to newly created processes.
     local_node: u64,
     /// Loss declarations are monotonic and idempotent.
@@ -461,7 +470,15 @@ impl Kernel {
             restart_blueprints: HashMap::new(),
             module_evaluators: HashMap::new(),
             frame_evaluators: HashMap::new(),
+            resident_sync_programs: std::collections::BTreeMap::new(),
             frame_evaluator_effects: HashMap::new(),
+            remote_lane_programs: HashMap::new(),
+            remote_lane_emissions: Vec::new(),
+            remote_lane_completed: HashSet::new(),
+            remote_lane_failed: HashSet::new(),
+            remote_lane_sequences: HashMap::new(),
+            remote_lane_outbox_base_entries: 0,
+            remote_lane_outbox_base_bytes: 0,
             local_node: 0,
             lost_nodes: HashSet::new(),
             scheduler,
@@ -563,6 +580,46 @@ impl Kernel {
                 value_offset,
             },
         );
+        Ok(())
+    }
+
+    /// Install a validated pointer-free remote-effect program. Only a real
+    /// continuation dispatched in this run class can instantiate it.
+    pub fn install_remote_lane_program(
+        &mut self,
+        run_class: u32,
+        program: crate::distributed::remote_lane_effect::RemoteLaneProgram,
+    ) -> Result<(), RuntimeError> {
+        if run_class < 1024 || self.remote_lane_programs.contains_key(&run_class) {
+            return Err(RuntimeError::InvalidModule);
+        }
+        self.remote_lane_programs.insert(run_class, program);
+        Ok(())
+    }
+    #[doc(hidden)]
+    pub fn set_remote_lane_outbox_usage(&mut self, entries: usize, bytes: usize) {
+        self.remote_lane_outbox_base_entries = entries;
+        self.remote_lane_outbox_base_bytes = bytes;
+    }
+    #[doc(hidden)]
+    pub fn drain_remote_lane_emissions(
+        &mut self,
+    ) -> Vec<crate::distributed::remote_lane_effect::KernelRemoteLaneEmission> {
+        std::mem::take(&mut self.remote_lane_emissions)
+    }
+    #[doc(hidden)]
+    pub fn fail_remote_lane_program(&mut self, continuation: Ref64) -> Result<(), RuntimeError> {
+        let _ = self.continuations.get(continuation)?;
+        self.remote_lane_failed.insert(continuation.key());
+        Ok(())
+    }
+    #[doc(hidden)]
+    pub fn complete_remote_lane_program(
+        &mut self,
+        continuation: Ref64,
+    ) -> Result<(), RuntimeError> {
+        let _ = self.continuations.get(continuation)?;
+        self.remote_lane_completed.insert(continuation.key());
         Ok(())
     }
 
@@ -2313,6 +2370,30 @@ impl Kernel {
         self.notify_supervisor(process, ExitReason::Failed);
     }
 
+    /// Restore the bounded lifecycle fields of a terminal owner process from a
+    /// validated remote-process snapshot. Recovery creates no runnable work and
+    /// emits no supervision notice: those outcomes and their apply-once ledger
+    /// were already durably committed before the crash.
+    pub(crate) fn restore_remote_process_terminal(
+        &mut self,
+        process: Ref64,
+        reason: ExitReason,
+    ) -> Result<(), RuntimeError> {
+        let descriptor = self.processes.get_mut(process)?;
+        if descriptor.live_continuations != 0 {
+            return Err(RuntimeError::InvalidStateAccess);
+        }
+        descriptor.status = match reason {
+            ExitReason::Completed => ProcessState::Terminated,
+            ExitReason::Failed => ProcessState::Failed,
+            ExitReason::Cancelled => ProcessState::Cancelled,
+            ExitReason::NodeLost => ProcessState::Failed,
+        } as u32;
+        descriptor.failure_count = u32::from(reason == ExitReason::Failed);
+        descriptor.last_committed_epoch = self.epoch;
+        Ok(())
+    }
+
     pub fn process_state(&self, p: Ref64) -> Result<ProcessState, RuntimeError> {
         let pd = self.processes.get(p)?;
         Ok(match pd.status {
@@ -3774,8 +3855,7 @@ impl Kernel {
             let object = self.objects.get(payload)?;
             (object.byte_length, object.version)
         };
-        let transferred =
-            self.mint_object_read(receiver, payload, payload_length, payload_version);
+        let transferred = self.mint_object_read(receiver, payload, payload_length, payload_version);
         let sender = SYSTEM_PRINCIPAL;
         let local_sequence = {
             let next = self

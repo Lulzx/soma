@@ -1,0 +1,61 @@
+Concurrent irregular host-queue chunk control, M4 Pro, 2026-08-07
+=====================================================================
+
+This is an honest irregular concurrent chunk control, NOT live ingress into one
+persistent resident command buffer. The current API freezes each chunk before
+its independent submission and exposes no device-visible ingress ring.
+
+Example: examples/resident_dynamic_irregular_arrival.rs
+Example SHA-256: 7c14b34a75d116b9243ac057002fbead7e8da6e86a248b5b2e4fec7b9a92f464
+Final candidate SHA-256: 6c5a02aab68570912ba6dfbfff90ab983d74153f37f9f75819792b0fe439deb3 (only diagnostic wording changed from host arrival to frozen-chunk control)
+Release-source SHA-256: 28a468a03156049707aa0cbc796d5b0b507e9ceefd1a6ae7697e003095dea9b5 (only a Clippy lint annotation was added after capture; executable body unchanged)
+Backend metal_scheduler.rs SHA-256: 1fffe51bd0b2810fca7dd519e0b52517927af8f17004efe5184a5e6141abd4f3
+Command: cargo run --release --features metal --example resident_dynamic_irregular_arrival
+Machine/OS: Mac16,8 M4 Pro, macOS 26.6 build 25G5028f
+
+Eight host threads each construct their own Metal backend/pipelines, synchronize
+at a ready barrier, then a second barrier releases them against a shared
+OnceLock<Instant>. Setup/compile is excluded. Delays after release are
+[0,3,11,12,24,31,33,45] ms and frozen lane chunks are
+[8192,4096,12288,2048,16384,6144,10240,6144]. Calls overlap (observed peak
+in-flight 2--3 grouped and exactly 3 generic) and completion order differs from
+launch order. Each full measurement therefore has eight real command-buffer
+submissions on independent queues, not eight sequential calls.
+
+The 65,536 total lanes retain alternating A/B layout, interleaved depth, 16
+steps, WORK=512 and competent generic break_if. Two AB/BA batches of 11 samples
+all match exact complete frames and globally rebased/sorted canonical trace.
+Elapsed time begins at simultaneous release and includes scheduled arrival waits,
+per-call allocation, encoding, submit/wait/readback, and thread join.
+
+This control establishes the concurrent irregular workload but no stable
+performance direction: position-stratified batch G/generic ratios are 1.0287
+and 0.9889 (a reversal). Overall median makespans are 54.108 ms grouped and
+53.634 ms generic. It is descriptive negative evidence only and does not meet
+the requested resident asynchronous-arrival application semantics.
+
+Raw CSV
+-------
+batch,sample,first,grouped_arrival_us,generic_arrival_us,grouped_peak_inflight,generic_peak_inflight,grouped_completion,generic_completion,grouped_submits,generic_submits,exact
+0,0,grouped,53913,53236,3,3,1:0:3:2:5:4:6:7,1:0:3:2:4:5:6:7,8,8,true
+0,1,generic,54076,50214,3,3,1:0:3:2:5:4:6:7,1:0:3:2:5:4:6:7,8,8,true
+0,2,grouped,59895,52032,3,3,1:0:3:2:4:5:6:7,0:1:3:2:5:4:6:7,8,8,true
+0,3,generic,54846,55465,3,3,1:0:3:2:5:4:6:7,1:0:3:2:4:5:6:7,8,8,true
+0,4,grouped,52044,52986,3,3,1:0:3:2:4:5:6:7,1:0:3:2:4:5:6:7,8,8,true
+0,5,generic,53058,52324,3,3,1:0:3:2:5:4:6:7,1:0:3:2:5:4:6:7,8,8,true
+0,6,grouped,54538,50148,3,3,1:0:3:2:5:4:6:7,1:0:3:2:5:6:4:7,8,8,true
+0,7,generic,55184,56124,3,3,1:0:3:2:5:4:6:7,1:0:3:2:5:4:6:7,8,8,true
+0,8,grouped,53802,53384,3,3,1:0:3:2:5:4:6:7,1:0:3:2:5:4:6:7,8,8,true
+0,9,generic,54140,51708,3,3,1:0:3:2:4:5:6:7,1:0:3:2:5:6:4:7,8,8,true
+0,10,grouped,56996,53063,3,3,1:0:3:2:5:4:6:7,1:0:3:2:4:5:6:7,8,8,true
+1,0,generic,52130,54784,2,3,1:0:3:2:5:4:6:7,1:0:3:2:5:4:6:7,8,8,true
+1,1,grouped,52343,56093,2,3,1:0:3:2:4:5:6:7,1:0:3:2:5:4:6:7,8,8,true
+1,2,generic,55288,55285,2,3,1:0:3:2:5:4:6:7,1:0:3:2:5:4:6:7,8,8,true
+1,3,grouped,53126,52953,3,3,1:0:3:2:5:4:6:7,1:0:3:2:5:4:6:7,8,8,true
+1,4,generic,50192,54897,3,3,1:0:3:2:5:4:6:7,1:0:3:2:4:5:6:7,8,8,true
+1,5,grouped,55985,54816,3,3,1:0:3:2:4:5:6:7,1:0:3:2:5:4:6:7,8,8,true
+1,6,generic,57011,55699,3,3,1:0:3:2:5:4:6:7,1:0:3:2:5:4:6:7,8,8,true
+1,7,grouped,53163,53050,3,3,1:0:3:2:5:4:6:7,1:0:3:2:4:5:6:7,8,8,true
+1,8,generic,55701,53884,3,3,1:0:3:2:5:6:4:7,1:0:3:2:5:4:6:7,8,8,true
+1,9,grouped,53353,54314,3,3,1:0:3:2:5:4:6:7,1:0:3:2:5:4:6:7,8,8,true
+1,10,generic,54294,54026,3,3,1:0:3:2:5:4:6:7,1:0:3:2:5:4:6:7,8,8,true

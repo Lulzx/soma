@@ -159,6 +159,32 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
+    pub(crate) fn canonical_fingerprint_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(match self.mode {
+            SchedulingMode::RunClassBins => 1,
+            SchedulingMode::PersistentFifo => 2,
+        });
+        out.extend_from_slice(&self.admissions.to_le_bytes());
+        let mut bins: Vec<_> = self.bins.iter().collect();
+        bins.sort_by_key(|(run_class, _)| **run_class);
+        for (run_class, bin) in bins {
+            out.extend_from_slice(&run_class.to_le_bytes());
+            out.extend_from_slice(&bin.capacity.to_le_bytes());
+            out.extend_from_slice(&bin.seq.to_le_bytes());
+            for buffer in [&bin.current, &bin.next] {
+                out.extend_from_slice(&(buffer.len() as u64).to_le_bytes());
+                for entry in buffer {
+                    out.push(entry.is_some() as u8);
+                    if let Some(reference) = entry {
+                        out.extend_from_slice(&reference.to_u64().to_le_bytes());
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// A scheduler that bins by the given mode.
     pub fn with_mode(mode: SchedulingMode) -> Scheduler {
         Scheduler {

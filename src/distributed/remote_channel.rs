@@ -550,6 +550,16 @@ impl RemoteChannelClient {
             epoch,
         }
     }
+    /// Rebind the transport proxy to the exact grant carried by a multiplexed
+    /// lane effect; endpoint and timeout are transport configuration only.
+    pub fn rebound(&self, grant: RemoteGrant, epoch: u32) -> Self {
+        Self {
+            endpoint: self.endpoint,
+            timeout: self.timeout,
+            grant,
+            epoch,
+        }
+    }
     pub fn set_epoch(&mut self, epoch: u32) {
         self.epoch = epoch
     }

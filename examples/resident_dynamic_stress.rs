@@ -9,13 +9,16 @@ fn main() {
     };
     use std::time::{Duration, Instant};
 
-    const A: u32 = 2_200;
-    const B: u32 = 2_201;
-    const GENERIC: u32 = 2_202;
-    const ONE_CLASS: u32 = 2_203;
-    const STEPS: u32 = 8;
-    const WORK: u32 = 32;
-    const SAMPLES: u32 = 6;
+    const A: u32 = 2_300;
+    const B: u32 = 2_301;
+    const GENERIC: u32 = 2_302;
+    const ONE_CLASS: u32 = 2_303;
+    const STEPS: u32 = 16;
+    const WORK: u32 = 512;
+    const LANES: usize = 49_152;
+    const BATCHES: u32 = 3;
+    const SAMPLES: u32 = 11;
+    const WARMUPS: u32 = 2;
 
     fn sources() -> (String, String, String, String) {
         let prefix = "field u32\nfield u32\nfield u64\nfield u32\nfield u32\nlocal acc\nlet n = load 0\nlet minus = const 0xffffffff\nlet d = add n minus\nstore 0 d\nlet v = load 2\nset acc v\n";
@@ -26,21 +29,23 @@ fn main() {
         };
         let a = prefix.to_owned() + &loop_a + &suffix(B, 1, 0);
         let b = prefix.to_owned() + &loop_b + &suffix(A, 0, 1);
-        // Each lane enters both loops, but BreakIf at the head of each loop
-        // makes the irrelevant class body cost one predicate, not WORK ALU rounds.
+        // This is a competent generic worker: every lane enters both loops,
+        // and break_if skips the irrelevant counted body at its head.
         let generic_tail = format!("let out = get acc\nstore 2 out\nlet current_sa = load 3\nlet current_sb = load 4\nstore 3 current_sb\nstore 4 current_sa\nlet base = const {B}\nlet delta = const 0xffffffff\nlet shift = mul current_sa delta\nlet next = add base shift\nstore 1 next\n");
         let generic = prefix.to_owned() + &loop_a + &loop_b + &generic_tail;
         let one = prefix.to_owned() + &loop_a + &suffix(A, 0, 1);
         (a, b, generic, one)
     }
 
-    fn input(lanes: usize, full_depth: bool, mixed_classes: bool) -> Vec<u8> {
+    fn input(lanes: usize, heterogeneous_depth: bool, mixed_classes: bool) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(lanes * 24);
         for lane in 0..lanes {
-            let remaining = if full_depth {
-                STEPS
-            } else {
+            // Both parities occur at every depth, so every live epoch remains
+            // class-mixed even as the shorter searches quiesce.
+            let remaining = if heterogeneous_depth {
                 STEPS - 2 * ((lane / 2) % 4) as u32
+            } else {
+                STEPS
             };
             let starts_a = !mixed_classes || lane % 2 == 0;
             bytes.extend_from_slice(&remaining.to_le_bytes());
@@ -67,14 +72,13 @@ fn main() {
         let mut trace = Vec::new();
         for epoch in 0..STEPS {
             let frozen = frames.clone();
-            // This is a real host class-bucket control, rather than a repeated
-            // scalar pass mislabeled as sorted: build both buckets every level.
             let mut buckets = [Vec::new(), Vec::new()];
             for lane in 0..lanes {
                 if active[lane] {
                     buckets[usize::from(classes[lane] == B)].push(lane);
                 }
             }
+            assert!(!buckets[0].is_empty() && !buckets[1].is_empty());
             for (bucket, program) in buckets.iter().zip([first, second]) {
                 for &lane in bucket {
                     let range = lane * 24..lane * 24 + 24;
@@ -131,41 +135,56 @@ fn main() {
         (started.elapsed().as_micros(), value)
     }
 
+    let compile_started = Instant::now();
     let (a_source, b_source, generic_source, one_source) = sources();
-    let first = compile_evaluator(46_200, "bench-a", &a_source).unwrap();
-    let second = compile_evaluator(46_201, "bench-b", &b_source).unwrap();
-    let generic = compile_evaluator(46_202, "bench-generic", &generic_source).unwrap();
-    let one = compile_evaluator(46_203, "bench-one", &one_source).unwrap();
+    let first = compile_evaluator(47_200, "stress-a", &a_source).unwrap();
+    let second = compile_evaluator(47_201, "stress-b", &b_source).unwrap();
+    let generic = compile_evaluator(47_202, "stress-generic", &generic_source).unwrap();
+    let one = compile_evaluator(47_203, "stress-one", &one_source).unwrap();
+    let compile_us = compile_started.elapsed().as_micros();
 
-    eprintln!("resident_dynamic_bench: bounded {STEPS}-step alternating-class divergent workload; {WORK} useful ALU rounds/step; release samples alternate grouped/generic order");
-    eprintln!("limitation: the resident dynamic graph is one Metal submit but remains standalone; it does not perform a Kernel Phase-G final commit");
-    println!("lanes,sample,first,cpu_bucket_us,grouped_us,generic_ungrouped_us,device_one_class_us,multisubmit_level_us,low_arrival_us,grouped_submits,generic_submits,level_submits,arrival_submits,exact");
-    for lanes in [1_024usize, 4_096, 16_384] {
-        let frames = input(lanes, false, true);
-        let full_frames = input(lanes, true, false);
-        let expected = cpu_bucketed(&first, &second, &frames, lanes);
-        let expected_one_class = cpu_fixed(&one, &full_frames, lanes);
-        for epoch in 0..STEPS {
-            let mut classes = expected
-                .1
-                .iter()
-                .filter(|event| event.epoch == epoch)
-                .map(|event| event.run_class);
-            let first_class = classes.next().expect("every epoch has active lanes");
-            assert!(
-                classes.any(|run_class| run_class != first_class),
-                "epoch {epoch} must exercise both run classes"
-            );
+    let frames = input(LANES, true, true);
+    let one_frames = input(LANES, false, false);
+    let expected = cpu_bucketed(&first, &second, &frames, LANES);
+    let expected_one = cpu_fixed(&one, &one_frames, LANES);
+    for epoch in 0..STEPS {
+        let events = expected.1.iter().filter(|event| event.epoch == epoch);
+        let (mut saw_a, mut saw_b) = (false, false);
+        for event in events {
+            saw_a |= event.run_class == A;
+            saw_b |= event.run_class == B;
         }
+        assert!(saw_a && saw_b, "epoch {epoch} must contain both classes");
+    }
 
-        let config = ResidentDynamicFrameConfig {
-            first_run_class: A,
-            second_run_class: B,
-            max_steps: STEPS,
-            cohort_width: 32,
-            remaining_offset: 0,
-            next_class_offset: 4,
-        };
+    let config = ResidentDynamicFrameConfig {
+        first_run_class: A,
+        second_run_class: B,
+        max_steps: STEPS,
+        cohort_width: 32,
+        remaining_offset: 0,
+        next_class_offset: 4,
+    };
+    let bindings: Vec<_> = (0..LANES)
+        .map(|lane| ResidentFrameBinding {
+            continuation: lane as u64 + 1,
+            process: lane as u64 + 1,
+            frame: lane as u64 + 1,
+            actor: lane as u64 + 1,
+            target: lane as u64 + 1,
+            ..Default::default()
+        })
+        .collect();
+
+    eprintln!("resident_dynamic_stress: M4-class bounded divergence stress; lanes={LANES} steps={STEPS} work={WORK} batches={BATCHES} samples={SAMPLES} warmups={WARMUPS}");
+    eprintln!("timings include per-call Metal allocation, one or more submit/waits, and final readback; evaluator compile_us={compile_us} is excluded");
+    eprintln!("primary input alternates initial A/B layout and has four heterogeneous depths; every epoch is asserted mixed; generic uses break_if");
+    eprintln!("low_arrival_us is a historical label for eight sequential chunk submissions, not asynchronous arrival");
+    println!("batch,sample,first,cpu_bucket_us,grouped_us,generic_us,one_class_us,sorted_multisubmit_us,low_arrival_us,grouped_submits,generic_submits,one_submits,multisubmit_submits,arrival_submits,exact");
+
+    for batch in 0..BATCHES {
+        // Recreate all device objects per batch. Compilation/allocation caused by
+        // construction and explicit warmups is outside the reported samples.
         let mut grouped = MetalResidentSearch::new().unwrap();
         grouped.install_frame_handler(A, &first).unwrap();
         grouped.install_frame_handler(B, &second).unwrap();
@@ -173,43 +192,46 @@ fn main() {
         ungrouped.install_frame_handler(GENERIC, &generic).unwrap();
         let mut one_class = MetalResidentSearch::new().unwrap();
         one_class.install_frame_handler(ONE_CLASS, &one).unwrap();
-        let bindings: Vec<_> = (0..lanes)
-            .map(|lane| ResidentFrameBinding {
-                continuation: lane as u64 + 1,
-                process: lane as u64 + 1,
-                frame: lane as u64 + 1,
-                actor: lane as u64 + 1,
-                target: lane as u64 + 1,
-                ..Default::default()
-            })
-            .collect();
+        let mut multisubmit = MetalResidentSearch::new().unwrap();
+        multisubmit.install_frame_handler(A, &first).unwrap();
+        multisubmit.install_frame_handler(B, &second).unwrap();
+        let mut arrival = MetalResidentSearch::new().unwrap();
+        arrival.install_frame_handler(A, &first).unwrap();
+        arrival.install_frame_handler(B, &second).unwrap();
 
-        // Warm pipelines and allocations before raw samples. Results are still
-        // checked; only these warm-up durations are omitted from CSV.
-        let warm_g = grouped
-            .run_dynamic_frame_graph(config, &frames, lanes as u32)
-            .unwrap();
-        let warm_u = ungrouped
-            .run_dynamic_ungrouped_frame_graph(config, GENERIC, &frames, lanes as u32)
-            .unwrap();
-        assert_eq!((warm_g.frames, warm_g.trace), expected);
-        assert_eq!((warm_u.frames, warm_u.trace), expected);
+        // The CPU oracle is timed once per batch, not immediately before each
+        // GPU pair: a multi-second interpreter run would thermally confound the
+        // first member of every AB/BA pair.
+        let (cpu_us, cpu_result) = micros(|| cpu_bucketed(&first, &second, &frames, LANES));
+        assert_eq!(cpu_result, expected);
 
+        for _ in 0..WARMUPS {
+            let g = grouped
+                .run_dynamic_frame_graph(config, &frames, LANES as u32)
+                .unwrap();
+            let u = ungrouped
+                .run_dynamic_ungrouped_frame_graph(config, GENERIC, &frames, LANES as u32)
+                .unwrap();
+            assert_eq!((g.frames, g.trace), expected);
+            assert_eq!((u.frames, u.trace), expected);
+        }
+
+        // Give every primary pair the same idle interval after warmup/control work.
+        std::thread::sleep(Duration::from_millis(50));
         for sample in 0..SAMPLES {
-            let (cpu_us, cpu_result) = micros(|| cpu_bucketed(&first, &second, &frames, lanes));
-            assert_eq!(cpu_result, expected);
-            let grouped_first = sample % 2 == 0;
+            std::thread::sleep(Duration::from_millis(25));
+            let grouped_first = (batch + sample) % 2 == 0;
             let run_grouped = |backend: &mut MetalResidentSearch| {
                 micros(|| {
                     backend
-                        .run_dynamic_frame_graph(config, &frames, lanes as u32)
+                        .run_dynamic_frame_graph(config, &frames, LANES as u32)
                         .unwrap()
                 })
             };
             let run_generic = |backend: &mut MetalResidentSearch| {
                 micros(|| {
                     backend
-                        .run_dynamic_ungrouped_frame_graph(config, GENERIC, &frames, lanes as u32)
+                        .run_dynamic_ungrouped_frame_graph(config, GENERIC, &frames, LANES as u32)
                         .unwrap()
                 })
             };
@@ -231,26 +253,23 @@ fn main() {
                             cohort_width: 32,
                         },
                         &bindings,
-                        &full_frames,
+                        &one_frames,
                     )
                     .unwrap()
             });
-            assert_eq!(one_result.frames, expected_one_class);
+            assert_eq!(one_result.frames, expected_one);
 
-            let mut level = MetalResidentSearch::new().unwrap();
-            level.install_frame_handler(A, &first).unwrap();
-            level.install_frame_handler(B, &second).unwrap();
-            let (level_us, level_frames) = micros(|| {
+            let (multisubmit_us, multisubmit_frames) = micros(|| {
                 let mut current = frames.clone();
                 for _ in 0..STEPS {
-                    current = level
+                    current = multisubmit
                         .run_dynamic_frame_graph(
                             ResidentDynamicFrameConfig {
                                 max_steps: 1,
                                 ..config
                             },
                             &current,
-                            lanes as u32,
+                            LANES as u32,
                         )
                         .unwrap()
                         .frames;
@@ -258,11 +277,8 @@ fn main() {
                 current
             });
 
-            let mut arrival = MetalResidentSearch::new().unwrap();
-            arrival.install_frame_handler(A, &first).unwrap();
-            arrival.install_frame_handler(B, &second).unwrap();
             let (arrival_us, arrival_frames) = micros(|| {
-                let chunk_lanes = (lanes / 8).max(1);
+                let chunk_lanes = LANES / 8;
                 let mut output = Vec::with_capacity(frames.len());
                 for chunk in frames.chunks(chunk_lanes * 24) {
                     output.extend(
@@ -279,11 +295,10 @@ fn main() {
                 && grouped_result.trace == expected.1
                 && generic_result.frames == expected.0
                 && generic_result.trace == expected.1
-                && level_frames == expected.0
+                && multisubmit_frames == expected.0
                 && arrival_frames == expected.0;
             assert!(exact);
-            println!("{lanes},{sample},{},{cpu_us},{grouped_us},{generic_us},{one_us},{level_us},{arrival_us},1,1,{STEPS},8,{exact}", if grouped_first { "grouped" } else { "generic" });
-            // Let alternating pairs begin from a less correlated host state.
+            println!("{batch},{sample},{},{cpu_us},{grouped_us},{generic_us},{one_us},{multisubmit_us},{arrival_us},1,1,1,{STEPS},8,{exact}", if grouped_first { "grouped" } else { "generic" });
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -291,5 +306,5 @@ fn main() {
 
 #[cfg(not(all(feature = "metal", target_os = "macos")))]
 fn main() {
-    eprintln!("resident_dynamic_bench requires macOS and --features metal");
+    eprintln!("resident_dynamic_stress requires macOS and --features metal");
 }

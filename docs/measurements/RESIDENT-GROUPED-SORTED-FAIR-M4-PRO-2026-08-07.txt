@@ -1,0 +1,162 @@
+Fair grouped one-submit vs sorted 16-submit, M4 Pro, 2026-08-07
+==================================================================
+
+NEGATIVE RAW CAPTURE (pre-optimization multi-encoder backend)
+
+Base tree: concurrent session based on 40dee06; no metal_scheduler edits in this capture.
+Backend src/executives/metal_scheduler.rs SHA-256: 1fffe51bd0b2810fca7dd519e0b52517927af8f17004efe5184a5e6141abd4f3
+Example: examples/resident_dynamic_sorted_fair.rs
+Example SHA-256: 5fa6c2f346f95d6b3e52acdc08e8fa9c2effffbc768ad98644edeff9b7440dbe
+Command run twice as independent processes:
+  cargo run --release --features metal --example resident_dynamic_sorted_fair
+Machine/OS: Mac16,8 M4 Pro (16 GPU cores), 24 GiB, macOS 26.6 25G5028f
+
+Regime/method: 65,536 alternating A/B lanes; interleaved depths 16/14/12/10;
+16 steps; WORK=512; width 32; 3 recreated-backend batches/process; 2 warmups;
+11 AB/BA samples/batch; equal 25ms pre-pair cooldown. One-submit grouped and
+16-submit grouped level-sync use identical handlers/input. The latter's 16
+one-step traces have epoch numbers rebased and are sorted canonically. Every
+sample checks both complete frames and complete canonical trace against the CPU
+class-bucket oracle. All exact=true. All 132 timings exceed 20ms (min grouped
+28.693ms, sorted 24.144ms). Timings include allocation, encoding, submit/wait,
+and readback. Submission counts are 1 and 16.
+
+Position-stratified analysis (G/S; >1 means grouped loses):
+process,batch,first_ratio,second_ratio,geometric_ratio
+1,0,1.0634,1.3440,1.1955
+1,1,1.0888,1.2814,1.1812
+1,2,1.3394,1.2093,1.2727
+2,0,1.0743,1.1936,1.1324
+2,1,0.9721,1.1448,1.0549
+2,2,1.0541,1.3682,1.2009
+
+All six batch estimators say one-submit grouped is slower. Median ratio 1.1883
+(IQR 1.1446--1.1996). A seeded 20,000-draw within-batch/call-position bootstrap
+has median 1.1626 and percentile 95% interval [1.1031, 1.2384]. Therefore the
+fair control confirms a material negative; fixed later control order was not
+the cause. This capture cannot support G5.
+
+Raw process 1 CSV
+-----------------
+batch,sample,first,grouped_us,sorted_16_submit_us,grouped_submits,sorted_submits,exact
+0,0,grouped,36910,24553,1,16,true
+0,1,sorted,31789,25217,1,16,true
+0,2,grouped,36922,24427,1,16,true
+0,3,sorted,32436,26225,1,16,true
+0,4,grouped,33041,35754,1,16,true
+0,5,sorted,36996,36871,1,16,true
+0,6,grouped,30920,26815,1,16,true
+0,7,sorted,35707,30787,1,16,true
+0,8,grouped,32437,27414,1,16,true
+0,9,sorted,38357,33521,1,16,true
+0,10,grouped,29759,26322,1,16,true
+1,0,sorted,32303,34438,1,16,true
+1,1,grouped,30858,24144,1,16,true
+1,2,sorted,36904,27916,1,16,true
+1,3,grouped,35588,31306,1,16,true
+1,4,sorted,35251,33002,1,16,true
+1,5,grouped,30958,25774,1,16,true
+1,6,sorted,35605,28768,1,16,true
+1,7,grouped,40550,26902,1,16,true
+1,8,sorted,33694,26348,1,16,true
+1,9,grouped,33628,33594,1,16,true
+1,10,sorted,28693,34791,1,16,true
+2,0,grouped,35792,32394,1,16,true
+2,1,sorted,39569,33111,1,16,true
+2,2,grouped,31295,29912,1,16,true
+2,3,sorted,30697,35559,1,16,true
+2,4,grouped,36311,24694,1,16,true
+2,5,sorted,32267,26224,1,16,true
+2,6,grouped,37558,24735,1,16,true
+2,7,sorted,31899,26916,1,16,true
+2,8,grouped,40481,25391,1,16,true
+2,9,sorted,30374,24843,1,16,true
+2,10,grouped,35151,27364,1,16,true
+
+Raw process 2 CSV
+-----------------
+batch,sample,first,grouped_us,sorted_16_submit_us,grouped_submits,sorted_submits,exact
+0,0,grouped,53632,32517,1,16,true
+0,1,sorted,51873,35915,1,16,true
+0,2,grouped,46097,43044,1,16,true
+0,3,sorted,50217,46678,1,16,true
+0,4,grouped,46909,42248,1,16,true
+0,5,sorted,52516,43461,1,16,true
+0,6,grouped,48455,45768,1,16,true
+0,7,sorted,53964,45226,1,16,true
+0,8,grouped,48717,44953,1,16,true
+0,9,sorted,54088,45966,1,16,true
+0,10,grouped,50631,53004,1,16,true
+1,0,sorted,56022,63715,1,16,true
+1,1,grouped,67407,59460,1,16,true
+1,2,sorted,55190,60338,1,16,true
+1,3,grouped,47662,37882,1,16,true
+1,4,sorted,44549,42685,1,16,true
+1,5,grouped,49117,48571,1,16,true
+1,6,sorted,56538,52114,1,16,true
+1,7,grouped,54706,49321,1,16,true
+1,8,sorted,62462,51912,1,16,true
+1,9,grouped,50562,48131,1,16,true
+1,10,sorted,52379,47339,1,16,true
+2,0,grouped,54636,34326,1,16,true
+2,1,sorted,53238,44456,1,16,true
+2,2,grouped,46877,41339,1,16,true
+2,3,sorted,48924,44226,1,16,true
+2,4,grouped,47030,38559,1,16,true
+2,5,sorted,55585,47969,1,16,true
+2,6,grouped,52128,46738,1,16,true
+2,7,sorted,53723,49450,1,16,true
+2,8,grouped,44873,39263,1,16,true
+2,9,sorted,51504,44544,1,16,true
+2,10,grouped,44224,38449,1,16,true
+
+Exploratory coalesced-encoder attempt (rejected)
+------------------------------------------------
+After the frozen two-process negative, an experimental backend merged reset,
+pack, evaluator, and transition into one encoder per epoch. Explicit resource
+barriers covered packed counts after reset; packed frames/ranks/count after
+pack; and evaluator output after evaluate. Epoch encoder boundaries retained
+full transition-to-next-pack ordering. The original multi-encoder path remained
+available via SOMA_METAL_DYNAMIC_MULTI_ENCODER. Backend SHA-256 for this
+experiment: 8d09859558afd34989a5794ad13dd12278234da5cabd179cf97ca9c121c1e658. Dynamic grouped/generic, unknown-class, width-1/32,
+and fallback tests passed exactly. One full 3x11 reuse process also remained
+exact, but it was slower in absolute terms and grouped still lost: batch raw
+median G/S values were 1.132, 1.086, and 1.076. Resource-scoped barrier overhead
+made the change counterproductive, so it was reverted rather than shipped.
+
+Raw rejected-optimization CSV
+-----------------------------
+batch,sample,first,grouped_us,sorted_16_submit_us,grouped_submits,sorted_submits,exact
+0,0,grouped,41990,30848,1,16,true
+0,1,sorted,39500,31087,1,16,true
+0,2,grouped,44505,33621,1,16,true
+0,3,sorted,49364,42856,1,16,true
+0,4,grouped,38074,37087,1,16,true
+0,5,sorted,47011,42489,1,16,true
+0,6,grouped,39732,38538,1,16,true
+0,7,sorted,43155,44584,1,16,true
+0,8,grouped,32931,31346,1,16,true
+0,9,sorted,45010,42204,1,16,true
+0,10,grouped,37835,31058,1,16,true
+1,0,sorted,40958,38853,1,16,true
+1,1,grouped,31347,29987,1,16,true
+1,2,sorted,38496,36222,1,16,true
+1,3,grouped,31148,29726,1,16,true
+1,4,sorted,40194,35443,1,16,true
+1,5,grouped,32328,29601,1,16,true
+1,6,sorted,42431,38097,1,16,true
+1,7,grouped,31967,31340,1,16,true
+1,8,sorted,40366,37737,1,16,true
+1,9,grouped,31111,29700,1,16,true
+1,10,sorted,38478,36453,1,16,true
+2,0,grouped,35412,25252,1,16,true
+2,1,sorted,33697,26790,1,16,true
+2,2,grouped,38768,33313,1,16,true
+2,3,sorted,37654,36756,1,16,true
+2,4,grouped,30722,28084,1,16,true
+2,5,sorted,35850,36368,1,16,true
+2,6,grouped,30749,28665,1,16,true
+2,7,sorted,36912,38309,1,16,true
+2,8,grouped,31877,30681,1,16,true
+2,9,sorted,42911,43051,1,16,true
+2,10,grouped,49107,58019,1,16,true

@@ -381,6 +381,28 @@ impl Kernel {
             });
         }
 
+        if self.remote_lane_programs.contains_key(&run_class) {
+            let entries = self
+                .remote_lane_outbox_base_entries
+                .saturating_add(self.remote_lane_emissions.len());
+            let bytes = self.remote_lane_outbox_base_bytes.saturating_add(
+                self.remote_lane_emissions
+                    .iter()
+                    .map(|emission| emission.batch.encode().len())
+                    .sum::<usize>(),
+            );
+            if entries >= crate::distributed::remote_lane_effect::MAX_REMOTE_LANE_OUTBOX_ENTRIES
+                || bytes.saturating_add(
+                    crate::distributed::remote_lane_effect::MAX_REMOTE_LANE_PROGRAM_FRAME_BYTES,
+                ) > crate::distributed::remote_lane_effect::MAX_REMOTE_LANE_OUTBOX_BYTES
+            {
+                return Some(EvaluatedStep {
+                    result: crate::abi::StepResult::fault(process, run_class),
+                    executed: false,
+                });
+            }
+        }
+
         self.trace(
             crate::abi::EventKind::ContinuationStarted,
             process,
@@ -402,9 +424,62 @@ impl Kernel {
         // why §4.17 could take the read away without changing a run.
         let frame_evaluator = self.frame_evaluators.get(&run_class).cloned();
         let frame_effect = self.frame_evaluator_effects.get(&run_class).copied();
+        let remote_program = self.remote_lane_programs.get(&run_class).cloned();
+        let remote_completed = self.remote_lane_completed.remove(&cont.key());
+        let remote_failed = self.remote_lane_failed.remove(&cont.key());
+        let mut remote_instantiated = if let Some(program) = remote_program.as_ref() {
+            if remote_completed || remote_failed {
+                Ok(None)
+            } else {
+                program
+                    .instantiate(self.epoch, self.current_lane, process, |target, send| {
+                        let key = (
+                            process.to_u64(),
+                            target.node.0,
+                            target.entity.to_u64(),
+                            send,
+                        );
+                        let sequence = self.remote_lane_sequences.entry(key).or_insert(0);
+                        let value = *sequence;
+                        *sequence = sequence.saturating_add(1);
+                        value
+                    })
+                    .map(Some)
+            }
+        } else {
+            Ok(None)
+        };
+        if let Ok(Some(batch)) = &remote_instantiated {
+            let entries = self
+                .remote_lane_outbox_base_entries
+                .saturating_add(self.remote_lane_emissions.len())
+                .saturating_add(1);
+            let bytes = self
+                .remote_lane_outbox_base_bytes
+                .saturating_add(
+                    self.remote_lane_emissions
+                        .iter()
+                        .map(|emission| emission.batch.encode().len())
+                        .sum::<usize>(),
+                )
+                .saturating_add(batch.encode().len());
+            if entries > crate::distributed::remote_lane_effect::MAX_REMOTE_LANE_OUTBOX_ENTRIES
+                || bytes > crate::distributed::remote_lane_effect::MAX_REMOTE_LANE_OUTBOX_BYTES
+            {
+                remote_instantiated =
+                    Err(crate::distributed::remote_lane_effect::RemoteLaneError::JournalFull);
+            }
+        }
         let result = {
             let mut lane = crate::executives::lane::LaneView::new(self, frame);
-            if let Some(program) = frame_evaluator {
+            if remote_program.is_some() {
+                match &remote_instantiated {
+                    Ok(Some(_)) => StepResult::yield_next(run_class),
+                    Ok(None) if remote_completed => StepResult::complete(),
+                    Ok(None) if remote_failed => StepResult::fault(process, run_class),
+                    _ => StepResult::fault(process, run_class),
+                }
+            } else if let Some(program) = frame_evaluator {
                 let input = lane
                     .object_bytes(process, frame)
                     .map(|bytes| bytes.to_vec());
@@ -452,6 +527,16 @@ impl Kernel {
                 cpu_scalar::dispatch(&mut lane, cont, process, run_class)
             }
         };
+        if let Ok(Some(batch)) = remote_instantiated {
+            self.remote_lane_emissions.push(
+                crate::distributed::remote_lane_effect::KernelRemoteLaneEmission {
+                    continuation: cont,
+                    process,
+                    run_class,
+                    batch,
+                },
+            );
+        }
         if let Ok(descriptor) = self.processes.get_mut(process) {
             descriptor.active_continuation = Ref64::NULL;
         }

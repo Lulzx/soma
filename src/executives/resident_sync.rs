@@ -90,7 +90,7 @@ fn previous_value(previous: &[ResidentOutcome]) -> Option<u64> {
     })
 }
 
-pub(super) fn validate_handler_program(
+pub(crate) fn validate_handler_program(
     program: &ResidentHandlerProgram,
     max_effects: u32,
     max_frame_bytes: u32,
@@ -287,6 +287,50 @@ pub struct ResidentEffectRecord {
     pub outcome: ResidentOutcome,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResidentFinalContinuation {
+    pub id: u64,
+    pub run_class: u32,
+    pub completed: bool,
+    pub pending: Option<ResidentEffect>,
+    /// Monotonic registration ticket used to reconstruct mailbox FIFO waiters.
+    pub waiter_order: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResidentInvocationRecord {
+    pub epoch: u32,
+    pub lane: u32,
+    pub continuation: u64,
+    pub run_class: u32,
+    /// 1 = Yield, 2 = Complete, 3 = Parked.
+    pub disposition: u32,
+    pub next_run_class: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResidentWakeRecord {
+    pub epoch: u32,
+    pub lane: u32,
+    pub cause_opcode: u32,
+    pub target: u32,
+    pub cause_continuation: u64,
+    pub continuation: u64,
+    pub run_class: u32,
+    pub ticket: u32,
+    pub ordinal: u32,
+    pub reserved: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResidentEpochRecord {
+    pub epoch: u32,
+    pub invocations: u32,
+    pub runnable_after: u32,
+    pub completed_after: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResidentSyncResult {
     pub frames: BTreeMap<u64, Vec<u8>>,
     pub effects: Vec<ResidentEffectRecord>,
@@ -298,6 +342,10 @@ pub struct ResidentSyncResult {
     pub completed: Vec<u64>,
     pub future_values: Vec<Option<u64>>,
     pub mailboxes: Vec<Vec<(u64, u64)>>,
+    pub final_continuations: Vec<ResidentFinalContinuation>,
+    pub invocations: Vec<ResidentInvocationRecord>,
+    pub wakes: Vec<ResidentWakeRecord>,
+    pub epoch_records: Vec<ResidentEpochRecord>,
 }
 
 #[derive(Clone)]
@@ -307,6 +355,7 @@ struct Cont {
     runnable: bool,
     completed: bool,
     pending: Option<ResidentEffect>,
+    waiter_order: u32,
 }
 struct FutureCell {
     value: Option<u64>,
@@ -412,6 +461,7 @@ pub fn run_resident_sync(
                     runnable: true,
                     completed: false,
                     pending: None,
+                    waiter_order: 0,
                 },
             )
         })
@@ -443,6 +493,7 @@ pub fn run_resident_sync(
         })
     };
     let mut result = ResidentSyncResult::default();
+    let mut waiter_order = 0u32;
     for epoch in 0..config.max_epochs {
         let mut lanes: Vec<u64> = cs
             .values()
@@ -488,6 +539,20 @@ pub fn run_resident_sync(
                 event: 0,
                 word: hash(&c.spec.frame),
             });
+            result.invocations.push(ResidentInvocationRecord {
+                epoch,
+                lane: li as u32,
+                continuation: *id,
+                run_class: c.spec.run_class,
+                disposition: match disposition {
+                    ResidentDisposition::Yield(_) => 1,
+                    ResidentDisposition::Complete => 2,
+                },
+                next_run_class: match disposition {
+                    ResidentDisposition::Yield(rc) => rc,
+                    ResidentDisposition::Complete => 0,
+                },
+            });
             emitted.push((*id, li as u32, effects, disposition));
         }
         // This loop is the canonical applier. No handler runs while it mutates tables.
@@ -513,7 +578,10 @@ pub fn run_resident_sync(
                                     if !f.waiters.contains(&id) {
                                         f.waiters.push(id)
                                     }
+                                    cs.get_mut(&id).unwrap().pending = Some(e);
                                     parked = true;
+                                    waiter_order = waiter_order.saturating_add(1);
+                                    cs.get_mut(&id).unwrap().waiter_order = waiter_order;
                                     ResidentOutcome::Registered
                                 }
                             }
@@ -528,7 +596,20 @@ pub fn run_resident_sync(
                                         f.value = Some(value);
                                         for w in std::mem::take(&mut f.waiters) {
                                             if let Some(c) = cs.get_mut(&w) {
+                                                result.wakes.push(ResidentWakeRecord {
+                                                    epoch,
+                                                    lane,
+                                                    cause_opcode: OP_RESOLVE_FUTURE,
+                                                    target,
+                                                    continuation: w,
+                                                    run_class: c.spec.run_class,
+                                                    ticket: c.waiter_order,
+                                                    ordinal: ord as u32,
+                                                    cause_continuation: id,
+                                                    reserved: 0,
+                                                });
                                                 c.runnable = true;
+                                                c.pending = None;
                                                 c.previous.push(ResidentOutcome::Resolved(value));
                                             }
                                         }
@@ -547,12 +628,27 @@ pub fn run_resident_sync(
                                         }
                                         cs.get_mut(&id).unwrap().pending = Some(e);
                                         parked = true;
+                                        waiter_order = waiter_order.saturating_add(1);
+                                        cs.get_mut(&id).unwrap().waiter_order = waiter_order;
                                         ResidentOutcome::Full
                                     } else {
                                         m.queue.push_back((actor, value));
                                         if let Some(w) = m.receivers.first().copied() {
                                             m.receivers.remove(0);
-                                            cs.get_mut(&w).unwrap().runnable = true;
+                                            let c = cs.get_mut(&w).unwrap();
+                                            result.wakes.push(ResidentWakeRecord {
+                                                epoch,
+                                                lane,
+                                                cause_opcode: OP_ENQUEUE_MESSAGE,
+                                                target,
+                                                continuation: w,
+                                                run_class: c.spec.run_class,
+                                                ticket: c.waiter_order,
+                                                ordinal: ord as u32,
+                                                cause_continuation: id,
+                                                reserved: 0,
+                                            });
+                                            c.runnable = true;
                                         }
                                         ResidentOutcome::Sent
                                     }
@@ -566,7 +662,20 @@ pub fn run_resident_sync(
                                     if let Some((sender, value)) = m.queue.pop_front() {
                                         if let Some(w) = m.senders.first().copied() {
                                             m.senders.remove(0);
-                                            cs.get_mut(&w).unwrap().runnable = true;
+                                            let c = cs.get_mut(&w).unwrap();
+                                            result.wakes.push(ResidentWakeRecord {
+                                                epoch,
+                                                lane,
+                                                cause_opcode: OP_RECEIVE_MESSAGE,
+                                                target,
+                                                continuation: w,
+                                                run_class: c.spec.run_class,
+                                                ticket: c.waiter_order,
+                                                ordinal: ord as u32,
+                                                cause_continuation: id,
+                                                reserved: 0,
+                                            });
+                                            c.runnable = true;
                                         }
                                         ResidentOutcome::Received { value, sender }
                                     } else {
@@ -575,6 +684,8 @@ pub fn run_resident_sync(
                                         }
                                         cs.get_mut(&id).unwrap().pending = Some(e);
                                         parked = true;
+                                        waiter_order = waiter_order.saturating_add(1);
+                                        cs.get_mut(&id).unwrap().waiter_order = waiter_order;
                                         ResidentOutcome::Empty
                                     }
                                 }
@@ -634,6 +745,17 @@ pub fn run_resident_sync(
                 }
             }
             result.operations.push(journal);
+            if parked {
+                if let Some(invocation) = result
+                    .invocations
+                    .iter_mut()
+                    .rev()
+                    .find(|invocation| invocation.epoch == epoch && invocation.lane == lane)
+                {
+                    invocation.disposition = 3;
+                    invocation.next_run_class = cs[&id].spec.run_class;
+                }
+            }
             let c = cs.get_mut(&id).unwrap();
             if !parked {
                 match disp {
@@ -649,8 +771,24 @@ pub fn run_resident_sync(
             }
         }
         result.epochs = epoch + 1;
+        result.epoch_records.push(ResidentEpochRecord {
+            epoch,
+            invocations: lanes.len() as u32,
+            runnable_after: cs.values().filter(|c| c.runnable && !c.completed).count() as u32,
+            completed_after: cs.values().filter(|c| c.completed).count() as u32,
+        });
     }
     result.quiescent = cs.values().all(|c| !c.runnable || c.completed);
+    result.final_continuations = cs
+        .values()
+        .map(|c| ResidentFinalContinuation {
+            id: c.spec.id,
+            run_class: c.spec.run_class,
+            completed: c.completed,
+            pending: c.pending,
+            waiter_order: c.pending.map_or(0, |_| c.waiter_order),
+        })
+        .collect();
     result.frames = cs.into_iter().map(|(id, c)| (id, c.spec.frame)).collect();
     result.future_values = fs.into_iter().map(|f| f.value).collect();
     result.mailboxes = ms

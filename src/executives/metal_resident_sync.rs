@@ -35,6 +35,9 @@ struct GpuConfig {
     effect_capacity: u32,
     trace_capacity: u32,
     mailbox_stride: u32,
+    invocation_capacity: u32,
+    wake_capacity: u32,
+    epoch_capacity: u32,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -128,6 +131,10 @@ struct GpuStatus {
     epochs: u32,
     quiescent: u32,
     error: u32,
+    invocation_count: u32,
+    wake_count: u32,
+    epoch_count: u32,
+    ticket: u32,
     reserved0: u32,
     reserved1: u32,
 }
@@ -135,7 +142,7 @@ struct GpuStatus {
 const SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
-struct Config { uint continuation_count, handler_count, instruction_count, future_count; uint mailbox_count, capability_count, max_epochs, max_effects; uint frame_stride, effect_capacity, trace_capacity, mailbox_stride; };
+struct Config { uint continuation_count, handler_count, instruction_count, future_count; uint mailbox_count, capability_count, max_epochs, max_effects; uint frame_stride, effect_capacity, trace_capacity, mailbox_stride; uint invocation_capacity,wake_capacity,epoch_capacity; };
 struct Cont { ulong id, actor; uint run_class, frame_len, state, last_epoch; uint previous_kind, pending_opcode, pending_target, reserved; ulong previous_value, previous_sender, pending_value; };
 struct Handler { uint run_class, instruction_offset, instruction_count, reserved; };
 struct Instruction { uint opcode, argument; ulong value; };
@@ -145,8 +152,11 @@ struct MailEntry { ulong sender, value; };
 struct Capability { ulong actor; uint kind, target, rights, reserved; };
 struct EffectRecord { uint epoch, lane, ordinal, opcode; ulong continuation; uint target, outcome; ulong value, result_value, result_sender; uint run_class, reserved; };
 struct Trace { uint epoch, lane; ulong continuation; uint run_class, event, word; };
-struct Status { uint effect_count, trace_count, completed_count, epochs; uint quiescent, error, reserved0, reserved1; };
+struct Status { uint effect_count, trace_count, completed_count, epochs; uint quiescent,error,invocation_count,wake_count; uint epoch_count,ticket,reserved0,reserved1; };
 struct Stage { uint continuation_index, effect_offset, effect_count, disposition; uint next_run_class, reserved0, reserved1, reserved2; };
+struct Invocation { uint epoch,lane; ulong continuation; uint run_class,disposition,next_run_class; };
+struct Wake { uint epoch,lane,cause_opcode,target; ulong cause_continuation,continuation; uint run_class,ticket,ordinal,reserved; };
+struct EpochRecord { uint epoch,invocations,runnable_after,completed_after; };
 constant uint RUNNABLE=1, PARKED=2, COMPLETE=3;
 constant uint AWAIT=1, RESOLVE=2, SEND=3, RECEIVE=4;
 constant uint OUT_RESOLVED=1, OUT_REGISTERED=2, OUT_SENT=3, OUT_RECEIVED=4, OUT_DENIED=5, OUT_INVALID=6, OUT_FULL=7, OUT_EMPTY=8, OUT_DOUBLE=9;
@@ -155,14 +165,15 @@ inline uint journal_opcode(uint op) { return op==AWAIT?11:(op==RESOLVE?10:(op==S
 inline uint hash_frame(device uchar* f,uint n){uint h=2166136261u;for(uint i=0;i<n;i++)h=(h^uint(f[i]))*16777619u;return h;}
 inline bool allowed(device const Capability* caps,uint n,ulong actor,uint kind,uint target,uint right){for(uint i=0;i<n;i++){Capability c=caps[i];if(c.actor==actor&&c.kind==kind&&c.target==target&&(c.rights&right)!=0)return true;}return false;}
 inline void add_trace(device Trace* traces,device Status* s,constant Config& cfg,uint epoch,uint lane,Cont c,uint event,uint word){if(s->trace_count>=cfg.trace_capacity){s->error=2;return;}Trace t={epoch,lane,c.id,c.run_class,event,word};traces[s->trace_count++]=t;}
-inline void wake_future(device Cont* cs,uint n,uint target,ulong value,uint epoch){for(uint i=0;i<n;i++)if(cs[i].state==PARKED&&cs[i].pending_opcode==AWAIT&&cs[i].pending_target==target){cs[i].state=RUNNABLE;cs[i].last_epoch=epoch;cs[i].pending_opcode=0;cs[i].previous_kind=OUT_RESOLVED;cs[i].previous_value=value;}}
-inline void wake_one(device Cont* cs,uint n,uint opcode,uint target,uint epoch){uint best=0xffffffffu;for(uint i=0;i<n;i++)if(cs[i].state==PARKED&&cs[i].pending_opcode==opcode&&cs[i].pending_target==target&&(best==0xffffffffu||cs[i].reserved<cs[best].reserved||(cs[i].reserved==cs[best].reserved&&cs[i].id<cs[best].id)))best=i;if(best!=0xffffffffu){cs[best].state=RUNNABLE;cs[best].last_epoch=epoch;}}
+inline void add_wake(device Wake* wakes,device Status* s,constant Config& cfg,uint epoch,uint lane,uint cause,uint target,ulong cause_continuation,uint ordinal,Cont c){if(s->wake_count>=cfg.wake_capacity){s->error=8;return;}Wake w={epoch,lane,cause,target,cause_continuation,c.id,c.run_class,c.reserved,ordinal,0};wakes[s->wake_count++]=w;}
+inline void wake_future(device Cont* cs,uint n,uint target,ulong value,uint epoch,uint lane,ulong cause_continuation,uint ordinal,device Wake* wakes,device Status* s,constant Config& cfg){for(uint i=0;i<n;i++)if(cs[i].state==PARKED&&cs[i].pending_opcode==AWAIT&&cs[i].pending_target==target){add_wake(wakes,s,cfg,epoch,lane,10,target,cause_continuation,ordinal,cs[i]);cs[i].state=RUNNABLE;cs[i].last_epoch=epoch;cs[i].pending_opcode=0;cs[i].previous_kind=OUT_RESOLVED;cs[i].previous_value=value;}}
+inline void wake_one(device Cont* cs,uint n,uint opcode,uint target,uint epoch,uint lane,uint cause,ulong cause_continuation,uint ordinal,device Wake* wakes,device Status* s,constant Config& cfg){uint best=0xffffffffu;for(uint i=0;i<n;i++)if(cs[i].state==PARKED&&cs[i].pending_opcode==opcode&&cs[i].pending_target==target&&(best==0xffffffffu||cs[i].reserved<cs[best].reserved||(cs[i].reserved==cs[best].reserved&&cs[i].id<cs[best].id)))best=i;if(best!=0xffffffffu){add_wake(wakes,s,cfg,epoch,lane,cause,target,cause_continuation,ordinal,cs[best]);cs[best].state=RUNNABLE;cs[best].last_epoch=epoch;}}
 kernel void resident_sync(
  constant Config& cfg [[buffer(0)]], device Cont* cs [[buffer(1)]], device uchar* frames [[buffer(2)]],
  device const Handler* handlers [[buffer(3)]], device const Instruction* ins [[buffer(4)]], device Future* futures [[buffer(5)]],
  device Mailbox* mails [[buffer(6)]], device MailEntry* entries [[buffer(7)]], device const Capability* caps [[buffer(8)]],
- device EffectRecord* records [[buffer(9)]], device Trace* traces [[buffer(10)]], device ulong* completed [[buffer(11)]], device Status* status [[buffer(12)]], device Stage* stages [[buffer(13)]], uint gid [[thread_position_in_grid]]) {
- if(gid!=0)return; Status s={0,0,0,0,0,0,0,0}; *status=s; if(cfg.continuation_count==0){status->quiescent=1;return;}
+ device EffectRecord* records [[buffer(9)]], device Trace* traces [[buffer(10)]], device ulong* completed [[buffer(11)]], device Status* status [[buffer(12)]], device Stage* stages [[buffer(13)]], device Invocation* invocations [[buffer(14)]], device Wake* wakes [[buffer(15)]], device EpochRecord* epoch_records [[buffer(16)]], uint gid [[thread_position_in_grid]]) {
+ if(gid!=0)return; Status s={0,0,0,0,0,0,0,0,0,0,0,0}; *status=s; if(cfg.continuation_count==0){status->quiescent=1;return;}
  for(uint epoch=0;epoch<cfg.max_epochs;epoch++){
   uint lane=0;
   // Handler phase: snapshot every runnable lane and emit bounded effects only.
@@ -183,13 +194,13 @@ kernel void resident_sync(
     else{Instruction x=ins[pc++];op=x.opcode;arg=x.argument;val=x.value;
      if(op==5||op==6){if(arg+8>c.frame_len||(op==6&&input_previous_kind!=OUT_RESOLVED&&input_previous_kind!=OUT_RECEIVED)){status->error=4;return;}ulong v=op==5?val:input_previous_value;for(uint bb=0;bb<8;bb++)frames[at*cfg.frame_stride+arg+bb]=uchar(v>>(bb*8));continue;}
      if(op==7){if((input_previous_kind!=OUT_RESOLVED&&input_previous_kind!=OUT_RECEIVED)||input_previous_value!=val)pc+=arg;continue;}
-     if(op==8){disposition=1;next_class=arg;break;}if(op==9){disposition=2;break;}
+     if(op==8){disposition=1;next_class=arg;break;}if(op==9){disposition=2;next_class=0;break;}
     }
     if(op<1||op>4||emitted>=cfg.max_effects||status->effect_count>=cfg.effect_capacity){status->error=5;return;}
     EffectRecord r={epoch,lane,emitted,journal_opcode(op),c.id,arg,0,val,0,0,c.run_class,0};records[status->effect_count++]=r;emitted++;
    }
    if(disposition==0){status->error=7;return;}
-   Stage st={at,effect_start,emitted,disposition,next_class,0,0,0};stages[lane]=st;cs[at]=c;
+   Stage st={at,effect_start,emitted,disposition,next_class,status->invocation_count,0,0};stages[lane]=st;if(status->invocation_count>=cfg.invocation_capacity){status->error=9;return;}Invocation iv={epoch,lane,c.id,c.run_class,disposition,next_class};invocations[status->invocation_count++]=iv;cs[at]=c;
    add_trace(traces,status,cfg,epoch,lane,c,0,hash_frame(frames+at*cfg.frame_stride,c.frame_len));lane++;
   }
   // Canonical applier phase. All invocation traces already occupy the prefix.
@@ -201,16 +212,16 @@ kernel void resident_sync(
     if(!allowed(caps,cfg.capability_count,c.actor,kind,arg,right))outcome=OUT_DENIED;
     else if((kind==2&&arg>=cfg.future_count)||(kind==3&&arg>=cfg.mailbox_count))outcome=OUT_INVALID;
     else if(op==AWAIT){if(futures[arg].resolved!=0){outcome=OUT_RESOLVED;result_value=futures[arg].value;}else{outcome=OUT_REGISTERED;parked=true;c.pending_opcode=AWAIT;c.pending_target=arg;}}
-    else if(op==RESOLVE){if(futures[arg].resolved!=0)outcome=OUT_DOUBLE;else{futures[arg].resolved=1;futures[arg].value=val;outcome=OUT_RESOLVED;result_value=val;wake_future(cs,cfg.continuation_count,arg,val,epoch);}}
-    else if(op==SEND){Mailbox m=mails[arg];if(m.count>=m.capacity){outcome=OUT_FULL;parked=true;c.pending_opcode=SEND;c.pending_target=arg;c.pending_value=val;}else{uint slot=arg*cfg.mailbox_stride+(m.head+m.count)%cfg.mailbox_stride;MailEntry ne={c.actor,val};entries[slot]=ne;m.count++;mails[arg]=m;outcome=OUT_SENT;wake_one(cs,cfg.continuation_count,RECEIVE,arg,epoch);}}
-    else{Mailbox m=mails[arg];if(m.count==0){outcome=OUT_EMPTY;parked=true;c.pending_opcode=RECEIVE;c.pending_target=arg;}else{uint slot=arg*cfg.mailbox_stride+m.head;MailEntry e=entries[slot];m.head=(m.head+1)%cfg.mailbox_stride;m.count--;mails[arg]=m;outcome=OUT_RECEIVED;result_value=e.value;result_sender=e.sender;c.pending_opcode=0;wake_one(cs,cfg.continuation_count,SEND,arg,epoch);}}
-    if(outcome==OUT_REGISTERED||outcome==OUT_FULL||outcome==OUT_EMPTY)c.reserved=++status->reserved0;
+    else if(op==RESOLVE){if(futures[arg].resolved!=0)outcome=OUT_DOUBLE;else{futures[arg].resolved=1;futures[arg].value=val;outcome=OUT_RESOLVED;result_value=val;wake_future(cs,cfg.continuation_count,arg,val,epoch,li,c.id,r.ordinal,wakes,status,cfg);}}
+    else if(op==SEND){Mailbox m=mails[arg];if(m.count>=m.capacity){outcome=OUT_FULL;parked=true;c.pending_opcode=SEND;c.pending_target=arg;c.pending_value=val;}else{uint slot=arg*cfg.mailbox_stride+(m.head+m.count)%cfg.mailbox_stride;MailEntry ne={c.actor,val};entries[slot]=ne;m.count++;mails[arg]=m;outcome=OUT_SENT;wake_one(cs,cfg.continuation_count,RECEIVE,arg,epoch,li,8,c.id,r.ordinal,wakes,status,cfg);}}
+    else{Mailbox m=mails[arg];if(m.count==0){outcome=OUT_EMPTY;parked=true;c.pending_opcode=RECEIVE;c.pending_target=arg;}else{uint slot=arg*cfg.mailbox_stride+m.head;MailEntry e=entries[slot];m.head=(m.head+1)%cfg.mailbox_stride;m.count--;mails[arg]=m;outcome=OUT_RECEIVED;result_value=e.value;result_sender=e.sender;c.pending_opcode=0;wake_one(cs,cfg.continuation_count,SEND,arg,epoch,li,9,c.id,r.ordinal,wakes,status,cfg);}}
+    if(outcome==OUT_REGISTERED||outcome==OUT_FULL||outcome==OUT_EMPTY)c.reserved=++status->ticket;
     r.outcome=outcome;r.result_value=result_value;r.result_sender=result_sender;records[ri]=r;add_trace(traces,status,cfg,epoch,li,c,r.opcode,outcome_code(outcome));
     if(outcome==OUT_RESOLVED||outcome==OUT_RECEIVED){c.previous_kind=outcome;c.previous_value=result_value;c.previous_sender=result_sender;}
    }
-   if(parked)c.state=PARKED;else if(st.disposition==1){c.state=RUNNABLE;c.run_class=st.next_run_class;}else{c.state=COMPLETE;completed[status->completed_count++]=c.id;}cs[st.continuation_index]=c;
+   if(parked){c.state=PARKED;invocations[st.reserved0].disposition=3;invocations[st.reserved0].next_run_class=c.run_class;}else if(st.disposition==1){c.state=RUNNABLE;c.run_class=st.next_run_class;}else{c.state=COMPLETE;completed[status->completed_count++]=c.id;}cs[st.continuation_index]=c;
   }
-  status->epochs=epoch+1;bool any=false;for(uint i=0;i<cfg.continuation_count;i++)if(cs[i].state==RUNNABLE)any=true;if(!any){status->quiescent=1;break;}
+  status->epochs=epoch+1;uint runnable_after=0,completed_after=0;for(uint i=0;i<cfg.continuation_count;i++){if(cs[i].state==RUNNABLE)runnable_after++;if(cs[i].state==COMPLETE)completed_after++;}if(status->epoch_count>=cfg.epoch_capacity){status->error=10;return;}EpochRecord er={epoch,lane,runnable_after,completed_after};epoch_records[status->epoch_count++]=er;if(runnable_after==0){status->quiescent=1;break;}
  }
  bool any=false;for(uint i=0;i<cfg.continuation_count;i++)if(cs[i].state==RUNNABLE)any=true;status->quiescent=any?0:1;
 }
@@ -256,6 +267,9 @@ impl MetalResidentSync {
         continuations.sort_by_key(|c| c.id);
         let effect_capacity =
             checked_capacity(config, continuations.len(), config.max_effects_per_step)?;
+        let invocation_capacity = (config.max_epochs as usize)
+            .checked_mul(continuations.len())
+            .ok_or(BackendError::InvalidInput)?;
         let trace_capacity = effect_capacity
             .checked_add(
                 (config.max_epochs as usize)
@@ -340,6 +354,9 @@ impl MetalResidentSync {
             effect_capacity: effect_capacity as u32,
             trace_capacity: trace_capacity as u32,
             mailbox_stride: config.max_continuations,
+            invocation_capacity: invocation_capacity as u32,
+            wake_capacity: invocation_capacity as u32,
+            epoch_capacity: config.max_epochs,
         };
         let cfg_b = self.buffer_from(std::slice::from_ref(&cfg));
         let cs_b = self.buffer_from(&gpu_conts);
@@ -360,6 +377,9 @@ impl MetalResidentSync {
         let completed_b = self.zero_buffer::<u64>(continuations.len());
         let status_b = self.zero_buffer::<GpuStatus>(1);
         let stages_b = self.zero_buffer::<GpuStage>(continuations.len());
+        let invocations_b = self.zero_buffer::<ResidentInvocationRecord>(invocation_capacity);
+        let wakes_b = self.zero_buffer::<ResidentWakeRecord>(invocation_capacity);
+        let epochs_b = self.zero_buffer::<ResidentEpochRecord>(config.max_epochs as usize);
         let command = self.queue.new_command_buffer();
         let encoder = command.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&self.pipeline);
@@ -378,6 +398,9 @@ impl MetalResidentSync {
             &completed_b,
             &status_b,
             &stages_b,
+            &invocations_b,
+            &wakes_b,
+            &epochs_b,
         ]
         .iter()
         .enumerate()
@@ -405,12 +428,18 @@ impl MetalResidentSync {
             || status.effect_count as usize > effect_capacity
             || status.trace_count as usize > trace_capacity
             || status.completed_count as usize > continuations.len()
+            || status.invocation_count as usize > invocation_capacity
+            || status.wake_count as usize > invocation_capacity
+            || status.epoch_count > config.max_epochs
         {
             return Err(BackendError::ExecutionFailed);
         }
         let raw_effects: Vec<GpuEffectRecord> = read_vec(&effects_b, status.effect_count as usize);
         let trace = read_vec(&traces_b, status.trace_count as usize);
         let completed = read_vec(&completed_b, status.completed_count as usize);
+        let invocations = read_vec(&invocations_b, status.invocation_count as usize);
+        let wakes = read_vec(&wakes_b, status.wake_count as usize);
+        let epoch_records = read_vec(&epochs_b, status.epoch_count as usize);
         decode(
             config,
             &continuations,
@@ -422,6 +451,9 @@ impl MetalResidentSync {
             raw_effects,
             trace,
             completed,
+            invocations,
+            wakes,
+            epoch_records,
             status,
         )
     }
@@ -584,6 +616,9 @@ fn decode(
     raw: Vec<GpuEffectRecord>,
     trace: Vec<ResidentSyncTrace>,
     completed: Vec<u64>,
+    invocations: Vec<ResidentInvocationRecord>,
+    wakes: Vec<ResidentWakeRecord>,
+    epoch_records: Vec<ResidentEpochRecord>,
     status: GpuStatus,
 ) -> Result<ResidentSyncResult, BackendError> {
     let stride = config.max_frame_bytes as usize;
@@ -655,6 +690,36 @@ fn decode(
     result.operations = journals.into_values().collect();
     result.trace = trace;
     result.completed = completed;
+    result.invocations = invocations;
+    result.wakes = wakes;
+    result.epoch_records = epoch_records;
+    result.final_continuations = cs
+        .iter()
+        .map(|continuation| ResidentFinalContinuation {
+            id: continuation.id,
+            run_class: continuation.run_class,
+            completed: continuation.state == 3,
+            pending: match continuation.pending_opcode {
+                0 => None,
+                1 => Some(ResidentEffect::FutureAwait {
+                    target: continuation.pending_target,
+                }),
+                3 => Some(ResidentEffect::MailboxSend {
+                    target: continuation.pending_target,
+                    value: continuation.pending_value,
+                }),
+                4 => Some(ResidentEffect::MailboxReceive {
+                    target: continuation.pending_target,
+                }),
+                _ => None,
+            },
+            waiter_order: if continuation.pending_opcode == 0 {
+                0
+            } else {
+                continuation.reserved
+            },
+        })
+        .collect();
     result.epochs = status.epochs;
     result.quiescent = status.quiescent != 0;
     result.future_values = futures
