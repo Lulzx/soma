@@ -43,6 +43,14 @@ same validated body IR consumed by all three backends. Syntax and semantics are
 documented in `docs/EVALUATOR-LANGUAGE.md`; `tests/evaluator_surface.rs` proves
 one named source runs through the reference, native CPU, and real Metal paths.
 
+The first device-scheduler hardware slice lives in `scheduler::device` and
+`executives::metal_scheduler`. Real Metal threads perform deterministic I13
+admission, stable run-class placement, and cohort disposition from persistent
+buffers in one command buffer. `tests/device_scheduler.rs` compares every
+placement field with the independent reference lowering. This is the planning
+phase; execution and canonical commit still need to be chained behind it. See
+`docs/DEVICE-SCHEDULER.md`.
+
 Read §1 for the project state and §6 for the test discipline before changing
 the code.
 

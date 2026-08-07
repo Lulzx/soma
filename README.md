@@ -298,6 +298,10 @@ Implemented now:
 - An opt-in speculative CPU epoch executive with isolated threaded lanes,
   complete `LaneView` operation/access journals, conflict validation, canonical
   replay, deterministic fallback, and reference-trace equivalence tests
+- A real Metal scheduling phase with persistent candidate/placement buffers,
+  concurrent deterministic admission, run-class bin placement, cohort lanes,
+  and all partial-cohort dispositions, checked field-for-field against an
+  independent reference schedule
 
 Not implemented:
 
@@ -307,10 +311,11 @@ Not implemented:
   execution. Its intentional semantic boundary excludes allocation, I/O,
   cross-lane output reads, and unbounded control flow; see
   [docs/EVALUATOR-LANGUAGE.md](docs/EVALUATOR-LANGUAGE.md)
-- A device-resident scheduler/executive or a distributed backend. The CPU
-  scheduler now has a real speculative threaded implementation, but it clones
-  kernel snapshots and starts scoped threads per eligible epoch; it does not
-  persist workers on a GPU or across machines
+- A complete device-resident executive or a distributed backend. Metal now
+  performs admission and cohort placement from resident buffers in one command
+  buffer, but continuation execution, lane journals, and canonical commit are
+  not yet chained behind that plan without a host boundary; see
+  [docs/DEVICE-SCHEDULER.md](docs/DEVICE-SCHEDULER.md)
 - Scheduler-overhead and end-to-end migration benchmarks. The batch backend
   itself is measured on hardware — CPU against Metal from 32 to 4M elements,
   where a Metal call's fixed cost goes, what a published cohort costs off-GPU,

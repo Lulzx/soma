@@ -3,7 +3,8 @@
 **Status:** partially implemented. §1–§3 are specification and are
 machine-checked. §4's semantic obligations and the speculative concurrent CPU
 executive (§4.18) are implemented; a persistent device-resident executive is
-not. §5–§6 are scope.
+partially implemented through real Metal admission and placement. §5–§6 are
+scope.
 
 v0.2 closed the semantic core: every entity and invariant it named was
 implemented and checked. v0.3 is the first version whose work is not "finish the
@@ -18,7 +19,7 @@ did not depend on it are done; the rest is scoped below.
 | **0** | Carried debts on the critical path | **done** (§1) |
 | **S** | An equivalence a concurrent implementation can satisfy | **done** (§2) |
 | **A** | General evaluator bodies and a compiler | **done** (§3) |
-| **B** | Persistent device-resident scheduler | **started** (§4) — semantics and concurrent CPU executive done; device residency not |
+| **B** | Persistent device-resident scheduler | **in progress** (§4) — semantics, concurrent CPU executive, and Metal planning done; device execution/commit not |
 | **C** | Distributed / multi-node implementation | scope (§5) |
 | **D** | Performance work on real hardware | scope (§6) |
 
@@ -371,10 +372,19 @@ step-budget check's position, which held already. Read visibility — §4.3's th
 problem, and the one that gated the applier's move — is settled as I25 rather
 than by deferring the remaining tables, for the reason §4.5 gives.
 
-What is *not* done is the executive that all of this was for. Lanes are
-reorderable and §4.6 reorders them — deterministically, on one thread — so the
-property is checked rather than claimed. Running them on several threads is
-mechanical rather than semantic work, and it is not done.
+The speculative CPU executive in §4.18 runs isolated lanes on several threads,
+validates their complete operation journals, and either commits them in plan
+order or replays the epoch through the reference path. That establishes the
+concurrent execution shape. What remains is carrying the same shape through a
+device plan, device lane execution, and canonical device commit.
+
+The first device phase is now real rather than modelled. `MetalDeviceScheduler`
+runs deterministic admission and stable run-class/cohort placement concurrently
+on Metal threads, with candidate and placement buffers retained across epochs
+and both passes encoded in one command buffer. It agrees field-for-field with
+the independent `reference_device_schedule` for all partial policies. It does
+not yet carry that plan through continuation execution and canonical commit;
+that remaining boundary is specified in `docs/DEVICE-SCHEDULER.md`.
 
 `kernel/epochs.rs` still cohorts, executes, and commits on the host, one
 continuation at a time. The Metal path dispatches a single collective and blocks

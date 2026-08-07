@@ -2,5 +2,6 @@
 
 pub mod admission;
 pub mod cohorts;
+pub mod device;
 pub mod lane_order;
 pub mod runnable_bins;
