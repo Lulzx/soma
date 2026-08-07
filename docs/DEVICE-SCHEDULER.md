@@ -21,10 +21,12 @@ mutable candidate for the same process and yields to the smallest
 longest-waiting, identity-tiebroken rule as `scheduler::admission::admit`, with
 no first-arriving atomic winner.
 
-Placement is a second GPU dispatch. Each admitted candidate counts earlier
-admitted candidates in its bin, producing a deterministic bin rank, cohort,
-and lane. The admission and placement dispatches are encoded into one command
-buffer, so no host read or round trip separates the decision from placement.
+Placement no longer performs a quadratic all-candidate scan. Admitted candidate
+indices are initialized in resident storage, sorted by `(bin, input order)` by
+a deterministic device-side bitonic network, and assigned bin rank through
+binary-search bounds in the sorted index. Results are written back in original
+candidate order. Every sorting stage and placement remain in one command
+buffer, so no host read or round trip separates admission from placement.
 
 The candidate and placement arrays use fixed-width, pointer-free structs whose
 Rust sizes are compile-time asserted against the MSL layout. Their shared Metal
@@ -67,10 +69,12 @@ independent oracle at that boundary. This moves the conflict gate needed before
 canonical commit onto the device. It does not yet move operation replay or
 handler execution there.
 
-The current algorithm is intentionally simple and quadratic in candidate
-count. It establishes the device ABI and semantic equivalence before replacing
-the comparison scans with parallel sort/scan primitives. Scheduler-overhead
-benchmarks will measure where that crossover is justified.
+Mutable-claim admission remains quadratic in the worst case because each
+mutable candidate compares the complete same-process claim set. Read-only
+candidates take the constant path, and placement is now `O(n log² n)` sorting
+plus `O(n log n)` bound lookup. Irregular randomized epochs from 1 through 127
+candidates, including non-power-of-two sizes, contested mutable claims, sparse
+bins, and all four partial policies agree field-for-field with the oracle.
 
 ## Remaining integration
 

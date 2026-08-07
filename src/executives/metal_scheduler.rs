@@ -101,24 +101,79 @@ kernel void soma_device_admit(
     placements[gid] = placement;
 }
 
-kernel void soma_device_place(
-    device const Candidate* candidates [[buffer(0)]],
-    device Placement* placements [[buffer(1)]],
+inline bool index_after(device const Candidate* candidates, uint left, uint right) {
+    if (left == 0xFFFFFFFFu) return right != 0xFFFFFFFFu;
+    if (right == 0xFFFFFFFFu) return false;
+    Candidate a = candidates[left];
+    Candidate b = candidates[right];
+    return a.bin > b.bin || (a.bin == b.bin && a.input_order > b.input_order);
+}
+
+kernel void soma_device_index_init(
+    device const Placement* placements [[buffer(0)]],
+    device uint* indices [[buffer(1)]],
     constant uint& count [[buffer(2)]],
-    constant uint& width [[buffer(3)]],
-    constant uint& policy [[buffer(4)]],
+    constant uint& padded [[buffer(3)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    if (gid >= count || placements[gid].disposition == 0u) return;
-    uint rank = 0u;
-    uint bin_count = 0u;
-    uint bin = candidates[gid].bin;
-    for (uint other = 0u; other < count; ++other) {
-        if (placements[other].disposition == 1u && candidates[other].bin == bin) {
-            if (other < gid) ++rank;
-            ++bin_count;
-        }
+    if (gid >= padded) return;
+    indices[gid] = gid < count && placements[gid].disposition == 1u ? gid : 0xFFFFFFFFu;
+}
+
+kernel void soma_device_index_sort(
+    device const Candidate* candidates [[buffer(0)]],
+    device uint* indices [[buffer(1)]],
+    constant uint& padded [[buffer(2)]],
+    constant uint& merge_width [[buffer(3)]],
+    constant uint& compare_distance [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= padded) return;
+    uint partner = gid ^ compare_distance;
+    if (partner <= gid || partner >= padded) return;
+    uint left = indices[gid];
+    uint right = indices[partner];
+    bool descending = (gid & merge_width) != 0u;
+    bool swap = descending ? index_after(candidates, right, left)
+                           : index_after(candidates, left, right);
+    if (swap) {
+        indices[gid] = right;
+        indices[partner] = left;
     }
+}
+
+kernel void soma_device_place_sorted(
+    device const Candidate* candidates [[buffer(0)]],
+    device Placement* placements [[buffer(1)]],
+    device const uint* indices [[buffer(2)]],
+    constant uint& count [[buffer(3)]],
+    constant uint& width [[buffer(4)]],
+    constant uint& policy [[buffer(5)]],
+    uint sorted_at [[thread_position_in_grid]]
+) {
+    if (sorted_at >= count) return;
+    uint original = indices[sorted_at];
+    if (original == 0xFFFFFFFFu) return;
+    uint bin = candidates[original].bin;
+    uint low = 0u;
+    uint high = sorted_at;
+    while (low < high) {
+        uint mid = low + (high - low) / 2u;
+        uint candidate_index = indices[mid];
+        if (candidate_index != 0xFFFFFFFFu && candidates[candidate_index].bin < bin) low = mid + 1u;
+        else high = mid;
+    }
+    uint first = low;
+    low = sorted_at + 1u;
+    high = count;
+    while (low < high) {
+        uint mid = low + (high - low) / 2u;
+        uint candidate_index = indices[mid];
+        if (candidate_index != 0xFFFFFFFFu && candidates[candidate_index].bin <= bin) low = mid + 1u;
+        else high = mid;
+    }
+    uint bin_count = low - first;
+    uint rank = sorted_at - first;
     uint remainder = bin_count % width;
     uint full_count = bin_count - remainder;
     uint disposition = 1u;
@@ -126,10 +181,10 @@ kernel void soma_device_place(
         if (policy == 0u) disposition = 2u;
         if (policy == 1u) disposition = 3u;
     }
-    placements[gid].disposition = disposition;
-    placements[gid].bin_rank = rank;
-    placements[gid].cohort = rank / width;
-    placements[gid].lane_in_cohort = rank % width;
+    placements[original].disposition = disposition;
+    placements[original].bin_rank = rank;
+    placements[original].cohort = rank / width;
+    placements[original].lane_in_cohort = rank % width;
 }
 
 kernel void soma_device_validate_journals(
@@ -160,9 +215,11 @@ pub struct MetalDeviceScheduler {
     device: Device,
     queue: CommandQueue,
     admission: ComputePipelineState,
+    index_init: ComputePipelineState,
+    index_sort: ComputePipelineState,
     placement: ComputePipelineState,
     journal_validation: ComputePipelineState,
-    resident: Option<(Buffer, Buffer, usize)>,
+    resident: Option<(Buffer, Buffer, Buffer, usize)>,
     journal_resident: Option<(Buffer, Buffer, usize, usize)>,
 }
 
@@ -176,14 +233,26 @@ impl MetalDeviceScheduler {
         let admission_fn = library
             .get_function("soma_device_admit", None)
             .map_err(|_| BackendError::ExecutionFailed)?;
+        let index_init_fn = library
+            .get_function("soma_device_index_init", None)
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let index_sort_fn = library
+            .get_function("soma_device_index_sort", None)
+            .map_err(|_| BackendError::ExecutionFailed)?;
         let placement_fn = library
-            .get_function("soma_device_place", None)
+            .get_function("soma_device_place_sorted", None)
             .map_err(|_| BackendError::ExecutionFailed)?;
         let journal_validation_fn = library
             .get_function("soma_device_validate_journals", None)
             .map_err(|_| BackendError::ExecutionFailed)?;
         let admission = device
             .new_compute_pipeline_state_with_function(&admission_fn)
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let index_init = device
+            .new_compute_pipeline_state_with_function(&index_init_fn)
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let index_sort = device
+            .new_compute_pipeline_state_with_function(&index_sort_fn)
             .map_err(|_| BackendError::ExecutionFailed)?;
         let placement = device
             .new_compute_pipeline_state_with_function(&placement_fn)
@@ -195,6 +264,8 @@ impl MetalDeviceScheduler {
             device,
             queue,
             admission,
+            index_init,
+            index_sort,
             placement,
             journal_validation,
             resident: None,
@@ -205,7 +276,7 @@ impl MetalDeviceScheduler {
     pub fn resident_capacity(&self) -> usize {
         self.resident
             .as_ref()
-            .map(|(_, _, capacity)| *capacity)
+            .map(|(_, _, _, capacity)| *capacity)
             .unwrap_or(0)
     }
 
@@ -216,12 +287,12 @@ impl MetalDeviceScheduler {
             .unwrap_or((0, 0))
     }
 
-    fn buffers(&mut self, count: usize) -> (&Buffer, &Buffer) {
+    fn buffers(&mut self, count: usize) -> (&Buffer, &Buffer, &Buffer) {
         let capacity = count.max(1).next_power_of_two();
         let needs_growth = self
             .resident
             .as_ref()
-            .is_none_or(|(_, _, resident_capacity)| *resident_capacity < count);
+            .is_none_or(|(_, _, _, resident_capacity)| *resident_capacity < count);
         if needs_growth {
             let candidates = self.device.new_buffer(
                 (capacity * std::mem::size_of::<DeviceCandidate>()) as u64,
@@ -231,10 +302,15 @@ impl MetalDeviceScheduler {
                 (capacity * std::mem::size_of::<DevicePlacement>()) as u64,
                 MTLResourceOptions::StorageModeShared,
             );
-            self.resident = Some((candidates, placements, capacity));
+            let indices = self.device.new_buffer(
+                (capacity * std::mem::size_of::<u32>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            self.resident = Some((candidates, placements, indices, capacity));
         }
-        let (candidates, placements, _) = self.resident.as_ref().expect("resident buffers");
-        (candidates, placements)
+        let (candidates, placements, indices, _) =
+            self.resident.as_ref().expect("resident buffers");
+        (candidates, placements, indices)
     }
 
     fn journal_buffers(&mut self, access_count: usize, lane_count: usize) -> (&Buffer, &Buffer) {
@@ -349,7 +425,7 @@ impl MetalDeviceScheduler {
             .enumerate()
             .map(|(index, candidate)| DeviceCandidate::from_candidate(candidate, index))
             .collect();
-        let (candidate_buffer, placement_buffer) = self.buffers(candidates.len());
+        let (candidate_buffer, placement_buffer, index_buffer) = self.buffers(candidates.len());
         unsafe {
             std::ptr::copy_nonoverlapping(
                 device_candidates.as_ptr().cast::<u8>(),
@@ -359,6 +435,7 @@ impl MetalDeviceScheduler {
         }
         let candidate_buffer = candidate_buffer.clone();
         let placement_buffer = placement_buffer.clone();
+        let index_buffer = index_buffer.clone();
 
         let command = self.queue.new_command_buffer();
         let admit = command.new_compute_command_encoder();
@@ -373,22 +450,71 @@ impl MetalDeviceScheduler {
         dispatch(admit, &self.admission, count);
         admit.end_encoding();
 
-        let place = command.new_compute_command_encoder();
-        place.set_compute_pipeline_state(&self.placement);
-        place.set_buffer(0, Some(&candidate_buffer), 0);
-        place.set_buffer(1, Some(&placement_buffer), 0);
-        place.set_bytes(
+        let padded = candidates.len().next_power_of_two() as u32;
+        let initialize = command.new_compute_command_encoder();
+        initialize.set_compute_pipeline_state(&self.index_init);
+        initialize.set_buffer(0, Some(&placement_buffer), 0);
+        initialize.set_buffer(1, Some(&index_buffer), 0);
+        initialize.set_bytes(
             2,
             std::mem::size_of::<u32>() as u64,
             (&count as *const u32).cast::<c_void>(),
         );
+        initialize.set_bytes(
+            3,
+            std::mem::size_of::<u32>() as u64,
+            (&padded as *const u32).cast::<c_void>(),
+        );
+        dispatch(initialize, &self.index_init, padded);
+        initialize.end_encoding();
+
+        let mut merge_width = 2u32;
+        while merge_width <= padded {
+            let mut compare_distance = merge_width / 2;
+            while compare_distance > 0 {
+                let sort = command.new_compute_command_encoder();
+                sort.set_compute_pipeline_state(&self.index_sort);
+                sort.set_buffer(0, Some(&candidate_buffer), 0);
+                sort.set_buffer(1, Some(&index_buffer), 0);
+                sort.set_bytes(
+                    2,
+                    std::mem::size_of::<u32>() as u64,
+                    (&padded as *const u32).cast::<c_void>(),
+                );
+                sort.set_bytes(
+                    3,
+                    std::mem::size_of::<u32>() as u64,
+                    (&merge_width as *const u32).cast::<c_void>(),
+                );
+                sort.set_bytes(
+                    4,
+                    std::mem::size_of::<u32>() as u64,
+                    (&compare_distance as *const u32).cast::<c_void>(),
+                );
+                dispatch(sort, &self.index_sort, padded);
+                sort.end_encoding();
+                compare_distance /= 2;
+            }
+            merge_width *= 2;
+        }
+
+        let place = command.new_compute_command_encoder();
+        place.set_compute_pipeline_state(&self.placement);
+        place.set_buffer(0, Some(&candidate_buffer), 0);
+        place.set_buffer(1, Some(&placement_buffer), 0);
+        place.set_buffer(2, Some(&index_buffer), 0);
         place.set_bytes(
             3,
+            std::mem::size_of::<u32>() as u64,
+            (&count as *const u32).cast::<c_void>(),
+        );
+        place.set_bytes(
+            4,
             std::mem::size_of::<u32>() as u64,
             (&width as *const u32).cast::<c_void>(),
         );
         place.set_bytes(
-            4,
+            5,
             std::mem::size_of::<u32>() as u64,
             (&policy as *const u32).cast::<c_void>(),
         );

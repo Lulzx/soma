@@ -351,9 +351,10 @@ submission and synchronization cost dominates small epochs. Only the largest,
 most partitioned cell crossed, by 2.9%; its p10–p90 ranges overlap, so it is
 parity rather than a robust win. The useful result is the shape: CPU planning
 grows from sub-microsecond to roughly 0.6ms, while Metal approaches it as the
-candidate set supplies enough parallel work. The present deterministic planner
-is deliberately quadratic; this is a baseline for the concurrent resident
-scheduler, not a performance endpoint.
+candidate set supplies enough parallel work. These measurements predate the
+stable device index sort in the later scheduler work. They are retained as the
+quadratic-placement baseline; the follow-up measurement must be compared
+against the raw commit named above rather than silently replacing it.
 
 Two negative controls prevent stronger conclusions:
 

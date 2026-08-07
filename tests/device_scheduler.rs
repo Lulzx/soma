@@ -194,3 +194,44 @@ fn real_metal_scheduler_matches_the_reference_and_reuses_resident_buffers() {
     );
     assert_eq!(metal.resident_capacity(), capacity);
 }
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn sorted_metal_placement_matches_irregular_non_power_of_two_epochs() {
+    use soma::executives::metal_scheduler::MetalDeviceScheduler;
+
+    let mut metal = MetalDeviceScheduler::new().unwrap();
+    let mut state = 0xD1B5_4A32_D192_ED03u64;
+    for count in [1usize, 2, 3, 7, 31, 32, 33, 127] {
+        let mut candidates = Vec::with_capacity(count);
+        for index in 0..count {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            candidates.push(candidate(
+                index as u32 + 1,
+                ((state >> 8) % 11) as u32 + 1,
+                ((state >> 24) % 19) as u32,
+                ((state >> 40) % 19) as u32,
+                ((state >> 52) % 9) as u32,
+                if state & 3 == 0 {
+                    StateAccess::Mutable
+                } else {
+                    StateAccess::ReadOnly
+                },
+            ));
+        }
+        for policy in [
+            PartialCohortPolicy::Defer,
+            PartialCohortPolicy::SendToCpu,
+            PartialCohortPolicy::RunPartial,
+            PartialCohortPolicy::MergeWithGenericClass,
+        ] {
+            assert_eq!(
+                metal.schedule(&candidates, 7, policy).unwrap(),
+                reference_device_schedule(&candidates, 7, policy),
+                "count={count} policy={policy:?}"
+            );
+        }
+    }
+}
