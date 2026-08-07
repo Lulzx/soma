@@ -1,7 +1,11 @@
-use soma::abi::{ProcessMode, Rights, StateAccess};
+use soma::abi::{ProcessMode, Ref64, Rights, StateAccess};
 use soma::compiler::frame::Frame;
-use soma::compiler::run_classes::{DEFAULT_MAX_STEPS, SEARCH_HEURISTIC};
-use soma::compiler::state_machine_lowering::{create_expand, HeuristicFrame, SearchFrame};
+use soma::compiler::run_classes::{
+    DEFAULT_MAX_STEPS, EXPAND_RESUME_2, POLL_FUTURE, SEARCH_HEURISTIC,
+};
+use soma::compiler::state_machine_lowering::{
+    create_expand, ExpandFrame, HeuristicFrame, JoinFrame, SearchFrame,
+};
 use soma::experiments::dynamic_search::{build, ControlKnobs};
 use soma::kernel::speculation::EpochExecutive;
 use soma::kernel::{ContinuationSpec, Kernel, SYSTEM_PRINCIPAL};
@@ -178,6 +182,115 @@ fn two_future_writers_conflict_and_replay_in_plan_order() {
     let stats = speculative.speculation_stats();
     assert_eq!(stats.committed_epochs, 0);
     assert_eq!(stats.conflict_fallbacks, 1);
+    let disagreements = conforms_traces(&reference.trace_snapshot(), &speculative.trace_snapshot());
+    assert!(disagreements.is_empty(), "{disagreements:#?}");
+}
+
+fn future_poll_race() -> Kernel {
+    let mut kernel = Kernel::new();
+    kernel.set_allocation_partitions(8);
+    let future = kernel.create_future(SYSTEM_PRINCIPAL);
+
+    let resolver = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    kernel
+        .grant_capability(SYSTEM_PRINCIPAL, resolver, future, Rights::RESOLVE, 0, 0)
+        .unwrap();
+    let mut resolver_frame = Vec::new();
+    HeuristicFrame { future, input: 41 }.encode(&mut resolver_frame);
+    kernel
+        .create_continuation(
+            SYSTEM_PRINCIPAL,
+            resolver,
+            ContinuationSpec::new(
+                StateAccess::ReadOnly,
+                SEARCH_HEURISTIC,
+                0,
+                resolver_frame,
+                DEFAULT_MAX_STEPS,
+            ),
+        )
+        .unwrap();
+
+    let poller = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    kernel
+        .grant_capability(SYSTEM_PRINCIPAL, poller, future, Rights::AWAIT, 0, 0)
+        .unwrap();
+    let mut poller_frame = Vec::new();
+    JoinFrame {
+        future,
+        observed: Ref64::NULL,
+    }
+    .encode(&mut poller_frame);
+    kernel
+        .create_continuation(
+            SYSTEM_PRINCIPAL,
+            poller,
+            ContinuationSpec::new(
+                StateAccess::ReadOnly,
+                POLL_FUTURE,
+                0,
+                poller_frame,
+                DEFAULT_MAX_STEPS,
+            ),
+        )
+        .unwrap();
+    kernel
+}
+
+#[test]
+fn a_future_poll_conflicts_with_resolution() {
+    let mut reference = future_poll_race();
+    let mut speculative = future_poll_race();
+    speculative.configure_epoch_executive(EpochExecutive::Speculative { max_lanes: 8 });
+
+    reference.run_epoch();
+    speculative.run_epoch();
+
+    assert_eq!(speculative.speculation_stats().conflict_fallbacks, 1);
+    let disagreements = conforms_traces(&reference.trace_snapshot(), &speculative.trace_snapshot());
+    assert!(disagreements.is_empty(), "{disagreements:#?}");
+}
+
+fn contested_mailbox() -> Kernel {
+    let mut kernel = Kernel::new();
+    kernel.set_allocation_partitions(8);
+    let receiver = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+    for value in [5, 9] {
+        let sender = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+        kernel
+            .grant_capability(SYSTEM_PRINCIPAL, sender, receiver, Rights::SEND, 0, 0)
+            .unwrap();
+        let mut frame = ExpandFrame::initial(value, receiver);
+        frame.heuristic_result = value;
+        let mut bytes = Vec::new();
+        frame.encode(&mut bytes);
+        kernel
+            .create_continuation(
+                SYSTEM_PRINCIPAL,
+                sender,
+                ContinuationSpec::new(
+                    StateAccess::ReadOnly,
+                    EXPAND_RESUME_2,
+                    0,
+                    bytes,
+                    DEFAULT_MAX_STEPS,
+                ),
+            )
+            .unwrap();
+    }
+    kernel
+}
+
+#[test]
+fn two_senders_to_one_mailbox_conflict() {
+    let mut reference = contested_mailbox();
+    let mut speculative = contested_mailbox();
+    speculative.configure_epoch_executive(EpochExecutive::Speculative { max_lanes: 8 });
+
+    reference.run_epoch();
+    speculative.run_epoch();
+
+    assert_eq!(speculative.speculation_stats().conflict_fallbacks, 1);
     let disagreements = conforms_traces(&reference.trace_snapshot(), &speculative.trace_snapshot());
     assert!(disagreements.is_empty(), "{disagreements:#?}");
 }

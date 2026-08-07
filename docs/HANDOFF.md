@@ -27,7 +27,7 @@ Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
 Repository: https://github.com/Lulzx/soma. The default semantic core is
-dependency-free. There are 408 default tests, seven additional tests behind the
+dependency-free. There are 410 default tests, seven additional tests behind the
 `metal` feature, seven compile-fail doc tests, and no Clippy warnings. The optional `metal`
 feature adds the `metal-rs` implementation dependency on macOS.
 

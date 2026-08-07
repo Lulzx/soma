@@ -98,7 +98,9 @@ cargo run --release --example speculative_epoch_report
 - same-process commit conflicts;
 - allocator/domain conflicts;
 - independent message, future, and allocation operations committing;
-- two writers of one future falling back and reproducing plan order.
+- two writers of one future falling back and reproducing plan order;
+- a governed future poll colliding with a resolver;
+- two senders contending for one mailbox.
 
 Every accepted execution uses the ordinary authority checks, trace emission,
 effect production, continuation commit, and epoch effect applier during
