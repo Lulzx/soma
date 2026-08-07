@@ -7,6 +7,7 @@ license = "MIT"
 
 [features]
 default = []
+resident-sync-measurement = []
 metal = ["dep:metal"]
 native = [
     "dep:cranelift-codegen",

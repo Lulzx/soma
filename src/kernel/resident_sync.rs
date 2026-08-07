@@ -2,19 +2,22 @@
 //!
 //! This deliberately narrow G2 slice supports local futures, initially empty
 //! local process mailboxes, exact live host-backed Object `Ref64` values, and
-//! governed fixed 8-byte object range reads/in-place writes on all-complete graphs. Installed pointer-free bytecode executes once on Metal;
+//! governed fixed 8-byte object range reads/in-place writes on all-complete
+//! graphs. Installed pointer-free bytecode executes once on Metal;
 //! after final readback, validated journals are replayed through the ordinary
 //! governed Kernel operations on a clone and published atomically.
 //!
 //! The admitted subset is intentionally strict: local unsupervised processes,
-//! RunClassBins + RunPartial, unique initial run classes, no competing mutable
-//! continuation for one process, no foreign payloads, no initial waiters/mail,
-//! no object growth/allocation, and no parked final result. This makes the resident lane set equal the
-//! canonical admission set; unsupported shapes refuse before submission.
+//! RunClassBins + RunPartial, no competing mutable continuation for one
+//! process, no foreign payloads, no initial waiters/mail, no object
+//! growth/allocation, and no final mailbox park (canonical final future-await
+//! parking is supported). This makes the resident lane set equal the canonical
+//! admission set; unsupported shapes refuse before submission.
 //!
 //! Exact invocation/applied-disposition, wake, and per-epoch records drive
 //! normal Phase-G effects, trace causality, Phase-H accounting, and admission
-//! history. CPU reference execution exists only in tests.
+//! history. CPU reference execution is test-only unless the explicit
+//! `resident-sync-measurement` feature exposes the separate measurement API.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -170,16 +173,39 @@ impl Kernel {
         &mut self,
         plan: KernelResidentSyncPlan,
     ) -> Result<u32, KernelResidentSyncError> {
-        if !plan.matches(self) {
-            return Err(KernelResidentSyncError::StalePlan);
-        }
-        let result = crate::executives::resident_sync::run_resident_sync(
-            &plan.config,
-            plan.continuations.clone(),
-            &plan.programs,
-        )
-        .ok_or(KernelResidentSyncError::BackendFailed)?;
-        plan.validate_and_import(self, result)
+        run_cpu_reference(self, plan)
+    }
+}
+
+#[cfg(any(test, feature = "resident-sync-measurement"))]
+fn run_cpu_reference(
+    kernel: &mut Kernel,
+    plan: KernelResidentSyncPlan,
+) -> Result<u32, KernelResidentSyncError> {
+    if !plan.matches(kernel) {
+        return Err(KernelResidentSyncError::StalePlan);
+    }
+    let result = crate::executives::resident_sync::run_resident_sync(
+        &plan.config,
+        plan.continuations.clone(),
+        &plan.programs,
+    )
+    .ok_or(KernelResidentSyncError::BackendFailed)?;
+    plan.validate_and_import(kernel, result)
+}
+
+/// Explicitly opt-in CPU reference execution for measurement and comparison.
+#[cfg(feature = "resident-sync-measurement")]
+pub mod measurement {
+    use super::{run_cpu_reference, KernelResidentSyncError, KernelResidentSyncPlan};
+    use crate::kernel::Kernel;
+
+    /// Execute an owned resident plan with the CPU reference and canonically import it.
+    pub fn execute_cpu_reference(
+        kernel: &mut Kernel,
+        plan: KernelResidentSyncPlan,
+    ) -> Result<u32, KernelResidentSyncError> {
+        run_cpu_reference(kernel, plan)
     }
 }
 
@@ -730,16 +756,12 @@ impl KernelResidentSyncPlan {
             continuations_by_id.insert(id, r);
             actors_by_id.insert(id, c.process);
         }
-        let mut classes = std::collections::HashSet::new();
         let mut mutable_processes = std::collections::HashSet::new();
         for continuation in continuations_by_id.values() {
             let descriptor = kernel
                 .continuations
                 .get(*continuation)
                 .map_err(|_| KernelResidentSyncError::UnsupportedShape)?;
-            if !classes.insert(descriptor.run_class) {
-                return Err(KernelResidentSyncError::UnsupportedShape);
-            }
             if descriptor.state_access == crate::abi::StateAccess::Mutable
                 && !mutable_processes.insert(descriptor.process)
             {
@@ -1152,18 +1174,66 @@ impl KernelResidentSyncPlan {
         }
         let mut invocation_positions = BTreeSet::new();
         let mut invocation_entities = BTreeSet::new();
-        for invocation in &result.invocations {
-            if invocation.epoch >= result.epochs
-                || invocation.disposition == 0
-                || invocation.disposition > 3
-                || !self
-                    .continuations_by_id
-                    .contains_key(&invocation.continuation)
-                || !invocation_positions.insert((invocation.epoch, invocation.lane))
-                || !invocation_entities.insert((invocation.epoch, invocation.continuation))
+        let mut current_run_classes: BTreeMap<_, _> = self
+            .continuations
+            .iter()
+            .map(|continuation| (continuation.id, continuation.run_class))
+            .collect();
+        let mut completed = BTreeSet::new();
+        let mut invocation_offset = 0usize;
+        for epoch in 0..result.epochs {
+            let epoch_start = invocation_offset;
+            while invocation_offset < result.invocations.len()
+                && result.invocations[invocation_offset].epoch == epoch
             {
+                invocation_offset += 1;
+            }
+            let epoch_invocations = &result.invocations[epoch_start..invocation_offset];
+            if epoch_invocations.is_empty() {
                 return Err(KernelResidentSyncError::InvalidDeviceResult);
             }
+            let mut previous_key = None;
+            for (lane, invocation) in epoch_invocations.iter().enumerate() {
+                let key = (invocation.run_class, invocation.continuation);
+                if invocation.lane as usize != lane
+                    || previous_key.is_some_and(|previous| previous >= key)
+                    || current_run_classes.get(&invocation.continuation)
+                        != Some(&invocation.run_class)
+                    || completed.contains(&invocation.continuation)
+                    || invocation.disposition == 0
+                    || invocation.disposition > 3
+                    || !self.programs.contains_key(&invocation.run_class)
+                    || !invocation_positions.insert((invocation.epoch, invocation.lane))
+                    || !invocation_entities.insert((invocation.epoch, invocation.continuation))
+                {
+                    return Err(KernelResidentSyncError::InvalidDeviceResult);
+                }
+                match invocation.disposition {
+                    1 => {
+                        if !self.programs.contains_key(&invocation.next_run_class) {
+                            return Err(KernelResidentSyncError::InvalidDeviceResult);
+                        }
+                        current_run_classes
+                            .insert(invocation.continuation, invocation.next_run_class);
+                    }
+                    2 => {
+                        if invocation.next_run_class != 0 {
+                            return Err(KernelResidentSyncError::InvalidDeviceResult);
+                        }
+                        completed.insert(invocation.continuation);
+                    }
+                    3 => {
+                        if invocation.next_run_class != invocation.run_class {
+                            return Err(KernelResidentSyncError::InvalidDeviceResult);
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                previous_key = Some(key);
+            }
+        }
+        if invocation_offset != result.invocations.len() {
+            return Err(KernelResidentSyncError::InvalidDeviceResult);
         }
         let mut effect_ordinals: BTreeMap<(u32, u32, u64), Vec<u32>> = BTreeMap::new();
         for effect in &result.effects {
@@ -1523,17 +1593,22 @@ impl KernelResidentSyncPlan {
                     let descriptor = k
                         .continuations
                         .get(reference)
-                        .expect("validated continuation");
-                    crate::scheduler::admission::Candidate {
+                        .map_err(|_| KernelResidentSyncError::StalePlan)?;
+                    if descriptor.status != ContinuationState::Runnable
+                        || descriptor.run_class != inv.run_class
+                    {
+                        return Err(KernelResidentSyncError::InvalidDeviceResult);
+                    }
+                    Ok(crate::scheduler::admission::Candidate {
                         bin: k.scheduler.bin_of(inv.run_class),
                         continuation: reference,
                         process: descriptor.process,
                         run_class: inv.run_class,
                         state_access: descriptor.state_access,
                         waiting_since: descriptor.last_run_epoch.max(descriptor.created_epoch),
-                    }
+                    })
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
             let decision = crate::scheduler::admission::admit(&candidates);
             if !decision.deferred().is_empty() {
                 return Err(KernelResidentSyncError::InvalidDeviceResult);
@@ -1545,22 +1620,33 @@ impl KernelResidentSyncPlan {
                     decision,
                 });
             k.current_lane = crate::abi::traces::HOST_LANE;
-            for inv in &invocations {
-                let cont = self.continuations_by_id[&inv.continuation];
+            let width = self.config.cohort_width as usize;
+            let mut cohort_start = 0usize;
+            while cohort_start < invocations.len() {
+                let run_class = invocations[cohort_start].run_class;
+                let class_end = invocations[cohort_start..]
+                    .iter()
+                    .position(|inv| inv.run_class != run_class)
+                    .map_or(invocations.len(), |offset| cohort_start + offset);
+                let cohort_end = cohort_start.saturating_add(width).min(class_end);
+                let active_lanes = cohort_end - cohort_start;
+                let first = self.continuations_by_id[&invocations[cohort_start].continuation];
                 k.trace(
                     EventKind::CohortCreated,
                     Ref64::NULL,
-                    cont,
-                    inv.run_class,
-                    1,
+                    first,
+                    run_class,
+                    active_lanes as u32,
                 );
                 k.accounting.cohorts += 1;
                 k.accounting.lane_slots += u64::from(self.config.cohort_width);
-                k.accounting.useful_lane_slots += 1;
-                k.accounting.idle_lane_slots += u64::from(self.config.cohort_width - 1);
-                if self.config.cohort_width == 1 {
+                k.accounting.useful_lane_slots += active_lanes as u64;
+                k.accounting.idle_lane_slots +=
+                    u64::from(self.config.cohort_width) - active_lanes as u64;
+                if active_lanes == width {
                     k.accounting.full_cohorts += 1;
                 }
+                cohort_start = cohort_end;
             }
             for inv in invocations {
                 let cont = self.continuations_by_id[&inv.continuation];
@@ -1986,6 +2072,154 @@ mod tests {
         let d = k.create_continuation(sender, sender, mk(send_rc)).unwrap();
         let plan = k.plan_resident_sync(16, 1, 8, width).unwrap();
         (k, plan, a, b, c, d)
+    }
+
+    fn shared_class_setup(width: u32) -> (Kernel, KernelResidentSyncPlan, Vec<Ref64>) {
+        let mut kernel = Kernel::new();
+        let run_classes = [1400, 1401];
+        for run_class in run_classes {
+            kernel
+                .install_resident_sync_program(KernelResidentProgram {
+                    run_class,
+                    instructions: vec![KernelResidentInstruction::plain(HANDLER_COMPLETE, 0, 0)],
+                })
+                .unwrap();
+        }
+        let mut continuations = Vec::new();
+        for index in 0..70 {
+            let process = kernel.create_process(Ref64::NULL, ProcessMode::Pure);
+            continuations.push(
+                kernel
+                    .create_continuation(
+                        process,
+                        process,
+                        ContinuationSpec::new(
+                            StateAccess::ReadOnly,
+                            run_classes[index / 35],
+                            0,
+                            vec![0; 8],
+                            1,
+                        ),
+                    )
+                    .unwrap(),
+            );
+        }
+        let plan = kernel.plan_resident_sync(2, 1, 8, width).unwrap();
+        (kernel, plan, continuations)
+    }
+
+    fn assert_shared_class_result(kernel: &Kernel, continuations: &[Ref64], width: u32) {
+        assert_eq!(kernel.scheduler.total_pending(), 0);
+        assert!(continuations.iter().all(|continuation| {
+            kernel.continuation_state(*continuation).unwrap() == ContinuationState::Completed
+        }));
+        assert_eq!(kernel.admission_log.len(), 1);
+        assert_eq!(kernel.admission_log[0].candidates.len(), 70);
+        let cohorts: Vec<_> = kernel
+            .trace_events()
+            .iter()
+            .filter(|event| event.event_kind == EventKind::CohortCreated)
+            .map(|event| (event.continuation, event.run_class, event.auxiliary))
+            .collect();
+        let expected = if width == 1 {
+            continuations
+                .iter()
+                .enumerate()
+                .map(|(index, continuation)| (*continuation, 1400 + (index / 35) as u32, 1))
+                .collect::<Vec<_>>()
+        } else {
+            vec![
+                (continuations[0], 1400, 32),
+                (continuations[32], 1400, 3),
+                (continuations[35], 1401, 32),
+                (continuations[67], 1401, 3),
+            ]
+        };
+        assert_eq!(cohorts, expected);
+        let cohort_count = if width == 1 { 70 } else { 4 };
+        let full_count = if width == 1 { 70 } else { 2 };
+        assert_eq!(kernel.accounting.cohorts, cohort_count);
+        assert_eq!(
+            kernel.accounting.lane_slots,
+            u64::from(width) * cohort_count
+        );
+        assert_eq!(kernel.accounting.useful_lane_slots, 70);
+        assert_eq!(
+            kernel.accounting.idle_lane_slots,
+            u64::from(width) * cohort_count - 70
+        );
+        assert_eq!(kernel.accounting.full_cohorts, full_count);
+        assert!(crate::semantics::invariants::check(kernel).is_empty());
+    }
+
+    #[test]
+    fn shared_run_classes_cpu_width_1_32_have_exact_canonical_cohorts() {
+        let mut runs = Vec::new();
+        for width in [1, 32] {
+            let (mut kernel, plan, continuations) = shared_class_setup(width);
+            assert_eq!(kernel.run_resident_sync_cpu_reference(plan), Ok(1));
+            assert_shared_class_result(&kernel, &continuations, width);
+            runs.push(kernel);
+        }
+        assert!(crate::semantics::order::placement_neutral(&[&runs[0], &runs[1]]).is_empty());
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn shared_run_classes_actual_metal_width_1_32_match_cpu_i19() {
+        let (mut cpu, cpu_plan, cpu_continuations) = shared_class_setup(1);
+        cpu.run_resident_sync_cpu_reference(cpu_plan).unwrap();
+        assert_shared_class_result(&cpu, &cpu_continuations, 1);
+        let mut metal_runs = Vec::new();
+        for width in [1, 32] {
+            let (mut kernel, plan, continuations) = shared_class_setup(width);
+            assert_eq!(kernel.run_resident_sync_metal(plan), Ok(1));
+            assert_shared_class_result(&kernel, &continuations, width);
+            metal_runs.push(kernel);
+        }
+        assert!(crate::semantics::order::placement_neutral(&[
+            &cpu,
+            &metal_runs[0],
+            &metal_runs[1],
+        ])
+        .is_empty());
+    }
+
+    #[test]
+    fn shared_run_class_device_order_and_run_class_tamper_refuse_atomically() {
+        let (kernel, plan, _) = shared_class_setup(32);
+        let result = crate::executives::resident_sync::run_resident_sync(
+            &plan.config,
+            plan.continuations.clone(),
+            &plan.programs,
+        )
+        .unwrap();
+        for case in 0..2 {
+            let mut kernel = kernel.clone();
+            let mut malformed = result.clone();
+            if case == 0 {
+                malformed.invocations.swap(31, 32);
+            } else {
+                malformed.invocations[34].run_class = 1401;
+            }
+            let fingerprint = KernelResidentSyncPlan::fingerprint(&kernel);
+            let trace_len = kernel.trace_events().len();
+            let accounting = kernel.accounting;
+            let admission_len = kernel.admission_log.len();
+            let effect_len = kernel.effect_log.len();
+            assert_eq!(
+                plan.clone().validate_and_import(&mut kernel, malformed),
+                Err(KernelResidentSyncError::InvalidDeviceResult)
+            );
+            assert_refusal_preserves_kernel(
+                &kernel,
+                fingerprint,
+                trace_len,
+                &accounting,
+                admission_len,
+                effect_len,
+            );
+        }
     }
 
     fn observe_setup(
