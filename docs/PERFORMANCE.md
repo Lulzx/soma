@@ -645,20 +645,74 @@ and bootstrap method are frozen in
 
 ## 14. Canonical Kernel resident-sync performance gate
 
-The canonical one-command-buffer `Kernel` resident-sync bridge is currently a
-semantic implementation, not a throughput implementation. The Metal entry
-point dispatches the requested width for ABI/I19 controls, but threads with
-`gid != 0` return; lane zero performs handler selection, interpretation,
-capability scans, canonical effect application, wakes, journals, and epoch
-advancement serially. Width 32 therefore changes the physical placement/control
-shape without providing parallel handler evaluation. No honest
-Metal-versus-competent-CPU speedup should be expected from this implementation.
+The canonical one-command-buffer `Kernel` resident-sync bridge now evaluates
+handlers in parallel on Metal and uses a bounded live-run-class selector; the
+canonical single-writer device apply phase remains ordered. This supersedes the
+older lane-zero-only description. The measurement below is a performance result
+for that implementation, not merely an ABI/placement control.
 
-A diagnostic normal-state workload was exact but had sub-20-ms CPU calls and
-roughly threefold slower Metal calls; an observe-heavy diagnostic amplified the
-serial capability scan and was prohibitively slower. Those temporary captures
-are not release evidence and are not used for a claim. Before a canonical G5
-benchmark is meaningful, the executive needs real bounded threadgroup-parallel
-handler evaluation with a canonical single-writer apply phase, plus a legitimate
-feature-gated measurement CPU oracle. Live device-visible ingress remains a
-separate missing requirement.
+The fixed release workload in
+`examples/resident_kernel_parallel_measure.rs` creates exactly 4,096
+continuations, 16 installed run classes/epochs, and 256 bounded bytecode
+instructions per class. It uses width 32 and one effect slot. One untimed warm-up
+of each backend is excluded. The nine timed pairs alternate AB/BA order (five AB,
+four BA), with exactly nine CPU-reference and nine physical-Metal observations.
+Kernel and plan construction, executor construction, and the per-observation
+kernel/plan clones occur before the timer and are therefore excluded
+symmetrically. The timed CPU region includes the complete reference execution
+and canonical validation/import. The timed Metal region includes the complete
+physical backend run, readback, canonical result validation, and atomic import;
+it does not exclude backend work selectively.
+
+The exact command was run once with a fixed 15-minute external timeout:
+
+```sh
+cargo run --release --example resident_kernel_parallel_measure \
+  --features metal,resident-sync-measurement \
+  > /private/tmp/resident-kernel-parallel.csv
+```
+
+It ran on `Apple M4 Pro` from clean source/example commit
+`5b22af29ac3ce8cfa252d0b6e04f04294afdd809` (CSV commit field
+`5b22af29ac3c`), using the `stable-aarch64-apple-darwin` toolchain and
+`rustc 1.92.0 (ded5c06cf 2025-12-08)` (`aarch64-apple-darwin`, LLVM 21.1.3).
+SHA-256 of the exact CSV, including header and summary, is
+`b42e967fa7860fdbe88df893b50f42e699dd85446f0be2cf105919effa5376aa`.
+For additional source identity, SHA-256 is
+`f76614393073d61a79837782b963a35841c4b6dd08715faaa74ff6a948f0aa08`
+for `src/kernel/resident_sync.rs` and
+`ae3342d4a879848b2d7b6b298412432348713ab0845efb8b3044d5641114a78c`
+for the example at that commit.
+
+Exact timed rows (nanoseconds) were:
+
+| sample | order | CPU reference | Metal |
+|---:|:---:|---:|---:|
+| 1 | AB | 143,234,792 | 333,142,042 |
+| 2 | BA | 144,122,250 | 324,747,625 |
+| 3 | AB | 141,600,958 | 336,569,708 |
+| 4 | BA | 145,093,500 | 324,151,458 |
+| 5 | AB | 145,541,958 | 349,667,291 |
+| 6 | BA | 138,327,417 | 321,245,875 |
+| 7 | AB | 146,825,208 | 342,234,875 |
+| 8 | BA | 142,629,875 | 325,995,709 |
+| 9 | AB | 139,490,709 | 327,795,583 |
+
+All 18 timed regions exceed the predeclared 20 ms qualification floor. All
+produce the identical complete canonical-state hash
+`6cbb5ec416e6b20d57038ba734ed03111701ceaaf9f8363a28fadf8734f5c66b`;
+each pair also passes canonical invariants and placement-neutral comparison.
+The median CPU-reference time is **143,234,792 ns** and the median Metal time is
+**327,795,583 ns**. Thus the honestly oriented CPU/Metal median speedup is
+**0.436964×**: Metal is **2.288519× slower**, not faster. A deterministic seeded
+10,000-draw paired bootstrap over the nine observations gives a 95% interval of
+**[0.423775, 0.445078]** for CPU/Metal speedup.
+
+This result is deliberately narrow. There is no live device-visible ingress;
+the benchmark executes a bounded-bytecode, fixed workload. Its reference CPU
+executor is an independent semantic oracle, **not** a competent
+persistent-worker CPU baseline. Consequently this negative canonical result
+neither demonstrates a general GPU advantage nor closes all of G5. It does show
+that parallel handler evaluation and the bounded selector remove the prior
+pathological runtime while the current full canonical Metal path still loses to
+this CPU reference on the stated workload.
