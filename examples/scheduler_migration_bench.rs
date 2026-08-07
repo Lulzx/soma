@@ -29,7 +29,9 @@ fn main() {
         !cfg!(debug_assertions)
     );
     scheduler_benchmark();
-    remote_benchmark();
+    if !std::env::args().any(|argument| argument == "--scheduler-only") {
+        remote_benchmark();
+    }
 }
 
 fn summarize(name: &str, samples: &[Duration]) {
@@ -67,63 +69,61 @@ fn candidates(count: u32, classes: u32) -> Vec<Candidate> {
 
 fn scheduler_benchmark() {
     println!("[scheduler planning: complete admission + bin/cohort placement]");
-    for count in [32, 128, 512, 2_048] {
+    for count in [32, 128, 512, 2_048, 8_192] {
         for classes in [1, 4, 16] {
             let candidates = candidates(count, classes);
-            let repetitions = if count <= 128 { 31 } else { 11 };
-            let mut cpu = Vec::with_capacity(repetitions);
-            for _ in 0..repetitions {
-                let started = Instant::now();
-                std::hint::black_box(soma::scheduler::device::reference_device_schedule(
-                    &candidates,
-                    32,
-                    PartialCohortPolicy::RunPartial,
-                ));
-                cpu.push(started.elapsed());
-            }
-            summarize(&format!("cpu candidates={count} classes={classes}"), &cpu);
-
-            #[cfg(all(feature = "metal", target_os = "macos"))]
-            {
-                use soma::executives::metal_scheduler::MetalDeviceScheduler;
-                let mut metal = MetalDeviceScheduler::new().expect("Metal scheduler available");
-                for _ in 0..3 {
-                    metal
-                        .schedule(&candidates, 32, PartialCohortPolicy::RunPartial)
-                        .unwrap();
-                }
-                let mut samples = Vec::with_capacity(repetitions);
-                for _ in 0..repetitions {
-                    let started = Instant::now();
-                    std::hint::black_box(
-                        metal
-                            .schedule(&candidates, 32, PartialCohortPolicy::RunPartial)
-                            .unwrap(),
-                    );
-                    samples.push(started.elapsed());
-                }
-                summarize(
-                    &format!("metal candidates={count} classes={classes}"),
-                    &samples,
-                );
-            }
+            let repetitions = if count <= 128 {
+                31
+            } else if count <= 2_048 {
+                11
+            } else {
+                7
+            };
+            measure_scheduler(
+                &format!("candidates={count} classes={classes}"),
+                &candidates,
+                32,
+                repetitions,
+            );
         }
     }
 
     println!("\n[scheduler negative control: cohort width one]");
-    let candidates = candidates(2_048, 16);
-    let repetitions = 11;
+    let width_candidates = candidates(2_048, 16);
+    measure_scheduler(
+        "candidates=2048 classes=16 width=1",
+        &width_candidates,
+        1,
+        11,
+    );
+
+    println!("\n[scheduler negative control: all mutable claims share one process]");
+    let mut contested = candidates(2_048, 16);
+    let process = Ref64::new(1, 1, Kind::Process);
+    for candidate in &mut contested {
+        candidate.process = process;
+        candidate.state_access = StateAccess::Mutable;
+    }
+    measure_scheduler(
+        "candidates=2048 classes=16 contested_mutable=true",
+        &contested,
+        32,
+        11,
+    );
+}
+
+fn measure_scheduler(name: &str, candidates: &[Candidate], width: u16, repetitions: usize) {
     let mut cpu = Vec::with_capacity(repetitions);
     for _ in 0..repetitions {
         let started = Instant::now();
         std::hint::black_box(soma::scheduler::device::reference_device_schedule(
-            &candidates,
-            1,
+            candidates,
+            width,
             PartialCohortPolicy::RunPartial,
         ));
         cpu.push(started.elapsed());
     }
-    summarize("cpu candidates=2048 classes=16 width=1", &cpu);
+    summarize(&format!("cpu {name}"), &cpu);
 
     #[cfg(all(feature = "metal", target_os = "macos"))]
     {
@@ -131,7 +131,7 @@ fn scheduler_benchmark() {
         let mut metal = MetalDeviceScheduler::new().expect("Metal scheduler available");
         for _ in 0..3 {
             metal
-                .schedule(&candidates, 1, PartialCohortPolicy::RunPartial)
+                .schedule(candidates, width, PartialCohortPolicy::RunPartial)
                 .unwrap();
         }
         let mut samples = Vec::with_capacity(repetitions);
@@ -139,12 +139,12 @@ fn scheduler_benchmark() {
             let started = Instant::now();
             std::hint::black_box(
                 metal
-                    .schedule(&candidates, 1, PartialCohortPolicy::RunPartial)
+                    .schedule(candidates, width, PartialCohortPolicy::RunPartial)
                     .unwrap(),
             );
             samples.push(started.elapsed());
         }
-        summarize("metal candidates=2048 classes=16 width=1", &samples);
+        summarize(&format!("metal {name}"), &samples);
     }
 }
 
