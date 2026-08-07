@@ -23,6 +23,26 @@ use super::batch::{AuxArray, BackendError, BackendKind, BatchBackend, BatchReque
 use crate::compiler::body::EvaluatorProgram;
 use crate::kernel::payload::{ForeignPayload, Payload};
 
+/// Non-semantic Metal choices exposed to configuration search.
+///
+/// `None` uses the pipeline's SIMD width. An explicit threadgroup width is
+/// clamped to both the pipeline maximum and the number of elements, so every
+/// positive value is executable and changes placement only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetalTuning {
+    pub threadgroup_width: Option<u64>,
+    pub reuse_scratch_buffers: bool,
+}
+
+impl Default for MetalTuning {
+    fn default() -> Self {
+        Self {
+            threadgroup_width: None,
+            reuse_scratch_buffers: true,
+        }
+    }
+}
+
 /// An object whose bytes are an `MTLBuffer` the GPU wrote and the backend has
 /// given away.
 ///
@@ -89,10 +109,15 @@ pub struct MetalBatchBackend {
     /// three quarters, not a per-call saving, and it moves the fitted
     /// per-element cost rather than the intercept.
     scratch: Option<(Buffer, Buffer, u64)>,
+    tuning: MetalTuning,
 }
 
 impl MetalBatchBackend {
     pub fn new() -> Result<Self, BackendError> {
+        Self::new_with_tuning(MetalTuning::default())
+    }
+
+    pub fn new_with_tuning(tuning: MetalTuning) -> Result<Self, BackendError> {
         let device = Device::system_default().ok_or(BackendError::Unavailable)?;
         let queue = device.new_command_queue();
         Ok(Self {
@@ -100,12 +125,25 @@ impl MetalBatchBackend {
             queue,
             pipelines: HashMap::new(),
             scratch: None,
+            tuning,
         })
+    }
+
+    pub fn tuning(&self) -> MetalTuning {
+        self.tuning
     }
 
     /// Input and output buffers of at least `bytes`, allocating only when the
     /// batch is larger than any seen so far.
     fn scratch_for(&mut self, bytes: u64) -> (Buffer, Buffer) {
+        if !self.tuning.reuse_scratch_buffers {
+            return (
+                self.device
+                    .new_buffer(bytes, MTLResourceOptions::StorageModeShared),
+                self.device
+                    .new_buffer(bytes, MTLResourceOptions::StorageModeShared),
+            );
+        }
         let big_enough = matches!(&self.scratch, Some((_, _, capacity)) if *capacity >= bytes);
         if !big_enough {
             let input = self
@@ -118,6 +156,17 @@ impl MetalBatchBackend {
         }
         let (input, output, _) = self.scratch.as_ref().expect("just populated");
         (input.clone(), output.clone())
+    }
+
+    fn threadgroup_width(&self, pipeline: &ComputePipelineState, elements: u32) -> u64 {
+        let requested = self
+            .tuning
+            .threadgroup_width
+            .unwrap_or_else(|| pipeline.thread_execution_width())
+            .max(1);
+        requested
+            .min(pipeline.max_total_threads_per_threadgroup())
+            .min(u64::from(elements).max(1))
     }
 
     /// Run one batch and return the buffer holding its output, or `None` when
@@ -241,7 +290,7 @@ impl MetalBatchBackend {
                 depth: 1,
             },
             MTLSize {
-                width: pipeline.thread_execution_width().min(element_count as u64),
+                width: self.threadgroup_width(&pipeline, element_count),
                 height: 1,
                 depth: 1,
             },
@@ -258,7 +307,14 @@ impl MetalBatchBackend {
     /// Compile every body in one pass, so a codegen defect surfaces at
     /// installation rather than in the middle of a collective.
     pub fn with(programs: &[&EvaluatorProgram]) -> Result<Self, BackendError> {
-        let mut backend = Self::new()?;
+        Self::with_tuning(programs, MetalTuning::default())
+    }
+
+    pub fn with_tuning(
+        programs: &[&EvaluatorProgram],
+        tuning: MetalTuning,
+    ) -> Result<Self, BackendError> {
+        let mut backend = Self::new_with_tuning(tuning)?;
         for program in programs {
             backend.install(program)?;
         }
@@ -494,9 +550,7 @@ impl BatchBackend for MetalBatchBackend {
                     depth: 1,
                 },
                 MTLSize {
-                    width: pipeline
-                        .thread_execution_width()
-                        .min(request.element_count as u64),
+                    width: self.threadgroup_width(pipeline, request.element_count),
                     height: 1,
                     depth: 1,
                 },

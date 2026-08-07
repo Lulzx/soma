@@ -14,7 +14,7 @@ use soma::compiler::examples;
 use soma::executives::batch::{
     execute_epoch_with_spill, execute_with_spill, BatchBackend, CpuReferenceBackend, PlacementStats,
 };
-use soma::executives::metal::MetalBatchBackend;
+use soma::executives::metal::{MetalBatchBackend, MetalTuning};
 use soma::kernel::ownership::freeze;
 use soma::kernel::{Kernel, SYSTEM_PRINCIPAL};
 use soma::replay::trace_reader::events_of;
@@ -210,6 +210,42 @@ fn a_reused_buffer_does_not_leak_the_previous_batch_into_a_smaller_one() {
         assert_eq!(
             after_long, expected,
             "evaluator {evaluator} leaked the previous batch through a reused buffer"
+        );
+    }
+}
+
+#[test]
+fn tuning_controls_change_only_physical_execution() {
+    let module = examples::module();
+    let programs = module.programs();
+    let mut cpu = CpuReferenceBackend::with(&programs);
+    let inputs = sample_elements();
+    let expected = cpu
+        .evaluate(examples::BITMIX, &inputs, 7, 8)
+        .expect("reference evaluation runs");
+
+    // One is deliberately below the SIMD width, while u64::MAX is above any
+    // pipeline maximum. Both must be accepted and safely clamped. Fresh
+    // scratch buffers exercise the other search dimension independently.
+    for tuning in [
+        MetalTuning::default(),
+        MetalTuning {
+            threadgroup_width: Some(1),
+            reuse_scratch_buffers: true,
+        },
+        MetalTuning {
+            threadgroup_width: Some(u64::MAX),
+            reuse_scratch_buffers: false,
+        },
+    ] {
+        let mut metal = MetalBatchBackend::with_tuning(&programs, tuning).unwrap();
+        assert_eq!(metal.tuning(), tuning);
+        let actual = metal
+            .evaluate(examples::BITMIX, &inputs, 7, 8)
+            .expect("tuned Metal evaluation runs");
+        assert_eq!(
+            actual, expected,
+            "physical tuning changed evaluator semantics: {tuning:?}"
         );
     }
 }
