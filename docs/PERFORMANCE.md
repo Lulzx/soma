@@ -368,6 +368,38 @@ plans placements, so that is fewer placement writes; it says nothing about
 scalar versus cohorted evaluator execution. The one-class cells likewise show
 that the crossover does not appear merely by moving planning onto Metal.
 
+#### Stable-sort follow-up (`7de12c3`, harness `882a7a4`)
+
+The next implementation replaces quadratic placement scans with a stable
+device index sort and binary-search bin bounds. A fresh sweep extends the
+read-only workload to 8,192 candidates:
+
+| candidates | classes | CPU median | Metal median | speedup |
+|---:|---:|---:|---:|---:|
+| 512 | 1 | 40.709µs | 262.875µs | 0.15× |
+| 2,048 | 1 | 589.708µs | 351.125µs | 1.68× |
+| 2,048 | 4 | 588.333µs | 445.875µs | 1.32× |
+| 2,048 | 16 | 603.125µs | 320.542µs | 1.88× |
+| 8,192 | 1 | 9.869ms | 1.022ms | 9.66× |
+| 8,192 | 4 | 9.798ms | 0.646ms | 15.17× |
+| 8,192 | 16 | 9.798ms | 0.951ms | 10.30× |
+
+The crossover is now robust at 2,048 in all three class regimes and widens by
+8,192. At 512, sort dispatch and synchronization still cost 5.8×–8.8× the CPU
+oracle, so a production policy should retain a measured CPU threshold.
+
+Admission has a different adversary. With all 2,048 candidates mutable and
+claiming one process, CPU admission takes 10.792µs while Metal takes 537.625µs
+(49.8× slower): only one lane survives, and every GPU claimant still scans the
+set. This control prevents attributing the read-only scaling result to all
+scheduler traffic. A grouped deterministic mutable-claim reduction remains an
+optimization target.
+
+The post-sort width-one control is 615.417µs CPU and 268.250µs Metal. As before,
+it measures placement writes rather than evaluator-lane throughput. Full raw
+trials and machine metadata are in
+`docs/measurements/SCHEDULER-SORT-M4-PRO-2026-08-07.txt`.
+
 ### 8.2 Authenticated remote execution and end-to-end migration
 
 The remote worker is a distinct service thread reached over framed TCP on
