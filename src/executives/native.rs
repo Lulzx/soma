@@ -1,10 +1,10 @@
 //! Native CPU JIT backend for evaluator bodies.
 //!
 //! The scalar backend remains I20's definition. This backend lowers the
-//! straight-line, pointwise subset used by the self-tuning study to Cranelift
-//! machine code and is checked byte-for-byte against that definition. Bodies
-//! with gathers, auxiliary arrays, or loops are declined rather than partly
-//! interpreted: `UnsupportedEvaluator` is an honest placement answer.
+//! evaluator language to Cranelift machine code and is checked byte-for-byte
+//! against that definition. Unsupported control-flow forms are declined rather
+//! than partly interpreted: `UnsupportedEvaluator` is an honest placement
+//! answer.
 
 use std::collections::HashMap;
 
@@ -15,15 +15,29 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{default_libcall_names, Linkage, Module};
 
-use super::batch::{evaluate_elementwise, AuxArray, BackendError, BackendKind, BatchBackend};
+use super::batch::{AuxArray, BackendError, BackendKind, BatchBackend};
 use crate::compiler::body::{EvaluatorProgram, FieldWidth, Op};
 
-type NativeEvaluator = unsafe extern "C" fn(*const u8, *mut u8, u32, u32, u32);
+type NativeEvaluator =
+    unsafe extern "C" fn(*const u8, *mut u8, u32, u32, *const u8, u32, u32, u32, u32);
 
 #[derive(Clone, Copy)]
 struct CompiledEvaluator {
     function: NativeEvaluator,
     stride: u32,
+    aux_stride: u32,
+}
+
+#[derive(Clone, Copy)]
+struct ArrayValues {
+    index: Value,
+    input: Value,
+    input_element: Value,
+    count: Value,
+    stride: Value,
+    aux: Value,
+    aux_count: Value,
+    aux_stride: Value,
 }
 
 pub struct NativeCpuBackend {
@@ -81,17 +95,10 @@ impl NativeCpuBackend {
     }
 
     fn compile(&mut self, program: &EvaluatorProgram) -> Result<NativeEvaluator, BackendError> {
-        if program.binds_aux()
-            || program.ops().iter().any(|op| {
-                matches!(
-                    op,
-                    Op::Gather(_, _)
-                        | Op::GatherAux(_, _)
-                        | Op::Repeat(_)
-                        | Op::EndRepeat
-                        | Op::BreakIf(_)
-                )
-            })
+        if program
+            .ops()
+            .iter()
+            .any(|op| matches!(op, Op::Repeat(_) | Op::EndRepeat | Op::BreakIf(_)))
         {
             return Err(BackendError::UnsupportedEvaluator);
         }
@@ -101,6 +108,10 @@ impl NativeCpuBackend {
         signature.params.extend([
             AbiParam::new(pointer),
             AbiParam::new(pointer),
+            AbiParam::new(types::I32),
+            AbiParam::new(types::I32),
+            AbiParam::new(pointer),
+            AbiParam::new(types::I32),
             AbiParam::new(types::I32),
             AbiParam::new(types::I32),
             AbiParam::new(types::I32),
@@ -126,9 +137,13 @@ impl NativeCpuBackend {
             let params = builder.block_params(entry).to_vec();
             let input = params[0];
             let output = params[1];
-            let stride = params[2];
-            let start = params[3];
-            let end = params[4];
+            let count = params[2];
+            let stride = params[3];
+            let aux = params[4];
+            let aux_count = params[5];
+            let aux_stride = params[6];
+            let start = params[7];
+            let end = params[8];
             let index = builder.declare_var(types::I32);
             builder.def_var(index, start);
             builder.ins().jump(header, &[]);
@@ -145,6 +160,16 @@ impl NativeCpuBackend {
             let element_offset = builder.ins().imul(at_pointer, stride_pointer);
             let input_element = builder.ins().iadd(input, element_offset);
             let output_element = builder.ins().iadd(output, element_offset);
+            let arrays = ArrayValues {
+                index: at,
+                input,
+                input_element,
+                count,
+                stride,
+                aux,
+                aux_count,
+                aux_stride,
+            };
             let mut locals = Vec::with_capacity(program.locals() as usize);
             for _ in 0..program.locals() {
                 let local = builder.declare_var(types::I64);
@@ -154,15 +179,7 @@ impl NativeCpuBackend {
             }
             let mut values: Vec<Value> = Vec::with_capacity(program.ops().len());
             for op in program.ops() {
-                let value = lower_op(
-                    &mut builder,
-                    program,
-                    *op,
-                    at,
-                    input_element,
-                    &values,
-                    &locals,
-                )?;
+                let value = lower_op(&mut builder, program, *op, arrays, &values, &locals)?;
                 values.push(value);
             }
             for store in program.stores() {
@@ -205,7 +222,13 @@ impl NativeCpuBackend {
         Ok(unsafe { std::mem::transmute::<*const u8, NativeEvaluator>(code) })
     }
 
-    fn run(&self, compiled: CompiledEvaluator, inputs: &[u8], element_count: u32) -> Vec<u8> {
+    fn run(
+        &self,
+        compiled: CompiledEvaluator,
+        inputs: &[u8],
+        element_count: u32,
+        aux: AuxArray<'_>,
+    ) -> Vec<u8> {
         let mut outputs = inputs.to_vec();
         if element_count == 0 {
             return outputs;
@@ -214,6 +237,7 @@ impl NativeCpuBackend {
         let per_worker = (element_count as usize).div_ceil(workers);
         let input_address = inputs.as_ptr() as usize;
         let output_address = outputs.as_mut_ptr() as usize;
+        let aux_address = aux.bytes.as_ptr() as usize;
         std::thread::scope(|scope| {
             for worker in 0..workers {
                 let start = worker * per_worker;
@@ -230,7 +254,11 @@ impl NativeCpuBackend {
                         (compiled.function)(
                             input_address as *const u8,
                             output_address as *mut u8,
+                            element_count,
                             compiled.stride,
+                            aux_address as *const u8,
+                            aux.element_count,
+                            aux.element_stride,
                             start as u32,
                             end as u32,
                         );
@@ -254,6 +282,7 @@ impl BatchBackend for NativeCpuBackend {
             CompiledEvaluator {
                 function,
                 stride: program.stride(),
+                aux_stride: program.aux_stride(),
             },
         );
         Ok(())
@@ -283,14 +312,11 @@ impl BatchBackend for NativeCpuBackend {
         element_stride: u32,
         aux: AuxArray<'_>,
     ) -> Result<Vec<u8>, BackendError> {
-        if aux.is_bound() {
-            return Err(BackendError::UnsupportedEvaluator);
-        }
         let compiled = *self
             .evaluators
             .get(&evaluator_id)
             .ok_or(BackendError::UnsupportedEvaluator)?;
-        if compiled.stride != element_stride {
+        if compiled.stride != element_stride || compiled.aux_stride != aux.element_stride {
             return Err(BackendError::InvalidInput);
         }
         let required = (element_count as usize)
@@ -299,7 +325,22 @@ impl BatchBackend for NativeCpuBackend {
         if inputs.len() < required {
             return Err(BackendError::InvalidInput);
         }
-        Ok(self.run(compiled, &inputs[..required], element_count))
+        let aux_required = (aux.element_count as usize)
+            .checked_mul(aux.element_stride as usize)
+            .ok_or(BackendError::InvalidInput)?;
+        if aux.bytes.len() < aux_required {
+            return Err(BackendError::InvalidInput);
+        }
+        Ok(self.run(
+            compiled,
+            &inputs[..required],
+            element_count,
+            AuxArray::new(
+                &aux.bytes[..aux_required],
+                aux.element_count,
+                aux.element_stride,
+            ),
+        ))
     }
 }
 
@@ -307,8 +348,7 @@ fn lower_op(
     builder: &mut FunctionBuilder<'_>,
     program: &EvaluatorProgram,
     op: Op,
-    index: Value,
-    input_element: Value,
+    arrays: ArrayValues,
     values: &[Value],
     locals: &[cranelift_frontend::Variable],
 ) -> Result<Value, BackendError> {
@@ -322,9 +362,48 @@ fn lower_op(
                 .layout()
                 .width(field)
                 .ok_or(BackendError::UnsupportedEvaluator)?;
-            load_field(builder, input_element, offset, width)
+            load_field(builder, arrays.input_element, offset, width)
         }
-        Op::Index => builder.ins().uextend(types::I64, index),
+        Op::Index => builder.ins().uextend(types::I64, arrays.index),
+        Op::Gather(at, field) => {
+            let offset = program
+                .layout()
+                .offset(field)
+                .ok_or(BackendError::UnsupportedEvaluator)?;
+            let width = program
+                .layout()
+                .width(field)
+                .ok_or(BackendError::UnsupportedEvaluator)?;
+            load_clamped(
+                builder,
+                arrays.input,
+                arrays.count,
+                arrays.stride,
+                values[at as usize],
+                offset,
+                width,
+            )
+        }
+        Op::GatherAux(at, field) => {
+            let layout = program
+                .aux_layout()
+                .ok_or(BackendError::UnsupportedEvaluator)?;
+            let offset = layout
+                .offset(field)
+                .ok_or(BackendError::UnsupportedEvaluator)?;
+            let width = layout
+                .width(field)
+                .ok_or(BackendError::UnsupportedEvaluator)?;
+            load_clamped_or_zero(
+                builder,
+                arrays.aux,
+                arrays.aux_count,
+                arrays.aux_stride,
+                values[at as usize],
+                offset,
+                width,
+            )
+        }
         Op::Const(value) => builder.ins().iconst(types::I64, value as i64),
         Op::Add(a, b) => builder.ins().iadd(values[a as usize], values[b as usize]),
         Op::Sub(a, b) => builder.ins().isub(values[a as usize], values[b as usize]),
@@ -368,7 +447,7 @@ fn lower_op(
             builder.def_var(locals[local as usize], value);
             value
         }
-        Op::Gather(_, _) | Op::GatherAux(_, _) | Op::Repeat(_) | Op::EndRepeat | Op::BreakIf(_) => {
+        Op::Repeat(_) | Op::EndRepeat | Op::BreakIf(_) => {
             return Err(BackendError::UnsupportedEvaluator)
         }
     };
@@ -419,14 +498,54 @@ fn field_type(width: FieldWidth) -> cranelift_codegen::ir::Type {
     }
 }
 
-// Keep the shared helper reachable in this feature configuration. It is the
-// shape a future gather-aware native fallback can use without changing the
-// backend boundary.
-#[allow(dead_code)]
-fn reference_shape_check(
-    inputs: &[u8],
-    element_count: u32,
-    element_stride: u32,
-) -> Result<Vec<u8>, BackendError> {
-    evaluate_elementwise(inputs, element_count, element_stride, |_, _| {})
+fn load_clamped(
+    builder: &mut FunctionBuilder<'_>,
+    base: Value,
+    count: Value,
+    stride: Value,
+    requested: Value,
+    field_offset: u32,
+    width: FieldWidth,
+) -> Value {
+    let count64 = builder.ins().uextend(types::I64, count);
+    let last = builder.ins().iadd_imm(count64, -1);
+    let past_end = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, requested, count64);
+    let at = builder.ins().select(past_end, last, requested);
+    let stride64 = builder.ins().uextend(types::I64, stride);
+    let byte_offset = builder.ins().imul(at, stride64);
+    let element = builder.ins().iadd(base, byte_offset);
+    load_field(builder, element, field_offset, width)
+}
+
+fn load_clamped_or_zero(
+    builder: &mut FunctionBuilder<'_>,
+    base: Value,
+    count: Value,
+    stride: Value,
+    requested: Value,
+    field_offset: u32,
+    width: FieldWidth,
+) -> Value {
+    let zero_block = builder.create_block();
+    let load_block = builder.create_block();
+    let merge = builder.create_block();
+    builder.append_block_param(merge, types::I64);
+    let empty = builder.ins().icmp_imm(IntCC::Equal, count, 0);
+    builder.ins().brif(empty, zero_block, &[], load_block, &[]);
+
+    builder.switch_to_block(zero_block);
+    let zero = builder.ins().iconst(types::I64, 0);
+    builder.ins().jump(merge, &[zero.into()]);
+
+    builder.switch_to_block(load_block);
+    let loaded = load_clamped(builder, base, count, stride, requested, field_offset, width);
+    builder.ins().jump(merge, &[loaded.into()]);
+
+    builder.seal_block(zero_block);
+    builder.seal_block(load_block);
+    builder.switch_to_block(merge);
+    builder.seal_block(merge);
+    builder.block_params(merge)[0]
 }

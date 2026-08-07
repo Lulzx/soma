@@ -2,7 +2,7 @@
 
 use soma::compiler::body::{ElementLayout, EvaluatorProgram, FieldWidth, Op, Store};
 use soma::compiler::examples;
-use soma::executives::batch::{BackendError, BatchBackend, CpuReferenceBackend};
+use soma::executives::batch::{AuxArray, BackendError, BatchBackend, CpuReferenceBackend};
 use soma::executives::native::NativeCpuBackend;
 
 fn inputs() -> Vec<u8> {
@@ -22,6 +22,8 @@ fn native_code_agrees_with_the_reference_on_every_supported_example() {
         examples::DOUBLE_PLUS_ONE_TAGGED,
         examples::MIN_AND_XOR,
         examples::BITMIX,
+        examples::NEIGHBOUR_MAX,
+        examples::PERMUTE,
     ]
     .iter()
     .map(|id| module.program(*id).unwrap())
@@ -108,12 +110,7 @@ fn native_lowering_covers_the_straight_line_integer_language() {
 #[test]
 fn unsupported_control_flow_and_gathers_are_declined() {
     let module = examples::module();
-    for id in [
-        examples::NEIGHBOUR_MAX,
-        examples::PERMUTE,
-        examples::WINDOW_SUM,
-        examples::RUN_LENGTH,
-    ] {
+    for id in [examples::WINDOW_SUM, examples::RUN_LENGTH] {
         let program = module.program(id).unwrap();
         let mut native = NativeCpuBackend::new().unwrap();
         assert_eq!(
@@ -123,6 +120,44 @@ fn unsupported_control_flow_and_gathers_are_declined() {
             program.name()
         );
     }
+}
+
+#[test]
+fn native_auxiliary_gathers_agree_with_the_reference() {
+    use soma::experiments::ant_scoring::{self, Sensor};
+
+    let program = ant_scoring::sensing_program();
+    let sensors = [
+        Sensor {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+            channel: 0,
+        },
+        Sensor {
+            x: 2,
+            y: 3,
+            width: 4,
+            height: 4,
+            channel: 1,
+        },
+    ];
+    let input = ant_scoring::pack_sensors(&sensors);
+    let grid: Vec<u8> = (0..32u16)
+        .flat_map(|value| value.wrapping_mul(17).to_le_bytes())
+        .collect();
+    let aux = AuxArray::new(&grid, 32, 2);
+    let mut reference = CpuReferenceBackend::with(&[&program]);
+    let mut native = NativeCpuBackend::with(&[&program]).unwrap().with_threads(2);
+    assert_eq!(
+        native
+            .evaluate_with_aux(program.id(), &input, 2, program.stride(), aux)
+            .unwrap(),
+        reference
+            .evaluate_with_aux(program.id(), &input, 2, program.stride(), aux)
+            .unwrap()
+    );
 }
 
 #[test]
