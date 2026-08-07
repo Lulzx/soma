@@ -155,15 +155,7 @@ impl Kernel {
         &mut self,
         plan: KernelResidentSyncPlan,
     ) -> Result<u32, KernelResidentSyncError> {
-        if !plan.matches(self) {
-            return Err(KernelResidentSyncError::StalePlan);
-        }
-        let metal = crate::executives::metal_resident_sync::MetalResidentSync::new()
-            .map_err(|_| KernelResidentSyncError::BackendUnavailable)?;
-        let result = metal
-            .run(&plan.config, plan.continuations.clone(), &plan.programs)
-            .map_err(|_| KernelResidentSyncError::BackendFailed)?;
-        plan.validate_and_import(self, result)
+        KernelResidentMetalExecutor::new()?.execute(self, plan)
     }
 
     /// Test-only independent CPU reference; it is intentionally impossible to
@@ -174,6 +166,48 @@ impl Kernel {
         plan: KernelResidentSyncPlan,
     ) -> Result<u32, KernelResidentSyncError> {
         run_cpu_reference(self, plan)
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn execute_metal(
+    metal: &crate::executives::metal_resident_sync::MetalResidentSync,
+    kernel: &mut Kernel,
+    plan: KernelResidentSyncPlan,
+) -> Result<u32, KernelResidentSyncError> {
+    if !plan.matches(kernel) {
+        return Err(KernelResidentSyncError::StalePlan);
+    }
+    let result = metal
+        .run(&plan.config, plan.continuations.clone(), &plan.programs)
+        .map_err(|_| KernelResidentSyncError::BackendFailed)?;
+    plan.validate_and_import(kernel, result)
+}
+
+/// Reusable physical-Metal executor for canonical owned-kernel resident runs.
+///
+/// Device, queue, shader library, and pipeline setup happen once in [`Self::new`].
+/// Each [`Self::execute`] performs the exact stale-plan check, physical backend
+/// run, result validation, and atomic import used by [`Kernel::run_resident_sync_metal`].
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub struct KernelResidentMetalExecutor {
+    metal: crate::executives::metal_resident_sync::MetalResidentSync,
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+impl KernelResidentMetalExecutor {
+    pub fn new() -> Result<Self, KernelResidentSyncError> {
+        let metal = crate::executives::metal_resident_sync::MetalResidentSync::new()
+            .map_err(|_| KernelResidentSyncError::BackendUnavailable)?;
+        Ok(Self { metal })
+    }
+
+    pub fn execute(
+        &self,
+        kernel: &mut Kernel,
+        plan: KernelResidentSyncPlan,
+    ) -> Result<u32, KernelResidentSyncError> {
+        execute_metal(&self.metal, kernel, plan)
     }
 }
 
@@ -206,6 +240,11 @@ pub mod measurement {
         plan: KernelResidentSyncPlan,
     ) -> Result<u32, KernelResidentSyncError> {
         run_cpu_reference(kernel, plan)
+    }
+
+    /// Stable hash of the complete canonical kernel position.
+    pub fn deterministic_state_hash(kernel: &Kernel) -> [u8; 32] {
+        KernelResidentSyncPlan::fingerprint(kernel)
     }
 }
 
@@ -2183,6 +2222,32 @@ mod tests {
             &metal_runs[1],
         ])
         .is_empty());
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn reusable_metal_executor_runs_multiple_kernels_and_rejects_stale_plan() {
+        let executor = KernelResidentMetalExecutor::new().unwrap();
+        let mut metal_runs = Vec::new();
+        for width in [1, 32] {
+            let (mut kernel, plan, continuations) = shared_class_setup(width);
+            assert_eq!(executor.execute(&mut kernel, plan), Ok(1));
+            assert_shared_class_result(&kernel, &continuations, width);
+            metal_runs.push(kernel);
+        }
+        assert!(
+            crate::semantics::order::placement_neutral(&[&metal_runs[0], &metal_runs[1],])
+                .is_empty()
+        );
+
+        let (mut stale, plan, _) = shared_class_setup(32);
+        stale.epoch = stale.epoch.wrapping_add(1);
+        let before = KernelResidentSyncPlan::fingerprint(&stale);
+        assert_eq!(
+            executor.execute(&mut stale, plan),
+            Err(KernelResidentSyncError::StalePlan)
+        );
+        assert_eq!(KernelResidentSyncPlan::fingerprint(&stale), before);
     }
 
     #[test]
