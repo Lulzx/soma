@@ -59,6 +59,10 @@ cluster node identity from allocator partition, while signed `RemoteGrant`s
 carry attenuated authority and are rechecked against a live revocation registry
 at use. The node-loss/partition decision is recorded in
 `docs/DISTRIBUTED.md`; transport failure does not masquerade as process fault.
+`distributed::remote_batch` is the first actual transport: authenticated framed
+TCP evaluator requests with content-addressed retry identities and a worker
+response ledger. `tests/remote_batch.rs` pins reference agreement, apply-once
+retry, revocation-before-cache, and unreachable-node failure semantics.
 
 Read §1 for the project state and §6 for the test discipline before changing
 the code.

@@ -309,6 +309,9 @@ Implemented now:
 - A distributed identity and signed delegation foundation: node-qualified
   references, audience/target/right/version/epoch-bound remote grants, live
   revocation checks, fixed-width encoding, and tamper-negative controls
+- An authenticated TCP evaluator backend with content-addressed requests,
+  apply-once response ledger, revocation-before-replay ordering, remote
+  placement accounting, and distinct unavailable/lost/protocol failures
 
 Not implemented:
 

@@ -6,6 +6,7 @@
 //! against its live revocation registry at use.
 
 pub mod authority;
+pub mod remote_batch;
 
 use crate::abi::Ref64;
 

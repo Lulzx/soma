@@ -1589,23 +1589,28 @@ are implemented and tested. `docs/DISTRIBUTED.md` fixes the failure model before
 transport: a partition is not a process fault, and declared node loss discards
 only uncommitted epoch journals before notifying remote supervisors.
 
+The first transport is also implemented. `RemoteBatchBackend` sends signed,
+content-addressed evaluator requests over framed TCP; the worker authorizes
+before consulting an apply-once response ledger. Remote placement is distinct
+from CPU and accelerator placement, and unavailable, lost, protocol, authority,
+and evaluator failures cannot be confused with successful bytes.
+
 The model is unusually well-positioned for the hard part: frames are durable
 position-independent byte blobs (v0.2 §1.1), so a continuation can resume on a
 node that did not suspend it without migrating register state.
 
 What is not done:
 
-- **Node identity in references.** §1.2 above. Closing the ABA window did not
-  give two nodes disjoint reference spaces.
-- **Capability spaces across nodes.** Capabilities are actor-relative and
-  checked at operation. A remote operation must carry proof of authority, and
-  revocation must be observable remotely. This is the largest single piece.
-- **Node failure vs. process failure.** v0.2 §6.3 contains process failure
-  precisely. Node loss is different: it can destroy a process that did not
-  fault, and it can partition a supervisor from its child. The supervision model
-  has no clause for this. Either node loss maps onto `Fault` — which claims the
-  machine can always detect it — or the specification grows an explicit
-  partition model. **Decide before writing any transport.**
+- **Node identity in kernel tables.** `RemoteRef` gives the wire a disjoint node
+  namespace without overloading allocator partitions; kernel entity ownership
+  and migration still need to carry it.
+- **Capability spaces across nodes.** Remote grants prove and attenuate
+  authority, pin versions and logical epochs, and observe live revocation at
+  use. Replicating revocation observations and connecting grants to every
+  stateful remote operation remain.
+- **Node-loss integration.** The partition/loss semantics are fixed in
+  `docs/DISTRIBUTED.md`; discard of uncommitted journals and remote-supervisor
+  notices still need executable kernel integration.
 - **Escrowed channel payloads** assume the kernel can hold a `READ` root for an
   in-flight message. Across nodes, "the kernel" is plural.
 

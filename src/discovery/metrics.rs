@@ -20,6 +20,7 @@ pub struct DiscoveryMetrics {
     pub wall_time: Duration,
     pub cpu_time: Duration,
     pub gpu_time: Duration,
+    pub remote_time: Duration,
 }
 
 impl DiscoveryMetrics {

@@ -99,8 +99,9 @@ pub(crate) fn execute_jobs(
     match kind {
         BackendKind::Cpu => metrics.cpu_time += backend_elapsed,
         BackendKind::Accelerator => metrics.gpu_time += backend_elapsed,
+        BackendKind::Remote => metrics.remote_time += backend_elapsed,
     }
-    if kind == BackendKind::Accelerator {
+    if matches!(kind, BackendKind::Accelerator | BackendKind::Remote) {
         metrics.command_buffers += 1;
     }
 
@@ -121,7 +122,7 @@ pub(crate) fn execute_jobs(
             ));
         }
     }
-    if kind == BackendKind::Accelerator {
+    if matches!(kind, BackendKind::Accelerator | BackendKind::Remote) {
         metrics.bytes_transferred = metrics.input_bytes + metrics.output_bytes;
     }
     Ok(outputs)

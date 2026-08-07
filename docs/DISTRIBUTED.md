@@ -23,6 +23,19 @@ valid signed grant is rejected after revocation. Authorization at use checks
 protocol version, issuer, signature, registry membership, audience, exact
 target, object version, rights, logical validity, and revocation.
 
+`RemoteBatchBackend` and `RemoteBatchServer` carry evaluator requests over
+framed TCP. Requests are content-addressed over shape, logical epoch, grant,
+primary input, and auxiliary input. The worker authorizes first, then consults
+its response ledger, so an exact retry applies once while a revoked grant cannot
+retrieve a cached response. Wire responses distinguish success, authority
+denial, malformed input, unsupported evaluator, and execution failure.
+
+The client separately distinguishes connection refusal (`NodeUnavailable`),
+loss after connection (`NodeLost`), and malformed responses (`ProtocolError`).
+Integration tests compare remote output with the CPU definition, prove duplicate
+application suppression, revoke before a cached retry, and show that an
+unreachable node cannot be mistaken for evaluator bytes.
+
 ## Failure semantics
 
 Transport failure and process failure are different outcomes.

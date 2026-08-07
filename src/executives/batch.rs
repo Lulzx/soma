@@ -16,6 +16,7 @@ use crate::kernel::{Kernel, RuntimeError};
 pub enum BackendKind {
     Cpu,
     Accelerator,
+    Remote,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,6 +25,10 @@ pub enum BackendError {
     UnsupportedEvaluator,
     InvalidInput,
     ExecutionFailed,
+    AuthorityDenied,
+    NodeUnavailable,
+    NodeLost,
+    ProtocolError,
     Runtime(RuntimeError),
 }
 
@@ -502,6 +507,7 @@ impl CpuReferenceBackend {
 pub struct PlacementStats {
     pub cpu_executions: u64,
     pub accelerator_executions: u64,
+    pub remote_executions: u64,
     pub cpu_spills: u64,
     pub migrations: u64,
     last_backend: HashMap<u32, BackendKind>,
@@ -512,6 +518,7 @@ impl PlacementStats {
         match kind {
             BackendKind::Cpu => self.cpu_executions += 1,
             BackendKind::Accelerator => self.accelerator_executions += 1,
+            BackendKind::Remote => self.remote_executions += 1,
         }
         if spilled {
             self.cpu_spills += 1;
