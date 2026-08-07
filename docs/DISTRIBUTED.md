@@ -42,6 +42,24 @@ all-or-error ordering contract without a connection handshake per cohort. A
 separate negative control accepts a connection and drops it before replying;
 the client reports `NodeLost`, distinct from connection refusal.
 
+`RemoteJournalValidator` applies the same transport and authority rules to the
+stateful pre-commit boundary. The coordinator serializes the actual read/write
+sets emitted by `LaneView` into the fixed device/wire ABI and sends the complete
+epoch to an authenticated worker. The worker makes the namespace-aware conflict
+decision, content-addresses the request, and records the response. Exact retry
+applies once; authorization is checked before the response ledger, so revoking
+a grant denies a formerly cached request. The client preserves distinct
+`Unavailable`, `NodeLost`, authority, protocol, and execution outcomes.
+
+This validator is wired directly into `Kernel::run_epoch_with_lane_validator`.
+A clean remote decision permits canonical coordinator commit. A conflict or
+transport error discards every speculative snapshot and takes the reference
+path before an operation or payload escapes. Tests exercise both a disjoint
+epoch that commits with an I18-equivalent trace and two future writers that
+fall back. The worker currently receives access journals, not operation
+payloads; operation replay and authoritative queue/future state remain on the
+coordinator.
+
 ## Failure semantics
 
 Transport failure and process failure are different outcomes.
@@ -81,10 +99,12 @@ source failure. The supervision control alternates nodes at every level, so all
 four supervisor/child edges are remote, and covers notify, escalation, and
 restart. Every run is legal, has the same outcome, and is I18-equivalent.
 
-This is a non-vacuous semantic placement test, not yet stateful message
-transport: one coordinator kernel still owns the channel and supervision
-queues. Those operations must next use authenticated remote journals before the
-full distributed exit criterion is satisfied.
+This is a non-vacuous semantic placement test. Stateful access journals now
+cross an authenticated remote boundary and gate real epoch commit, but one
+coordinator kernel still owns and replays the channel, future, and supervision
+operations. Sending those operation payloads to their owning nodes, then
+committing their acknowledgements in canonical order, remains before the full
+distributed exit criterion is satisfied.
 
 ## Completion evidence
 

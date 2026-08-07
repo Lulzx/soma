@@ -21,7 +21,10 @@ pub const DEVICE_ACCESS_WRITE: u32 = 2;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaneValidationError {
     InvalidInput,
+    AuthorityDenied,
     Unavailable,
+    NodeLost,
+    ProtocolError,
     ExecutionFailed,
 }
 
