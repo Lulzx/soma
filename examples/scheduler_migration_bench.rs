@@ -98,18 +98,20 @@ fn scheduler_benchmark() {
     );
 
     println!("\n[scheduler negative control: all mutable claims share one process]");
-    let mut contested = candidates(2_048, 16);
-    let process = Ref64::new(1, 1, Kind::Process);
-    for candidate in &mut contested {
-        candidate.process = process;
-        candidate.state_access = StateAccess::Mutable;
+    for count in [2_048, 8_192] {
+        let mut contested = candidates(count, 16);
+        let process = Ref64::new(1, 1, Kind::Process);
+        for candidate in &mut contested {
+            candidate.process = process;
+            candidate.state_access = StateAccess::Mutable;
+        }
+        measure_scheduler(
+            &format!("candidates={count} classes=16 contested_mutable=true"),
+            &contested,
+            32,
+            if count == 2_048 { 11 } else { 7 },
+        );
     }
-    measure_scheduler(
-        "candidates=2048 classes=16 contested_mutable=true",
-        &contested,
-        32,
-        11,
-    );
 }
 
 fn measure_scheduler(name: &str, candidates: &[Candidate], width: u16, repetitions: usize) {
