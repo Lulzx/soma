@@ -19,6 +19,9 @@ use crate::scheduler::device::{
     LaneConflictValidator, LaneValidationError,
 };
 use crate::scheduler::device::{ResidentSearchConfig, ResidentSearchResult};
+use crate::scheduler::device_ops::{
+    DeviceLaneOperation, DeviceOperationJournal, DeviceOperationSlice,
+};
 
 use super::batch::BackendError;
 
@@ -61,6 +64,19 @@ struct LaneConflict {
     uint conflicts;
     uint first_other_lane;
     uint reserved;
+};
+
+struct LaneOperation {
+    uint lane; uint ordinal; uint opcode; uint flags;
+    ulong actor; ulong target; ulong value; ulong auxiliary; ulong result_ref;
+    uint payload_offset; uint payload_len; uint result_code; uint result_aux;
+};
+
+struct OperationSlice {
+    uint operation_offset;
+    uint operation_count;
+    uint payload_len;
+    uint expected_lane;
 };
 
 inline bool wins_mutable_claim(
@@ -246,6 +262,26 @@ kernel void soma_device_validate_journals(
     LaneConflict result = {lane, first != 0xFFFFFFFFu, first, 0u};
     conflicts[lane] = result;
 }
+
+kernel void soma_device_validate_operations(
+    device const LaneOperation* operations [[buffer(0)]],
+    device const OperationSlice* slices [[buffer(1)]],
+    device uint* valid [[buffer(2)]],
+    constant uint& slice_count [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= slice_count) return;
+    OperationSlice slice = slices[gid];
+    uint ok = 1u;
+    for (uint ordinal = 0u; ordinal < slice.operation_count; ++ordinal) {
+        LaneOperation operation = operations[slice.operation_offset + ordinal];
+        bool payload_fits = operation.payload_offset <= slice.payload_len
+            && operation.payload_len <= slice.payload_len - operation.payload_offset;
+        if (operation.ordinal != ordinal || operation.opcode < 1u || operation.opcode > 11u
+            || operation.lane != slice.expected_lane || !payload_fits) ok = 0u;
+    }
+    valid[gid] = ok;
+}
 "#;
 
 pub struct MetalDeviceScheduler {
@@ -257,8 +293,10 @@ pub struct MetalDeviceScheduler {
     index_sort: ComputePipelineState,
     placement: ComputePipelineState,
     journal_validation: ComputePipelineState,
+    operation_validation: ComputePipelineState,
     resident: Option<(Buffer, Buffer, Buffer, usize)>,
     journal_resident: Option<(Buffer, Buffer, usize, usize)>,
+    operation_resident: Option<(Buffer, Buffer, Buffer, usize, usize)>,
 }
 
 impl MetalDeviceScheduler {
@@ -286,6 +324,9 @@ impl MetalDeviceScheduler {
         let journal_validation_fn = library
             .get_function("soma_device_validate_journals", None)
             .map_err(|_| BackendError::ExecutionFailed)?;
+        let operation_validation_fn = library
+            .get_function("soma_device_validate_operations", None)
+            .map_err(|_| BackendError::ExecutionFailed)?;
         let admission = device
             .new_compute_pipeline_state_with_function(&admission_fn)
             .map_err(|_| BackendError::ExecutionFailed)?;
@@ -304,6 +345,9 @@ impl MetalDeviceScheduler {
         let journal_validation = device
             .new_compute_pipeline_state_with_function(&journal_validation_fn)
             .map_err(|_| BackendError::ExecutionFailed)?;
+        let operation_validation = device
+            .new_compute_pipeline_state_with_function(&operation_validation_fn)
+            .map_err(|_| BackendError::ExecutionFailed)?;
         Ok(Self {
             device,
             queue,
@@ -313,8 +357,10 @@ impl MetalDeviceScheduler {
             index_sort,
             placement,
             journal_validation,
+            operation_validation,
             resident: None,
             journal_resident: None,
+            operation_resident: None,
         })
     }
 
@@ -384,6 +430,46 @@ impl MetalDeviceScheduler {
         (accesses, conflicts)
     }
 
+    fn operation_buffers(
+        &mut self,
+        operation_count: usize,
+        slice_count: usize,
+    ) -> (&Buffer, &Buffer, &Buffer) {
+        let operation_capacity = operation_count.max(1).next_power_of_two();
+        let slice_capacity = slice_count.max(1).next_power_of_two();
+        let needs_growth = self.operation_resident.as_ref().is_none_or(
+            |(_, _, _, resident_operations, resident_slices)| {
+                *resident_operations < operation_count || *resident_slices < slice_count
+            },
+        );
+        if needs_growth {
+            let operations = self.device.new_buffer(
+                (operation_capacity * std::mem::size_of::<DeviceLaneOperation>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let slices = self.device.new_buffer(
+                (slice_capacity * std::mem::size_of::<DeviceOperationSlice>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let valid = self.device.new_buffer(
+                (slice_capacity * std::mem::size_of::<u32>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            self.operation_resident = Some((
+                operations,
+                slices,
+                valid,
+                operation_capacity,
+                slice_capacity,
+            ));
+        }
+        let (operations, slices, valid, _, _) = self
+            .operation_resident
+            .as_ref()
+            .expect("resident operation buffers");
+        (operations, slices, valid)
+    }
+
     /// Validate a complete epoch's lane access journals concurrently.
     /// Results are indexed by canonical lane number, not device completion
     /// order, and the buffers remain resident for later epochs.
@@ -447,6 +533,103 @@ impl MetalDeviceScheduler {
             )
         }
         .to_vec())
+    }
+
+    /// Validate fixed-width operation records and every byte-arena bound on
+    /// Metal. Payload bytes do not need to be copied for a structural check;
+    /// each slice supplies the authoritative arena length.
+    pub fn validate_operation_journals(
+        &mut self,
+        journals: &[&DeviceOperationJournal],
+    ) -> Result<(), BackendError> {
+        if journals.is_empty() {
+            return Ok(());
+        }
+        let operation_count = journals.iter().try_fold(0usize, |total, journal| {
+            total.checked_add(journal.operations.len())
+        });
+        let Some(operation_count) = operation_count else {
+            return Err(BackendError::InvalidInput);
+        };
+        if operation_count > u32::MAX as usize || journals.len() > u32::MAX as usize {
+            return Err(BackendError::InvalidInput);
+        }
+        let mut operations = Vec::with_capacity(operation_count);
+        let mut slices = Vec::with_capacity(journals.len());
+        for journal in journals {
+            let operation_offset: u32 = operations
+                .len()
+                .try_into()
+                .map_err(|_| BackendError::InvalidInput)?;
+            let operation_count: u32 = journal
+                .operations
+                .len()
+                .try_into()
+                .map_err(|_| BackendError::InvalidInput)?;
+            let payload_len: u32 = journal
+                .payload
+                .len()
+                .try_into()
+                .map_err(|_| BackendError::InvalidInput)?;
+            let expected_lane = journal
+                .operations
+                .first()
+                .map(|operation| operation.lane)
+                .unwrap_or(u32::MAX);
+            operations.extend_from_slice(&journal.operations);
+            slices.push(DeviceOperationSlice {
+                operation_offset,
+                operation_count,
+                payload_len,
+                expected_lane,
+            });
+        }
+        let (operation_buffer, slice_buffer, valid_buffer) =
+            self.operation_buffers(operations.len(), slices.len());
+        unsafe {
+            if !operations.is_empty() {
+                std::ptr::copy_nonoverlapping(
+                    operations.as_ptr().cast::<u8>(),
+                    operation_buffer.contents().cast::<u8>(),
+                    std::mem::size_of_val(operations.as_slice()),
+                );
+            }
+            std::ptr::copy_nonoverlapping(
+                slices.as_ptr().cast::<u8>(),
+                slice_buffer.contents().cast::<u8>(),
+                std::mem::size_of_val(slices.as_slice()),
+            );
+        }
+        let operation_buffer = operation_buffer.clone();
+        let slice_buffer = slice_buffer.clone();
+        let valid_buffer = valid_buffer.clone();
+        let slice_count = slices.len() as u32;
+        let command = self.queue.new_command_buffer();
+        let encoder = command.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.operation_validation);
+        encoder.set_buffer(0, Some(&operation_buffer), 0);
+        encoder.set_buffer(1, Some(&slice_buffer), 0);
+        encoder.set_buffer(2, Some(&valid_buffer), 0);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<u32>() as u64,
+            (&slice_count as *const u32).cast::<c_void>(),
+        );
+        dispatch(encoder, &self.operation_validation, slice_count);
+        encoder.end_encoding();
+        command.commit();
+        command.wait_until_completed();
+        if command.status() != MTLCommandBufferStatus::Completed {
+            return Err(BackendError::ExecutionFailed);
+        }
+        let valid = unsafe {
+            std::slice::from_raw_parts(valid_buffer.contents().cast::<u32>(), slices.len())
+        };
+        if valid.iter().all(|valid| *valid == 1) {
+            Ok(())
+        } else {
+            Err(BackendError::InvalidInput)
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -651,13 +834,31 @@ impl LaneConflictValidator for MetalDeviceScheduler {
         accesses: &[DeviceLaneAccess],
         lane_count: u32,
     ) -> Result<Vec<DeviceLaneConflict>, LaneValidationError> {
-        MetalDeviceScheduler::validate_lane_journals(self, accesses, lane_count).map_err(|error| {
-            match error {
-                BackendError::InvalidInput => LaneValidationError::InvalidInput,
-                BackendError::Unavailable => LaneValidationError::Unavailable,
-                _ => LaneValidationError::ExecutionFailed,
-            }
-        })
+        MetalDeviceScheduler::validate_lane_journals(self, accesses, lane_count)
+            .map_err(lane_validation_error)
+    }
+
+    fn validate_epoch(
+        &mut self,
+        accesses: &[DeviceLaneAccess],
+        lane_count: u32,
+        operations: &[&DeviceOperationJournal],
+    ) -> Result<Vec<DeviceLaneConflict>, LaneValidationError> {
+        if operations.len() != lane_count as usize {
+            return Err(LaneValidationError::InvalidInput);
+        }
+        self.validate_operation_journals(operations)
+            .map_err(lane_validation_error)?;
+        self.validate_lane_journals(accesses, lane_count)
+            .map_err(lane_validation_error)
+    }
+}
+
+fn lane_validation_error(error: BackendError) -> LaneValidationError {
+    match error {
+        BackendError::InvalidInput => LaneValidationError::InvalidInput,
+        BackendError::Unavailable => LaneValidationError::Unavailable,
+        _ => LaneValidationError::ExecutionFailed,
     }
 }
 

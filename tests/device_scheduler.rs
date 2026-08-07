@@ -6,6 +6,7 @@ use soma::scheduler::device::{
     DeviceLaneAccess, ResidentSearchConfig, DEVICE_DEFERRED, DEVICE_POLICY_DEFERRED, DEVICE_RUN,
     DEVICE_SEND_TO_CPU,
 };
+use soma::scheduler::device_ops::{DeviceLaneOperation, DeviceOperationJournal};
 
 fn candidate(
     id: u32,
@@ -133,6 +134,34 @@ fn real_metal_lane_journal_validation_matches_the_reference() {
         metal.validate_lane_journals(&[], 3).unwrap()[2].conflicts,
         0
     );
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn real_metal_validates_operation_records_and_arena_bounds() {
+    use soma::executives::metal_scheduler::MetalDeviceScheduler;
+
+    let valid = DeviceOperationJournal {
+        operations: vec![DeviceLaneOperation {
+            lane: 7,
+            ordinal: 0,
+            opcode: 6,
+            payload_offset: 1,
+            payload_len: 3,
+            ..DeviceLaneOperation::default()
+        }],
+        payload: vec![1, 2, 3, 4],
+    };
+    let mut metal = MetalDeviceScheduler::new().unwrap();
+    metal.validate_operation_journals(&[&valid]).unwrap();
+
+    let mut bad_bounds = valid.clone();
+    bad_bounds.operations[0].payload_len = 4;
+    assert!(metal.validate_operation_journals(&[&bad_bounds]).is_err());
+
+    let mut bad_opcode = valid;
+    bad_opcode.operations[0].opcode = 12;
+    assert!(metal.validate_operation_journals(&[&bad_opcode]).is_err());
 }
 
 #[test]

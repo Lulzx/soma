@@ -101,6 +101,14 @@ rejected journals still leave no state behind. This establishes the exact ABI
 a Metal handler must emit and removes host data-model design from the remaining
 device lowering.
 
+Real Metal also consumes the complete operation records from those epochs. One
+thread per lane slice verifies contiguous ordinals, the closed eleven-opcode
+set, one canonical lane identity, and every offset/length against that lane's
+arena size. The operation, slice, and result buffers remain resident and grow
+geometrically. Invalid opcode and out-of-bounds arena controls fail on hardware;
+the actual speculative epoch path runs this gate before Metal's access-conflict
+decision and canonical host replay.
+
 Read-only admission takes the constant path. Small mutable sets retain the
 bounded quadratic comparison path; large mutable sets and placement use
 `O(n log² n)` sorting plus `O(n log n)` bound lookup. Irregular randomized

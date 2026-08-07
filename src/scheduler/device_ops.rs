@@ -47,6 +47,18 @@ pub struct DeviceLaneOperation {
 
 const _: () = assert!(std::mem::size_of::<DeviceLaneOperation>() == 72);
 
+/// Bounds for one lane's range in a flattened operation array.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeviceOperationSlice {
+    pub operation_offset: u32,
+    pub operation_count: u32,
+    pub payload_len: u32,
+    pub expected_lane: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<DeviceOperationSlice>() == 16);
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DeviceOperationJournal {
     pub operations: Vec<DeviceLaneOperation>,
