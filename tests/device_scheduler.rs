@@ -235,3 +235,39 @@ fn sorted_metal_placement_matches_irregular_non_power_of_two_epochs() {
         }
     }
 }
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn sorted_mutable_admission_matches_the_set_rule() {
+    use soma::executives::metal_scheduler::MetalDeviceScheduler;
+
+    let candidates: Vec<_> = (0..257u32)
+        .map(|index| {
+            candidate(
+                index + 1,
+                index % 17 + 1,
+                index.wrapping_mul(11) % 23,
+                index.wrapping_mul(11) % 23,
+                index.wrapping_mul(7) % 13,
+                if index % 4 == 0 {
+                    StateAccess::ReadOnly
+                } else {
+                    StateAccess::Mutable
+                },
+            )
+        })
+        .collect();
+    let mut metal = MetalDeviceScheduler::new().unwrap();
+    for policy in [
+        PartialCohortPolicy::Defer,
+        PartialCohortPolicy::SendToCpu,
+        PartialCohortPolicy::RunPartial,
+        PartialCohortPolicy::MergeWithGenericClass,
+    ] {
+        assert_eq!(
+            metal.schedule(&candidates, 9, policy).unwrap(),
+            reference_device_schedule(&candidates, 9, policy),
+            "policy={policy:?}"
+        );
+    }
+}

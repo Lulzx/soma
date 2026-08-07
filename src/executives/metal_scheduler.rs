@@ -101,11 +101,18 @@ kernel void soma_device_admit(
     placements[gid] = placement;
 }
 
-inline bool index_after(device const Candidate* candidates, uint left, uint right) {
+inline bool index_after(device const Candidate* candidates, uint left, uint right, uint mode) {
     if (left == 0xFFFFFFFFu) return right != 0xFFFFFFFFu;
     if (right == 0xFFFFFFFFu) return false;
     Candidate a = candidates[left];
     Candidate b = candidates[right];
+    if (mode == 0u) {
+        if (a.process != b.process) return a.process > b.process;
+        if (a.state_access != b.state_access) return a.state_access < b.state_access;
+        if (a.waiting_since != b.waiting_since) return a.waiting_since > b.waiting_since;
+        if (a.continuation != b.continuation) return a.continuation > b.continuation;
+        return a.input_order > b.input_order;
+    }
     return a.bin > b.bin || (a.bin == b.bin && a.input_order > b.input_order);
 }
 
@@ -114,10 +121,12 @@ kernel void soma_device_index_init(
     device uint* indices [[buffer(1)]],
     constant uint& count [[buffer(2)]],
     constant uint& padded [[buffer(3)]],
+    constant uint& admitted_only [[buffer(4)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= padded) return;
-    indices[gid] = gid < count && placements[gid].disposition == 1u ? gid : 0xFFFFFFFFu;
+    indices[gid] = gid < count && (admitted_only == 0u || placements[gid].disposition == 1u)
+        ? gid : 0xFFFFFFFFu;
 }
 
 kernel void soma_device_index_sort(
@@ -126,6 +135,7 @@ kernel void soma_device_index_sort(
     constant uint& padded [[buffer(2)]],
     constant uint& merge_width [[buffer(3)]],
     constant uint& compare_distance [[buffer(4)]],
+    constant uint& mode [[buffer(5)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= padded) return;
@@ -134,12 +144,39 @@ kernel void soma_device_index_sort(
     uint left = indices[gid];
     uint right = indices[partner];
     bool descending = (gid & merge_width) != 0u;
-    bool swap = descending ? index_after(candidates, right, left)
-                           : index_after(candidates, left, right);
+    bool swap = descending ? index_after(candidates, right, left, mode)
+                           : index_after(candidates, left, right, mode);
     if (swap) {
         indices[gid] = right;
         indices[partner] = left;
     }
+}
+
+kernel void soma_device_admit_sorted(
+    device const Candidate* candidates [[buffer(0)]],
+    device Placement* placements [[buffer(1)]],
+    device const uint* indices [[buffer(2)]],
+    constant uint& count [[buffer(3)]],
+    uint sorted_at [[thread_position_in_grid]]
+) {
+    if (sorted_at >= count) return;
+    uint original = indices[sorted_at];
+    Candidate candidate = candidates[original];
+    bool wins = true;
+    if (candidate.state_access == 2u && sorted_at > 0u) {
+        Candidate previous = candidates[indices[sorted_at - 1u]];
+        wins = previous.process != candidate.process || previous.state_access != 2u;
+    }
+    Placement placement;
+    placement.disposition = wins ? 1u : 0u;
+    placement.bin = candidate.bin;
+    placement.run_class = candidate.run_class;
+    placement.bin_rank = 0u;
+    placement.cohort = 0u;
+    placement.lane_in_cohort = 0u;
+    placement.input_order = candidate.input_order;
+    placement.reserved = 0u;
+    placements[original] = placement;
 }
 
 kernel void soma_device_place_sorted(
@@ -215,6 +252,7 @@ pub struct MetalDeviceScheduler {
     device: Device,
     queue: CommandQueue,
     admission: ComputePipelineState,
+    sorted_admission: ComputePipelineState,
     index_init: ComputePipelineState,
     index_sort: ComputePipelineState,
     placement: ComputePipelineState,
@@ -233,6 +271,9 @@ impl MetalDeviceScheduler {
         let admission_fn = library
             .get_function("soma_device_admit", None)
             .map_err(|_| BackendError::ExecutionFailed)?;
+        let sorted_admission_fn = library
+            .get_function("soma_device_admit_sorted", None)
+            .map_err(|_| BackendError::ExecutionFailed)?;
         let index_init_fn = library
             .get_function("soma_device_index_init", None)
             .map_err(|_| BackendError::ExecutionFailed)?;
@@ -247,6 +288,9 @@ impl MetalDeviceScheduler {
             .map_err(|_| BackendError::ExecutionFailed)?;
         let admission = device
             .new_compute_pipeline_state_with_function(&admission_fn)
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let sorted_admission = device
+            .new_compute_pipeline_state_with_function(&sorted_admission_fn)
             .map_err(|_| BackendError::ExecutionFailed)?;
         let index_init = device
             .new_compute_pipeline_state_with_function(&index_init_fn)
@@ -264,6 +308,7 @@ impl MetalDeviceScheduler {
             device,
             queue,
             admission,
+            sorted_admission,
             index_init,
             index_sort,
             placement,
@@ -404,6 +449,76 @@ impl MetalDeviceScheduler {
         .to_vec())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn encode_index_sort(
+        &self,
+        command: &metal::CommandBufferRef,
+        candidate_buffer: &Buffer,
+        placement_buffer: &Buffer,
+        index_buffer: &Buffer,
+        count: u32,
+        padded: u32,
+        admitted_only: u32,
+        mode: u32,
+    ) {
+        let initialize = command.new_compute_command_encoder();
+        initialize.set_compute_pipeline_state(&self.index_init);
+        initialize.set_buffer(0, Some(placement_buffer), 0);
+        initialize.set_buffer(1, Some(index_buffer), 0);
+        initialize.set_bytes(
+            2,
+            std::mem::size_of::<u32>() as u64,
+            (&count as *const u32).cast::<c_void>(),
+        );
+        initialize.set_bytes(
+            3,
+            std::mem::size_of::<u32>() as u64,
+            (&padded as *const u32).cast::<c_void>(),
+        );
+        initialize.set_bytes(
+            4,
+            std::mem::size_of::<u32>() as u64,
+            (&admitted_only as *const u32).cast::<c_void>(),
+        );
+        dispatch(initialize, &self.index_init, padded);
+        initialize.end_encoding();
+
+        let mut merge_width = 2u32;
+        while merge_width <= padded {
+            let mut compare_distance = merge_width / 2;
+            while compare_distance > 0 {
+                let sort = command.new_compute_command_encoder();
+                sort.set_compute_pipeline_state(&self.index_sort);
+                sort.set_buffer(0, Some(candidate_buffer), 0);
+                sort.set_buffer(1, Some(index_buffer), 0);
+                sort.set_bytes(
+                    2,
+                    std::mem::size_of::<u32>() as u64,
+                    (&padded as *const u32).cast::<c_void>(),
+                );
+                sort.set_bytes(
+                    3,
+                    std::mem::size_of::<u32>() as u64,
+                    (&merge_width as *const u32).cast::<c_void>(),
+                );
+                sort.set_bytes(
+                    4,
+                    std::mem::size_of::<u32>() as u64,
+                    (&compare_distance as *const u32).cast::<c_void>(),
+                );
+                sort.set_bytes(
+                    5,
+                    std::mem::size_of::<u32>() as u64,
+                    (&mode as *const u32).cast::<c_void>(),
+                );
+                dispatch(sort, &self.index_sort, padded);
+                sort.end_encoding();
+                compare_distance /= 2;
+            }
+            merge_width *= 2;
+        }
+    }
+
     pub fn schedule(
         &mut self,
         candidates: &[Candidate],
@@ -437,66 +552,59 @@ impl MetalDeviceScheduler {
         let placement_buffer = placement_buffer.clone();
         let index_buffer = index_buffer.clone();
 
-        let command = self.queue.new_command_buffer();
-        let admit = command.new_compute_command_encoder();
-        admit.set_compute_pipeline_state(&self.admission);
-        admit.set_buffer(0, Some(&candidate_buffer), 0);
-        admit.set_buffer(1, Some(&placement_buffer), 0);
-        admit.set_bytes(
-            2,
-            std::mem::size_of::<u32>() as u64,
-            (&count as *const u32).cast::<c_void>(),
-        );
-        dispatch(admit, &self.admission, count);
-        admit.end_encoding();
-
         let padded = candidates.len().next_power_of_two() as u32;
-        let initialize = command.new_compute_command_encoder();
-        initialize.set_compute_pipeline_state(&self.index_init);
-        initialize.set_buffer(0, Some(&placement_buffer), 0);
-        initialize.set_buffer(1, Some(&index_buffer), 0);
-        initialize.set_bytes(
-            2,
-            std::mem::size_of::<u32>() as u64,
-            (&count as *const u32).cast::<c_void>(),
-        );
-        initialize.set_bytes(
-            3,
-            std::mem::size_of::<u32>() as u64,
-            (&padded as *const u32).cast::<c_void>(),
-        );
-        dispatch(initialize, &self.index_init, padded);
-        initialize.end_encoding();
-
-        let mut merge_width = 2u32;
-        while merge_width <= padded {
-            let mut compare_distance = merge_width / 2;
-            while compare_distance > 0 {
-                let sort = command.new_compute_command_encoder();
-                sort.set_compute_pipeline_state(&self.index_sort);
-                sort.set_buffer(0, Some(&candidate_buffer), 0);
-                sort.set_buffer(1, Some(&index_buffer), 0);
-                sort.set_bytes(
-                    2,
-                    std::mem::size_of::<u32>() as u64,
-                    (&padded as *const u32).cast::<c_void>(),
-                );
-                sort.set_bytes(
-                    3,
-                    std::mem::size_of::<u32>() as u64,
-                    (&merge_width as *const u32).cast::<c_void>(),
-                );
-                sort.set_bytes(
-                    4,
-                    std::mem::size_of::<u32>() as u64,
-                    (&compare_distance as *const u32).cast::<c_void>(),
-                );
-                dispatch(sort, &self.index_sort, padded);
-                sort.end_encoding();
-                compare_distance /= 2;
-            }
-            merge_width *= 2;
+        let command = self.queue.new_command_buffer();
+        let mutable_count = candidates
+            .iter()
+            .filter(|candidate| candidate.state_access == crate::abi::StateAccess::Mutable)
+            .count();
+        if mutable_count >= 128 {
+            self.encode_index_sort(
+                command,
+                &candidate_buffer,
+                &placement_buffer,
+                &index_buffer,
+                count,
+                padded,
+                0,
+                0,
+            );
+            let admit = command.new_compute_command_encoder();
+            admit.set_compute_pipeline_state(&self.sorted_admission);
+            admit.set_buffer(0, Some(&candidate_buffer), 0);
+            admit.set_buffer(1, Some(&placement_buffer), 0);
+            admit.set_buffer(2, Some(&index_buffer), 0);
+            admit.set_bytes(
+                3,
+                std::mem::size_of::<u32>() as u64,
+                (&count as *const u32).cast::<c_void>(),
+            );
+            dispatch(admit, &self.sorted_admission, count);
+            admit.end_encoding();
+        } else {
+            let admit = command.new_compute_command_encoder();
+            admit.set_compute_pipeline_state(&self.admission);
+            admit.set_buffer(0, Some(&candidate_buffer), 0);
+            admit.set_buffer(1, Some(&placement_buffer), 0);
+            admit.set_bytes(
+                2,
+                std::mem::size_of::<u32>() as u64,
+                (&count as *const u32).cast::<c_void>(),
+            );
+            dispatch(admit, &self.admission, count);
+            admit.end_encoding();
         }
+
+        self.encode_index_sort(
+            command,
+            &candidate_buffer,
+            &placement_buffer,
+            &index_buffer,
+            count,
+            padded,
+            1,
+            1,
+        );
 
         let place = command.new_compute_command_encoder();
         place.set_compute_pipeline_state(&self.placement);

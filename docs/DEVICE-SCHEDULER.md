@@ -21,6 +21,14 @@ mutable candidate for the same process and yields to the smallest
 longest-waiting, identity-tiebroken rule as `scheduler::admission::admit`, with
 no first-arriving atomic winner.
 
+That comparison kernel remains the low-fixed-cost path for fewer than 128
+mutable claims. At 128 or more, indices are instead sorted by full process
+identity, mutable-before-read-only access, waiting age, and continuation
+identity; the first mutable claim in each process group wins. The threshold
+changes only the algorithm, not the decision. In particular the device ABI now
+carries the complete process `Ref64`, rather than its slot/partition key, so a
+generation can never alias another claim.
+
 Placement no longer performs a quadratic all-candidate scan. Admitted candidate
 indices are initialized in resident storage, sorted by `(bin, input order)` by
 a deterministic device-side bitonic network, and assigned bin rank through
@@ -69,12 +77,12 @@ independent oracle at that boundary. This moves the conflict gate needed before
 canonical commit onto the device. It does not yet move operation replay or
 handler execution there.
 
-Mutable-claim admission remains quadratic in the worst case because each
-mutable candidate compares the complete same-process claim set. Read-only
-candidates take the constant path, and placement is now `O(n log² n)` sorting
-plus `O(n log n)` bound lookup. Irregular randomized epochs from 1 through 127
-candidates, including non-power-of-two sizes, contested mutable claims, sparse
-bins, and all four partial policies agree field-for-field with the oracle.
+Read-only admission takes the constant path. Small mutable sets retain the
+bounded quadratic comparison path; large mutable sets and placement use
+`O(n log² n)` sorting plus `O(n log n)` bound lookup. Irregular randomized
+epochs from 1 through 127 candidates and a separate 257-candidate mixed mutable
+epoch—including non-power-of-two sizes, contested claims, sparse bins, and all
+four partial policies—agree field-for-field with the oracle.
 
 ## Remaining integration
 

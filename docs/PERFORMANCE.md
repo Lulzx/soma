@@ -392,8 +392,8 @@ Admission has a different adversary. With all 2,048 candidates mutable and
 claiming one process, CPU admission takes 10.792µs while Metal takes 537.625µs
 (49.8× slower): only one lane survives, and every GPU claimant still scans the
 set. This control prevents attributing the read-only scaling result to all
-scheduler traffic. A grouped deterministic mutable-claim reduction remains an
-optimization target.
+scheduler traffic. The subsequent scheduler slice adds the grouped,
+deterministic mutable-claim sort; this row remains its before measurement.
 
 The post-sort width-one control is 615.417µs CPU and 268.250µs Metal. As before,
 it measures placement writes rather than evaluator-lane throughput. Full raw

@@ -170,7 +170,7 @@ impl DeviceCandidate {
     pub fn from_candidate(candidate: Candidate, input_order: usize) -> Self {
         Self {
             continuation: candidate.continuation.to_u64(),
-            process: candidate.process.key(),
+            process: candidate.process.to_u64(),
             bin: candidate.bin,
             run_class: candidate.run_class,
             waiting_since: candidate.waiting_since,
