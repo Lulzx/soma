@@ -16,7 +16,7 @@ use crate::compiler::body::{ElementLayout, EvaluatorProgram, FieldWidth, Op, Sto
 use crate::discovery::invariants::{verify_pair, DiscoveryInvariantReport};
 use crate::discovery::{
     execute_naive, execute_optimized, DiscoveryError, DiscoveryEvent, DiscoveryNode,
-    DiscoveryResult, DiscoveryTrace, EvaluationSpec, FusionClass, ModuleDigest,
+    DiscoveryResult, DiscoveryTrace, EvaluationSpec, FusionClass, ModuleDigest, ObjectDigest,
 };
 use crate::executives::batch::{
     execute_epoch_with_spill, execute_with_spill, BackendError, BatchBackend, CpuReferenceBackend,
@@ -25,6 +25,9 @@ use crate::executives::batch::{
 use crate::experiments::backend_bench::{synthetic_inputs, synthetic_program};
 use crate::kernel::ownership::freeze;
 use crate::kernel::{Kernel, SYSTEM_PRINCIPAL};
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+use crate::executives::metal::{MetalBatchBackend, MetalTuning};
 
 const REPLAY_EVALUATOR: u32 = 20_000;
 
@@ -123,6 +126,13 @@ pub struct TimingObservation {
     pub config_id: u32,
     pub trial: u32,
     pub elapsed_nanos: u64,
+    pub output_digest: ObjectDigest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PhysicalMeasurement {
+    pub elapsed_nanos: u64,
+    pub output_digest: ObjectDigest,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -155,17 +165,47 @@ pub struct SelfTuningReport {
 
 pub fn cpu_configurations(thread_counts: &[usize]) -> Vec<ExecutionConfig> {
     let mut configs = Vec::new();
-    for &threads in thread_counts {
+    let threads: std::collections::BTreeSet<_> = thread_counts
+        .iter()
+        .map(|threads| (*threads).max(1))
+        .collect();
+    for threads in threads {
         for batched_epoch in [false, true] {
             configs.push(ExecutionConfig {
                 id: configs.len() as u32 + 1,
                 placement: Placement::Cpu,
                 batched_epoch,
-                cpu_threads: threads.max(1),
+                cpu_threads: threads,
                 threadgroup_width: None,
                 reuse_scratch_buffers: true,
             });
         }
+    }
+    configs
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn hardware_configurations(thread_counts: &[usize]) -> Vec<ExecutionConfig> {
+    let mut configs = cpu_configurations(thread_counts);
+    let mut push_metal = |batched_epoch, threadgroup_width, reuse_scratch_buffers| {
+        configs.push(ExecutionConfig {
+            id: configs.len() as u32 + 1,
+            placement: Placement::Metal,
+            batched_epoch,
+            cpu_threads: 1,
+            threadgroup_width,
+            reuse_scratch_buffers,
+        });
+    };
+
+    // Isolate command grouping and allocation reuse at the default width.
+    push_metal(false, None, true);
+    push_metal(true, None, false);
+    // Then search threadgroup width with both of those choices held at their
+    // production defaults. `None` is intentionally a candidate: a hard-coded
+    // width has to beat the device-reported SIMD width, not merely differ.
+    for width in [None, Some(32), Some(64), Some(128), Some(256)] {
+        push_metal(true, width, true);
     }
     configs
 }
@@ -176,7 +216,10 @@ pub fn cpu_configurations(thread_counts: &[usize]) -> Vec<ExecutionConfig> {
 pub fn capture_with(
     study: &TuningStudy,
     configs: &[ExecutionConfig],
-    mut measure: impl FnMut(&TuningWorkload, &ExecutionConfig) -> Result<u64, BackendError>,
+    mut measure: impl FnMut(
+        &TuningWorkload,
+        &ExecutionConfig,
+    ) -> Result<PhysicalMeasurement, BackendError>,
 ) -> Result<CapturedStudy, BackendError> {
     if configs.is_empty() || study.workloads.is_empty() || study.trials == 0 {
         return Err(BackendError::InvalidInput);
@@ -191,11 +234,13 @@ pub fn capture_with(
             let offset = trial as usize % configs.len();
             for position in 0..configs.len() {
                 let config = &configs[(position + offset) % configs.len()];
+                let measured = measure(workload, config)?;
                 observations.push(TimingObservation {
                     workload_id: workload.id,
                     config_id: config.id,
                     trial,
-                    elapsed_nanos: measure(workload, config)?,
+                    elapsed_nanos: measured.elapsed_nanos,
+                    output_digest: measured.output_digest,
                 });
             }
         }
@@ -249,6 +294,70 @@ pub fn capture_cpu(
     })
 }
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn capture_metal(
+    study: &TuningStudy,
+    thread_counts: &[usize],
+) -> Result<CapturedStudy, BackendError> {
+    let configs = hardware_configurations(thread_counts);
+    let programs: Vec<_> = study
+        .workloads
+        .iter()
+        .map(|workload| synthetic_program(21_000 + workload.id, 2, workload.alu_ops))
+        .collect();
+    let refs: Vec<_> = programs.iter().collect();
+    // All Metal candidates share this backend and therefore these compiled
+    // pipelines. `set_tuning` changes only dispatch-time policy.
+    let mut metal = MetalBatchBackend::with(&refs)?;
+    let mut cpu_backends: BTreeMap<usize, CpuReferenceBackend> = thread_counts
+        .iter()
+        .copied()
+        .map(|threads| {
+            (
+                threads.max(1),
+                CpuReferenceBackend::with(&refs).with_threads(threads),
+            )
+        })
+        .collect();
+    let fallback_threads = cpu_backends
+        .keys()
+        .next()
+        .copied()
+        .ok_or(BackendError::InvalidInput)?;
+
+    capture_with(study, &configs, |workload, config| {
+        let program = programs
+            .iter()
+            .find(|program| program.id() == 21_000 + workload.id)
+            .ok_or(BackendError::InvalidInput)?;
+        match config.placement {
+            Placement::Cpu => {
+                let cpu = cpu_backends
+                    .get_mut(&config.cpu_threads)
+                    .ok_or(BackendError::InvalidInput)?;
+                measure_epoch_once(
+                    program,
+                    workload,
+                    u32::MAX,
+                    &mut metal,
+                    cpu,
+                    config.batched_epoch,
+                )
+            }
+            Placement::Metal => {
+                metal.set_tuning(MetalTuning {
+                    threadgroup_width: config.threadgroup_width,
+                    reuse_scratch_buffers: config.reuse_scratch_buffers,
+                });
+                let cpu = cpu_backends
+                    .get_mut(&fallback_threads)
+                    .ok_or(BackendError::InvalidInput)?;
+                measure_epoch_once(program, workload, 1, &mut metal, cpu, config.batched_epoch)
+            }
+        }
+    })
+}
+
 pub fn replay(captured: CapturedStudy) -> Result<SelfTuningReport, DiscoveryError> {
     replay_with_preparation_sharing(captured, true)
 }
@@ -281,6 +390,14 @@ pub fn run_cpu(
     thread_counts: &[usize],
 ) -> Result<SelfTuningReport, DiscoveryError> {
     replay(capture_cpu(study, thread_counts).map_err(DiscoveryError::Backend)?)
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn run_metal(
+    study: &TuningStudy,
+    thread_counts: &[usize],
+) -> Result<SelfTuningReport, DiscoveryError> {
+    replay(capture_metal(study, thread_counts).map_err(DiscoveryError::Backend)?)
 }
 
 pub fn trace_from_capture(captured: &CapturedStudy, share_preparation: bool) -> DiscoveryTrace {
@@ -357,6 +474,9 @@ pub fn trace_from_capture(captured: &CapturedStudy, share_preparation: bool) -> 
                 ],
             );
             evaluation.contract = config.label().into_bytes();
+            evaluation
+                .contract
+                .extend_from_slice(&observation.output_digest.0);
             let observation_request = request;
             trace.push(DiscoveryEvent::NodeRequested {
                 request,
@@ -451,6 +571,19 @@ fn validate_capture(captured: &CapturedStudy) -> Result<(), DiscoveryError> {
         ));
     }
     for workload in &captured.study.workloads {
+        let mut output_digests = captured
+            .observations
+            .iter()
+            .filter(|sample| sample.workload_id == workload.id)
+            .map(|sample| sample.output_digest);
+        let expected_digest = output_digests.next().ok_or(DiscoveryError::InvalidTrace(
+            "self-tuning workload has no observations",
+        ))?;
+        if output_digests.any(|digest| digest != expected_digest) {
+            return Err(DiscoveryError::InvalidTrace(
+                "self-tuning configuration output mismatch",
+            ));
+        }
         for config in &captured.configs {
             for trial in 0..captured.study.trials {
                 let count = captured
@@ -512,7 +645,7 @@ fn measure_epoch_once(
     accelerator: &mut dyn BatchBackend,
     cpu: &mut dyn BatchBackend,
     batched: bool,
-) -> Result<u64, BackendError> {
+) -> Result<PhysicalMeasurement, BackendError> {
     let stride = program.stride();
     let bytes = synthetic_inputs(workload.elements_per_cohort, stride);
     let mut kernel = Kernel::new();
@@ -542,8 +675,8 @@ fn measure_epoch_once(
 
     let mut stats = PlacementStats::default();
     let started = Instant::now();
-    if batched {
-        let outputs = execute_epoch_with_spill(
+    let outputs = if batched {
+        execute_epoch_with_spill(
             &mut kernel,
             owner,
             &collectives,
@@ -551,9 +684,9 @@ fn measure_epoch_once(
             accelerator,
             cpu,
             &mut stats,
-        )?;
-        std::hint::black_box(outputs);
+        )?
     } else {
+        let mut outputs = Vec::with_capacity(collectives.len());
         for collective in collectives {
             let output = execute_with_spill(
                 &mut kernel,
@@ -564,8 +697,22 @@ fn measure_epoch_once(
                 cpu,
                 &mut stats,
             )?;
-            std::hint::black_box(output);
+            outputs.push(output);
         }
+        outputs
+    };
+    let elapsed_nanos = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+    let mut output_bytes = Vec::new();
+    for output in outputs {
+        output_bytes.extend_from_slice(
+            kernel
+                .object_bytes(owner, output)
+                .map_err(BackendError::from)?,
+        );
     }
-    Ok(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64)
+    std::hint::black_box(&output_bytes);
+    Ok(PhysicalMeasurement {
+        elapsed_nanos,
+        output_digest: ObjectDigest::of(&output_bytes),
+    })
 }

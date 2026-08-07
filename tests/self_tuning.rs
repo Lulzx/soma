@@ -1,7 +1,7 @@
-use soma::discovery::DiscoveryError;
+use soma::discovery::{DiscoveryError, ObjectDigest};
 use soma::experiments::self_tuning::{
     capture_with, cpu_configurations, replay, replay_with_preparation_sharing, run_cpu,
-    CapturedStudy, TimingObservation, TuningStudy, TuningWorkload,
+    CapturedStudy, PhysicalMeasurement, TimingObservation, TuningStudy, TuningWorkload,
 };
 
 fn tiny_study(trials: u32) -> TuningStudy {
@@ -23,7 +23,10 @@ fn acquisition_is_counterbalanced_and_preserves_every_trial() {
     let mut calls = Vec::new();
     let captured = capture_with(&study, &configs, |_, config| {
         calls.push(config.id);
-        Ok(u64::from(config.id))
+        Ok(PhysicalMeasurement {
+            elapsed_nanos: u64::from(config.id),
+            output_digest: ObjectDigest::of(b"same output"),
+        })
     })
     .unwrap();
 
@@ -44,6 +47,7 @@ fn identical_observations() -> CapturedStudy {
                 config_id: config.id,
                 trial,
                 elapsed_nanos: 42,
+                output_digest: ObjectDigest::of(b"same output"),
             })
         })
         .collect();
@@ -102,10 +106,39 @@ fn malformed_capture_is_rejected_before_replay() {
 }
 
 #[test]
+fn differing_configuration_outputs_invalidate_the_study() {
+    let mut malformed = identical_observations();
+    malformed.observations[0].output_digest = ObjectDigest::of(b"wrong output");
+    assert_eq!(
+        replay(malformed).unwrap_err(),
+        DiscoveryError::InvalidTrace("self-tuning configuration output mismatch")
+    );
+}
+
+#[test]
 fn real_cpu_search_produces_equivalent_scientific_state() {
     let report = run_cpu(&tiny_study(3), &[1, 2]).unwrap();
     assert!(report.invariants.all_hold());
     assert_eq!(report.captured.observations.len(), 12);
     assert_eq!(report.rankings.len(), 1);
     assert_eq!(report.rankings[0].configs.len(), 4);
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn real_metal_search_shares_compilation_and_preserves_outputs() {
+    use soma::experiments::self_tuning::{hardware_configurations, run_metal};
+
+    let report = run_metal(&tiny_study(2), &[1, 2]).unwrap();
+    assert!(report.invariants.all_hold());
+    assert_eq!(report.captured.configs, hardware_configurations(&[1, 2]));
+    assert_eq!(
+        report.captured.observations.len(),
+        report.captured.configs.len() * 2
+    );
+    assert!(report
+        .captured
+        .configs
+        .iter()
+        .any(|config| config.placement == soma::experiments::self_tuning::Placement::Metal));
 }
