@@ -68,11 +68,11 @@
 //! the grouping *visible*; it does not make it fast, and it says nothing about
 //! throughput.
 
-use crate::abi::{ObjectKind, ProcessMode, Ref64, Rights, StateAccess, SupervisionPolicy};
-use crate::compiler::frame::{ByteCursor, Frame, FrameError};
-use crate::compiler::frame::{put_ref64, put_u16, put_u32, put_u64, put_u8, put_vec_u64};
-use crate::compiler::run_classes::{ANT_EXPLORE, COLONY_AGGREGATE, WORLD_STEP};
 use crate::abi::PartialCohortPolicy;
+use crate::abi::{ObjectKind, ProcessMode, Ref64, Rights, StateAccess, SupervisionPolicy};
+use crate::compiler::frame::{put_ref64, put_u16, put_u32, put_u64, put_u8, put_vec_u64};
+use crate::compiler::frame::{ByteCursor, Frame, FrameError};
+use crate::compiler::run_classes::{ANT_EXPLORE, COLONY_AGGREGATE, WORLD_STEP};
 use crate::kernel::accounting::Accounting;
 use crate::kernel::{ContinuationSpec, Kernel, SYSTEM_PRINCIPAL};
 use crate::scheduler::runnable_bins::SchedulingMode;
@@ -897,7 +897,8 @@ pub fn observe_ants(kernel: &mut Kernel, colony: &AntColony) -> Vec<AntView> {
         let Some((run_class, alive)) = continuation_status(kernel, handle.continuation) else {
             continue;
         };
-        let Some(frame) = read_frame::<AntFrame>(kernel, handle.process, handle.continuation) else {
+        let Some(frame) = read_frame::<AntFrame>(kernel, handle.process, handle.continuation)
+        else {
             continue;
         };
         views.push(AntView {

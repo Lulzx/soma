@@ -238,18 +238,19 @@ pub fn create_expand(kernel: &mut Kernel, request_value: u64) -> (Ref64, Ref64) 
     let frame = ExpandFrame::initial(request_value, requester);
     let mut bytes = Vec::new();
     frame.encode(&mut bytes);
-    let cont = kernel.create_continuation(
-        crate::kernel::SYSTEM_PRINCIPAL,
-        expand,
-        ContinuationSpec::new(
-            StateAccess::ReadOnly,
-            EXPAND_RESUME_0,
-            EXPAND_RESUME_0,
-            bytes,
-            DEFAULT_MAX_STEPS,
-        ),
-    )
-    .expect("system may create the initial continuation");
+    let cont = kernel
+        .create_continuation(
+            crate::kernel::SYSTEM_PRINCIPAL,
+            expand,
+            ContinuationSpec::new(
+                StateAccess::ReadOnly,
+                EXPAND_RESUME_0,
+                EXPAND_RESUME_0,
+                bytes,
+                DEFAULT_MAX_STEPS,
+            ),
+        )
+        .expect("system may create the initial continuation");
 
     // Ingest the request message into the search process's mailbox (§18 Phase A).
     // This wakes resume_0 if it is already waiting; otherwise it is consumed on

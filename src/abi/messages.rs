@@ -19,7 +19,7 @@ pub struct MessageDescriptor {
     pub sender_sequence: u64,
     pub logical_timestamp: u64,
 
-    pub payload: Ref64,               // CapRef
+    pub payload: Ref64,                // CapRef
     pub transferred_capability: Ref64, // CapRef
 
     pub completion_future: Ref64,

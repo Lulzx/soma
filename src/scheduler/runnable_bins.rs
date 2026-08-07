@@ -111,7 +111,11 @@ impl DoubleBin {
 
     /// Every queued continuation in this bin, current buffer first.
     fn entries(&self) -> impl Iterator<Item = Ref64> + '_ {
-        self.current.iter().chain(self.next.iter()).flatten().copied()
+        self.current
+            .iter()
+            .chain(self.next.iter())
+            .flatten()
+            .copied()
     }
 
     /// Swap `next` into `current` at the epoch boundary.

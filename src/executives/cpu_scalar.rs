@@ -21,8 +21,8 @@ use crate::abi::{MessageDescriptor, StateAccess, StepResult};
 use crate::compiler::frame::{ByteCursor, Frame};
 use crate::compiler::run_classes::{
     ant_class_index, search_class_index, COLONY_AGGREGATE, DEFAULT_MAX_STEPS, EXPAND_RESUME_0,
-    EXPAND_RESUME_1, EXPAND_RESUME_2, JOIN_AWAIT, JOIN_RESUME, POLL_ACT, POLL_FUTURE, SEARCH_BRANCH,
-    SEARCH_HEURISTIC, WORLD_STEP,
+    EXPAND_RESUME_1, EXPAND_RESUME_2, JOIN_AWAIT, JOIN_RESUME, POLL_ACT, POLL_FUTURE,
+    SEARCH_BRANCH, SEARCH_HEURISTIC, WORLD_STEP,
 };
 use crate::compiler::state_machine_lowering::{
     search_step, ExpandFrame, HeuristicFrame, JoinFrame, SearchFrame,
@@ -91,8 +91,7 @@ pub fn dispatch(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64, rc: u32) -
 
 fn frame_bytes(lane: &mut LaneView<'_>, actor: Ref64) -> Vec<u8> {
     let obj = lane.frame();
-    lane
-        .object_bytes(actor, obj)
+    lane.object_bytes(actor, obj)
         .map(|b| b.to_vec())
         .unwrap_or_default()
 }
@@ -140,19 +139,18 @@ fn expand_resume_0(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> Step
             };
             let mut hb = Vec::new();
             hframe.encode(&mut hb);
-            lane
-                .create_continuation(
-                    process,
-                    process,
-                    ContinuationSpec::new(
-                        StateAccess::ReadOnly,
-                        SEARCH_HEURISTIC,
-                        0,
-                        hb,
-                        DEFAULT_MAX_STEPS,
-                    ),
-                )
-                .expect("a process may create its own continuation");
+            lane.create_continuation(
+                process,
+                process,
+                ContinuationSpec::new(
+                    StateAccess::ReadOnly,
+                    SEARCH_HEURISTIC,
+                    0,
+                    hb,
+                    DEFAULT_MAX_STEPS,
+                ),
+            )
+            .expect("a process may create its own continuation");
 
             store_frame(lane, process, &frame);
             match lane.await_future(process, cont, fut, EXPAND_RESUME_1) {
@@ -215,19 +213,18 @@ fn expand_resume_2(lane: &mut LaneView<'_>, cont: Ref64, process: Ref64) -> Step
         let cframe = SearchFrame::leaf(m, 0);
         let mut cb = Vec::new();
         cframe.encode(&mut cb);
-        lane
-            .create_continuation(
-                process,
-                child,
-                ContinuationSpec::new(
-                    StateAccess::ReadOnly,
-                    SEARCH_BRANCH,
-                    0,
-                    cb,
-                    DEFAULT_MAX_STEPS,
-                ),
-            )
-            .expect("the creator holds WRITE on the child process");
+        lane.create_continuation(
+            process,
+            child,
+            ContinuationSpec::new(
+                StateAccess::ReadOnly,
+                SEARCH_BRANCH,
+                0,
+                cb,
+                DEFAULT_MAX_STEPS,
+            ),
+        )
+        .expect("the creator holds WRITE on the child process");
         frame.move_index += 1;
     }
 
@@ -410,19 +407,12 @@ fn search_branch(lane: &mut LaneView<'_>, _cont: Ref64, process: Ref64, index: u
             let run_class = cframe.run_class();
             let mut cb = Vec::new();
             cframe.encode(&mut cb);
-            lane
-                .create_continuation(
-                    process,
-                    child,
-                    ContinuationSpec::new(
-                        StateAccess::ReadOnly,
-                        run_class,
-                        0,
-                        cb,
-                        DEFAULT_MAX_STEPS,
-                    ),
-                )
-                .expect("the creator holds WRITE on the child process");
+            lane.create_continuation(
+                process,
+                child,
+                ContinuationSpec::new(StateAccess::ReadOnly, run_class, 0, cb, DEFAULT_MAX_STEPS),
+            )
+            .expect("the creator holds WRITE on the child process");
         }
         // Spawn with no continuation: the commit phase terminates this node.
         StepResult::spawn(process, 0)

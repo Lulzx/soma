@@ -27,7 +27,10 @@ pub fn events_of<'a>(
     kernel: &'a Kernel,
     kind: EventKind,
 ) -> impl Iterator<Item = &'a TraceEvent> + 'a {
-    kernel.trace_events().iter().filter(move |t| t.event_kind == kind)
+    kernel
+        .trace_events()
+        .iter()
+        .filter(move |t| t.event_kind == kind)
 }
 
 /// Whether two runs produced identical traces (used to assert determinism).

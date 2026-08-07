@@ -181,11 +181,7 @@ pub fn report(knobs: &ControlKnobs, cohort_width: u16) -> String {
     let mut s = String::new();
     s.push_str(&format!(
         "branching={} depth={} roots={} classes={} width={}\n",
-        knobs.branching_factor,
-        knobs.depth,
-        knobs.process_count,
-        knobs.class_count,
-        cohort_width
+        knobs.branching_factor, knobs.depth, knobs.process_count, knobs.class_count, cohort_width
     ));
     for (label, run) in [("persistent-fifo", c.fifo), ("run-class", c.cohorted)] {
         s.push_str(&format!(
@@ -215,11 +211,7 @@ pub fn baseline_report(knobs: &ControlKnobs, cohort_width: u16) -> String {
     let mut s = String::new();
     s.push_str(&format!(
         "branching={} depth={} roots={} classes={} width={}\n",
-        knobs.branching_factor,
-        knobs.depth,
-        knobs.process_count,
-        knobs.class_count,
-        cohort_width
+        knobs.branching_factor, knobs.depth, knobs.process_count, knobs.class_count, cohort_width
     ));
     s.push_str(&format!(
         "  {:<22} dispatches={:<7} occupancy={:.3}  host_launches={}\n",

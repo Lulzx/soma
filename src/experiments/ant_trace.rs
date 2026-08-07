@@ -182,8 +182,7 @@ impl<W: Write> Exporter<W> {
             self.options.cohort_width,
             crate::abi::PartialCohortPolicy::RunPartial,
         );
-        let (mut kernel, colony) =
-            crate::experiments::ant_colony::build_in(kernel, knobs);
+        let (mut kernel, colony) = crate::experiments::ant_colony::build_in(kernel, knobs);
 
         self.write_header(&mut kernel, &colony)?;
 
@@ -300,8 +299,8 @@ impl<W: Write> Exporter<W> {
         // The run-class table, so the viewer never hardcodes a behaviour name.
         write!(self.sink, ",\"run_classes\":{{")?;
         let mut first = true;
-        for run_class in crate::compiler::run_classes::ANT_BASE
-            ..=crate::compiler::run_classes::WORLD_STEP
+        for run_class in
+            crate::compiler::run_classes::ANT_BASE..=crate::compiler::run_classes::WORLD_STEP
         {
             if let Some(name) = ant_class_name(run_class) {
                 if !first {
@@ -342,7 +341,9 @@ impl<W: Write> Exporter<W> {
             }
             packed.extend_from_slice(&ant.x.to_le_bytes());
             packed.extend_from_slice(&ant.y.to_le_bytes());
-            let behaviour = ant.run_class.saturating_sub(crate::compiler::run_classes::ANT_BASE);
+            let behaviour = ant
+                .run_class
+                .saturating_sub(crate::compiler::run_classes::ANT_BASE);
             packed.push((behaviour as u8 & 0x07) | if ant.carrying { CARRYING_BIT } else { 0 });
             written += 1;
         }

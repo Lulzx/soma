@@ -232,20 +232,16 @@ impl<'a> LaneView<'a> {
             .record_speculative_write(Resource::Process(actor));
         self.kernel
             .record_speculative_write(Resource::Process(process));
-        let recorded_spec = self
-            .kernel
-            .is_speculative_recording()
-            .then(|| spec.clone());
+        let recorded_spec = self.kernel.is_speculative_recording().then(|| spec.clone());
         let result = self.kernel.create_continuation(actor, process, spec);
         if let Some(spec) = recorded_spec {
-            self.kernel.record_speculative_operation(
-                LaneOperation::CreateContinuation {
+            self.kernel
+                .record_speculative_operation(LaneOperation::CreateContinuation {
                     actor,
                     process,
                     spec,
                     result,
-                },
-            );
+                });
         }
         result
     }
@@ -365,8 +361,7 @@ impl<'a> LaneView<'a> {
     ) -> Result<(), RuntimeError> {
         self.kernel
             .record_speculative_write(Resource::Future(future));
-        self.kernel
-            .record_speculative_read(Resource::Object(value));
+        self.kernel.record_speculative_read(Resource::Object(value));
         let result = self.kernel.resolve_future(actor, future, value);
         self.kernel
             .record_speculative_operation(LaneOperation::ResolveFuture {

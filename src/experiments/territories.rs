@@ -238,7 +238,9 @@ fn proportional_blocks(trace: &ArrivalTrace, territories: usize) -> HashMap<u32,
 
     let mut start = 0;
     for (i, (class, _)) in classes.iter().enumerate() {
-        let len = sizes[i].max(1).min(territories - start.min(territories - 1));
+        let len = sizes[i]
+            .max(1)
+            .min(territories - start.min(territories - 1));
         blocks.insert(*class, (start.min(territories - 1), len));
         start = (start + len).min(territories);
     }
@@ -324,11 +326,11 @@ pub fn territory_policy(trace: &ArrivalTrace, cfg: &TerritoryConfig) -> Territor
     let last_tick = trace.horizon();
 
     let dispatch = |out: &mut TerritoryOutcome,
-                        queue: &mut VecDeque<Arrival>,
-                        territory: usize,
-                        run_class: u32,
-                        count: usize,
-                        tick: u32| {
+                    queue: &mut VecDeque<Arrival>,
+                    territory: usize,
+                    run_class: u32,
+                    count: usize,
+                    tick: u32| {
         let batch: Vec<Arrival> = queue.drain(..count).collect();
         let cost = dispatch_cost(&vec![run_class; count], cfg.width);
         out.cost.dispatches += cost.dispatches;
@@ -419,8 +421,7 @@ pub fn territory_policy(trace: &ArrivalTrace, cfg: &TerritoryConfig) -> Territor
 /// cohort fill. This is the number distributed cohorting has to match, and it
 /// is deliberately the strongest form of the baseline.
 pub fn global_sort_reference(trace: &ArrivalTrace, width: u16, window: u32) -> DispatchCost {
-    crate::experiments::irregular_arrival::bulk_policy(trace, width, window)
-        .cost
+    crate::experiments::irregular_arrival::bulk_policy(trace, width, window).cost
 }
 
 /// One row of the placement comparison.

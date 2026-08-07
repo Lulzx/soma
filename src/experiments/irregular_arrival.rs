@@ -464,12 +464,7 @@ pub fn regime_point(knobs: &IrregularKnobs, width: u16, budget: f64) -> RegimePo
     let sweep: Vec<u32> = vec![0, 1, 2, 4, 8, 16, 32, 64];
     let f = frontiers(&t, width, &sweep);
 
-    let peak = f
-        .soma
-        .iter()
-        .map(|p| p.occupancy)
-        .fold(0.0f64, f64::max)
-        - 1e-9;
+    let peak = f.soma.iter().map(|p| p.occupancy).fold(0.0f64, f64::max) - 1e-9;
     let wait_to_peak = |points: &[FrontierPoint]| {
         points
             .iter()

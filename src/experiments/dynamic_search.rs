@@ -82,18 +82,19 @@ pub fn build_in(mut kernel: Kernel, knobs: &ControlKnobs) -> Kernel {
         let run_class = frame.run_class();
         let mut bytes = Vec::new();
         frame.encode(&mut bytes);
-        kernel.create_continuation(
-            crate::kernel::SYSTEM_PRINCIPAL,
-            p,
-            ContinuationSpec::new(
-                StateAccess::ReadOnly,
-                run_class,
-                0,
-                bytes,
-                DEFAULT_MAX_STEPS,
-            ),
-        )
-        .expect("system may create root continuations");
+        kernel
+            .create_continuation(
+                crate::kernel::SYSTEM_PRINCIPAL,
+                p,
+                ContinuationSpec::new(
+                    StateAccess::ReadOnly,
+                    run_class,
+                    0,
+                    bytes,
+                    DEFAULT_MAX_STEPS,
+                ),
+            )
+            .expect("system may create root continuations");
     }
     kernel
 }

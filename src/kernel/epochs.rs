@@ -365,12 +365,7 @@ impl Kernel {
         })
     }
 
-    fn commit_evaluated(
-        &mut self,
-        cont: Ref64,
-        process: Ref64,
-        evaluated: EvaluatedStep,
-    ) -> usize {
+    fn commit_evaluated(&mut self, cont: Ref64, process: Ref64, evaluated: EvaluatedStep) -> usize {
         let consumed = commit::apply_step_result(self, cont, process, evaluated.result);
         if evaluated.executed {
             if let Ok(c) = self.continuations.get_mut(cont) {
@@ -544,11 +539,8 @@ impl Kernel {
                 self.object_payloads
                     .insert(object.key(), Payload::Host(bytes.clone()));
             }
-            steps += self.commit_evaluated(
-                outcome.continuation,
-                outcome.process,
-                outcome.evaluated,
-            );
+            steps +=
+                self.commit_evaluated(outcome.continuation, outcome.process, outcome.evaluated);
             self.leave_lane();
         }
         Some(steps)
@@ -576,9 +568,7 @@ impl Kernel {
                 spec,
                 result,
             } => self.create_continuation(*actor, *process, spec.clone()) == *result,
-            LaneOperation::CreateFuture { actor, result } => {
-                self.create_future(*actor) == *result
-            }
+            LaneOperation::CreateFuture { actor, result } => self.create_future(*actor) == *result,
             LaneOperation::CreateObject {
                 actor,
                 kind,
@@ -603,9 +593,7 @@ impl Kernel {
                 payload,
                 sender_continuation,
                 result,
-            } => {
-                self.enqueue_message(*actor, *receiver, *payload, *sender_continuation) == *result
-            }
+            } => self.enqueue_message(*actor, *receiver, *payload, *sender_continuation) == *result,
             LaneOperation::ReceiveMessage {
                 actor,
                 continuation,
@@ -623,9 +611,7 @@ impl Kernel {
                 future,
                 next_run_class,
                 result,
-            } => {
-                self.await_future(*actor, *continuation, *future, *next_run_class) == *result
-            }
+            } => self.await_future(*actor, *continuation, *future, *next_run_class) == *result,
         })
     }
 }

@@ -523,10 +523,7 @@ impl Kernel {
         }
     }
 
-    pub(crate) fn record_speculative_operation(
-        &mut self,
-        operation: speculation::LaneOperation,
-    ) {
+    pub(crate) fn record_speculative_operation(&mut self, operation: speculation::LaneOperation) {
         if let Some(journal) = &mut self.speculation_journal {
             journal.push(operation);
         }
@@ -2603,7 +2600,11 @@ impl Kernel {
             // resolver went first was indistinguishable from one in which
             // there had never been anything to wait for. It is also what I25
             // clause 2 reads to tell the two apart (v0.3 §4.15).
-            let value = self.futures.get(future).map(|f| f.value).unwrap_or(Ref64::NULL);
+            let value = self
+                .futures
+                .get(future)
+                .map(|f| f.value)
+                .unwrap_or(Ref64::NULL);
             self.trace_full(
                 EventKind::FutureAwaitSettled,
                 actor,

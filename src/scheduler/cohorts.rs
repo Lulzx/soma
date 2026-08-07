@@ -126,8 +126,7 @@ pub fn build_cohorts(
                 }
                 // Both remaining policies dispatch the remainder as-is; Phase 1
                 // has no generic class for the merge variant to fold into.
-                PartialCohortPolicy::RunPartial
-                | PartialCohortPolicy::MergeWithGenericClass => {}
+                PartialCohortPolicy::RunPartial | PartialCohortPolicy::MergeWithGenericClass => {}
             }
         }
 

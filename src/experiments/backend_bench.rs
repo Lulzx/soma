@@ -289,8 +289,8 @@ pub fn time_epoch(
         .collect();
 
     let once = |kernel: &mut Kernel,
-                    accelerator: &mut dyn BatchBackend,
-                    cpu: &mut dyn BatchBackend|
+                accelerator: &mut dyn BatchBackend,
+                cpu: &mut dyn BatchBackend|
      -> Result<Duration, BackendError> {
         let collectives: Vec<Ref64> = inputs
             .iter()

@@ -612,9 +612,7 @@ fn bounded_resource_independence(kernel: &Kernel, out: &mut Vec<Violation>) {
                     winners
                         .iter()
                         .filter(move |winner| *winner != other)
-                        .map(move |winner| {
-                            (key, (*winner).min(*other), (*winner).max(*other))
-                        })
+                        .map(move |winner| (key, (*winner).min(*other), (*winner).max(*other)))
                 })
                 .min_by_key(|(_, first, second)| (*first, *second))
         })

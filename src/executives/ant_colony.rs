@@ -19,11 +19,11 @@ use crate::compiler::run_classes::{
     COLONY_AGGREGATE, WORLD_STEP,
 };
 use crate::executives::cpu_scalar::{load_frame, store_frame};
+use crate::executives::lane::LaneView;
 use crate::experiments::ant_colony::{
     read_trail, split_mix, write_slot, write_trail, AntFrame, ColonyFrame, Deposit, Terrain,
     WorldFrame, DEPOSIT_RECORD, DIRECTIONS, TRAIL_FOOD, TRAIL_HOME,
 };
-use crate::executives::lane::LaneView;
 
 /// What an ant can see from where it stands. Gathered once per step so the
 /// decision below is a pure function of it.
