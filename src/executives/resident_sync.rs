@@ -118,6 +118,8 @@ pub const HANDLER_EFFECT_OBJECT_WRITE: u32 = 12;
 pub const HANDLER_ADD_FRAME_IMMEDIATE_U64: u32 = 13;
 /// Complete when the little-endian frame word at `argument` equals `value`.
 pub const HANDLER_COMPLETE_IF_FRAME_U64_EQ: u32 = 14;
+/// Yield to the run class encoded as a little-endian `u32` in the frame.
+pub const HANDLER_YIELD_FRAME_U32: u32 = 15;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResidentHandlerProgram {
@@ -210,6 +212,14 @@ pub(crate) fn validate_handler_program(
                 pending.push((pc + 1, effects));
                 pending.push((skipped, effects));
             }
+            HANDLER_YIELD_FRAME_U32 => {
+                if (instruction.argument as usize)
+                    .checked_add(4)
+                    .is_none_or(|end| end > max_frame_bytes as usize)
+                {
+                    return false;
+                }
+            }
             HANDLER_YIELD | HANDLER_COMPLETE => {}
             _ => return false,
         }
@@ -300,6 +310,17 @@ fn execute_program(
             }
             HANDLER_YIELD => {
                 disposition = Some(ResidentDisposition::Yield(instruction.argument));
+                break;
+            }
+            HANDLER_YIELD_FRAME_U32 => {
+                let at = instruction.argument as usize;
+                let end = at.checked_add(4)?;
+                let word: [u8; 4] = frame.get(at..end)?.try_into().ok()?;
+                let next_run_class = u32::from_le_bytes(word);
+                if next_run_class == 0 {
+                    return None;
+                }
+                disposition = Some(ResidentDisposition::Yield(next_run_class));
                 break;
             }
             HANDLER_COMPLETE => {

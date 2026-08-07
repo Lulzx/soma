@@ -29,7 +29,8 @@ use crate::executives::resident_sync::{
     HANDLER_ADD_FRAME_IMMEDIATE_U64, HANDLER_COMPLETE_IF_FRAME_U64_EQ, HANDLER_EFFECT_FUTURE_AWAIT,
     HANDLER_EFFECT_FUTURE_OBSERVE, HANDLER_EFFECT_FUTURE_RESOLVE, HANDLER_EFFECT_MAILBOX_RECEIVE,
     HANDLER_EFFECT_MAILBOX_SEND, HANDLER_EFFECT_OBJECT_READ, HANDLER_EFFECT_OBJECT_WRITE,
-    RESOURCE_FUTURE, RESOURCE_MAILBOX, RESOURCE_OBJECT, RIGHT_READ, RIGHT_WRITE,
+    HANDLER_STORE_IMMEDIATE_U64, HANDLER_YIELD_FRAME_U32, RESOURCE_FUTURE, RESOURCE_MAILBOX,
+    RESOURCE_OBJECT, RIGHT_READ, RIGHT_WRITE,
 };
 use crate::kernel::Kernel;
 use crate::scheduler::device::reference_lane_conflicts;
@@ -81,11 +82,17 @@ impl KernelResidentInstruction {
             value,
         }
     }
+    pub fn store_frame_immediate(offset: u32, value: u64) -> Self {
+        Self::plain(HANDLER_STORE_IMMEDIATE_U64, offset, value)
+    }
     pub fn add_frame_immediate(offset: u32, value: u64) -> Self {
         Self::plain(HANDLER_ADD_FRAME_IMMEDIATE_U64, offset, value)
     }
     pub fn complete_if_frame_eq(offset: u32, value: u64) -> Self {
         Self::plain(HANDLER_COMPLETE_IF_FRAME_U64_EQ, offset, value)
+    }
+    pub fn yield_frame_run_class(offset: u32) -> Self {
+        Self::plain(HANDLER_YIELD_FRAME_U32, offset, 0)
     }
     pub fn plain(opcode: u32, argument: u32, value: u64) -> Self {
         Self {
@@ -3591,31 +3598,83 @@ mod tests {
         let mut kernel = Kernel::new();
         let process = kernel.create_process(Ref64::NULL, ProcessMode::Pure);
         let run_class = 1750;
-        kernel
-            .install_resident_sync_program(KernelResidentProgram {
-                run_class,
-                instructions: vec![
-                    KernelResidentInstruction::add_frame_immediate(0, 1),
-                    KernelResidentInstruction::complete_if_frame_eq(0, 0),
-                    KernelResidentInstruction::plain(HANDLER_YIELD, run_class, 0),
-                ],
-            })
-            .unwrap();
+        for (class, next_class) in [(run_class, run_class + 1), (run_class + 1, run_class)] {
+            kernel
+                .install_resident_sync_program(KernelResidentProgram {
+                    run_class: class,
+                    instructions: vec![
+                        KernelResidentInstruction::add_frame_immediate(0, 1),
+                        KernelResidentInstruction::complete_if_frame_eq(0, 0),
+                        KernelResidentInstruction::store_frame_immediate(8, u64::from(next_class)),
+                        KernelResidentInstruction::yield_frame_run_class(8),
+                    ],
+                })
+                .unwrap();
+        }
+        let mut initial_frame = vec![0; 16];
+        initial_frame[..8].copy_from_slice(&(u64::MAX - 4).to_le_bytes());
         let continuation = kernel
             .create_continuation(
                 process,
                 process,
-                ContinuationSpec::new(
-                    StateAccess::ReadOnly,
-                    run_class,
-                    0,
-                    (u64::MAX - 4).to_le_bytes().to_vec(),
-                    6,
-                ),
+                ContinuationSpec::new(StateAccess::ReadOnly, run_class, 0, initial_frame, 6),
             )
             .unwrap();
-        let plan = kernel.plan_resident_sync(5, 1, 8, width).unwrap();
+        let plan = kernel.plan_resident_sync(5, 1, 16, width).unwrap();
         (kernel, plan, continuation)
+    }
+
+    #[test]
+    fn dynamic_frame_run_class_refuses_unknown_target_atomically() {
+        let mut kernel = Kernel::new();
+        let process = kernel.create_process(Ref64::NULL, ProcessMode::Pure);
+        kernel
+            .install_resident_sync_program(KernelResidentProgram {
+                run_class: 1760,
+                instructions: vec![
+                    KernelResidentInstruction::store_frame_immediate(0, 1761),
+                    KernelResidentInstruction::yield_frame_run_class(0),
+                ],
+            })
+            .unwrap();
+        kernel
+            .install_resident_sync_program(KernelResidentProgram {
+                run_class: 1761,
+                instructions: vec![KernelResidentInstruction::plain(HANDLER_COMPLETE, 0, 0)],
+            })
+            .unwrap();
+        kernel
+            .create_continuation(
+                process,
+                process,
+                ContinuationSpec::new(StateAccess::ReadOnly, 1760, 0, vec![0; 8], 2),
+            )
+            .unwrap();
+        let plan = kernel.plan_resident_sync(2, 1, 8, 1).unwrap();
+        let mut result = crate::executives::resident_sync::run_resident_sync(
+            &plan.config,
+            plan.continuations.clone(),
+            &plan.programs,
+        )
+        .unwrap();
+        result.invocations[0].next_run_class = 9_999;
+        let fingerprint = KernelResidentSyncPlan::fingerprint(&kernel);
+        let trace_len = kernel.trace_events().len();
+        let accounting = kernel.accounting;
+        let admission_len = kernel.admission_log.len();
+        let effect_len = kernel.effect_log.len();
+        assert_eq!(
+            plan.validate_and_import(&mut kernel, result),
+            Err(KernelResidentSyncError::InvalidDeviceResult)
+        );
+        assert_refusal_preserves_kernel(
+            &kernel,
+            fingerprint,
+            trace_len,
+            &accounting,
+            admission_len,
+            effect_len,
+        );
     }
 
     #[test]
