@@ -1,0 +1,52 @@
+# Distributed SOMA
+
+Distributed execution preserves the single-node epoch contract. A node may
+speculatively execute lanes, but its lane events and effects become visible
+only through canonical epoch commit. Loss before commit discards that node's
+entire uncommitted journal; loss after commit is already part of the run. A
+coordinator never guesses that a process faulted merely because a transport
+timed out.
+
+## Identity and authority
+
+`distributed::RemoteRef` pairs a 64-bit `NodeId` with the existing `Ref64`.
+The `Ref64::partition` remains an allocator partition inside a node; it is not
+overloaded as a cluster node identifier. Two nodes can therefore allocate the
+same partition and slot without naming the same entity.
+
+A remote reference is not authority. `RemoteGrant` is a fixed-width,
+little-endian delegation containing issuer, audience, actor, remote target,
+rights, object version, inclusive logical-epoch bounds, a unique nonce, and an
+HMAC-SHA-256 signature. The signature proves provenance and prevents field
+tampering. The issuer's live registry supplies the other half: an otherwise
+valid signed grant is rejected after revocation. Authorization at use checks
+protocol version, issuer, signature, registry membership, audience, exact
+target, object version, rights, logical validity, and revocation.
+
+## Failure semantics
+
+Transport failure and process failure are different outcomes.
+
+- A connection error before acknowledgement is `NodeUnavailable`; the request
+  may be retried with the same request identity.
+- A connection loss after acknowledgement is resolved through the node's
+  request ledger. Pure evaluator requests are content-addressed and replayable.
+  Stateful lane requests are not externally visible until epoch commit.
+- A partition is not automatically a fault. The coordinator may wait or apply
+  an explicit `declare_lost` policy at an epoch boundary.
+- Declared node loss discards uncommitted journals and emits a node-loss notice
+  to every remote process's supervisor. It does not claim those processes
+  executed a `Fault` instruction.
+- A committed remote effect is never rolled back. Recovery resumes from the
+  last committed epoch and request identities suppress duplicate application.
+
+The transport must make these states distinct on the wire; an empty payload or
+generic execution error cannot stand in for any of them.
+
+## Completion evidence
+
+The backend is complete only when the two-node streaming graph and supervision
+tree are I18-equivalent to their single-node runs, every process is remote from
+its supervisor in the non-vacuity control, revocation is observed at remote
+use, duplicate requests apply once, and killing a node mid-epoch produces the
+defined discard-and-notify result.

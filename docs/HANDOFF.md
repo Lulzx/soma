@@ -54,6 +54,12 @@ intermediate host read, stable device-side run-class placement, exact cohort
 accounting, and CPU digest agreement. General lane execution and canonical
 commit still need device lowering. See `docs/DEVICE-SCHEDULER.md`.
 
+Distributed work starts in `distributed::authority`. `RemoteRef` separates
+cluster node identity from allocator partition, while signed `RemoteGrant`s
+carry attenuated authority and are rechecked against a live revocation registry
+at use. The node-loss/partition decision is recorded in
+`docs/DISTRIBUTED.md`; transport failure does not masquerade as process fault.
+
 Read §1 for the project state and §6 for the test discipline before changing
 the code.
 

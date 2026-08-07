@@ -19,6 +19,7 @@
 pub mod abi;
 pub mod compiler;
 pub mod discovery;
+pub mod distributed;
 pub mod executives;
 pub mod experiments;
 pub mod kernel;

@@ -1583,7 +1583,11 @@ definition.
 
 ## 5. C — distributed, trace-equivalent
 
-**Not started, and still the long pole.** Roughly the size of B and A combined.
+**Started, and still the long pole.** Node-qualified identity, signed remote
+delegation, logical-epoch validity, version pinning, and live revocation checks
+are implemented and tested. `docs/DISTRIBUTED.md` fixes the failure model before
+transport: a partition is not a process fault, and declared node loss discards
+only uncommitted epoch journals before notifying remote supervisors.
 
 The model is unusually well-positioned for the hard part: frames are durable
 position-independent byte blobs (v0.2 §1.1), so a continuation can resume on a

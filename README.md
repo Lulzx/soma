@@ -306,6 +306,9 @@ Implemented now:
   search, with device-resident double-buffered continuation frontiers, stable
   run-class placement, cohort accounting, and exact CPU agreement on work,
   epochs, placement costs, and two order-independent result digests
+- A distributed identity and signed delegation foundation: node-qualified
+  references, audience/target/right/version/epoch-bound remote grants, live
+  revocation checks, fixed-width encoding, and tamper-negative controls
 
 Not implemented:
 
