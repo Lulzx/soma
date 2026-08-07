@@ -21,6 +21,16 @@ share the same path, and D1-D7 compare terminal hypotheses, evidence, and
 provenance. See [docs/DISCOVERY.md](docs/DISCOVERY.md) and run
 `cargo run --release --example discovery_report`.
 
+## Speculative concurrent epochs
+
+The optional CPU epoch executive runs isolated lanes on scoped OS threads,
+records the complete `LaneView` operation/access journal, and commits only a
+conflict-free history in canonical lane order. Conflicting futures, mailboxes,
+domains, processes, objects, or allocator partitions discard their speculative
+state and replay through the deterministic reference loop. See
+[docs/SPECULATIVE-EPOCHS.md](docs/SPECULATIVE-EPOCHS.md) and run
+`cargo run --release --example speculative_epoch_report`.
+
 Stable Rust. The semantic core has no dependencies. The optional macOS Metal
 backend is enabled with `--features metal`.
 
@@ -236,6 +246,7 @@ src/
   replay/       trace reader and deterministic comparison
   semantics/    executable invariants
   experiments/  scheduler studies and baselines
+  discovery/    content-addressed discovery DAG execution
 ```
 
 Implemented now:
@@ -281,6 +292,9 @@ Implemented now:
   collective-boundary migration accounting
 - An optional real Apple Metal compute backend, validated against the CPU
   result and the semantic invariant checker
+- An opt-in speculative CPU epoch executive with isolated threaded lanes,
+  complete `LaneView` operation/access journals, conflict validation, canonical
+  replay, deterministic fallback, and reference-trace equivalence tests
 
 Not implemented:
 
@@ -290,17 +304,10 @@ Not implemented:
   a validation-time bound on the unrolled length so totality and the step budget
   survive. There are still no calls, no floating point, and no surface syntax
   above the `op` lines
-- A concurrent, device-resident scheduler/executive, or a distributed backend.
-  The semantics are ready for one and nothing uses it: admission is
-  order-independent (I22), the trace's order is recoverable from event position
-  rather than a shared clock (I23), allocation is partitioned so lanes need no
-  shared allocator, and commit is canonical — an epoch runs every lane, then
-  applies what they produced in plan order, so nothing an epoch commits depends
-  on the order its lanes ran (I24, I25). Lanes are reorderable and the executive
-  reorders them — reversed or permuted per epoch, checked to produce the same
-  run and the same commit sequence — but it does so on one thread. The only
-  threads in `src/` evaluate a batch's elements in parallel, which the body
-  language's purity rules already paid for; the scheduler itself is sequential
+- A device-resident scheduler/executive or a distributed backend. The CPU
+  scheduler now has a real speculative threaded implementation, but it clones
+  kernel snapshots and starts scoped threads per eligible epoch; it does not
+  persist workers on a GPU or across machines
 - Scheduler-overhead and end-to-end migration benchmarks. The batch backend
   itself is measured on hardware — CPU against Metal from 32 to 4M elements,
   where a Metal call's fixed cost goes, what a published cohort costs off-GPU,

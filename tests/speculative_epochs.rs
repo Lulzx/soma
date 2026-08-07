@@ -84,8 +84,7 @@ fn a_process_commit_conflict_replays_the_whole_epoch() {
     assert_eq!(stats.committed_epochs, 0);
     assert_eq!(stats.fallback_epochs, 1);
     assert_eq!(stats.conflict_fallbacks, 1);
-    let disagreements =
-        conforms_traces(&reference.trace_snapshot(), &speculative.trace_snapshot());
+    let disagreements = conforms_traces(&reference.trace_snapshot(), &speculative.trace_snapshot());
     assert!(disagreements.is_empty(), "{disagreements:#?}");
     assert_legal(&speculative);
 }
@@ -108,9 +107,7 @@ fn contended_allocation_falls_back_before_any_snapshot_effect_can_escape() {
     let stats = speculative.speculation_stats();
     assert_eq!(stats.fallback_epochs, 1);
     assert_eq!(stats.conflict_fallbacks, 1);
-    assert!(
-        conforms_traces(&reference.trace_snapshot(), &speculative.trace_snapshot()).is_empty()
-    );
+    assert!(conforms_traces(&reference.trace_snapshot(), &speculative.trace_snapshot()).is_empty());
     assert_legal(&speculative);
 }
 
@@ -135,8 +132,7 @@ fn independent_mailboxes_futures_and_allocations_commit() {
     let stats = speculative.speculation_stats();
     assert!(stats.committed_epochs >= 2, "{stats:?}");
     assert!(stats.committed_lanes >= 8, "{stats:?}");
-    let disagreements =
-        conforms_traces(&reference.trace_snapshot(), &speculative.trace_snapshot());
+    let disagreements = conforms_traces(&reference.trace_snapshot(), &speculative.trace_snapshot());
     assert!(disagreements.is_empty(), "{disagreements:#?}");
     assert_legal(&speculative);
 }
@@ -148,14 +144,7 @@ fn contested_future() -> Kernel {
     for input in [7, 13] {
         let process = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
         kernel
-            .grant_capability(
-                SYSTEM_PRINCIPAL,
-                process,
-                future,
-                Rights::RESOLVE,
-                0,
-                0,
-            )
+            .grant_capability(SYSTEM_PRINCIPAL, process, future, Rights::RESOLVE, 0, 0)
             .unwrap();
         let frame = HeuristicFrame { future, input };
         let mut bytes = Vec::new();
@@ -189,7 +178,6 @@ fn two_future_writers_conflict_and_replay_in_plan_order() {
     let stats = speculative.speculation_stats();
     assert_eq!(stats.committed_epochs, 0);
     assert_eq!(stats.conflict_fallbacks, 1);
-    let disagreements =
-        conforms_traces(&reference.trace_snapshot(), &speculative.trace_snapshot());
+    let disagreements = conforms_traces(&reference.trace_snapshot(), &speculative.trace_snapshot());
     assert!(disagreements.is_empty(), "{disagreements:#?}");
 }

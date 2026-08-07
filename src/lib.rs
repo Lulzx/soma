@@ -7,7 +7,8 @@
 //! 2. A deterministic CPU continuation interpreter (`executives::cpu_scalar`)
 //!    and an optional Metal batch backend (`executives::metal`);
 //! 3. Processes, messages, futures, and double-buffered runnable bins over a
-//!    single-threaded epoch lifecycle (`kernel`, `scheduler`), together with
+//!    deterministic reference and speculative concurrent epoch lifecycles
+//!    (`kernel`, `scheduler`), together with
 //!    the `Expand` state machine and a synthetic branching-search workload
 //!    (`compiler`, `experiments`) that prove resumable continuations run
 //!    deterministically.

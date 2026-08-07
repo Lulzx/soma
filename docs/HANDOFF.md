@@ -14,14 +14,20 @@ The default implementation trace compresses 2,184 logical requests to 910
 physical evaluator realizations and 12 dispatches with identical terminal
 scientific state. Local release smoke runs showed a modest CPU improvement and
 a larger Metal improvement, but do not quote a single run or structural
-compression as a performance result. The concurrent lane executive remains
-separate work, as §4.17's narrowed `LaneView` comments state.
+compression as a performance result.
+
+The narrowed §4.17 surface now feeds an opt-in speculative concurrent CPU
+executive. It executes isolated lane snapshots on real threads, records all 15
+`LaneView` operations and their resource accesses, validates conflicts, and
+either replays canonically or discards everything and invokes the reference
+loop. Start with [SPECULATIVE-EPOCHS.md](SPECULATIVE-EPOCHS.md),
+`kernel/speculation.rs`, and `tests/speculative_epochs.rs`.
 
 Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
 Repository: https://github.com/Lulzx/soma. The default semantic core is
-dependency-free. There are 403 default tests, seven additional tests behind the
+dependency-free. There are 408 default tests, seven additional tests behind the
 `metal` feature, seven compile-fail doc tests, and no Clippy warnings. The optional `metal`
 feature adds the `metal-rs` implementation dependency on macOS.
 
@@ -38,6 +44,7 @@ cargo run --example territory_report   # distribution across territories
 cargo run --example streaming_report   # channel back-pressure + failure
 cargo run --example supervision_report # notification vs failure escalation
 cargo run --example multi_input_report # atomic join + skew/failure controls
+cargo run --release --example speculative_epoch_report # threaded epoch crossover
 ```
 
 The measurement examples are separate, want `--release`, and are documented in
@@ -76,7 +83,7 @@ Two documents, and they are not equals:
 | Doc | Status |
 | --- | --- |
 | `docs/SOMA-v0.2.md` | **Current.** The semantic specification. Start here. |
-| `docs/SOMA-v0.3.md` | **Current for anything added since v0.2.** §1–§3 are implemented and checked: the equivalence relation, evaluator bodies, and the carried debts. So are §4.1, §4.2 and §4.4, three of the device scheduler's four obligations. What is left of §4.3 and all of §5–§6 scope the rest of the device scheduler, the distributed implementation, and performance work. |
+| `docs/SOMA-v0.3.md` | **Current for anything added since v0.2.** §1–§3 and §4's semantic obligations are implemented and checked. §4.18 records the speculative concurrent CPU executive. Persistent device residency, distribution, and the remaining hardware work stay scoped by §4–§6. |
 | `docs/SOMA-P1.md` | Historical. The original broad Phase-1 contract, still referenced by `§n` markers in code comments. Useful context, but it describes a wider system than the one being built, and its framing is what the refocus moved away from. |
 
 The directory is still named `gpu-os` and the crate `soma`. Harmless, but expect
@@ -347,10 +354,10 @@ Added in v0.3:
   chosen. No `Deref` to `Kernel` and no constructor outside the crate, both as
   `compile_fail` doctests with a passing null beside them. The value is that an
   operation with no lane-local form is now a compile error inside a step, so
-  what remains before lanes can run concurrently is four cross-lane writes
-  (`enqueue_message`, `receive_message`, `resolve_future`, `await_future`)
-  rather than an audit of the kernel. Reads need a shared borrow, allocation has
-  §4.8's shards, own-frame writes are disjoint by I8.
+  the concurrent executive journals all fifteen operations. Its access set
+  explicitly covers the four cross-lane writes (`enqueue_message`,
+  `receive_message`, `resolve_future`, `await_future`), while reads, allocation,
+  and own-frame writes use the same closed journal and conflict validator.
 - An effect log (I24). A step no longer writes a runnable bin; it produces the
   entries it wants and the kernel applies them, in the order the plan puts the
   producing lanes in. `Scheduler::enqueue` demands a token only the applier can
@@ -790,4 +797,5 @@ decision that would otherwise depend on `HashMap` iteration order.
    most likely to surprise you — why trace equality had to go, and why both
    backends used to agree about nothing. Then pick up §4 (the persistent device
    scheduler). All four of its obligations are discharged in §4.1, §4.2, §4.4
-   and §4.5; what is not built is the concurrent executive they were for.
+   and §4.5. Then read `docs/SPECULATIVE-EPOCHS.md` for the concurrent CPU
+   implementation those obligations now support.

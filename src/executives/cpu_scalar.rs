@@ -13,8 +13,8 @@
 //! A step takes a [`LaneView`] rather than the kernel (v0.3 §4.10). That is
 //! what makes the set of things a step does finite and visible: the view offers
 //! fifteen operations, an operation with no lane-local form is a compile error
-//! inside a handler, and the remaining work to run lanes concurrently is
-//! therefore enumerable rather than an audit.
+//! inside a handler, and the speculative executive can journal the entire
+//! reachable effect surface rather than audit arbitrary kernel calls.
 
 use crate::abi::Ref64;
 use crate::abi::{MessageDescriptor, StateAccess, StepResult};

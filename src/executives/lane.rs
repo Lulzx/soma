@@ -23,9 +23,10 @@
 //! call". That is the technique `docs/SOMA-CAPABILITIES.md` used to close the
 //! operation set and §4.1 used to seal `Admission`, applied to the executive.
 //!
-//! **This view still borrows the kernel mutably**, so it does not make lanes
-//! run concurrently and nothing here claims it does. It makes the set of things
-//! that would have to change finite and visible. The categories are:
+//! A view still borrows *one kernel snapshot* mutably. The reference executive
+//! lends it the real kernel; the speculative executive lends every worker an
+//! isolated clone and records the calls for validation and canonical replay.
+//! The categories that journal closes are:
 //!
 //! * *Reads* — `frame`, `epoch_number`, `future_value`, `object_bytes`,
 //!   `read_u64_object`.
@@ -37,16 +38,14 @@
 //!   fixed for the epoch, and `frame` is a copy taken before the step began.
 //!   `continuations` used to sit here and is the subject of §4.17.
 //! * *Allocation* — `create_process`, `create_continuation`, `create_future`,
-//!   `create_object`. §4.8's shards are the lane-local form; wiring them is
-//!   mechanical.
+//!   `create_object`. Allocator partitions are resources in the access set;
+//!   disjoint partitions replay, shared ones conflict.
 //! * *Own-frame writes* — `host_payload_mut`, `object_bytes_mut`. I8 (frame
 //!   exclusivity) already guarantees no two continuations share a frame, so
 //!   these are disjoint across lanes by an invariant the checker enforces.
 //! * *Cross-lane writes* — `enqueue_message`, `resolve_future`, `await_future`,
-//!   `receive_message`. These are the genuinely hard four: they touch state
-//!   another lane may also touch, so they need journalling in the shape §4.4
-//!   used for bin entries. I25 is what makes that safe — no lane observes
-//!   another within an epoch — and it is already checked.
+//!   `receive_message`. These are journalled with mailbox/future/process access
+//!   keys. A conflict discards the snapshots and invokes the reference loop.
 //!
 //! Four operations, not a kernel. That is the result of writing this down.
 
@@ -314,7 +313,7 @@ impl<'a> LaneView<'a> {
         self.kernel.object_bytes_mut(actor, obj)
     }
 
-    // ---- cross-lane writes (the four that need journalling) ---------------
+    // ---- cross-lane writes (journalled and conflict-validated) ------------
 
     pub fn enqueue_message(
         &mut self,

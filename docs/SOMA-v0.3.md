@@ -1,9 +1,9 @@
 # SOMA v0.3
 
 **Status:** partially implemented. §1–§3 are specification and are
-machine-checked, as are §4.1, §4.2, §4.4 and §4.5. §4's four obligations are
-discharged; the concurrent executive they were for is not written. §5–§6 are
-scope.
+machine-checked. §4's semantic obligations and the speculative concurrent CPU
+executive (§4.18) are implemented; a persistent device-resident executive is
+not. §5–§6 are scope.
 
 v0.2 closed the semantic core: every entity and invariant it named was
 implemented and checked. v0.3 is the first version whose work is not "finish the
@@ -18,7 +18,7 @@ did not depend on it are done; the rest is scoped below.
 | **0** | Carried debts on the critical path | **done** (§1) |
 | **S** | An equivalence a concurrent implementation can satisfy | **done** (§2) |
 | **A** | General evaluator bodies and a compiler | **done** (§3) |
-| **B** | Persistent device-resident scheduler | **started** (§4) — semantics done, executive not |
+| **B** | Persistent device-resident scheduler | **started** (§4) — semantics and concurrent CPU executive done; device residency not |
 | **C** | Distributed / multi-node implementation | scope (§5) |
 | **D** | Performance work on real hardware | scope (§6) |
 
@@ -969,11 +969,9 @@ work into four items rather than a quantity:
 **Four operations, not a kernel.** That is the result of writing it down, and it
 is the answer §4.3 could not give.
 
-**This view still borrows the kernel mutably**, so it does not make lanes run
-concurrently and nothing here claims it does. Retyping the handlers changed no
-run, which is the whole evidence offered for it: the same workloads produce the
-same traces and leave legal states. What it changed is that the remaining
-distance is enumerable.
+**At this point in the sequence the view still borrowed the kernel mutably.**
+Retyping the handlers changed no run; §4.18 later uses one mutable view per
+isolated snapshot and turns the closed operation surface into a replay journal.
 
 ### 4.11 A lane produces its events too
 
@@ -1505,6 +1503,35 @@ stronger sense than being counted. Three are governed — `object_bytes`,
 `frame`, read nothing a lane is able to write.
 
 ---
+
+### 4.18 Speculative concurrent epochs
+
+The CPU executive now has the optimistic implementation §4.3 anticipated. It
+clones one immutable pre-Phase-F state into isolated worker snapshots, runs the
+lanes on scoped OS threads, and records every call through `LaneView` together
+with object, future, process, mailbox, domain, and allocator-partition accesses.
+
+The validator rejects every read/write or write/write overlap. It also replays
+the concrete operation journals on a disposable kernel before touching the real
+one. A conflict or replay mismatch discards all snapshots and runs the original
+plan-order loop. A valid history replays through the ordinary kernel operations
+and `apply_step_result` in lane-number order, so authority checks, trace events,
+effects, allocation identities, and terminal state all cross the same semantic
+boundary as the reference implementation.
+
+The four writes §4.10 left open are no longer special cases outside the model:
+message enqueue/receive use mailbox keys and future resolve/await use future
+keys. Allocation uses the plan-derived partition and process creation also
+writes its domain. Fault containment and pre-existing cancellation remain
+reference-only because their footprint is intentionally broader than the closed
+set declared so far.
+
+This is an opt-in CPU executive, not a claim that optimism is always faster.
+Snapshot cloning, a validation replay, and thread startup lose badly on small
+steps. The measured crossover and controls are in
+`docs/SPECULATIVE-EPOCHS.md`; the local M4 Pro sweep reaches 5.78× at eight
+million arithmetic iterations across eight lanes and about 0.1× at one thousand
+iterations per lane.
 
 ## 5. C — distributed, trace-equivalent
 
