@@ -1,15 +1,18 @@
 //! Compiler and source-lowering layer (§22 and §24 of the historical contract).
 //!
 //! Generated state machines cover continuation programs. The deliberately
-//! small textual module surface in `ir` names batch evaluators and their resume
-//! points; it is not a general-purpose language. Each resume point becomes a
-//! run class; frames are byte blobs with a per-run-class layout (see `frame`).
+//! textual module surface in `ir` names batch evaluators and their resume
+//! points. `surface` is the named-value language for authoring arbitrary
+//! validated evaluator bodies without hand-numbering SSA instructions. Each
+//! resume point becomes a run class; frames are byte blobs with a per-run-class
+//! layout (see `frame`).
 
 pub mod body;
 pub mod examples;
 pub mod frame;
 pub mod ir;
 pub mod state_machine_lowering;
+pub mod surface;
 
 /// Run-class identifiers. Every resume point of every state machine is its own
 /// run class (§22), so the runnable-bin key and the interpreter dispatch key are

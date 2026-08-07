@@ -36,6 +36,13 @@ definition; `tests/native_backend.rs` covers all integer operations, packed
 field widths, gathers, auxiliary arrays, nested repeats, divergent exits, and
 threaded execution.
 
+`compiler::surface::compile_evaluator` is the human-facing compiler front end.
+It resolves named immutable values and locals, preserves structured loops, and
+lowers arbitrary source within SOMA's pure, total evaluator contract to the
+same validated body IR consumed by all three backends. Syntax and semantics are
+documented in `docs/EVALUATOR-LANGUAGE.md`; `tests/evaluator_surface.rs` proves
+one named source runs through the reference, native CPU, and real Metal paths.
+
 Read §1 for the project state and §6 for the test discipline before changing
 the code.
 
@@ -558,9 +565,8 @@ Language compute kernel, dispatches it through shared buffers, waits for command
 completion, and returns bytes through that common path. The integration test
 runs on real Apple GPU hardware and compares its output and semantic trace with
 the CPU path.
-This is not yet a persistent device scheduler, arbitrary evaluator compiler, or
-hardware performance result. `src/experiments/territories.rs` remains the
-placement-policy model.
+This is not yet a persistent device scheduler or hardware performance result.
+`src/experiments/territories.rs` remains the placement-policy model.
 
 ### 5.10 The effect log
 

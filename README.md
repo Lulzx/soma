@@ -242,7 +242,7 @@ src/
   kernel/       machine state, epochs, commit, ownership, accounting
   executives/   scalar interpreter and physical batch backends
   scheduler/    run-class bins and cohort construction
-  compiler/     frame encoding and hand-written state-machine lowering
+  compiler/     evaluator language, body IR, frames, and state-machine lowering
   replay/       trace reader and deterministic comparison
   semantics/    executable invariants
   experiments/  scheduler studies and baselines
@@ -275,6 +275,9 @@ Implemented now:
   proves committed FIFO data survives producer failure
 - A minimal hardware-neutral evaluator IR with frozen-array schemas and resume
   points, connected to `BatchEvaluate` creation
+- A named-value evaluator source language with declarations, immutable values,
+  mutable loop locals, structured counted loops, source-line diagnostics, and
+  lowering to the validated evaluator IR
 - Gathering bodies: `index` names an element's own position and `gather` reads
   any element of the frozen input array, so stencils and permutations lower to
   both backends. Reads are confined to the frozen input, never the output, so a
@@ -298,12 +301,12 @@ Implemented now:
 
 Not implemented:
 
-- A general-purpose language or compiler for arbitrary evaluator bodies. Bodies
-  gather, loop, and read a second bound array now — counted `repeat`, early
-  `breakif`, mutable locals, and `gatheraux` against a second frozen array, with
-  a validation-time bound on the unrolled length so totality and the step budget
-  survive. There are still no calls, no floating point, and no surface syntax
-  above the `op` lines
+- Evaluator calls and floating point. The general-purpose evaluator compiler
+  now covers arbitrary programs within SOMA's pure, total, element-wise
+  contract and lowers named source to reference, native CPU, and Metal
+  execution. Its intentional semantic boundary excludes allocation, I/O,
+  cross-lane output reads, and unbounded control flow; see
+  [docs/EVALUATOR-LANGUAGE.md](docs/EVALUATOR-LANGUAGE.md)
 - A device-resident scheduler/executive or a distributed backend. The CPU
   scheduler now has a real speculative threaded implementation, but it clones
   kernel snapshots and starts scoped threads per eligible epoch; it does not

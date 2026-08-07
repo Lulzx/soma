@@ -234,6 +234,14 @@ which is not evidence about a compiler.
 `compiler::body` defines a deliberately small one, because the property under
 test is placement-independent publication, not language design:
 
+`compiler::surface` is its named-value source front end. It adds human-readable
+field, auxiliary-array, local, value, loop, and store declarations with
+source-line diagnostics, then lowers to the same validated body IR used by the
+reference interpreter, Cranelift native CPU backend, and Metal code generator.
+It is general-purpose within the pure, total, element-wise evaluator contract;
+the contract's deliberate exclusions are described in
+`docs/EVALUATOR-LANGUAGE.md`.
+
 - **Pure and total.** No allocation and no division (which would be partial).
   Every program terminates in a number of steps decided at validation time:
   `step_bound` multiplies out the loop nesting and `MAX_STEPS` is the ceiling.
