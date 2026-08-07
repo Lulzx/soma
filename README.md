@@ -311,7 +311,8 @@ Implemented now:
   revocation checks, fixed-width encoding, and tamper-negative controls
 - An authenticated TCP evaluator backend with content-addressed requests,
   apply-once response ledger, revocation-before-replay ordering, remote
-  placement accounting, and distinct unavailable/lost/protocol failures
+  placement accounting, ordered epoch multiplexing, and distinct
+  unavailable/lost/protocol failures
 
 Not implemented:
 

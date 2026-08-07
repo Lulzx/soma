@@ -36,6 +36,12 @@ Integration tests compare remote output with the CPU definition, prove duplicate
 application suppression, revoke before a cached retry, and show that an
 unreachable node cannot be mistaken for evaluator bytes.
 
+`BatchBackend::evaluate_epoch` uses one TCP session for every request offered
+together and returns payloads in request order, preserving the backend's
+all-or-error ordering contract without a connection handshake per cohort. A
+separate negative control accepts a connection and drops it before replying;
+the client reports `NodeLost`, distinct from connection refusal.
+
 ## Failure semantics
 
 Transport failure and process failure are different outcomes.

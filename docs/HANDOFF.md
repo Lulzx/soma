@@ -63,6 +63,8 @@ at use. The node-loss/partition decision is recorded in
 TCP evaluator requests with content-addressed retry identities and a worker
 response ledger. `tests/remote_batch.rs` pins reference agreement, apply-once
 retry, revocation-before-cache, and unreachable-node failure semantics.
+Epoch evaluation multiplexes ordered cohort requests over one TCP session, and
+the accepted-then-dropped control distinguishes node loss from unavailability.
 
 Read §1 for the project state and §6 for the test discipline before changing
 the code.

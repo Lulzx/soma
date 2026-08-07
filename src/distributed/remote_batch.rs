@@ -13,8 +13,9 @@ use super::{NodeId, RemoteRef};
 use crate::abi::Rights;
 use crate::compiler::body::EvaluatorProgram;
 use crate::executives::batch::{
-    AuxArray, BackendError, BackendKind, BatchBackend, CpuReferenceBackend,
+    AuxArray, BackendError, BackendKind, BatchBackend, BatchRequest, CpuReferenceBackend,
 };
+use crate::kernel::payload::Payload;
 
 const MAGIC: u32 = 0x534F_4D41;
 const WIRE_VERSION: u16 = 1;
@@ -296,15 +297,30 @@ impl RemoteBatchServer {
         service: Arc<Mutex<RemoteBatchService>>,
         requests: usize,
     ) -> std::io::Result<()> {
-        for stream in listener.incoming().take(requests) {
-            let mut stream = stream?;
-            let frame = read_frame(&mut stream)?;
-            let response = service
-                .lock()
-                .map_err(|_| std::io::Error::other("remote service poisoned"))?
-                .handle(&frame)
-                .encode();
-            write_frame(&mut stream, &response)?;
+        let mut served = 0usize;
+        while served < requests {
+            let (mut stream, _) = listener.accept()?;
+            while served < requests {
+                let frame = match read_frame(&mut stream) {
+                    Ok(frame) => frame,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                        ) =>
+                    {
+                        break
+                    }
+                    Err(error) => return Err(error),
+                };
+                let response = service
+                    .lock()
+                    .map_err(|_| std::io::Error::other("remote service poisoned"))?
+                    .handle(&frame)
+                    .encode();
+                write_frame(&mut stream, &response)?;
+                served += 1;
+            }
         }
         Ok(())
     }
@@ -347,7 +363,12 @@ impl RemoteBatchBackend {
     }
 
     fn round_trip(&self, request: WireRequest) -> Result<Vec<u8>, BackendError> {
-        let mut stream = TcpStream::connect_timeout(&self.endpoint, self.timeout)
+        let mut stream = self.connect()?;
+        self.round_trip_on(&mut stream, request)
+    }
+
+    fn connect(&self) -> Result<TcpStream, BackendError> {
+        let stream = TcpStream::connect_timeout(&self.endpoint, self.timeout)
             .map_err(|_| BackendError::NodeUnavailable)?;
         stream
             .set_read_timeout(Some(self.timeout))
@@ -355,8 +376,16 @@ impl RemoteBatchBackend {
         stream
             .set_write_timeout(Some(self.timeout))
             .map_err(|_| BackendError::NodeUnavailable)?;
-        write_frame(&mut stream, &request.encode()).map_err(|_| BackendError::NodeLost)?;
-        let response = read_frame(&mut stream).map_err(|_| BackendError::NodeLost)?;
+        Ok(stream)
+    }
+
+    fn round_trip_on(
+        &self,
+        stream: &mut TcpStream,
+        request: WireRequest,
+    ) -> Result<Vec<u8>, BackendError> {
+        write_frame(stream, &request.encode()).map_err(|_| BackendError::NodeLost)?;
+        let response = read_frame(stream).map_err(|_| BackendError::NodeLost)?;
         let response = WireResponse::decode(&response).ok_or(BackendError::ProtocolError)?;
         if response.id != request.id {
             return Err(BackendError::ProtocolError);
@@ -421,6 +450,37 @@ impl BatchBackend for RemoteBatchBackend {
             aux,
             self.grant,
         ))
+    }
+
+    fn evaluate_epoch(
+        &mut self,
+        requests: &[BatchRequest<'_>],
+    ) -> Result<Vec<Payload>, BackendError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut wire = Vec::with_capacity(requests.len());
+        for request in requests {
+            let Some((stride, aux_stride)) = self.programs.get(&request.evaluator_id) else {
+                return Err(BackendError::UnsupportedEvaluator);
+            };
+            if *stride != request.element_stride || *aux_stride != request.aux.element_stride {
+                return Err(BackendError::InvalidInput);
+            }
+            wire.push(WireRequest::new(
+                self.epoch,
+                request.evaluator_id,
+                request.inputs,
+                request.element_count,
+                request.element_stride,
+                request.aux,
+                self.grant,
+            ));
+        }
+        let mut stream = self.connect()?;
+        wire.into_iter()
+            .map(|request| self.round_trip_on(&mut stream, request).map(Payload::from))
+            .collect()
     }
 }
 
