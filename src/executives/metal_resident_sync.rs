@@ -187,7 +187,7 @@ struct Invocation { uint epoch,lane; ulong continuation; uint run_class,disposit
 struct Wake { uint epoch,lane,cause_opcode,target; ulong cause_continuation,continuation; uint run_class,ticket,ordinal,reserved; };
 struct EpochRecord { uint epoch,invocations,runnable_after,completed_after; };
 constant uint RUNNABLE=1, PARKED=2, COMPLETE=3;
-constant uint AWAIT=1, RESOLVE=2, SEND=3, RECEIVE=4, OBSERVE=10, OBJECT_READ=11, OBJECT_WRITE=12, ADD_FRAME=13, COMPLETE_IF_FRAME_EQ=14, YIELD_FRAME=15;
+constant uint AWAIT=1, RESOLVE=2, SEND=3, RECEIVE=4, OBSERVE=10, OBJECT_READ=11, OBJECT_WRITE=12, ADD_FRAME=13, COMPLETE_IF_FRAME_EQ=14, YIELD_FRAME=15, ADD_FRAME_WORD=16, YIELD_IF_FRAME_ZERO=17;
 constant uint OUT_RESOLVED=1, OUT_REGISTERED=2, OUT_SENT=3, OUT_RECEIVED=4, OUT_DENIED=5, OUT_INVALID=6, OUT_FULL=7, OUT_EMPTY=8, OUT_DOUBLE=9, OUT_PENDING=10, OUT_OBJECT_READ=11, OUT_OBJECT_WRITTEN=12;
 inline uint outcome_code(uint o) { if(o==OUT_RESOLVED||o==OUT_RECEIVED||o==OUT_OBJECT_READ)return 2; if(o==OUT_REGISTERED)return 3; if(o==OUT_EMPTY||o==OUT_PENDING)return 1; if(o==OUT_INVALID)return 0x101; if(o==OUT_DENIED)return 0x104; if(o==OUT_FULL)return 0x10c; if(o==OUT_DOUBLE)return 0x111; return 0; }
 inline uint journal_opcode(uint op) { return op==OBJECT_READ?2:(op==OBJECT_WRITE?7:(op==OBSERVE?1:(op==AWAIT?11:(op==RESOLVE?10:(op==SEND?8:9))))); }
@@ -272,8 +272,9 @@ kernel void resident_sync(
       Instruction x=ins[pc++];op=x.opcode;arg=x.argument;target=(op==OBJECT_READ||op==OBJECT_WRITE)?x.target:x.argument;val=x.value;
       if(op==5||op==6){if(arg+8>c.frame_len||(op==6&&input_previous_kind!=OUT_RESOLVED&&input_previous_kind!=OUT_RECEIVED&&input_previous_kind!=OUT_OBJECT_READ)){error=4;break;}ulong v=op==5?val:input_previous_value;for(uint bb=0;bb<8;bb++)frames[at*cfg.frame_stride+arg+bb]=uchar(v>>(bb*8));continue;}
       if(op==ADD_FRAME||op==COMPLETE_IF_FRAME_EQ){if(arg+8>c.frame_len){error=4;break;}ulong frame_value=0;for(uint bb=0;bb<8;bb++)frame_value|=ulong(frames[at*cfg.frame_stride+arg+bb])<<(bb*8);if(op==ADD_FRAME){frame_value+=val;for(uint bb=0;bb<8;bb++)frames[at*cfg.frame_stride+arg+bb]=uchar(frame_value>>(bb*8));}else if(frame_value==val){disposition=2;next_class=0;break;}continue;}
+      if(op==ADD_FRAME_WORD){if(arg+8>c.frame_len||val>0xfffffffful||uint(val)+8>c.frame_len){error=4;break;}ulong destination_value=0,source_value=0;for(uint bb=0;bb<8;bb++){destination_value|=ulong(frames[at*cfg.frame_stride+arg+bb])<<(bb*8);source_value|=ulong(frames[at*cfg.frame_stride+uint(val)+bb])<<(bb*8);}destination_value+=source_value;for(uint bb=0;bb<8;bb++)frames[at*cfg.frame_stride+arg+bb]=uchar(destination_value>>(bb*8));continue;}
       if(op==7){if((input_previous_kind!=OUT_RESOLVED&&input_previous_kind!=OUT_RECEIVED&&input_previous_kind!=OUT_OBJECT_READ)||input_previous_value!=val)pc+=arg;continue;}
-      if(op==8){disposition=1;next_class=arg;break;}if(op==YIELD_FRAME){if(arg+4>c.frame_len){error=4;break;}next_class=0;for(uint bb=0;bb<4;bb++)next_class|=uint(frames[at*cfg.frame_stride+arg+bb])<<(bb*8);if(next_class==0){error=4;break;}disposition=1;break;}if(op==9){disposition=2;next_class=0;break;}
+      if(op==8){disposition=1;next_class=arg;break;}if(op==YIELD_FRAME){if(arg+4>c.frame_len){error=4;break;}next_class=0;for(uint bb=0;bb<4;bb++)next_class|=uint(frames[at*cfg.frame_stride+arg+bb])<<(bb*8);if(next_class==0){error=4;break;}disposition=1;break;}if(op==YIELD_IF_FRAME_ZERO){if(arg+8>c.frame_len){error=4;break;}ulong predicate=0;for(uint bb=0;bb<8;bb++)predicate|=ulong(frames[at*cfg.frame_stride+arg+bb])<<(bb*8);next_class=predicate==0?uint(val):uint(val>>32);if(next_class==0){error=4;break;}disposition=1;break;}if(op==9){disposition=2;next_class=0;break;}
      }
      if(!((op>=1&&op<=4)||op==OBSERVE||op==OBJECT_READ||op==OBJECT_WRITE)||emitted>=cfg.max_effects){error=5;break;}
      uint scratch_at=lane*cfg.max_effects+emitted;

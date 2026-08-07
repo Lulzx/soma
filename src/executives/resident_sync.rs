@@ -120,6 +120,10 @@ pub const HANDLER_ADD_FRAME_IMMEDIATE_U64: u32 = 13;
 pub const HANDLER_COMPLETE_IF_FRAME_U64_EQ: u32 = 14;
 /// Yield to the run class encoded as a little-endian `u32` in the frame.
 pub const HANDLER_YIELD_FRAME_U32: u32 = 15;
+/// Wrapping add from the frame word at `value` into the word at `argument`.
+pub const HANDLER_ADD_FRAME_U64: u32 = 16;
+/// Yield by a frame-zero predicate; `value` packs zero/nonzero run classes.
+pub const HANDLER_YIELD_IF_FRAME_ZERO_U64: u32 = 17;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResidentHandlerProgram {
@@ -212,10 +216,33 @@ pub(crate) fn validate_handler_program(
                 pending.push((pc + 1, effects));
                 pending.push((skipped, effects));
             }
+            HANDLER_ADD_FRAME_U64 => {
+                if instruction.value > u64::from(u32::MAX)
+                    || (instruction.argument as usize)
+                        .checked_add(8)
+                        .is_none_or(|end| end > max_frame_bytes as usize)
+                    || (instruction.value as usize)
+                        .checked_add(8)
+                        .is_none_or(|end| end > max_frame_bytes as usize)
+                {
+                    return false;
+                }
+                pending.push((pc + 1, effects));
+            }
             HANDLER_YIELD_FRAME_U32 => {
                 if (instruction.argument as usize)
                     .checked_add(4)
                     .is_none_or(|end| end > max_frame_bytes as usize)
+                {
+                    return false;
+                }
+            }
+            HANDLER_YIELD_IF_FRAME_ZERO_U64 => {
+                if (instruction.argument as usize)
+                    .checked_add(8)
+                    .is_none_or(|end| end > max_frame_bytes as usize)
+                    || instruction.value as u32 == 0
+                    || (instruction.value >> 32) as u32 == 0
                 {
                     return false;
                 }
@@ -312,11 +339,38 @@ fn execute_program(
                 disposition = Some(ResidentDisposition::Yield(instruction.argument));
                 break;
             }
+            HANDLER_ADD_FRAME_U64 => {
+                let destination = instruction.argument as usize;
+                let source = usize::try_from(instruction.value).ok()?;
+                let destination_end = destination.checked_add(8)?;
+                let source_end = source.checked_add(8)?;
+                let destination_word: [u8; 8] =
+                    frame.get(destination..destination_end)?.try_into().ok()?;
+                let source_word: [u8; 8] = frame.get(source..source_end)?.try_into().ok()?;
+                let value = u64::from_le_bytes(destination_word)
+                    .wrapping_add(u64::from_le_bytes(source_word));
+                frame[destination..destination_end].copy_from_slice(&value.to_le_bytes());
+            }
             HANDLER_YIELD_FRAME_U32 => {
                 let at = instruction.argument as usize;
                 let end = at.checked_add(4)?;
                 let word: [u8; 4] = frame.get(at..end)?.try_into().ok()?;
                 let next_run_class = u32::from_le_bytes(word);
+                if next_run_class == 0 {
+                    return None;
+                }
+                disposition = Some(ResidentDisposition::Yield(next_run_class));
+                break;
+            }
+            HANDLER_YIELD_IF_FRAME_ZERO_U64 => {
+                let at = instruction.argument as usize;
+                let end = at.checked_add(8)?;
+                let word: [u8; 8] = frame.get(at..end)?.try_into().ok()?;
+                let next_run_class = if u64::from_le_bytes(word) == 0 {
+                    instruction.value as u32
+                } else {
+                    (instruction.value >> 32) as u32
+                };
                 if next_run_class == 0 {
                     return None;
                 }
@@ -1092,6 +1146,41 @@ pub fn run_resident_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn frame_word_arithmetic_and_conditional_targets_are_statically_bounded() {
+        let invalid_source = ResidentHandlerProgram {
+            run_class: 1200,
+            instructions: vec![
+                ResidentInstruction {
+                    opcode: HANDLER_ADD_FRAME_U64,
+                    argument: 0,
+                    target: 0,
+                    reserved: 0,
+                    value: u64::MAX,
+                },
+                ResidentInstruction {
+                    opcode: HANDLER_COMPLETE,
+                    argument: 0,
+                    target: 0,
+                    reserved: 0,
+                    value: 0,
+                },
+            ],
+        };
+        assert!(!validate_handler_program(&invalid_source, 1, 16));
+        let zero_target = ResidentHandlerProgram {
+            run_class: 1200,
+            instructions: vec![ResidentInstruction {
+                opcode: HANDLER_YIELD_IF_FRAME_ZERO_U64,
+                argument: 0,
+                target: 0,
+                reserved: 0,
+                value: u64::from(1200u32) << 32,
+            }],
+        };
+        assert!(!validate_handler_program(&zero_target, 1, 16));
+    }
+
     fn cap(actor: u64, kind: u32, target: u32, rights: u32) -> ResidentCapability {
         ResidentCapability {
             actor,

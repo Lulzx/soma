@@ -26,11 +26,12 @@ use crate::abi::{EventKind, FutureState, Kind, Ref64, Rights};
 use crate::executives::resident_sync::{
     InitialFuture, ResidentCapability, ResidentEffect, ResidentHandlerProgram, ResidentInstruction,
     ResidentObject, ResidentObjectCapability, ResidentSyncConfig, ResidentSyncResult,
-    HANDLER_ADD_FRAME_IMMEDIATE_U64, HANDLER_COMPLETE_IF_FRAME_U64_EQ, HANDLER_EFFECT_FUTURE_AWAIT,
-    HANDLER_EFFECT_FUTURE_OBSERVE, HANDLER_EFFECT_FUTURE_RESOLVE, HANDLER_EFFECT_MAILBOX_RECEIVE,
-    HANDLER_EFFECT_MAILBOX_SEND, HANDLER_EFFECT_OBJECT_READ, HANDLER_EFFECT_OBJECT_WRITE,
-    HANDLER_STORE_IMMEDIATE_U64, HANDLER_YIELD_FRAME_U32, RESOURCE_FUTURE, RESOURCE_MAILBOX,
-    RESOURCE_OBJECT, RIGHT_READ, RIGHT_WRITE,
+    HANDLER_ADD_FRAME_IMMEDIATE_U64, HANDLER_ADD_FRAME_U64, HANDLER_COMPLETE_IF_FRAME_U64_EQ,
+    HANDLER_EFFECT_FUTURE_AWAIT, HANDLER_EFFECT_FUTURE_OBSERVE, HANDLER_EFFECT_FUTURE_RESOLVE,
+    HANDLER_EFFECT_MAILBOX_RECEIVE, HANDLER_EFFECT_MAILBOX_SEND, HANDLER_EFFECT_OBJECT_READ,
+    HANDLER_EFFECT_OBJECT_WRITE, HANDLER_STORE_IMMEDIATE_U64, HANDLER_YIELD_FRAME_U32,
+    HANDLER_YIELD_IF_FRAME_ZERO_U64, RESOURCE_FUTURE, RESOURCE_MAILBOX, RESOURCE_OBJECT,
+    RIGHT_READ, RIGHT_WRITE,
 };
 use crate::kernel::Kernel;
 use crate::scheduler::device::reference_lane_conflicts;
@@ -88,11 +89,21 @@ impl KernelResidentInstruction {
     pub fn add_frame_immediate(offset: u32, value: u64) -> Self {
         Self::plain(HANDLER_ADD_FRAME_IMMEDIATE_U64, offset, value)
     }
+    pub fn add_frame_word(destination: u32, source: u32) -> Self {
+        Self::plain(HANDLER_ADD_FRAME_U64, destination, u64::from(source))
+    }
     pub fn complete_if_frame_eq(offset: u32, value: u64) -> Self {
         Self::plain(HANDLER_COMPLETE_IF_FRAME_U64_EQ, offset, value)
     }
     pub fn yield_frame_run_class(offset: u32) -> Self {
         Self::plain(HANDLER_YIELD_FRAME_U32, offset, 0)
+    }
+    pub fn yield_if_frame_zero(offset: u32, zero_class: u32, nonzero_class: u32) -> Self {
+        Self::plain(
+            HANDLER_YIELD_IF_FRAME_ZERO_U64,
+            offset,
+            u64::from(zero_class) | (u64::from(nonzero_class) << 32),
+        )
     }
     pub fn plain(opcode: u32, argument: u32, value: u64) -> Self {
         Self {
@@ -3598,29 +3609,43 @@ mod tests {
         let mut kernel = Kernel::new();
         let process = kernel.create_process(Ref64::NULL, ProcessMode::Pure);
         let run_class = 1750;
-        for (class, next_class) in [(run_class, run_class + 1), (run_class + 1, run_class)] {
-            kernel
-                .install_resident_sync_program(KernelResidentProgram {
-                    run_class: class,
-                    instructions: vec![
-                        KernelResidentInstruction::add_frame_immediate(0, 1),
-                        KernelResidentInstruction::complete_if_frame_eq(0, 0),
-                        KernelResidentInstruction::store_frame_immediate(8, u64::from(next_class)),
-                        KernelResidentInstruction::yield_frame_run_class(8),
-                    ],
-                })
-                .unwrap();
-        }
-        let mut initial_frame = vec![0; 16];
-        initial_frame[..8].copy_from_slice(&(u64::MAX - 4).to_le_bytes());
+        kernel
+            .install_resident_sync_program(KernelResidentProgram {
+                run_class,
+                instructions: vec![
+                    KernelResidentInstruction::add_frame_immediate(0, 1),
+                    KernelResidentInstruction::complete_if_frame_eq(0, 0),
+                    KernelResidentInstruction::store_frame_immediate(16, u64::from(run_class + 1)),
+                    KernelResidentInstruction::yield_frame_run_class(16),
+                ],
+            })
+            .unwrap();
+        kernel
+            .install_resident_sync_program(KernelResidentProgram {
+                run_class: run_class + 1,
+                instructions: vec![
+                    KernelResidentInstruction::add_frame_word(0, 8),
+                    KernelResidentInstruction::yield_if_frame_zero(0, run_class + 2, run_class),
+                ],
+            })
+            .unwrap();
+        kernel
+            .install_resident_sync_program(KernelResidentProgram {
+                run_class: run_class + 2,
+                instructions: vec![KernelResidentInstruction::plain(HANDLER_COMPLETE, 0, 0)],
+            })
+            .unwrap();
+        let mut initial_frame = vec![0; 24];
+        initial_frame[..8].copy_from_slice(&(u64::MAX - 5).to_le_bytes());
+        initial_frame[8..16].copy_from_slice(&1u64.to_le_bytes());
         let continuation = kernel
             .create_continuation(
                 process,
                 process,
-                ContinuationSpec::new(StateAccess::ReadOnly, run_class, 0, initial_frame, 6),
+                ContinuationSpec::new(StateAccess::ReadOnly, run_class, 0, initial_frame, 7),
             )
             .unwrap();
-        let plan = kernel.plan_resident_sync(5, 1, 16, width).unwrap();
+        let plan = kernel.plan_resident_sync(7, 1, 24, width).unwrap();
         (kernel, plan, continuation)
     }
 
@@ -3682,7 +3707,7 @@ mod tests {
         let mut runs = Vec::new();
         for width in [1, 32] {
             let (mut kernel, plan, continuation) = arithmetic_frame_setup(width);
-            assert_eq!(kernel.run_resident_sync_cpu_reference(plan), Ok(5));
+            assert_eq!(kernel.run_resident_sync_cpu_reference(plan), Ok(7));
             assert_eq!(
                 kernel.continuation_state(continuation),
                 Ok(ContinuationState::Completed)
@@ -3707,7 +3732,7 @@ mod tests {
         let mut runs = Vec::new();
         for width in [1, 32] {
             let (mut kernel, plan, continuation) = arithmetic_frame_setup(width);
-            assert_eq!(kernel.run_resident_sync_metal(plan), Ok(5));
+            assert_eq!(kernel.run_resident_sync_metal(plan), Ok(7));
             assert_eq!(
                 kernel.continuation_state(continuation),
                 Ok(ContinuationState::Completed)
