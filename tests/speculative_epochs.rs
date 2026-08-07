@@ -45,6 +45,29 @@ fn disjoint_lanes_commit_the_reference_run() {
     assert_legal(&speculative);
 }
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn actual_epoch_journals_are_validated_on_metal_before_commit() {
+    use soma::executives::metal_scheduler::MetalDeviceScheduler;
+
+    let knobs = leaf_knobs();
+    let mut reference = build(&knobs);
+    let mut device_validated = build(&knobs);
+    device_validated.configure_epoch_executive(EpochExecutive::Speculative { max_lanes: 16 });
+    let mut metal = MetalDeviceScheduler::new().unwrap();
+
+    reference.run_epoch();
+    device_validated.run_epoch_with_lane_validator(&mut metal);
+
+    assert_eq!(device_validated.speculation_stats().committed_epochs, 1);
+    assert!(conforms_traces(
+        &reference.trace_snapshot(),
+        &device_validated.trace_snapshot()
+    )
+    .is_empty());
+    assert_legal(&device_validated);
+}
+
 fn two_leaves_in_one_process() -> Kernel {
     let mut kernel = Kernel::new();
     let process = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
@@ -184,6 +207,27 @@ fn two_future_writers_conflict_and_replay_in_plan_order() {
     assert_eq!(stats.conflict_fallbacks, 1);
     let disagreements = conforms_traces(&reference.trace_snapshot(), &speculative.trace_snapshot());
     assert!(disagreements.is_empty(), "{disagreements:#?}");
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn metal_conflict_decision_falls_back_before_future_writes_escape() {
+    use soma::executives::metal_scheduler::MetalDeviceScheduler;
+
+    let mut reference = contested_future();
+    let mut device_validated = contested_future();
+    device_validated.configure_epoch_executive(EpochExecutive::Speculative { max_lanes: 8 });
+    let mut metal = MetalDeviceScheduler::new().unwrap();
+
+    reference.run_epoch();
+    device_validated.run_epoch_with_lane_validator(&mut metal);
+
+    assert_eq!(device_validated.speculation_stats().conflict_fallbacks, 1);
+    assert!(conforms_traces(
+        &reference.trace_snapshot(),
+        &device_validated.trace_snapshot()
+    )
+    .is_empty());
 }
 
 fn future_poll_race() -> Kernel {

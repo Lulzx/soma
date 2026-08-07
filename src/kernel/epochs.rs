@@ -19,6 +19,7 @@ use crate::kernel::speculation::{EpochExecutive, LaneJournal, LaneOperation, Res
 use crate::kernel::Kernel;
 use crate::scheduler::admission::{admit, AdmissionRecord, Candidate};
 use crate::scheduler::cohorts::{build_cohorts, CohortPlan};
+use crate::scheduler::device::{reference_lane_conflicts, LaneConflictValidator};
 
 #[derive(Clone, Copy, Debug)]
 struct EvaluatedStep {
@@ -43,6 +44,23 @@ impl Kernel {
     /// buffer) is promoted to `current`, executed, and any work it produces
     /// lands in `next` for the following epoch (§13, §18).
     pub fn run_epoch(&mut self) -> usize {
+        self.run_epoch_validated(None)
+    }
+
+    /// Run one epoch and use `validator` for the complete speculative lane
+    /// journal before canonical commit. A validation error or conflict causes
+    /// the same whole-epoch reference fallback as the in-process validator.
+    pub fn run_epoch_with_lane_validator(
+        &mut self,
+        validator: &mut dyn LaneConflictValidator,
+    ) -> usize {
+        self.run_epoch_validated(Some(validator))
+    }
+
+    fn run_epoch_validated(
+        &mut self,
+        mut validator: Option<&mut dyn LaneConflictValidator>,
+    ) -> usize {
         // Under a bounded retention policy the logs carry only the epoch that
         // just ran, so this is where last epoch's records stop being the
         // caller's to drain. Under the default `Retain` it does nothing. A
@@ -209,9 +227,15 @@ impl Kernel {
         self.lane_order.arrange(&mut lanes, self.epoch);
 
         let steps = match self.epoch_executive {
-            EpochExecutive::Speculative { max_lanes } => self
-                .execute_lanes_speculatively(&lanes, max_lanes)
-                .unwrap_or_else(|| self.execute_lanes_reference(&lanes)),
+            EpochExecutive::Speculative { max_lanes } => {
+                let speculative = match validator.take() {
+                    Some(validator) => {
+                        self.execute_lanes_speculatively(&lanes, max_lanes, Some(validator))
+                    }
+                    None => self.execute_lanes_speculatively(&lanes, max_lanes, None),
+                };
+                speculative.unwrap_or_else(|| self.execute_lanes_reference(&lanes))
+            }
             EpochExecutive::Reference => self.execute_lanes_reference(&lanes),
         };
 
@@ -395,6 +419,7 @@ impl Kernel {
         &mut self,
         lanes: &[(u32, Ref64)],
         max_lanes: usize,
+        validator: Option<&mut dyn LaneConflictValidator>,
     ) -> Option<usize> {
         if lanes.len() < 2 || lanes.len() > max_lanes.max(1) {
             return None;
@@ -469,22 +494,52 @@ impl Kernel {
             self.speculation_stats.unsupported_fallbacks += 1;
             return None;
         }
-        for left in 0..outcomes.len() {
-            for right in left + 1..outcomes.len() {
-                if outcomes[left]
-                    .journal
-                    .conflicts_with(&outcomes[right].journal)
-                {
+        // Execution order is deliberately discarded here. Lane number is the
+        // canonical position assigned by the epoch plan.
+        outcomes.sort_by_key(|outcome| outcome.lane);
+        if let Some(validator) = validator {
+            let accesses: Vec<_> = outcomes
+                .iter()
+                .enumerate()
+                .flat_map(|(lane, outcome)| outcome.journal.device_accesses(lane as u32))
+                .collect();
+            let conflicts = match validator.validate_lane_journals(&accesses, outcomes.len() as u32)
+            {
+                Ok(conflicts) if conflicts.len() == outcomes.len() => conflicts,
+                _ => {
                     self.speculation_stats.fallback_epochs += 1;
-                    self.speculation_stats.conflict_fallbacks += 1;
+                    self.speculation_stats.unsupported_fallbacks += 1;
                     return None;
+                }
+            };
+            debug_assert_eq!(
+                conflicts,
+                reference_lane_conflicts(&accesses, outcomes.len() as u32)
+            );
+            if conflicts.iter().any(|conflict| conflict.conflicts != 0) {
+                self.speculation_stats.fallback_epochs += 1;
+                self.speculation_stats.conflict_fallbacks += 1;
+                return None;
+            }
+        } else {
+            for left in 0..outcomes.len() {
+                for right in left + 1..outcomes.len() {
+                    if outcomes[left]
+                        .journal
+                        .conflicts_with(&outcomes[right].journal)
+                    {
+                        self.speculation_stats.fallback_epochs += 1;
+                        self.speculation_stats.conflict_fallbacks += 1;
+                        return None;
+                    }
                 }
             }
         }
 
-        // Execution order is deliberately discarded here. Lane number is the
-        // canonical position assigned by the epoch plan.
-        outcomes.sort_by_key(|outcome| outcome.lane);
+        /*
+         * Device validation and host validation both end at this exact gate.
+         * Nothing from a snapshot is replayed before it passes.
+         */
         // Validate replay against a disposable copy before touching the real
         // kernel. A mismatch means an access declaration was incomplete; no
         // partial canonical commit may escape in that case.

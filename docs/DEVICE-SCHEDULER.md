@@ -53,9 +53,19 @@ set function and cannot depend on physical completion order.
 The access and result buffers grow geometrically and remain resident across
 epochs. `tests/device_scheduler.rs` compares the Metal result to an independent
 CPU oracle, reverses journal input order, exercises read/read and namespace
-negative controls, and verifies buffer reuse. This moves the conflict gate
-needed before canonical commit onto the device. It does not yet move operation
-replay or handler execution there.
+negative controls, and verifies buffer reuse.
+
+This is wired into actual epochs through
+`Kernel::run_epoch_with_lane_validator`. The speculative workers execute from
+the same pre-epoch snapshot and emit the real `LaneView` journals; the journals
+are sorted into the fixed device ABI; Metal decides whether the epoch can
+commit; and any conflict or device error sends the entire epoch through the
+reference path before an operation or payload escapes. Disjoint dynamic-search
+lanes commit with a reference-equivalent trace, while two writers of one future
+exercise the fallback. A debug build also compares the device decision with the
+independent oracle at that boundary. This moves the conflict gate needed before
+canonical commit onto the device. It does not yet move operation replay or
+handler execution there.
 
 The current algorithm is intentionally simple and quadratic in candidate
 count. It establishes the device ABI and semantic equivalence before replacing

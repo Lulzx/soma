@@ -16,6 +16,7 @@ use crate::abi::cohorts::PartialCohortPolicy;
 use crate::scheduler::admission::Candidate;
 use crate::scheduler::device::{
     DeviceCandidate, DeviceLaneAccess, DeviceLaneConflict, DevicePlacement, DeviceSchedule,
+    LaneConflictValidator, LaneValidationError,
 };
 use crate::scheduler::device::{ResidentSearchConfig, ResidentSearchResult};
 
@@ -407,6 +408,22 @@ impl MetalDeviceScheduler {
         }
         .to_vec();
         Ok(DeviceSchedule { placements })
+    }
+}
+
+impl LaneConflictValidator for MetalDeviceScheduler {
+    fn validate_lane_journals(
+        &mut self,
+        accesses: &[DeviceLaneAccess],
+        lane_count: u32,
+    ) -> Result<Vec<DeviceLaneConflict>, LaneValidationError> {
+        MetalDeviceScheduler::validate_lane_journals(self, accesses, lane_count).map_err(|error| {
+            match error {
+                BackendError::InvalidInput => LaneValidationError::InvalidInput,
+                BackendError::Unavailable => LaneValidationError::Unavailable,
+                _ => LaneValidationError::ExecutionFailed,
+            }
+        })
     }
 }
 

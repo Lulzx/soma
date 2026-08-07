@@ -18,6 +18,38 @@ pub const DEVICE_SEND_TO_CPU: u32 = 3;
 pub const DEVICE_ACCESS_READ: u32 = 1;
 pub const DEVICE_ACCESS_WRITE: u32 = 2;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneValidationError {
+    InvalidInput,
+    Unavailable,
+    ExecutionFailed,
+}
+
+/// Pluggable validator used at the speculative epoch's pre-commit boundary.
+pub trait LaneConflictValidator {
+    fn validate_lane_journals(
+        &mut self,
+        accesses: &[DeviceLaneAccess],
+        lane_count: u32,
+    ) -> Result<Vec<DeviceLaneConflict>, LaneValidationError>;
+}
+
+#[derive(Default)]
+pub struct ReferenceLaneConflictValidator;
+
+impl LaneConflictValidator for ReferenceLaneConflictValidator {
+    fn validate_lane_journals(
+        &mut self,
+        accesses: &[DeviceLaneAccess],
+        lane_count: u32,
+    ) -> Result<Vec<DeviceLaneConflict>, LaneValidationError> {
+        if accesses.iter().any(|access| access.lane >= lane_count) {
+            return Err(LaneValidationError::InvalidInput);
+        }
+        Ok(reference_lane_conflicts(accesses, lane_count))
+    }
+}
+
 /// One semantic resource access emitted by a lane.
 ///
 /// The representation is pointer-free and has the same layout in Rust, Metal,
@@ -37,6 +69,16 @@ pub struct DeviceLaneAccess {
 const _: () = assert!(std::mem::size_of::<DeviceLaneAccess>() == 24);
 
 impl DeviceLaneAccess {
+    pub fn new(lane: u32, resource_kind: u32, resource: u64, mode: u32, ordinal: u32) -> Self {
+        Self {
+            resource,
+            lane,
+            resource_kind,
+            mode,
+            ordinal,
+        }
+    }
+
     pub fn read(lane: u32, resource_kind: u32, resource: Ref64, ordinal: u32) -> Self {
         Self {
             resource: resource.to_u64(),

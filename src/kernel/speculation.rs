@@ -9,6 +9,7 @@ use std::collections::HashSet;
 
 use crate::abi::{MessageDescriptor, ObjectKind, ProcessMode, Ref64};
 use crate::kernel::{AwaitOutcome, ContinuationSpec, RuntimeError};
+use crate::scheduler::device::{DeviceLaneAccess, DEVICE_ACCESS_READ, DEVICE_ACCESS_WRITE};
 
 /// How Phase F executes admitted lanes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -140,5 +141,39 @@ impl LaneJournal {
                 .writes
                 .iter()
                 .any(|resource| self.reads.contains(resource))
+    }
+
+    pub(crate) fn device_accesses(&self, lane: u32) -> Vec<DeviceLaneAccess> {
+        let mut accesses: Vec<_> = self
+            .reads
+            .iter()
+            .map(|resource| (resource.device_key(), DEVICE_ACCESS_READ))
+            .chain(
+                self.writes
+                    .iter()
+                    .map(|resource| (resource.device_key(), DEVICE_ACCESS_WRITE)),
+            )
+            .collect();
+        accesses.sort_unstable();
+        accesses
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, ((resource_kind, resource), mode))| {
+                DeviceLaneAccess::new(lane, resource_kind, resource, mode, ordinal as u32)
+            })
+            .collect()
+    }
+}
+
+impl Resource {
+    fn device_key(self) -> (u32, u64) {
+        match self {
+            Self::Object(reference) => (1, reference.to_u64()),
+            Self::Future(reference) => (2, reference.to_u64()),
+            Self::Process(reference) => (3, reference.to_u64()),
+            Self::Mailbox(reference) => (4, reference.to_u64()),
+            Self::Domain(reference) => (5, reference.to_u64()),
+            Self::Allocation(partition) => (6, u64::from(partition)),
+        }
     }
 }
