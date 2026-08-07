@@ -134,35 +134,75 @@ struct OwnedProcessService {
     shutdown: Arc<AtomicBool>,
 }
 
-#[derive(Clone, Copy)]
-enum RemoteLaneWaitKind {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteLaneOperationKind {
     FutureAwait,
+    FutureResolve,
     ChannelSend,
     ChannelReceive,
+    ObjectWrite,
+}
+impl RemoteLaneOperationKind {
+    fn from_operation(operation: &RemoteLaneOperation) -> Option<Self> {
+        match operation {
+            RemoteLaneOperation::FutureAwait => Some(Self::FutureAwait),
+            RemoteLaneOperation::FutureResolve { .. } => Some(Self::FutureResolve),
+            RemoteLaneOperation::ChannelSend { .. } => Some(Self::ChannelSend),
+            RemoteLaneOperation::ChannelReceive { .. } => Some(Self::ChannelReceive),
+            RemoteLaneOperation::ObjectWrite { .. } => Some(Self::ObjectWrite),
+            _ => None,
+        }
+    }
+    fn is_blocking(self) -> bool {
+        matches!(
+            self,
+            Self::FutureAwait | Self::ChannelSend | Self::ChannelReceive
+        )
+    }
+}
+#[derive(Clone)]
+struct RemoteLaneExpectedOutcome {
+    request_id: RemoteLaneRequestId,
+    target: RemoteRef,
+    kind: RemoteLaneOperationKind,
 }
 #[derive(Clone)]
 struct RemoteLaneWaitReceipt {
     continuation: Ref64,
-    target: RemoteRef,
-    kind: RemoteLaneWaitKind,
+    blocking_target: RemoteRef,
+    blocking_kind: RemoteLaneOperationKind,
+    /// The blocking request id is the stable identity of this entire emission.
+    group_id: RemoteLaneRequestId,
+    expected: Vec<RemoteLaneExpectedOutcome>,
     session_binding: Option<([u8; 16], NodeId, NodeId)>,
 }
 
 fn valid_remote_lane_shape(
-    kind: RemoteLaneWaitKind,
+    kind: RemoteLaneOperationKind,
     result: &Result<RemoteLaneApply, RemoteLaneError>,
 ) -> bool {
     match result {
         Err(_) | Ok(RemoteLaneApply::WouldBlock) => true,
         Ok(RemoteLaneApply::Applied(value)) => matches!(
             (kind, value),
-            (RemoteLaneWaitKind::FutureAwait, RemoteLaneValue::Ref(_))
-                | (RemoteLaneWaitKind::ChannelReceive, RemoteLaneValue::Ref(_))
-                | (RemoteLaneWaitKind::ChannelSend, RemoteLaneValue::Unit)
+            (
+                RemoteLaneOperationKind::FutureAwait,
+                RemoteLaneValue::Ref(_)
+            ) | (
+                RemoteLaneOperationKind::FutureResolve,
+                RemoteLaneValue::Unit
+            ) | (
+                RemoteLaneOperationKind::ChannelReceive,
+                RemoteLaneValue::Ref(_)
+            ) | (RemoteLaneOperationKind::ChannelSend, RemoteLaneValue::Unit)
+                | (
+                    RemoteLaneOperationKind::ObjectWrite,
+                    RemoteLaneValue::Version { .. }
+                )
         ),
         Ok(RemoteLaneApply::Closed) => matches!(
             kind,
-            RemoteLaneWaitKind::ChannelSend | RemoteLaneWaitKind::ChannelReceive
+            RemoteLaneOperationKind::ChannelSend | RemoteLaneOperationKind::ChannelReceive
         ),
         Ok(RemoteLaneApply::Lost) => true,
     }
@@ -261,24 +301,37 @@ impl RemoteNodeRuntime {
     ) -> Result<(), RemoteNodeRuntimeError> {
         let receipt = self
             .remote_lane_waiters
-            .get_mut(&request_id)
+            .get(&request_id)
+            .cloned()
             .ok_or(RemoteNodeRuntimeError::UnknownResource)?;
         if session.issuer != self.node {
             return Err(RemoteNodeRuntimeError::WrongNode);
         }
-        if session.owner != receipt.target.node {
+        if session.owner != receipt.blocking_target.node {
             return Err(RemoteNodeRuntimeError::WrongOwner);
         }
         let binding = (session.session_id, session.issuer, session.owner);
-        if receipt
-            .session_binding
-            .is_some_and(|existing| existing != binding)
-        {
+        // Refuse a conflicting route for any member before changing any member.
+        if receipt.expected.iter().any(|expected| {
+            self.remote_lane_waiters
+                .get(&expected.request_id)
+                .is_none_or(|member| {
+                    member.group_id != receipt.group_id
+                        || member
+                            .session_binding
+                            .is_some_and(|existing| existing != binding)
+                })
+        }) {
             return Err(RemoteNodeRuntimeError::Lane(
                 RemoteLaneError::InvalidEnvelope,
             ));
         }
-        receipt.session_binding = Some(binding);
+        for expected in &receipt.expected {
+            self.remote_lane_waiters
+                .get_mut(&expected.request_id)
+                .expect("members were checked above")
+                .session_binding = Some(binding);
+        }
         Ok(())
     }
 
@@ -305,20 +358,48 @@ impl RemoteNodeRuntime {
         session_binding: ([u8; 16], NodeId, NodeId),
     ) -> Result<(), RemoteNodeRuntimeError> {
         let mut seen = std::collections::HashSet::new();
+        let mut group_ids = Vec::new();
         for outcome in outcomes {
             if !seen.insert(outcome.request_id) {
                 return Err(RemoteNodeRuntimeError::Lane(
                     RemoteLaneError::InvalidEnvelope,
                 ));
             }
-            let Some(receipt) = self.remote_lane_waiters.get(&outcome.request_id) else {
-                // A verified batch may contain non-blocking operations for which the
-                // runtime intentionally has no waiter receipt.
-                continue;
-            };
+            let receipt = self.remote_lane_waiters.get(&outcome.request_id).ok_or(
+                RemoteNodeRuntimeError::Lane(RemoteLaneError::InvalidEnvelope),
+            )?;
+            let expected = receipt
+                .expected
+                .iter()
+                .find(|expected| expected.request_id == outcome.request_id)
+                .ok_or(RemoteNodeRuntimeError::Lane(
+                    RemoteLaneError::InvalidEnvelope,
+                ))?;
             if receipt.session_binding != Some(session_binding)
-                || outcome.target != receipt.target
-                || !valid_remote_lane_shape(receipt.kind, &outcome.result)
+                || outcome.target != expected.target
+                || !valid_remote_lane_shape(expected.kind, &outcome.result)
+            {
+                return Err(RemoteNodeRuntimeError::Lane(
+                    RemoteLaneError::InvalidEnvelope,
+                ));
+            }
+            if !group_ids.contains(&receipt.group_id) {
+                group_ids.push(receipt.group_id);
+            }
+        }
+        // A verified transport frame must contain the complete result vector for
+        // every emission it mentions. Missing members are an atomic refusal.
+        for group_id in &group_ids {
+            let receipt =
+                self.remote_lane_waiters
+                    .get(group_id)
+                    .ok_or(RemoteNodeRuntimeError::Lane(
+                        RemoteLaneError::InvalidEnvelope,
+                    ))?;
+            if receipt
+                .expected
+                .iter()
+                .any(|expected| !seen.contains(&expected.request_id))
             {
                 return Err(RemoteNodeRuntimeError::Lane(
                     RemoteLaneError::InvalidEnvelope,
@@ -326,21 +407,37 @@ impl RemoteNodeRuntime {
             }
         }
 
-        // Kernel transitions are attempted on a clone. A later bad transition cannot
-        // partially consume waiters or outbox entries from the live runtime.
+        // Attempt all terminal group transitions on a clone.  A retryable member
+        // keeps the complete group parked, including already-applied members.
         let mut kernel = self.kernel.clone();
-        let mut completed = Vec::new();
-        for outcome in outcomes {
-            if matches!(
-                outcome.result,
-                Ok(RemoteLaneApply::WouldBlock) | Err(RemoteLaneError::NodeUnavailable)
-            ) {
+        let mut terminal_groups = Vec::new();
+        for group_id in group_ids {
+            let receipt = self
+                .remote_lane_waiters
+                .get(&group_id)
+                .expect("group validated above");
+            let group_outcomes: Vec<_> = receipt
+                .expected
+                .iter()
+                .map(|expected| {
+                    outcomes
+                        .iter()
+                        .find(|outcome| outcome.request_id == expected.request_id)
+                        .expect("complete group validated above")
+                })
+                .collect();
+            if group_outcomes.iter().any(|outcome| {
+                matches!(
+                    outcome.result,
+                    Ok(RemoteLaneApply::WouldBlock) | Err(RemoteLaneError::NodeUnavailable)
+                )
+            }) {
                 continue;
             }
-            let Some(receipt) = self.remote_lane_waiters.get(&outcome.request_id) else {
-                continue;
-            };
-            if matches!(outcome.result, Ok(RemoteLaneApply::Applied(_))) {
+            let success = group_outcomes
+                .iter()
+                .all(|outcome| matches!(outcome.result, Ok(RemoteLaneApply::Applied(_))));
+            if success {
                 kernel
                     .complete_remote_lane_program(receipt.continuation)
                     .map_err(RemoteNodeRuntimeError::Kernel)?;
@@ -349,34 +446,46 @@ impl RemoteNodeRuntime {
                     .fail_remote_lane_program(receipt.continuation)
                     .map_err(RemoteNodeRuntimeError::Kernel)?;
             }
-            match receipt.kind {
-                RemoteLaneWaitKind::FutureAwait => kernel.wake_remote_future_waiter(
+            match receipt.blocking_kind {
+                RemoteLaneOperationKind::FutureAwait => kernel.wake_remote_future_waiter(
                     receipt.continuation,
-                    receipt.target.node.0,
-                    receipt.target.entity,
+                    receipt.blocking_target.node.0,
+                    receipt.blocking_target.entity,
                 ),
-                RemoteLaneWaitKind::ChannelSend | RemoteLaneWaitKind::ChannelReceive => kernel
-                    .wake_remote_channel_waiter(
+                RemoteLaneOperationKind::ChannelSend | RemoteLaneOperationKind::ChannelReceive => {
+                    kernel.wake_remote_channel_waiter(
                         receipt.continuation,
-                        receipt.target.node.0,
-                        receipt.target.entity,
-                    ),
+                        receipt.blocking_target.node.0,
+                        receipt.blocking_target.entity,
+                    )
+                }
+                _ => unreachable!("validated programs have exactly one blocking operation"),
             }
-            completed.push(outcome.request_id);
+            terminal_groups.push(group_id);
         }
-        if !completed.is_empty() {
-            self.kernel = kernel;
+        if terminal_groups.is_empty() {
+            return Ok(());
         }
-        for request_id in completed {
-            self.remote_lane_waiters.remove(&request_id);
-            self.outbound_remote_lane.retain(|emission| {
-                !emission
-                    .batch
-                    .effects()
-                    .iter()
-                    .any(|effect| effect.request_id == request_id)
-            });
+        self.kernel = kernel;
+        let mut removed = std::collections::HashSet::new();
+        for group_id in terminal_groups {
+            let receipt = self
+                .remote_lane_waiters
+                .get(&group_id)
+                .expect("terminal group still present")
+                .clone();
+            for expected in receipt.expected {
+                removed.insert(expected.request_id);
+                self.remote_lane_waiters.remove(&expected.request_id);
+            }
         }
+        self.outbound_remote_lane.retain(|emission| {
+            !emission
+                .batch
+                .effects()
+                .iter()
+                .any(|effect| removed.contains(&effect.request_id))
+        });
         Ok(())
     }
 
@@ -388,31 +497,41 @@ impl RemoteNodeRuntime {
     ) -> Result<(), RemoteNodeRuntimeError> {
         let receipt = self
             .remote_lane_waiters
-            .remove(&request_id)
+            .get(&request_id)
+            .cloned()
             .ok_or(RemoteNodeRuntimeError::UnknownResource)?;
         self.kernel
             .fail_remote_lane_program(receipt.continuation)
             .map_err(RemoteNodeRuntimeError::Kernel)?;
+        let ids: std::collections::HashSet<_> = receipt
+            .expected
+            .iter()
+            .map(|expected| expected.request_id)
+            .collect();
+        for id in &ids {
+            self.remote_lane_waiters.remove(id);
+        }
         self.outbound_remote_lane.retain(|emission| {
             !emission
                 .batch
                 .effects()
                 .iter()
-                .any(|effect| effect.request_id == request_id)
+                .any(|effect| ids.contains(&effect.request_id))
         });
-        match receipt.kind {
-            RemoteLaneWaitKind::FutureAwait => self.kernel.wake_remote_future_waiter(
+        match receipt.blocking_kind {
+            RemoteLaneOperationKind::FutureAwait => self.kernel.wake_remote_future_waiter(
                 receipt.continuation,
-                receipt.target.node.0,
-                receipt.target.entity,
+                receipt.blocking_target.node.0,
+                receipt.blocking_target.entity,
             ),
-            RemoteLaneWaitKind::ChannelSend | RemoteLaneWaitKind::ChannelReceive => {
+            RemoteLaneOperationKind::ChannelSend | RemoteLaneOperationKind::ChannelReceive => {
                 self.kernel.wake_remote_channel_waiter(
                     receipt.continuation,
-                    receipt.target.node.0,
-                    receipt.target.entity,
+                    receipt.blocking_target.node.0,
+                    receipt.blocking_target.entity,
                 )
             }
+            _ => unreachable!("validated programs have exactly one blocking operation"),
         }
         Ok(())
     }
@@ -873,70 +992,93 @@ impl RemoteNodeRuntime {
         self.kernel
             .set_remote_lane_outbox_usage(self.outbound_remote_lane.len(), pending_bytes);
         self.kernel.run_epoch();
-        for emission in self.kernel.drain_remote_lane_emissions() {
-            // One blocking dependency per v1 program. Refuse ambiguous mixed
-            // waits transactionally before publishing the outbound frame.
-            let waits: Vec<_> = emission
-                .batch
-                .effects()
-                .iter()
-                .filter_map(|effect| match effect.operation {
-                    RemoteLaneOperation::FutureAwait => Some((
-                        effect.request_id,
-                        effect.target,
-                        RemoteLaneWaitKind::FutureAwait,
-                    )),
-                    RemoteLaneOperation::ChannelSend { .. } => Some((
-                        effect.request_id,
-                        effect.target,
-                        RemoteLaneWaitKind::ChannelSend,
-                    )),
-                    RemoteLaneOperation::ChannelReceive { .. } => Some((
-                        effect.request_id,
-                        effect.target,
-                        RemoteLaneWaitKind::ChannelReceive,
-                    )),
-                    _ => None,
-                })
-                .collect();
-            if waits.len() > 1 {
+        let mut kernel = self.kernel.clone();
+        let emissions = kernel.drain_remote_lane_emissions();
+        let mut pending = Vec::with_capacity(emissions.len());
+        let mut all_ids = std::collections::HashSet::new();
+        // Validate every emission before mutating any waiter, receipt, or
+        // outbox. Installed programs promise exactly one blocking member.
+        for emission in emissions {
+            let mut expected = Vec::with_capacity(emission.batch.effects().len());
+            let mut blocking = Vec::new();
+            let mut owner = None;
+            for effect in emission.batch.effects() {
+                let kind = RemoteLaneOperationKind::from_operation(&effect.operation).ok_or(
+                    RemoteNodeRuntimeError::Lane(RemoteLaneError::InvalidProgram),
+                )?;
+                if !all_ids.insert(effect.request_id)
+                    || self.remote_lane_waiters.contains_key(&effect.request_id)
+                    || owner.is_some_and(|node| node != effect.target.node)
+                {
+                    return Err(RemoteNodeRuntimeError::Lane(
+                        RemoteLaneError::InvalidProgram,
+                    ));
+                }
+                owner = Some(effect.target.node);
+                if kind.is_blocking() {
+                    blocking.push((effect.request_id, effect.target, kind));
+                }
+                expected.push(RemoteLaneExpectedOutcome {
+                    request_id: effect.request_id,
+                    target: effect.target,
+                    kind,
+                });
+            }
+            if blocking.len() != 1 || expected.is_empty() {
                 return Err(RemoteNodeRuntimeError::Lane(
                     RemoteLaneError::InvalidProgram,
                 ));
             }
-            if let Some((id, target, kind)) = waits.first().copied() {
-                match kind {
-                    RemoteLaneWaitKind::FutureAwait => self
-                        .kernel
-                        .register_remote_future_waiter(
-                            emission.continuation,
-                            target.node.0,
-                            target.entity,
-                            emission.run_class,
-                        )
-                        .map_err(RemoteNodeRuntimeError::Kernel)?,
-                    RemoteLaneWaitKind::ChannelSend | RemoteLaneWaitKind::ChannelReceive => self
-                        .kernel
+            let (group_id, blocking_target, blocking_kind) = blocking[0];
+            let continuation = emission.continuation;
+            pending.push((
+                emission,
+                RemoteLaneWaitReceipt {
+                    continuation,
+                    blocking_target,
+                    blocking_kind,
+                    group_id,
+                    expected,
+                    session_binding: None,
+                },
+            ));
+        }
+
+        // Waiter registration is fallible, so perform the complete publication
+        // against clones and swap it into the live runtime only after all groups
+        // have registered successfully.
+        let mut waiters = self.remote_lane_waiters.clone();
+        let mut outbox = self.outbound_remote_lane.clone();
+        for (emission, receipt) in pending {
+            match receipt.blocking_kind {
+                RemoteLaneOperationKind::FutureAwait => kernel
+                    .register_remote_future_waiter(
+                        emission.continuation,
+                        receipt.blocking_target.node.0,
+                        receipt.blocking_target.entity,
+                        emission.run_class,
+                    )
+                    .map_err(RemoteNodeRuntimeError::Kernel)?,
+                RemoteLaneOperationKind::ChannelSend | RemoteLaneOperationKind::ChannelReceive => {
+                    kernel
                         .register_remote_channel_waiter(
                             emission.continuation,
-                            target.node.0,
-                            target.entity,
+                            receipt.blocking_target.node.0,
+                            receipt.blocking_target.entity,
                             emission.run_class,
                         )
-                        .map_err(RemoteNodeRuntimeError::Kernel)?,
+                        .map_err(RemoteNodeRuntimeError::Kernel)?
                 }
-                self.remote_lane_waiters.insert(
-                    id,
-                    RemoteLaneWaitReceipt {
-                        continuation: emission.continuation,
-                        target,
-                        kind,
-                        session_binding: None,
-                    },
-                );
+                _ => unreachable!(),
             }
-            self.outbound_remote_lane.push(emission);
+            for member in &receipt.expected {
+                waiters.insert(member.request_id, receipt.clone());
+            }
+            outbox.push(emission);
         }
+        self.kernel = kernel;
+        self.remote_lane_waiters = waiters;
+        self.outbound_remote_lane = outbox;
         let epoch = self.kernel.current_epoch();
         for resource in &self.owned_processes {
             resource
@@ -1092,26 +1234,126 @@ impl RemoteNodeRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::{valid_remote_lane_shape, RemoteLaneWaitKind};
+    use super::{valid_remote_lane_shape, RemoteLaneOperationKind};
     use crate::distributed::remote_lane_effect::{RemoteLaneApply, RemoteLaneValue};
 
     #[test]
     fn verified_terminal_shapes_accept_lost_but_not_future_closed() {
         assert!(valid_remote_lane_shape(
-            RemoteLaneWaitKind::FutureAwait,
+            RemoteLaneOperationKind::FutureAwait,
             &Ok(RemoteLaneApply::Lost),
         ));
         assert!(!valid_remote_lane_shape(
-            RemoteLaneWaitKind::FutureAwait,
+            RemoteLaneOperationKind::FutureAwait,
             &Ok(RemoteLaneApply::Closed),
         ));
         assert!(valid_remote_lane_shape(
-            RemoteLaneWaitKind::ChannelReceive,
+            RemoteLaneOperationKind::ChannelReceive,
             &Ok(RemoteLaneApply::Closed),
         ));
         assert!(!valid_remote_lane_shape(
-            RemoteLaneWaitKind::FutureAwait,
+            RemoteLaneOperationKind::FutureAwait,
             &Ok(RemoteLaneApply::Applied(RemoteLaneValue::Unit)),
         ));
+    }
+
+    #[test]
+    fn mixed_partial_terminal_group_remains_parked_and_malformed_is_atomic() {
+        use crate::abi::{Kind, ProcessMode, Ref64, StateAccess};
+        use crate::distributed::{NodeId, RemoteRef};
+        use crate::kernel::{ContinuationSpec, Kernel, SYSTEM_PRINCIPAL};
+
+        let worker = NodeId(900);
+        let owner = NodeId(901);
+        let mut kernel = Kernel::new();
+        let actor = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+        let continuation = kernel
+            .create_continuation(
+                actor,
+                actor,
+                ContinuationSpec::new(StateAccess::ReadOnly, 9001, 9001, vec![], 2),
+            )
+            .unwrap();
+        let future = RemoteRef {
+            node: owner,
+            entity: Ref64::new(1, 1, Kind::Future),
+        };
+        let object = RemoteRef {
+            node: owner,
+            entity: Ref64::new(2, 1, Kind::Object),
+        };
+        kernel
+            .register_remote_future_waiter(continuation, owner.0, future.entity, 9001)
+            .unwrap();
+        let mut runtime = super::RemoteNodeRuntime::new(worker, kernel);
+        let wait_id = crate::distributed::remote_lane_effect::RemoteLaneRequestId([1; 32]);
+        let write_id = crate::distributed::remote_lane_effect::RemoteLaneRequestId([2; 32]);
+        let binding = ([3; 16], worker, owner);
+        let expected = vec![
+            super::RemoteLaneExpectedOutcome {
+                request_id: wait_id,
+                target: future,
+                kind: RemoteLaneOperationKind::FutureAwait,
+            },
+            super::RemoteLaneExpectedOutcome {
+                request_id: write_id,
+                target: object,
+                kind: RemoteLaneOperationKind::ObjectWrite,
+            },
+        ];
+        let receipt = super::RemoteLaneWaitReceipt {
+            continuation,
+            blocking_target: future,
+            blocking_kind: RemoteLaneOperationKind::FutureAwait,
+            group_id: wait_id,
+            expected,
+            session_binding: Some(binding),
+        };
+        runtime.remote_lane_waiters.insert(wait_id, receipt.clone());
+        runtime.remote_lane_waiters.insert(write_id, receipt);
+
+        let partial = vec![
+            crate::distributed::remote_lane_effect::RemoteLaneOutcome {
+                request_id: wait_id,
+                target: future,
+                result: Ok(RemoteLaneApply::Applied(RemoteLaneValue::Ref(object))),
+            },
+            crate::distributed::remote_lane_effect::RemoteLaneOutcome {
+                request_id: write_id,
+                target: object,
+                result: Err(
+                    crate::distributed::remote_lane_effect::RemoteLaneError::NodeUnavailable,
+                ),
+            },
+        ];
+        assert!(runtime
+            .apply_remote_lane_outcomes(&partial[..1], binding)
+            .is_err());
+        assert_eq!(runtime.remote_lane_waiters.len(), 2);
+        runtime
+            .apply_remote_lane_outcomes(&partial, binding)
+            .unwrap();
+        assert_eq!(runtime.remote_lane_waiters.len(), 2);
+        assert_eq!(
+            runtime.kernel.continuation_state(continuation).unwrap(),
+            crate::abi::ContinuationState::Waiting
+        );
+
+        let malformed = vec![
+            partial[0].clone(),
+            crate::distributed::remote_lane_effect::RemoteLaneOutcome {
+                request_id: write_id,
+                target: object,
+                result: Ok(RemoteLaneApply::Applied(RemoteLaneValue::Unit)),
+            },
+        ];
+        assert!(runtime
+            .apply_remote_lane_outcomes(&malformed, binding)
+            .is_err());
+        assert_eq!(runtime.remote_lane_waiters.len(), 2);
+        assert_eq!(
+            runtime.kernel.continuation_state(continuation).unwrap(),
+            crate::abi::ContinuationState::Waiting
+        );
     }
 }

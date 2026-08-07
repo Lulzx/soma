@@ -314,11 +314,20 @@ each payload, and both actual and stride arena bytes (16 MiB) are checked before
 CPU cloning or Metal allocation. A domain-separated SHA-256 plan fingerprint
 covers the relevant public and private commit state.
 
+A quiescent graph may now publish a final local pending-future await rather
+than treating every park as deadlock. Final pending metadata is tied to the last
+registered effect, canonical ticket order, target, disposition, and next class;
+replay reconstructs the ordinary Kernel waiter/dependency state transactionally.
+An ordinary resolution wakes that imported waiter, and a newly planned bounded
+resident step observes settlement and completes. CPU and actual Metal widths
+1/32 produce the same canonical parked state; tampered ticket/target/outcome or
+disposition refuses atomically.
+
 This closes canonical commit only for local unsupervised, unique-run-class,
-all-complete future/mailbox/fixed-range-object programs with initially empty
-waiters/mailboxes, stable pre-existing capabilities, host-backed object
-payloads, `RunClassBins`, and `RunPartial`. Parked quiescence, supervision,
-allocation or resizing, foreign resources, device capability creation,
-admission deferral, multiple mutable continuations per process, sub-full-range
-ordinary Kernel object authorization, and broader handler/effect shapes refuse.
-The general G2 executive therefore remains open.
+completed-or-future-parked future/mailbox/fixed-range-object programs with
+initially empty waiters/mailboxes, stable pre-existing capabilities, host-backed
+object payloads, `RunClassBins`, and `RunPartial`. Final mailbox parking,
+supervision, allocation or resizing, foreign resources, device capability
+creation, admission deferral, multiple mutable continuations per process,
+sub-full-range ordinary Kernel object authorization, and broader handler/effect
+shapes refuse. The general G2 executive therefore remains open.

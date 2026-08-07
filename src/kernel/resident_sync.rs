@@ -1038,6 +1038,9 @@ impl KernelResidentSyncPlan {
         kernel: &mut Kernel,
         result: ResidentSyncResult,
     ) -> Result<u32, KernelResidentSyncError> {
+        if !self.matches(kernel) {
+            return Err(KernelResidentSyncError::StalePlan);
+        }
         if !result.quiescent {
             return Err(KernelResidentSyncError::NotQuiescent);
         }
@@ -1049,15 +1052,18 @@ impl KernelResidentSyncPlan {
         {
             return Err(KernelResidentSyncError::InvalidDeviceResult);
         }
-        // This first Kernel-owned slice publishes only completed graphs. A
-        // parked-only "quiescent" result is a deadlock, not a publishable end
-        // state, until pending retry import exists.
-        if result
+        // A quiescent resident graph may contain a strictly canonical parked
+        // future await. Mailbox parking remains outside this publication slice:
+        // unlike a future waiter, its FIFO identity also depends on mailbox
+        // capacity and sender/receiver queue ordering.
+        let all_ids: BTreeSet<_> = self.continuations_by_id.keys().copied().collect();
+        let final_ids: BTreeSet<_> = result
             .final_continuations
             .iter()
-            .any(|c| !c.completed || c.pending.is_some())
-        {
-            return Err(KernelResidentSyncError::NotQuiescent);
+            .map(|continuation| continuation.id)
+            .collect();
+        if final_ids.len() != result.final_continuations.len() || final_ids != all_ids {
+            return Err(KernelResidentSyncError::InvalidDeviceResult);
         }
         let completed_ids: BTreeSet<_> = result.completed.iter().copied().collect();
         let final_completed_ids: BTreeSet<_> = result
@@ -1068,9 +1074,81 @@ impl KernelResidentSyncPlan {
             .collect();
         if completed_ids.len() != result.completed.len()
             || completed_ids != final_completed_ids
-            || completed_ids != self.continuations_by_id.keys().copied().collect()
+            || result.final_continuations.iter().any(|continuation| {
+                continuation.completed != continuation.pending.is_none()
+                    || (!continuation.completed
+                        && !matches!(
+                            continuation.pending,
+                            Some(ResidentEffect::FutureAwait { .. })
+                        ))
+                    || (continuation.completed && continuation.waiter_order != 0)
+            })
         {
             return Err(KernelResidentSyncError::InvalidDeviceResult);
+        }
+
+        // Registration tickets are assigned to every blocking operation in
+        // canonical execution order, including waiters subsequently woken.
+        // Matching the ticket prevents a forged final waiter from being
+        // substituted for a different invocation of the same continuation.
+        let mut blocking = result
+            .effects
+            .iter()
+            .filter(|effect| {
+                matches!(
+                    effect.outcome,
+                    crate::executives::resident_sync::ResidentOutcome::Registered
+                        | crate::executives::resident_sync::ResidentOutcome::Full
+                        | crate::executives::resident_sync::ResidentOutcome::Empty
+                )
+            })
+            .collect::<Vec<_>>();
+        blocking.sort_by_key(|effect| (effect.epoch, effect.lane, effect.ordinal));
+        for final_continuation in result
+            .final_continuations
+            .iter()
+            .filter(|continuation| !continuation.completed)
+        {
+            let pending = final_continuation
+                .pending
+                .ok_or(KernelResidentSyncError::InvalidDeviceResult)?;
+            let invocation = result
+                .invocations
+                .iter()
+                .filter(|invocation| invocation.continuation == final_continuation.id)
+                .max_by_key(|invocation| (invocation.epoch, invocation.lane))
+                .ok_or(KernelResidentSyncError::InvalidDeviceResult)?;
+            let matching = result
+                .effects
+                .iter()
+                .filter(|effect| {
+                    effect.epoch == invocation.epoch
+                        && effect.lane == invocation.lane
+                        && effect.continuation == final_continuation.id
+                        && effect.effect == pending
+                        && effect.outcome
+                            == crate::executives::resident_sync::ResidentOutcome::Registered
+                })
+                .collect::<Vec<_>>();
+            let last_ordinal = result
+                .effects
+                .iter()
+                .filter(|effect| effect.epoch == invocation.epoch && effect.lane == invocation.lane)
+                .map(|effect| effect.ordinal)
+                .max();
+            if invocation.disposition != 3
+                || invocation.next_run_class != final_continuation.run_class
+                || matching.len() != 1
+                || last_ordinal != Some(matching[0].ordinal)
+                || final_continuation.waiter_order == 0
+                || blocking
+                    .iter()
+                    .position(|effect| std::ptr::eq(*effect, matching[0]))
+                    .map(|position| position as u32 + 1)
+                    != Some(final_continuation.waiter_order)
+            {
+                return Err(KernelResidentSyncError::InvalidDeviceResult);
+            }
         }
         let mut invocation_positions = BTreeSet::new();
         let mut invocation_entities = BTreeSet::new();
@@ -1582,9 +1660,20 @@ impl KernelResidentSyncPlan {
                             }
                         }
                         ResidentEffect::FutureAwait { .. } => {
-                            let outcome =
-                                k.await_future(actor, cont, target, inv.next_run_class)
-                                    .map_err(|_| KernelResidentSyncError::InvalidDeviceResult)?;
+                            // `next_run_class` belongs to a registered park. An
+                            // already-settled await preserves the executing class
+                            // until the disposition performs yield/complete.
+                            let await_run_class = if matches!(
+                                effect.outcome,
+                                crate::executives::resident_sync::ResidentOutcome::Registered
+                            ) {
+                                inv.next_run_class
+                            } else {
+                                inv.run_class
+                            };
+                            let outcome = k
+                                .await_future(actor, cont, target, await_run_class)
+                                .map_err(|_| KernelResidentSyncError::InvalidDeviceResult)?;
                             match (outcome, effect.outcome) {
                                 (
                                     crate::kernel::AwaitOutcome::Registered,
@@ -1726,16 +1815,68 @@ impl KernelResidentSyncPlan {
                 return Err(KernelResidentSyncError::InvalidDeviceResult);
             }
         }
+        let mut expected_future_waiters: BTreeMap<u64, Vec<(u32, Ref64)>> = BTreeMap::new();
         for final_c in &r.final_continuations {
+            let continuation = self.continuations_by_id[&final_c.id];
             let descriptor = k
                 .continuations
-                .get(self.continuations_by_id[&final_c.id])
+                .get(continuation)
                 .map_err(|_| KernelResidentSyncError::InvalidDeviceResult)?;
-            if descriptor.run_class != final_c.run_class
-                || descriptor.status != ContinuationState::Completed
-            {
+            if descriptor.run_class != final_c.run_class {
                 return Err(KernelResidentSyncError::InvalidDeviceResult);
             }
+            if final_c.completed {
+                if descriptor.status != ContinuationState::Completed {
+                    return Err(KernelResidentSyncError::InvalidDeviceResult);
+                }
+            } else {
+                let Some(ResidentEffect::FutureAwait { target }) = final_c.pending else {
+                    return Err(KernelResidentSyncError::InvalidDeviceResult);
+                };
+                let future = self
+                    .futures
+                    .get(target as usize)
+                    .copied()
+                    .ok_or(KernelResidentSyncError::InvalidDeviceResult)?;
+                if descriptor.status != ContinuationState::Waiting
+                    || descriptor.dependency != future
+                    || k.future_value(future).is_some()
+                    || k.scheduler
+                        .pending_entries()
+                        .iter()
+                        .any(|(_, queued)| *queued == continuation)
+                {
+                    return Err(KernelResidentSyncError::InvalidDeviceResult);
+                }
+                expected_future_waiters
+                    .entry(future.key())
+                    .or_default()
+                    .push((final_c.waiter_order, continuation));
+            }
+        }
+        for waiters in expected_future_waiters.values_mut() {
+            waiters.sort_by_key(|(order, _)| *order);
+        }
+        let actual_future_waiters: BTreeMap<u64, Vec<Ref64>> = k
+            .future_waiters
+            .iter()
+            .filter(|(_, waiters)| !waiters.is_empty())
+            .map(|(future, waiters)| (*future, waiters.clone()))
+            .collect();
+        let expected_future_waiters: BTreeMap<u64, Vec<Ref64>> = expected_future_waiters
+            .into_iter()
+            .map(|(future, waiters)| {
+                (
+                    future,
+                    waiters
+                        .into_iter()
+                        .map(|(_, continuation)| continuation)
+                        .collect(),
+                )
+            })
+            .collect();
+        if actual_future_waiters != expected_future_waiters {
+            return Err(KernelResidentSyncError::InvalidDeviceResult);
         }
         Ok(())
     }
@@ -2085,16 +2226,17 @@ mod tests {
     }
 
     #[test]
-    fn refusal_is_atomic_for_parked_quiescence() {
+    fn parked_future_quiescence_publishes_canonical_waiter() {
         let mut k = Kernel::new();
         let p = k.create_process(Ref64::NULL, ProcessMode::Pure);
         let f = k.create_future(p);
+        let payload = k.create_object(p, ObjectKind::MessagePayload, vec![1]);
         let rc = 1200;
         k.install_resident_sync_program(KernelResidentProgram {
             run_class: rc,
             instructions: vec![
                 KernelResidentInstruction::effect(HANDLER_EFFECT_FUTURE_AWAIT, f, Ref64::NULL),
-                KernelResidentInstruction::plain(HANDLER_YIELD, rc, 0),
+                KernelResidentInstruction::plain(HANDLER_COMPLETE, 0, 0),
             ],
         })
         .unwrap();
@@ -2127,11 +2269,8 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(
-            k.run_resident_sync_cpu_reference(plan),
-            Err(KernelResidentSyncError::NotQuiescent)
-        );
-        assert_eq!(KernelResidentSyncPlan::fingerprint(&k), before);
+        assert_eq!(k.run_resident_sync_cpu_reference(plan), Ok(1));
+        assert_ne!(KernelResidentSyncPlan::fingerprint(&k), before);
         let after: Vec<_> = k
             .trace_events()
             .iter()
@@ -2152,11 +2291,149 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(after, trace);
+        assert_ne!(after, trace);
+        assert_eq!(k.continuation_state(c).unwrap(), ContinuationState::Waiting);
+        assert_eq!(k.continuations.get(c).unwrap().dependency, f);
+        assert_eq!(k.future_waiters.get(&f.key()), Some(&vec![c]));
+
+        // The imported waiter is live canonical state: an ordinary governed
+        // mutation drains it, normal Phase G makes it runnable, and the second
+        // phase observes settlement and completes without resident import.
+        k.resolve_future(p, f, payload).unwrap();
+        k.apply_epoch_effects();
+        assert!(k
+            .scheduler
+            .pending_entries()
+            .iter()
+            .any(|(_, queued)| *queued == c));
         assert_eq!(
             k.continuation_state(c).unwrap(),
             ContinuationState::Runnable
         );
+        // Re-plan the live woken continuation. The same bounded resident
+        // handler now observes settlement and completes canonically.
+        let resume_plan = k.plan_resident_sync(4, 1, 8, 1).unwrap();
+        assert_eq!(k.run_resident_sync_cpu_reference(resume_plan), Ok(1));
+        assert_eq!(
+            k.continuation_state(c).unwrap(),
+            ContinuationState::Completed
+        );
+        assert!(k.future_waiters.get(&f.key()).is_none_or(Vec::is_empty));
+        assert!(crate::semantics::invariants::check(&k).is_empty());
+    }
+
+    #[test]
+    fn parked_future_metadata_tamper_refuses_atomically() {
+        for case in 0..4 {
+            let mut kernel = Kernel::new();
+            let process = kernel.create_process(Ref64::NULL, ProcessMode::Pure);
+            let future = kernel.create_future(process);
+            let run_class = 1201;
+            kernel
+                .install_resident_sync_program(KernelResidentProgram {
+                    run_class,
+                    instructions: vec![
+                        KernelResidentInstruction::effect(
+                            HANDLER_EFFECT_FUTURE_AWAIT,
+                            future,
+                            Ref64::NULL,
+                        ),
+                        KernelResidentInstruction::plain(HANDLER_YIELD, run_class, 0),
+                    ],
+                })
+                .unwrap();
+            kernel
+                .create_continuation(
+                    process,
+                    process,
+                    ContinuationSpec::new(StateAccess::ReadOnly, run_class, 0, vec![0; 8], 8),
+                )
+                .unwrap();
+            let plan = kernel.plan_resident_sync(1, 1, 8, 1).unwrap();
+            let mut result = crate::executives::resident_sync::run_resident_sync(
+                &plan.config,
+                plan.continuations.clone(),
+                &plan.programs,
+            )
+            .unwrap();
+            match case {
+                0 => result.final_continuations[0].waiter_order = 2,
+                1 => {
+                    result.final_continuations[0].pending =
+                        Some(ResidentEffect::FutureAwait { target: u32::MAX })
+                }
+                2 => result.invocations[0].disposition = 1,
+                _ => {
+                    result.effects[0].outcome =
+                        crate::executives::resident_sync::ResidentOutcome::Pending
+                }
+            }
+            let fingerprint = KernelResidentSyncPlan::fingerprint(&kernel);
+            let trace_len = kernel.trace_events().len();
+            let accounting = kernel.accounting;
+            let admission_len = kernel.admission_log.len();
+            let effect_len = kernel.effect_log.len();
+            assert_eq!(
+                plan.validate_and_import(&mut kernel, result),
+                Err(KernelResidentSyncError::InvalidDeviceResult)
+            );
+            assert_refusal_preserves_kernel(
+                &kernel,
+                fingerprint,
+                trace_len,
+                &accounting,
+                admission_len,
+                effect_len,
+            );
+        }
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn metal_parked_future_width_1_32_matches_cpu_canonical_state() {
+        fn parked(width: u32) -> (Kernel, KernelResidentSyncPlan) {
+            let mut kernel = Kernel::new();
+            let process = kernel.create_process(Ref64::NULL, ProcessMode::Pure);
+            let future = kernel.create_future(process);
+            let run_class = 1202;
+            kernel
+                .install_resident_sync_program(KernelResidentProgram {
+                    run_class,
+                    instructions: vec![
+                        KernelResidentInstruction::effect(
+                            HANDLER_EFFECT_FUTURE_AWAIT,
+                            future,
+                            Ref64::NULL,
+                        ),
+                        KernelResidentInstruction::plain(HANDLER_YIELD, run_class, 0),
+                    ],
+                })
+                .unwrap();
+            kernel
+                .create_continuation(
+                    process,
+                    process,
+                    ContinuationSpec::new(StateAccess::ReadOnly, run_class, 0, vec![0; 8], 8),
+                )
+                .unwrap();
+            let plan = kernel.plan_resident_sync(1, 1, 8, width).unwrap();
+            (kernel, plan)
+        }
+
+        for width in [1, 32] {
+            let (base, plan) = parked(width);
+            let mut cpu = base.clone();
+            cpu.run_resident_sync_cpu_reference(plan.clone()).unwrap();
+            let mut metal = base;
+            metal.run_resident_sync_metal(plan).unwrap();
+            assert_eq!(
+                KernelResidentSyncPlan::fingerprint(&metal),
+                KernelResidentSyncPlan::fingerprint(&cpu)
+            );
+            assert_eq!(metal.effect_log, cpu.effect_log);
+            assert_eq!(metal.admission_log, cpu.admission_log);
+            assert_eq!(metal.accounting, cpu.accounting);
+        }
     }
 
     #[test]

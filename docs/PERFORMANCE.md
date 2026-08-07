@@ -641,3 +641,24 @@ open. Full raw samples, oracle hashes, source/backend hashes, hardware identity,
 and bootstrap method are frozen in
 `measurements/RESIDENT-STATE-RICH-FAIR-M4-PRO-2026-08-07.txt` and
 `measurements/RESIDENT-STATE-RICH-CONTROLS-M4-PRO-2026-08-07.txt`.
+
+
+## 14. Canonical Kernel resident-sync performance gate
+
+The canonical one-command-buffer `Kernel` resident-sync bridge is currently a
+semantic implementation, not a throughput implementation. The Metal entry
+point dispatches the requested width for ABI/I19 controls, but threads with
+`gid != 0` return; lane zero performs handler selection, interpretation,
+capability scans, canonical effect application, wakes, journals, and epoch
+advancement serially. Width 32 therefore changes the physical placement/control
+shape without providing parallel handler evaluation. No honest
+Metal-versus-competent-CPU speedup should be expected from this implementation.
+
+A diagnostic normal-state workload was exact but had sub-20-ms CPU calls and
+roughly threefold slower Metal calls; an observe-heavy diagnostic amplified the
+serial capability scan and was prohibitively slower. Those temporary captures
+are not release evidence and are not used for a claim. Before a canonical G5
+benchmark is meaningful, the executive needs real bounded threadgroup-parallel
+handler evaluation with a canonical single-writer apply phase, plus a legitimate
+feature-gated measurement CPU oracle. Live device-visible ingress remains a
+separate missing requirement.

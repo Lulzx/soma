@@ -175,16 +175,26 @@ and exact signed lane-error classes.
 An executable two-owner application now combines authenticated channel
 back-pressure/drop/retry/wake, a pending future plus authoritative object write,
 live grant revocation and worker fault, and content-bound process-lifecycle and
-supervision receipts through their existing authorized transports. It asserts exact resources, versions, queues, traces,
-non-shadow ownership, bounded ledgers, and apply-once nonces. This authenticates
-configured peers, not a public-key identity or TLS channel. Replay state remains
-process-incarnation scoped: either peer restart requires a fresh unpredictable
-session identifier/key. The v1 Kernel path still emits exactly one future-await,
-channel-send, or channel-receive operation through special dispatch; the object
-operation in the application is submitted through the bounded lane transport,
-not general Kernel `LaneView`. General signed remote `LaneView`, direct
-canonical remote parking, mixed/object Kernel result-frame dispatch, and durable
-live recovery remain open.
+supervision receipts through their existing authorized transports. The future
+await and object write are emitted by one real installed Kernel remote program,
+not manually concatenated host batches. The strict mixed subset permits at most
+16 instructions and 64 KiB of contiguous write payload, requires exactly one
+blocking future/channel operation plus bounded object writes or future resolves,
+and binds every grant to one issuer/audience/actor route. Runtime receipts track
+the whole emission: every outcome must be present, unique, target/shape correct,
+and bound to the same session; any retryable member retains the parked
+continuation and full outbox, and only an all-terminal vector clone-transitions
+the Kernel and removes the group. Object reads remain rejected until a governed
+result-frame destination exists. The application asserts exact resources,
+versions, queues, traces, non-shadow ownership, bounded ledgers, and apply-once
+nonces.
+
+This authenticates configured peers, not a public-key identity or TLS channel.
+Replay state remains process-incarnation scoped: either peer restart requires a
+fresh unpredictable session identifier/key. This remains special bounded
+Kernel dispatch, not general `LaneView`: arbitrary operation mixtures, object
+read/result-frame publication, multiple blocking dependencies, direct canonical
+remote parking, and durable live recovery remain open.
 
 ## Failure semantics
 

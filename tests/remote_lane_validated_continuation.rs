@@ -256,6 +256,42 @@ fn invalid_multi_wait_program_is_refused_before_kernel_execution() {
         RemoteLaneProgram::validate(vec![instruction], vec![1]),
         Err(RemoteLaneError::InvalidProgram)
     ));
+    assert!(matches!(
+        RemoteLaneProgram::validate(
+            vec![instruction; MAX_REMOTE_LANE_PROGRAM_INSTRUCTIONS + 1],
+            vec![],
+        ),
+        Err(RemoteLaneError::InvalidProgram)
+    ));
+    assert!(matches!(
+        RemoteLaneProgram::validate(
+            vec![instruction],
+            vec![0; MAX_REMOTE_LANE_PROGRAM_PAYLOAD + 1],
+        ),
+        Err(RemoteLaneError::InvalidProgram)
+    ));
+    let mut malformed = instruction;
+    malformed.argument0 = 1;
+    assert!(matches!(
+        RemoteLaneProgram::validate(vec![malformed], vec![]),
+        Err(RemoteLaneError::InvalidProgram)
+    ));
+    let read_grant = authority.lock().unwrap().issue(GrantSpec {
+        audience: owner,
+        actor,
+        target,
+        rights: Rights::READ,
+        object_version: 1,
+        valid_from_epoch: 0,
+        valid_until_epoch: 2,
+    });
+    let mut read = instruction;
+    read.opcode = PROGRAM_OBJECT_READ;
+    read.grant = read_grant.encode();
+    assert!(matches!(
+        RemoteLaneProgram::validate(vec![read], vec![]),
+        Err(RemoteLaneError::InvalidProgram)
+    ));
     assert_eq!(kernel.current_epoch(), 0);
     assert!(kernel
         .trace_events()

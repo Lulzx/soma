@@ -39,12 +39,16 @@ journals, CPU/Metal width-1/32 parity, ordinary-Kernel authority-trace and final
 byte equivalence, explicit 4,096-object/16,384-capability/16-MiB arena bounds,
 and atomic stale/range/growth/conflict/malformed refusals. An independent
 governed reference matches I18 and the complete
-scheduler/effect/admission/accounting state. This is a canonical commit slice,
-but only for local unsupervised, unique-run-class, all-complete programs with
-pre-existing stable authority and initially empty waiter/mailbox state.
-Allocation/resizing, channels, supervision, device capability creation,
-admission deferral, parked final state, broader handler shapes, and the general
-canonical bridge remain to be integrated.
+scheduler/effect/admission/accounting state. A final pending local future await
+may now publish exact canonical waiter/dependency/ticket state, wake under an
+ordinary resolution, and complete in a subsequent bounded resident plan; CPU
+and Metal widths 1/32 agree and metadata tampering refuses atomically. This is a
+canonical commit slice, but only for local unsupervised, unique-run-class,
+completed-or-future-parked programs with pre-existing stable authority and
+initially empty waiter/mailbox state. Allocation/resizing, channels,
+supervision, device capability creation, admission deferral, final mailbox
+parking, broader handler shapes, and the general canonical bridge remain to be
+integrated.
 
 ## G3 — Distributed ownership [in progress]
 
@@ -65,11 +69,15 @@ node-qualified envelope, wake, priority, back-pressure, revocation, loss, and
 I18 controls. A bounded authenticated multiplexed protocol carries six future/channel/object
 operations with exact grant rebinding, issuer-qualified actors, canonical
 apply-once positions, late/collision rejection, and preserved transport error
-classes. A deliberately narrower validated Kernel dispatch can emit exactly one
-blocking future-await, channel-send, or channel-receive operation, park in
-private node-qualified state, and retry exact retained work across two real
-runtimes/TCP; it is special dispatch, not general `LaneView`. Its bounded
-multiplexed response transport now authenticates configured peers and binds
+classes. A deliberately narrower validated Kernel dispatch can emit one
+blocking future-await, channel-send, or channel-receive together with bounded
+object writes or future resolves as one exact emission, park in private
+node-qualified state, and retry exact retained work across two real runtimes/TCP.
+The whole result vector is one transactional/session-bound receipt group; any
+retryable member retains the complete waiter and outbox, while only an
+all-terminal vector completes or faults. Object reads and arbitrary mixtures
+remain unsupported, so this is special dispatch, not general `LaneView`. Its
+bounded multiplexed response transport now authenticates configured peers and binds
 ordered outcomes to the exact session, issuer, owner, nonce, request digest,
 boundary, and response ordinal before any Kernel wake or fault. Atomic
 multi-frame staging, boundary-first refusal, exact temporary retry, mixed live
@@ -83,10 +91,9 @@ ledgers. Owner-side process templates provide content-bound create/restart
 receipts, terminal lifecycle observation, bounded snapshot/WAL apply-once
 durability, and exact terminal recovery. Signed bounded lifecycle requests now
 cross TCP between two real runtimes, but responses are not mutually
-authenticated and live-state recovery remains explicitly refused. General
-remote `LaneView`, direct canonical remote park, Kernel object/mixed/result-frame
-dispatch, persisted lane replay state, and durable live process recovery remain
-gates.
+authenticated and live-state recovery remains explicitly refused. General remote `LaneView`, direct canonical remote park, object-read/result-frame
+publication, arbitrary or multiple-blocking Kernel mixtures, persisted lane
+replay state, and durable live process recovery remain gates.
 
 ## G4 — Bounded programming surface [complete]
 
@@ -137,9 +144,13 @@ competent-generic comparison is null/negative: median grouped/generic 1.0042,
 bootstrap 95% interval [0.9979, 1.0103]. Width-one, one-class, 16-submit, and
 eight-frozen-chunk controls are retained. Thus the result isolates migration
 avoidance rather than evaluator cohorting throughput. The graph also has no
-canonical Kernel commit or live device-visible ingress. Discovery and
-self-tuning provide additional controls. A qualifying end-to-end cohorting
-speedup is not yet established.
+canonical Kernel commit or live device-visible ingress. Moreover, the current
+canonical resident-sync Metal shader uses only lane zero for semantic execution;
+width 1/32 is an I19 placement control, not parallel handler throughput. A
+threadgroup-parallel evaluate phase with deterministic single-writer apply is a
+prerequisite to an honest canonical speedup benchmark. Discovery and self-tuning
+provide additional controls. A qualifying end-to-end cohorting speedup is not
+yet established.
 
 ## G6 — Release discipline [complete]
 

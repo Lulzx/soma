@@ -12,9 +12,8 @@ use soma::distributed::remote_future::{
     RemoteFutureClient, RemoteFutureService, RemoteFutureState,
 };
 use soma::distributed::remote_lane_effect::{
-    RemoteLaneApi, RemoteLaneApply, RemoteLaneClientRouter, RemoteLaneEffectService,
-    RemoteLaneInstruction, RemoteLaneOperation, RemoteLaneProgram, PROGRAM_CHANNEL_RECEIVE,
-    PROGRAM_FUTURE_AWAIT,
+    RemoteLaneApply, RemoteLaneClientRouter, RemoteLaneEffectService, RemoteLaneInstruction,
+    RemoteLaneProgram, PROGRAM_CHANNEL_RECEIVE, PROGRAM_FUTURE_AWAIT, PROGRAM_OBJECT_WRITE,
 };
 use soma::distributed::remote_lane_transport::{
     RemoteLaneClientSession, RemoteLaneOwnerSession, RemoteLaneTransportClient,
@@ -147,8 +146,17 @@ fn authenticated_two_owner_multi_resource_wake_fault_and_lifecycle_are_exact() {
         .install_remote_lane_program(
             7102,
             RemoteLaneProgram::validate(
-                vec![instruction(PROGRAM_FUTURE_AWAIT, future_ref, future_grant)],
-                vec![],
+                vec![
+                    instruction(PROGRAM_FUTURE_AWAIT, future_ref, future_grant),
+                    RemoteLaneInstruction {
+                        opcode: PROGRAM_OBJECT_WRITE,
+                        argument0: 0,
+                        argument1: 0,
+                        payload_len: 4,
+                        ..instruction(PROGRAM_OBJECT_WRITE, object_ref, object_grant)
+                    },
+                ],
+                b"DATA".to_vec(),
             )
             .unwrap(),
         )
@@ -259,8 +267,8 @@ fn authenticated_two_owner_multi_resource_wake_fault_and_lifecycle_are_exact() {
         )
     });
 
-    // Two real continuations take the honest v1 special-dispatch path. It is not
-    // a general LaneView: each installed program contains exactly one wait.
+    // Both continuations take the real Kernel special-dispatch path. The data
+    // program emits one wait and one bounded object write as a single batch.
     worker_runtime.run_epoch().unwrap();
     let emissions = worker_runtime.pending_outbound_remote_lane();
     assert_eq!(emissions.len(), 2);
@@ -306,27 +314,12 @@ fn authenticated_two_owner_multi_resource_wake_fault_and_lifecycle_are_exact() {
         .accept_authenticated_remote_lane_outcomes(blocked_channel)
         .unwrap();
 
-    let mut object_lane = RemoteLaneApi::new(0, 0xffff, actor);
-    object_lane
-        .emit(
-            object_ref,
-            object_grant,
-            RemoteLaneOperation::ObjectWrite {
-                expected_version: 0,
-                offset: 0,
-                bytes: b"DATA".to_vec(),
-            },
-        )
-        .unwrap();
-    let object_batch = object_lane.finish();
     let data_session = RemoteLaneClientSession::new([2; 16], worker, data_owner, [0xa2; 32]);
     worker_runtime
         .bind_remote_lane_waiter_session(future_batch.effects()[0].request_id, &data_session)
         .unwrap();
     let mut data_transport = RemoteLaneTransportClient::new(data_lane_endpoint, data_session);
-    let first_data = data_transport
-        .exchange(0, &[future_batch, object_batch])
-        .unwrap();
+    let first_data = data_transport.exchange(0, &[future_batch]).unwrap();
     let data_nonce = first_data.nonce();
     assert_eq!(first_data.outcomes().len(), 2);
     assert_eq!(
@@ -348,6 +341,10 @@ fn authenticated_two_owner_multi_resource_wake_fault_and_lifecycle_are_exact() {
     worker_runtime
         .accept_authenticated_remote_lane_outcomes(first_data)
         .unwrap();
+    assert!(worker_runtime
+        .pending_outbound_remote_lane()
+        .iter()
+        .any(|emission| emission.continuation == future_continuation));
 
     // Make the channel receive ready, then deliberately drop one authenticated
     // response. Retrying retains byte-identical request/nonce and applies once.

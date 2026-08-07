@@ -23,8 +23,12 @@ pub const MAX_REMOTE_LANE_LEDGER_ENTRIES: usize = 4096;
 pub const MAX_REMOTE_LANE_LEDGER_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_REMOTE_LANE_OUTBOX_ENTRIES: usize = 256;
 pub const MAX_REMOTE_LANE_OUTBOX_BYTES: usize = 1024 * 1024;
-/// Conservative encoded size reservation for the single-instruction v1 program.
-pub const MAX_REMOTE_LANE_PROGRAM_FRAME_BYTES: usize = 512;
+/// Strict Kernel-program bounds.  This is deliberately much smaller than the
+/// general journal limit: one dispatch may contain one blocking operation and a
+/// small, finite set of non-blocking writes/resolves.
+pub const MAX_REMOTE_LANE_PROGRAM_INSTRUCTIONS: usize = 16;
+pub const MAX_REMOTE_LANE_PROGRAM_PAYLOAD: usize = 64 * 1024;
+pub const MAX_REMOTE_LANE_PROGRAM_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_REMOTE_LANE_PAYLOAD: usize = 1024 * 1024;
 const MAGIC: u32 = 0x534c_4546;
 const VERSION: u16 = 1;
@@ -766,21 +770,18 @@ impl RemoteLaneProgram {
         instructions: Vec<RemoteLaneInstruction>,
         payload: Vec<u8>,
     ) -> Result<Self, RemoteLaneError> {
-        // v1 Kernel dispatch intentionally accepts exactly one operation that
-        // can park. Multi-op/group result commit and frame result slots are a
-        // later version; rejecting here is transactional, before dispatch.
-        if instructions.len() != 1
-            || !payload.is_empty()
-            || !matches!(
-                instructions[0].opcode,
-                PROGRAM_FUTURE_AWAIT | PROGRAM_CHANNEL_SEND | PROGRAM_CHANNEL_RECEIVE
-            )
+        if instructions.is_empty()
+            || instructions.len() > MAX_REMOTE_LANE_PROGRAM_INSTRUCTIONS
+            || payload.len() > MAX_REMOTE_LANE_PROGRAM_PAYLOAD
         {
             return Err(RemoteLaneError::InvalidProgram);
         }
+
+        let mut blocking = 0usize;
+        let mut payload_cursor = 0usize;
+        let mut route: Option<(NodeId, NodeId, Ref64)> = None;
         for i in &instructions {
-            if i.reserved != 0 || !(PROGRAM_FUTURE_AWAIT..=PROGRAM_OBJECT_WRITE).contains(&i.opcode)
-            {
+            if i.reserved != 0 {
                 return Err(RemoteLaneError::InvalidProgram);
             }
             let grant = RemoteGrant::decode(&i.grant).ok_or(RemoteLaneError::InvalidProgram)?;
@@ -788,15 +789,86 @@ impl RemoteLaneProgram {
                 node: NodeId(i.target_node),
                 entity: Ref64::from_u64(i.target_entity),
             };
-            if grant.target != target {
+            // Every semantic route component is taken from, and must agree with,
+            // the signed grant.  A program is one authenticated owner batch.
+            if grant.target != target || grant.audience != target.node {
                 return Err(RemoteLaneError::InvalidProgram);
             }
-            let end = (i.payload_offset as usize)
-                .checked_add(i.payload_len as usize)
-                .ok_or(RemoteLaneError::InvalidProgram)?;
-            if end > payload.len() || (i.opcode != PROGRAM_OBJECT_WRITE && i.payload_len != 0) {
+            let this_route = (grant.issuer, grant.audience, grant.actor);
+            if route.is_some_and(|expected| expected != this_route) {
                 return Err(RemoteLaneError::InvalidProgram);
             }
+            route = Some(this_route);
+
+            let required = match i.opcode {
+                PROGRAM_FUTURE_AWAIT => {
+                    blocking += 1;
+                    if i.argument0 != 0
+                        || i.argument1 != 0
+                        || i.value != 0
+                        || i.payload_offset != 0
+                        || i.payload_len != 0
+                    {
+                        return Err(RemoteLaneError::InvalidProgram);
+                    }
+                    Rights::AWAIT
+                }
+                PROGRAM_FUTURE_RESOLVE => {
+                    if i.argument0 != 0
+                        || i.argument1 != 0
+                        || i.payload_offset != 0
+                        || i.payload_len != 0
+                    {
+                        return Err(RemoteLaneError::InvalidProgram);
+                    }
+                    Rights::RESOLVE
+                }
+                PROGRAM_CHANNEL_SEND => {
+                    blocking += 1;
+                    if i.argument0 != 0
+                        || i.argument1 != 0
+                        || i.payload_offset != 0
+                        || i.payload_len != 0
+                    {
+                        return Err(RemoteLaneError::InvalidProgram);
+                    }
+                    Rights::SEND
+                }
+                PROGRAM_CHANNEL_RECEIVE => {
+                    blocking += 1;
+                    if i.argument0 != 0
+                        || i.argument1 != 0
+                        || i.value != 0
+                        || i.payload_offset != 0
+                        || i.payload_len != 0
+                    {
+                        return Err(RemoteLaneError::InvalidProgram);
+                    }
+                    Rights::RECEIVE
+                }
+                // Reads need an explicit result-frame destination contract.  Do
+                // not pretend that a verified byte result can currently be used.
+                PROGRAM_OBJECT_READ => return Err(RemoteLaneError::InvalidProgram),
+                PROGRAM_OBJECT_WRITE => {
+                    if i.value != 0 || i.payload_offset as usize != payload_cursor {
+                        return Err(RemoteLaneError::InvalidProgram);
+                    }
+                    payload_cursor = payload_cursor
+                        .checked_add(i.payload_len as usize)
+                        .ok_or(RemoteLaneError::InvalidProgram)?;
+                    if payload_cursor > payload.len() {
+                        return Err(RemoteLaneError::InvalidProgram);
+                    }
+                    Rights::WRITE
+                }
+                _ => return Err(RemoteLaneError::InvalidProgram),
+            };
+            if grant.rights & required != required {
+                return Err(RemoteLaneError::InvalidProgram);
+            }
+        }
+        if blocking != 1 || payload_cursor != payload.len() {
+            return Err(RemoteLaneError::InvalidProgram);
         }
         Ok(Self {
             instructions,
