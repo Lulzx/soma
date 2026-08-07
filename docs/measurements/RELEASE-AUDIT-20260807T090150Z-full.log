@@ -1,0 +1,1146 @@
+SOMA REAL-DEVICE RELEASE AUDIT
+schema: 1
+mode: full
+qualifying_release_evidence: yes
+started_utc: 2026-08-07T09:01:50Z
+repository: /Users/lulzx/work/gpu-os
+commit: 8f48bb6cdea2eed19470c652107fd0dc15b9dc65
+tree_clean_at_start: yes
+----- rustc -Vv -----
+rustc 1.92.0 (ded5c06cf 2025-12-08)
+binary: rustc
+commit-hash: ded5c06cf21d2b93bffd5d884aa6e96934ee4234
+commit-date: 2025-12-08
+host: aarch64-apple-darwin
+release: 1.92.0
+LLVM version: 21.1.3
+----- cargo -Vv -----
+cargo 1.92.0 (344c4567c 2025-10-21)
+release: 1.92.0
+commit-hash: 344c4567c634a25837e3c3476aac08af84cf9203
+commit-date: 2025-10-21
+host: aarch64-apple-darwin
+libgit2: 1.9.1 (sys:0.20.2 vendored)
+libcurl: 8.7.1 (sys:0.4.83+curl-8.15.0 system ssl:(SecureTransport) LibreSSL/3.3.6)
+ssl: OpenSSL 3.5.4 30 Sep 2025
+os: Mac OS 26.6.0 [64-bit]
+----- sw_vers -----
+ProductName:		macOS
+ProductVersion:		26.6
+BuildVersion:		25G5028f
+----- uname -a -----
+Darwin Lulzxs-MacBook-Pro.local 25.6.0 Darwin Kernel Version 25.6.0: Fri May 15 02:00:17 PDT 2026; root:xnu-12377.160.49.0.1~42/RELEASE_ARM64_T6041 arm64
+----- system_profiler SPDisplaysDataType (GPU identity) -----
+Graphics/Displays:
+
+    Apple M4 Pro:
+
+      Chipset Model: Apple M4 Pro
+      Type: GPU
+      Bus: Built-In
+      Total Number of Cores: 16
+      Vendor: Apple (0x106b)
+      Metal Support: Metal 4
+      Displays:
+        Color LCD:
+          Display Type: Built-in Liquid Retina XDR Display
+          Resolution: 3024 x 1964 Retina
+          Main Display: Yes
+          Mirror: Off
+          Online: Yes
+          Automatically Adjust Brightness: Yes
+          Connection Type: Internal
+
+===== VALIDATION =====
+$ cargo test --all-features
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.21s
+     Running unittests src/lib.rs (target/debug/deps/soma-53ce44da715ea23e)
+
+running 25 tests
+test executives::resident_sync::tests::rejects_programs_with_multiple_potential_parks ... ok
+test experiments::backend_bench::tests::a_backend_that_is_slower_per_element_never_crosses_over ... ok
+test experiments::backend_bench::tests::a_fitted_model_recovers_the_line_it_was_given ... ok
+test executives::resident_sync::tests::handler_previous_is_immutable_during_step_and_cleared_after_consumption ... ok
+test executives::resident_sync::tests::successful_mailbox_send_wakes_and_delivers_to_parked_receiver ... ok
+test executives::resident_sync::tests::independently_expected_error_outcomes_and_exact_journals ... ok
+test executives::resident_sync::tests::width_1_and_32_are_i19_identical ... ok
+test experiments::backend_bench::tests::a_synthetic_body_computes_the_same_thing_on_both_lowerings_of_its_own_interpreter ... ok
+test experiments::discovery_bench::tests::crossover_is_a_measured_size_and_respects_the_margin ... ok
+test experiments::discovery_bench::tests::percentile_selects_an_observed_sample ... ok
+test experiments::backend_bench::tests::op_count_scales_the_body ... ok
+test kernel::trace_buffer_tests::a_host_event_is_appended_where_it_is_emitted ... ok
+test kernel::trace_buffer_tests::an_undrained_event_is_counted_as_retained ... ok
+test kernel::trace_buffer_tests::a_lanes_events_do_not_reach_the_trace_until_the_lane_ends ... ok
+test kernel::trace_buffer_tests::draining_hands_out_the_clock_in_emission_order ... ok
+test kernel::trace_buffer_tests::the_buffer_does_not_decide_a_position ... ok
+test kernel::trace_buffer_tests::entering_a_lane_over_an_undrained_buffer_is_rejected - should panic ... ok
+test experiments::discovery_bench::tests::every_measured_sample_keeps_d1_through_d7 ... ok
+test executives::metal_resident_sync::tests::rejects_unbounded_frames_effects_and_control_flow ... ok
+test executives::metal_resident_sync::tests::absent_previous_store_fails_boundedly ... ok
+test executives::metal_resident_sync::tests::class_zero_and_invalid_target_match_oracle ... ok
+test executives::metal_resident_sync::tests::value_bearing_previous_survives_later_denial ... ok
+test executives::metal_resident_sync::tests::mailbox_waiters_wake_in_registration_not_identity_order ... ok
+test executives::metal_resident_sync::tests::mailbox_wake_delivery_and_authority_errors_match_cpu ... ok
+test executives::metal_resident_sync::tests::width_1_and_32_match_cpu_oracle_exactly ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.05s
+
+     Running tests/abi_refs.rs (target/debug/deps/abi_refs-468a797c58400d9e)
+
+running 18 tests
+test a_shard_appends_rather_than_recycling_a_freed_slot ... ok
+test a_shard_of_the_wrong_kind_does_not_resolve ... ok
+test a_shard_refuses_a_reference_it_did_not_mint ... ok
+test alloc_returns_valid_ref_and_get_reads_value ... ok
+test a_shards_references_survive_the_merge ... ok
+test get_rejects_wrong_kind ... ok
+test get_rejects_bad_slot ... ok
+test delete_with_stale_ref_is_noop ... ok
+test null_ref_is_invalid ... ok
+test merging_a_shard_matches_allocating_inline ... ok
+test kind_u8_roundtrips ... ok
+test ref64_to_u64_roundtrips ... ok
+test stale_reference_rejected_after_delete ... ok
+test slot_reuse_bumps_generation ... ok
+test table_iterates_live_entries_in_order ... ok
+test ordinary_churn_still_recycles_slots ... ok
+test two_lanes_allocate_into_their_own_partitions_at_the_same_time ... ok
+test a_slot_is_retired_rather_than_wrapping_its_generation ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/admission.rs (target/debug/deps/admission-f717d9ef785a9823)
+
+running 10 tests
+test identity_breaks_a_tie_between_equally_starved_continuations ... ok
+test the_longest_waiting_mutable_continuation_wins_the_claim ... ok
+test read_only_continuations_of_one_process_are_never_deferred ... ok
+test permutation_really_reorders_the_candidates ... ok
+test first_come_admission_is_order_dependent ... ok
+test the_workload_really_makes_mutable_continuations_compete ... ok
+test a_deferred_claim_loser_runs_in_the_following_epoch ... ok
+test an_epoch_whose_decision_does_not_follow_from_its_candidates_is_reported ... ok
+test every_workload_in_the_suite_admits_deterministically ... ok
+test admission_decides_the_same_thing_in_any_discovery_order ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/allocation_partitions.rs (target/debug/deps/allocation_partitions-4f840e662b7ec0be)
+
+running 6 tests
+test slot_numbers_repeat_across_partitions ... ok
+test a_lanes_partition_comes_from_its_position_not_its_identity ... ok
+test partitioning_really_spreads_the_allocations ... ok
+test a_partitioned_run_really_names_its_entities_differently ... ok
+test partitioning_composes_with_cohort_width ... ok
+test spreading_allocation_across_partitions_is_not_observable ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/ant_collective.rs (target/debug/deps/ant_collective-e2d189d356e3bd91)
+
+running 3 tests
+test collective_sensing_reclaims_epoch_temporaries ... ok
+test collective_sensing_simulates_the_host_reference_world ... ok
+test metal_collective_simulates_the_host_reference_world ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.62s
+
+     Running tests/ant_colony.rs (target/debug/deps/ant_colony-7eda5237f7d2672b)
+
+running 13 tests
+test a_failure_stays_inside_the_colony_it_happened_in ... ok
+test the_colony_satisfies_the_invariants ... ok
+test without_a_predator_nothing_fails ... ok
+test ants_move_away_from_their_nests ... ok
+test the_aggregation_pipeline_keeps_running ... ok
+test foraging_emerges ... ok
+test the_population_persists ... ok
+test both_schedules_simulate_the_same_world ... ok
+test the_colony_keeps_working_after_a_strike ... ok
+test binning_has_no_effect_at_width_one ... ok
+test the_run_is_deterministic ... ok
+test the_identical_world_check_can_fail ... ok
+test run_class_binning_beats_a_persistent_fifo ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+
+     Running tests/ant_scoring.rs (target/debug/deps/ant_scoring-7c9498f2c6395607)
+
+running 10 tests
+test the_generated_module_parses ... ok
+test a_body_that_names_a_second_array_and_is_given_none_is_refused ... ok
+test a_small_batch_spills_to_the_cpu ... ok
+test a_tie_resolves_to_the_first_maximum ... ok
+test the_body_computes_the_argmax ... ok
+test a_sensing_batch_spills_to_the_cpu_like_any_other ... ok
+test the_null_is_that_the_grid_actually_decides_something ... ok
+test the_body_gathers_the_neighbourhood_the_host_would_have_gathered ... ok
+test metal_senses_the_trail_grid_and_agrees_with_the_cpu ... ok
+test metal_agrees_with_the_cpu_reference ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.51s
+
+     Running tests/baselines.rs (target/debug/deps/baselines-008387653d889566)
+
+running 8 tests
+test dispatch_cost_matches_build_cohorts ... ok
+test bulk_frontier_expands_the_same_tree_as_soma ... ok
+test bulk_frontier_is_deterministic ... ok
+test sorting_the_frontier_is_what_makes_the_manual_batch_strong ... ok
+test soma_beats_only_the_weak_baseline ... ok
+test the_baseline_needs_the_host_and_soma_does_not ... ok
+test soma_stays_within_the_bulk_tolerance ... ok
+test a_competent_manual_batch_ties_soma_on_level_synchronous_work ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+     Running tests/batch_backends.rs (target/debug/deps/batch_backends-a02e042386c7dea2)
+
+running 3 tests
+test switching_backend_at_a_collective_boundary_counts_as_migration ... ok
+test unavailable_or_underfilled_accelerator_work_spills_to_cpu ... ok
+test accelerator_and_cpu_publish_identical_frozen_results ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/capabilities.rs (target/debug/deps/capabilities-d57bed25e7e89845)
+
+running 13 tests
+test external_ingest_is_reserved_for_the_system_principal ... ok
+test revoking_a_parent_is_observed_when_a_parked_capability_is_reused ... ok
+test grants_require_transfer_authority_and_must_attenuate ... ok
+test a_subrange_capability_cannot_open_whole_object_mutation ... ok
+test freezing_replaces_mutable_authority_with_read_authority_for_the_new_version ... ok
+test derivation_can_only_reduce_rights_and_range ... ok
+test creating_execution_requires_write_on_the_target_process ... ok
+test genesis_mints_full_target_appropriate_rights ... ok
+test messaging_and_future_operations_require_their_specific_rights ... ok
+test write_requires_live_unexpired_authority_at_use ... ok
+test capability_references_are_relative_to_the_process_space ... ok
+test exported_authority_survives_when_the_exporting_process_faults ... ok
+test await_authority_is_rechecked_when_a_continuation_resumes ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/channels_collectives.rs (target/debug/deps/channels_collectives-9092138793a845db)
+
+running 6 tests
+test collective_and_completion_future_must_agree ... ok
+test cancelling_collective_owner_settles_collective_and_completion_future ... ok
+test channel_transfers_read_authority_and_committed_payload_survives_sender_cancellation ... ok
+test channel_capacity_is_an_executable_invariant ... ok
+test batch_evaluate_publishes_only_frozen_arrays_through_its_future ... ok
+test bounded_channel_wakes_waiters_and_drains_after_close ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cohorting.rs (target/debug/deps/cohorting-56d24f7d178f1a29)
+
+running 10 tests
+test cohort_width_is_clamped_to_the_abi_maximum ... ok
+test partial_policies_differ_only_on_the_remainder ... ok
+test a_lane_group_spanning_k_run_classes_costs_k_dispatches ... ok
+test uniform_bin_splits_into_full_cohorts_plus_a_remainder ... ok
+test defer_policy_still_reaches_quiescence ... ok
+test cohorted_execution_is_deterministic_and_traced ... ok
+test width_one_cohorting_reduces_to_scalar_execution ... ok
+test a_single_run_class_gives_cohorting_no_advantage ... ok
+test both_modes_execute_exactly_the_same_work ... ok
+test divergent_work_meets_the_occupancy_criterion ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/device_scheduler.rs (target/debug/deps/device_scheduler-4b9a26352f9cc6d5)
+
+running 19 tests
+test reference_lane_journal_validation_is_namespace_aware_and_order_independent ... ok
+test reference_device_admission_is_the_scheduler_rule ... ok
+test every_partial_policy_has_an_explicit_device_disposition ... ok
+test resident_frame_graph_cpu_oracle_emits_commit_abi_and_canonical_trace ... ok
+test sorted_lane_journal_validation_matches_the_pairwise_rule ... ok
+test dynamic_resident_frontier_rejects_unknown_device_next_class ... ok
+test real_metal_validates_operation_records_and_arena_bounds ... ok
+test resident_future_resolve_conflict_falls_back_before_canonical_commit ... ok
+test real_metal_lane_journal_validation_matches_the_reference ... ok
+test compiled_resident_frame_handler_matches_cpu_i19_and_trace ... ok
+test real_metal_scheduler_matches_the_reference_and_reuses_resident_buffers ... ok
+test resident_future_resolve_commits_canonically_and_is_i18_i19_neutral ... ok
+test resident_frame_handler_is_a_canonical_kernel_epoch_executive ... ok
+test grouped_metal_journal_validation_matches_irregular_access_sets ... ok
+test sorted_mutable_admission_matches_the_set_rule ... ok
+test dynamic_two_handler_frontier_quiesces_without_intermediate_host_reads ... ok
+test ungrouped_generic_persistent_worker_matches_cohorted_handlers ... ok
+test sorted_metal_placement_matches_irregular_non_power_of_two_epochs ... ok
+test dynamic_search_stays_on_device_across_epochs ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.40s
+
+     Running tests/discovery_accounting.rs (target/debug/deps/discovery_accounting-e5f8c4bc9055ea32)
+
+running 2 tests
+test malformed_logical_input_is_rejected_before_batching ... ok
+test every_logical_request_has_exactly_one_fate ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.68s
+
+     Running tests/discovery_dedup.rs (target/debug/deps/discovery_dedup-792198696da62b42)
+
+running 2 tests
+test deterministic_duplicates_have_one_realization ... ok
+test no_duplicate_control_does_not_invent_cache_hits ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.74s
+
+     Running tests/discovery_equivalence.rs (target/debug/deps/discovery_equivalence-7c7de6f680c2174b)
+
+running 2 tests
+test semantic_change_is_detected ... ok
+test identical_trace_has_identical_scientific_state ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.68s
+
+     Running tests/discovery_fusion.rs (target/debug/deps/discovery_fusion-a6f66da006c6e8ab)
+
+running 3 tests
+test gathering_bodies_are_never_concatenated ... ok
+test pointwise_work_is_partitioned_from_fused_outputs ... ok
+test evaluator_heterogeneity_is_a_fusion_control ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.86s
+
+     Running tests/discovery_invalidation.rs (target/debug/deps/discovery_invalidation-f68cf6149ee31458)
+
+running 5 tests
+test a_request_made_after_rejection_is_cancelled_even_if_its_key_is_ready ... ok
+test rejecting_a_parent_withdraws_its_entire_hypothesis_branch ... ok
+test a_cancelled_dependency_is_rescheduled_if_new_interest_reaches_it ... ok
+test zero_rejection_control_cancels_nothing ... ok
+test rejecting_hypotheses_withdraws_unshared_pending_work ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.80s
+
+     Running tests/discovery_observations.rs (target/debug/deps/discovery_observations-c97650fdb9be8063)
+
+running 1 test
+test identical_observations_execute_twice_but_may_share_a_dispatch ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/distributed_equivalence.rs (target/debug/deps/distributed_equivalence-45a3fa70fdb6898a)
+
+running 2 tests
+test every_supervision_edge_is_remote_and_i18_equivalent ... ok
+test two_node_streaming_graph_is_i18_equivalent ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/domain_quota.rs (target/debug/deps/domain_quota-79872914831fd5af)
+
+running 10 tests
+test the_refusal_names_the_domain_that_refused ... ok
+test a_created_process_records_the_domain_it_drew_on ... ok
+test i25_is_silent_when_one_lane_is_refused ... ok
+test an_unbounded_domain_is_never_contended ... ok
+test i25_is_silent_when_the_bound_has_room ... ok
+test clause_1_does_not_see_it ... ok
+test a_refused_step_faults_rather_than_aborting_the_machine ... ok
+test two_lane_orders_disagree_when_the_quota_binds ... ok
+test i25_reports_a_contended_quota ... ok
+test the_orders_agree_when_the_quota_has_room ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/domains_contracts.rs (target/debug/deps/domains_contracts-82c1ae4a9a7e1327)
+
+running 4 tests
+test a_contract_is_actor_relative_authority ... ok
+test hardware_and_wall_clock_requirements_are_rejected ... ok
+test contracts_bound_steps_and_frame_bytes ... ok
+test domains_enforce_membership_authority_and_creation_quota ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/dynamic_search.rs (target/debug/deps/dynamic_search-4fb87b6e0549887c)
+
+running 5 tests
+test node_count_scales_with_branching_and_depth ... ok
+test runnable_bins_group_by_run_class ... ok
+test search_terminates ... ok
+test search_visits_expected_number_of_processes ... ok
+test search_is_deterministic ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/effect_log.rs (target/debug/deps/effect_log-c84c7fffadaccd23)
+
+running 12 tests
+test cancelling_a_process_withdraws_the_effects_its_lane_produced ... ok
+test the_same_lane_applies_its_resume_when_the_process_survives ... ok
+test sorting_the_log_by_position_recovers_the_order_it_was_applied_in ... ok
+test the_log_spans_several_lanes_of_several_epochs ... ok
+test an_epoch_applies_its_lanes_in_plan_order ... ok
+test every_effect_shape_is_exercised ... ok
+test producing_effects_did_not_change_the_run ... ok
+test every_bin_entry_is_an_applied_effect ... ok
+test an_effect_applied_twice_is_rejected ... ok
+test applying_out_of_plan_order_is_rejected ... ok
+test two_effects_at_one_position_are_rejected ... ok
+test an_unmediated_bin_entry_is_rejected ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/emission_order.rs (target/debug/deps/emission_order-b805a36f79927799)
+
+running 7 tests
+test host_events_precede_the_lanes_of_their_epoch ... ok
+test sorting_by_position_reconstructs_the_run ... ok
+test one_lane_carries_one_continuation ... ok
+test the_run_really_uses_several_lanes_across_several_epochs ... ok
+test i23_catches_an_event_emitted_out_of_position_order ... ok
+test i23_catches_two_events_at_one_position ... ok
+test every_cohort_width_emits_in_position_order ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/evaluator_bodies.rs (target/debug/deps/evaluator_bodies-344d7cbf4050d7cb)
+
+running 53 tests
+test a_body_that_stores_nothing_is_rejected ... ok
+test a_body_cannot_read_outside_its_declared_element ... ok
+test a_gather_cannot_take_its_index_from_an_instruction_that_has_not_run ... ok
+test a_gather_cannot_read_a_field_outside_the_declared_element ... ok
+test a_collective_whose_evaluator_no_backend_installed_is_refused ... ok
+test a_body_whose_unrolled_length_exceeds_the_bound_is_rejected ... ok
+test a_body_cannot_write_outside_its_declared_element ... ok
+test a_body_cannot_reference_an_instruction_that_has_not_run ... ok
+test a_layout_whose_stride_contradicts_the_evaluator_is_rejected ... ok
+test a_local_outside_the_declared_set_is_rejected ... ok
+test a_divergent_backend_is_caught ... ok
+test a_body_is_deterministic ... ok
+test a_loop_that_is_never_closed_is_rejected ... ok
+test a_loop_with_no_iterations_is_rejected ... ok
+test a_nested_loop_runs_the_product_of_its_trip_counts ... ok
+test a_loop_carries_nothing_but_its_locals ... ok
+test a_gather_reads_the_input_and_never_the_output ... ok
+test a_gather_counts_as_observing_the_field_it_reads ... ok
+test a_loops_worst_case_length_is_known_before_it_runs ... ok
+test a_value_computed_inside_a_loop_cannot_be_read_after_it ... ok
+test a_collective_publishes_what_its_body_computes ... ok
+test an_aux_field_outside_the_aux_layout_is_rejected ... ok
+test an_aux_gather_past_the_end_clamps_to_the_last_element ... ok
+test an_evaluator_may_still_be_declared_without_a_body ... ok
+test a_loop_accumulates_across_iterations ... ok
+test a_single_element_array_gathers_only_itself ... ok
+test body_lines_without_an_evaluator_are_rejected ... ok
+test closing_a_loop_that_was_never_opened_is_rejected ... ok
+test declaring_an_array_the_body_never_reads_is_rejected ... ok
+test a_gathering_body_still_reads_the_whole_array_from_every_thread ... ok
+test a_threaded_epoch_keeps_its_results_in_request_order ... ok
+test an_early_exit_leaves_on_a_different_iteration_per_element ... ok
+test leaving_a_loop_from_outside_every_loop_is_rejected ... ok
+test an_out_of_range_gather_index_clamps_to_the_last_element ... ok
+test gathering_from_an_array_the_body_never_declared_is_rejected ... ok
+test agreeing_backends_pass_the_check ... ok
+test index_gives_each_element_its_own_position ... ok
+test bitmix_masks_its_shift_amounts_to_six_bits ... ok
+test divergence_is_a_property_of_a_body_and_the_examples_disagree_about_it ... ok
+test reading_an_enclosing_scopes_value_from_inside_a_loop_is_allowed ... ok
+test double_plus_one_computes_two_x_plus_one_and_preserves_other_fields ... ok
+test declining_a_body_is_allowed_but_answering_wrongly_is_not ... ok
+test min_and_xor_takes_both_branches_and_writes_both_fields ... ok
+test the_null_is_that_a_local_carries_the_same_value_out_legally ... ok
+test the_edges_clamp_instead_of_wrapping_or_faulting ... ok
+test the_example_module_parses_and_derives_its_strides ... ok
+test the_generated_metal_declares_its_values_before_its_loops ... ok
+test one_failed_request_fails_the_whole_threaded_epoch ... ok
+test neighbour_max_reads_both_neighbours ... ok
+test the_null_is_that_the_thread_count_is_real ... ok
+test every_example_body_agrees_across_two_independent_interpreters ... ok
+test running_an_epochs_collectives_in_parallel_publishes_the_same_bytes ... ok
+test threading_the_elements_does_not_change_a_byte ... ok
+
+test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/evaluator_surface.rs (target/debug/deps/evaluator_surface-4f181b15e2c635ac)
+
+running 8 tests
+test diagnostics_name_the_source_line_and_failure_kind ... ok
+test calls_reject_unknown_functions_wrong_arity_and_recursion ... ok
+test inlining_still_obeys_the_validated_expanded_step_bound ... ok
+test calls_inline_nested_and_forward_declared_functions ... ok
+test named_source_lowers_to_the_existing_loop_bodies ... ok
+test named_source_runs_on_the_reference_backend ... ok
+test named_source_runs_as_native_machine_code ... ok
+test named_source_runs_on_real_metal ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.52s
+
+     Running tests/expand_state_machine.rs (target/debug/deps/expand_state_machine-7d9d978a2cb2a28b)
+
+running 4 tests
+test expand_process_terminates_and_replies ... ok
+test expand_reply_value_tracks_input ... ok
+test expand_visits_expected_events_in_order ... ok
+test expand_is_deterministic ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/f32_evaluator.rs (target/debug/deps/f32_evaluator-9f50ea8bb755d167)
+
+running 10 tests
+test validation_rejects_integer_float_mixing_and_wrong_store_fields ... ok
+test reference_f32_is_exact_for_finite_and_special_values ... ok
+test reference_sub_div_comparison_and_float_select_have_exact_special_semantics ... ok
+test typed_float_local_starts_at_canonical_positive_zero_and_accumulates ... ok
+test native_f32_is_byte_identical_to_reference ... ok
+test native_float_local_loop_is_byte_identical ... ok
+test complete_native_f32_surface_is_byte_identical ... ok
+test metal_f32_is_byte_identical_to_reference ... ok
+test metal_float_local_loop_is_byte_identical ... ok
+test complete_metal_f32_surface_is_byte_identical ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.38s
+
+     Running tests/foreign_await.rs (target/debug/deps/foreign_await-4e410682df5b9d42)
+
+running 10 tests
+test an_await_that_found_the_value_published_is_in_the_trace ... ok
+test the_awaiting_handler_reads_a_future_it_did_not_create ... ok
+test both_routes_leave_the_same_state ... ok
+test two_lane_orders_disagree_over_whether_an_await_parks ... ok
+test the_orders_agree_when_nobody_resolves ... ok
+test clause_1_sees_the_order_in_which_the_awaiter_parked ... ok
+test clause_2_sees_the_order_in_which_the_resolver_went_first ... ok
+test the_orders_agree_when_the_lanes_touch_different_futures ... ok
+test the_orders_agree_when_the_future_was_settled_before_the_epoch ... ok
+test i25_reports_the_run_whichever_order_it_ran_in ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/future_assignment.rs (target/debug/deps/future_assignment-aa75a1d2c48c6218)
+
+running 7 tests
+test a_refused_resolve_is_in_the_trace ... ok
+test a_refused_resolver_faults_and_the_state_stays_legal ... ok
+test clause_1_does_not_see_it ... ok
+test two_lane_orders_disagree_over_which_value_a_future_takes ... ok
+test i25_reports_a_contested_future ... ok
+test the_orders_agree_when_the_future_was_already_settled ... ok
+test the_orders_agree_when_each_lane_has_its_own_future ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/future_poll.rs (target/debug/deps/future_poll-3069f8b128791428)
+
+running 10 tests
+test a_poll_without_the_right_is_denied ... ok
+test an_authorized_poll_is_a_governed_effect ... ok
+test the_two_orders_leave_the_poller_holding_different_things ... ok
+test the_deciding_epoch_differs_in_one_events_fields_and_nothing_else ... ok
+test the_orders_agree_when_nobody_resolves ... ok
+test clause_1_is_blind_in_both_orders ... ok
+test the_divergence_reaches_the_trace_an_epoch_late ... ok
+test the_orders_agree_when_the_lanes_touch_different_futures ... ok
+test the_orders_agree_when_the_value_was_published_before_the_epoch ... ok
+test the_epoch_that_was_decided_is_the_one_that_reports ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/identity_equivalence.rs (target/debug/deps/identity_equivalence-f2edb126d203c626)
+
+running 7 tests
+test the_reference_run_really_names_several_entities_per_kind ... ok
+test merging_two_entities_is_reported ... ok
+test an_inconsistent_renaming_is_reported ... ok
+test renaming_across_partitions_conforms ... ok
+test a_uniformly_renamed_run_conforms ... ok
+test swapping_two_entities_uniformly_is_a_renaming_and_conforms ... ok
+test dropping_an_entity_is_reported ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/irregular_arrival.rs (target/debug/deps/irregular_arrival-04cbde9a6b63dd8b)
+
+running 14 tests
+test irregularity_spreads_the_trace_out_in_time ... ok
+test the_trace_covers_the_whole_tree_exactly_once ... ok
+test only_the_bulk_policy_needs_the_host ... ok
+test the_waiting_knob_actually_bounds_the_waiting ... ok
+test trace_generation_is_deterministic ... ok
+test policies_are_deterministic ... ok
+test a_zero_wait_budget_removes_the_advantage_entirely ... ok
+test level_synchronous_work_shows_no_advantage ... ok
+test irregular_arrival_separates_the_two_frontiers ... ok
+test waiting_longer_buys_occupancy_for_both ... ok
+test sparse_arrivals_starve_both_policies ... ok
+test both_policies_dispatch_every_arrival_exactly_once ... ok
+test the_advantage_needs_irregularity_and_grows_with_it ... ok
+test the_regime_map_is_not_a_single_lucky_point ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running tests/kernel_edge_cases.rs (target/debug/deps/kernel_edge_cases-ceabed9560af4f5c)
+
+running 14 tests
+test futures_are_single_assignment ... ok
+test assert_live_enforces_kind_and_liveness ... ok
+test pure_processes_reject_mutable_state_continuations ... ok
+test awaiting_a_resolved_future_yields_instead_of_parking ... ok
+test process_state_mutation_requires_the_active_mutable_continuation ... ok
+test every_blocked_sender_is_registered_and_woken_in_order ... ok
+test freezing_is_idempotent_and_makes_an_object_untransferable ... ok
+test read_only_continuations_of_one_process_can_share_an_epoch ... ok
+test exhausted_step_budget_faults_before_dispatch_and_leaves_no_bin_entry ... ok
+test cancellation_requested_during_execution_finalizes_at_the_commit_boundary ... ok
+test mutable_process_state_access_runs_at_most_one_continuation_per_epoch ... ok
+test cancellation_settles_futures_and_wakes_senders_blocked_on_the_mailbox ... ok
+test failure_cancels_siblings_and_fails_owned_futures_without_stranding_waiters ... ok
+test blocked_reply_does_not_respawn_children_on_re_entry ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/lane_independence.rs (target/debug/deps/lane_independence-5b7ebc05982f1854)
+
+running 4 tests
+test an_edge_touching_the_host_lane_is_not_a_violation ... ok
+test a_delivery_between_two_lanes_of_one_epoch_is_reported ... ok
+test the_null_is_that_these_runs_have_an_order_and_several_lanes ... ok
+test no_lane_of_an_epoch_observes_another ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/lane_order.rs (target/debug/deps/lane_order-dfdf157c63e0be6b)
+
+running 8 tests
+test reordering_is_a_placement_and_i19_treats_it_as_one ... ok
+test the_orders_really_do_run_lanes_differently ... ok
+test sorting_a_reordered_trace_by_position_recovers_the_plan_order_trace ... ok
+test commit_applies_the_same_effects_in_the_same_order_whatever_order_lanes_ran ... ok
+test i23s_second_clause_still_holds_of_the_plan_order_executive ... ok
+test every_order_leaves_a_legal_state ... ok
+test no_lane_observes_another_under_any_order ... ok
+test a_reordered_run_reproduces_the_plan_order_run ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/lane_view.rs (target/debug/deps/lane_view-6dd90598f7c961e4)
+
+running 2 tests
+test the_workloads_actually_exercise_the_view ... ok
+test routing_every_step_through_a_lane_changed_no_run ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/log_retention.rs (target/debug/deps/log_retention-8ea547324bd7a7ab)
+
+running 5 tests
+test bounded_retention_bounds_the_logs ... ok
+test retain_is_the_default_and_keeps_the_whole_run ... ok
+test undrained_records_are_reported_as_dropped ... ok
+test retention_does_not_change_the_run ... ok
+test streaming_reconstructs_the_retained_trace_exactly ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/mailbox_capacity.rs (target/debug/deps/mailbox_capacity-90b3298c6845ce5d)
+
+running 9 tests
+test a_lane_that_won_and_lost_is_still_raced_by_a_lane_that_only_won ... ok
+test a_blocked_send_is_in_the_trace ... ok
+test i25_is_silent_when_the_mailbox_has_room ... ok
+test clause_1_does_not_see_it ... ok
+test a_blocked_sender_parks_rather_than_losing_its_message ... ok
+test two_lane_orders_disagree_when_the_mailbox_has_one_slot ... ok
+test the_orders_agree_when_the_mailbox_has_room ... ok
+test i25_reports_a_contended_mailbox ... ok
+test the_orders_agree_when_the_mailbox_is_already_full ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/mailbox_drain.rs (target/debug/deps/mailbox_drain-6126c66f1cda1464)
+
+running 9 tests
+test a_blocked_receive_is_in_the_trace ... ok
+test the_orders_agree_when_the_mailbox_is_empty ... ok
+test a_blocked_receiver_parks_rather_than_spinning ... ok
+test two_lane_orders_disagree_when_the_mailbox_holds_one_message ... ok
+test clause_1_does_not_see_it ... ok
+test i25_reports_a_drained_mailbox ... ok
+test the_orders_agree_when_each_lane_has_its_own_mailbox ... ok
+test a_message_for_everyone_is_still_a_race ... ok
+test the_report_names_the_two_lanes_and_is_the_same_text_every_run ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/metal_backend.rs (target/debug/deps/metal_backend-5c6b2e2f91b794b9)
+
+running 7 tests
+test metal_rejects_an_evaluator_it_was_never_given ... ok
+test a_gpu_batch_is_published_where_the_gpu_wrote_it ... ok
+test reinstalling_same_id_with_different_code_replaces_the_pipeline ... ok
+test a_reused_buffer_does_not_leak_the_previous_batch_into_a_smaller_one ... ok
+test every_example_body_agrees_between_metal_and_the_cpu_interpreter ... ok
+test an_epoch_publishes_exactly_what_running_its_collectives_one_at_a_time_does ... ok
+test tuning_controls_change_only_physical_execution ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.32s
+
+     Running tests/minimal_ir.rs (target/debug/deps/minimal_ir-411fd1c772eee122)
+
+running 6 tests
+test module_rejects_empty_shapes_and_names ... ok
+test textual_module_rejects_ambiguous_surface_syntax ... ok
+test module_rejects_ambiguous_evaluator_and_resume_identities ... ok
+test evaluator_ir_instantiates_the_named_batch_collective ... ok
+test loaded_instantiation_rejects_a_different_module_with_reused_ids ... ok
+test textual_module_loads_and_links_its_collective ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/multi_input_graph.rs (target/debug/deps/multi_input_graph-d4de5b3bead3c467)
+
+running 6 tests
+test duplicate_inputs_are_rejected ... ok
+test all_input_receive_is_atomic ... ok
+test retry_moves_the_waiter_to_the_inputs_that_are_still_missing ... ok
+test producer_failure_preserves_exactly_the_committed_prefix ... ok
+test skewed_inputs_preserve_fifo_and_apply_backpressure ... ok
+test multi_input_runs_are_deterministic ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/native_backend.rs (target/debug/deps/native_backend-dfe88848cd50dbed)
+
+running 5 tests
+test native_backend_rejects_shape_and_installation_mismatches ... ok
+test native_nested_repeats_carry_locals_like_the_reference ... ok
+test native_lowering_covers_the_straight_line_integer_language ... ok
+test native_auxiliary_gathers_agree_with_the_reference ... ok
+test native_code_agrees_with_the_reference_on_every_supported_example ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/node_loss.rs (target/debug/deps/node_loss-e390b56202c648ba)
+
+running 3 tests
+test a_partition_does_nothing_until_loss_is_explicitly_declared ... ok
+test loss_declaration_is_system_only_idempotent_and_prevents_new_placement ... ok
+test declared_node_loss_is_not_a_program_fault ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/publication_scaling.rs (target/debug/deps/publication_scaling-b07cd5a237374277)
+
+running 3 tests
+test an_epoch_does_not_get_slower_as_idle_processes_accumulate ... ok
+test publishing_a_batch_does_not_get_slower_as_the_kernel_fills_up ... ok
+test cancelling_a_process_does_not_get_slower_as_the_scheduler_fills_up ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+     Running tests/reclamation.rs (target/debug/deps/reclamation-03be9c72f3bf72fd)
+
+running 8 tests
+test a_process_whose_supervisor_has_not_looked_is_kept ... ok
+test published_batches_are_not_reclaimed_with_their_producer ... ok
+test a_batch_nothing_can_name_is_reclaimable_and_one_that_is_named_is_not ... ok
+test a_reference_into_reclaimed_state_is_stale_rather_than_wrong ... ok
+test a_finished_process_gives_back_everything_it_was_holding ... ok
+test a_run_that_reclaims_computes_what_a_run_that_does_not_computes ... ok
+test a_run_that_releases_its_batches_stays_bounded ... ok
+test reclaiming_repeatedly_keeps_a_long_run_flat ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/remote_authority.rs (target/debug/deps/remote_authority-fdb78fafd0b9e4bb)
+
+running 5 tests
+test revocation_is_observed_at_remote_use ... ok
+test signed_grants_round_trip_and_tampering_fails_closed ... ok
+test protocol_and_object_versions_are_pinned_at_use ... ok
+test logical_epoch_bounds_are_inclusive_and_enforced ... ok
+test a_remote_reference_is_not_authority ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/remote_batch.rs (target/debug/deps/remote_batch-7c7fa32245e738d7)
+
+running 6 tests
+test an_unreachable_node_is_not_reported_as_bad_evaluator_bytes ... ok
+test loss_after_connection_is_distinct_from_unavailability ... ok
+test duplicate_content_addressed_requests_apply_once ... ok
+test revocation_is_checked_before_the_response_ledger ... ok
+test an_epoch_uses_one_session_and_preserves_request_order ... ok
+test authenticated_tcp_backend_agrees_with_the_reference ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/remote_channel.rs (target/debug/deps/remote_channel-944e978eb3a5c101)
+
+running 4 tests
+test transport_failures_distinguish_unavailable_lost_and_protocol ... ok
+test successful_mutations_apply_once_and_revocation_precedes_replay ... ok
+test owner_keeps_bounded_fifo_and_sequence ... ok
+test close_drains_then_reports_closed_and_rights_are_specific ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/remote_channel_kernel_bridge.rs (target/debug/deps/remote_channel_kernel_bridge-5ba8feba9f5a0926)
+
+running 1 test
+test epoch_probe_wakes_only_the_locally_ready_operation_without_shadow_channel_state ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/remote_future.rs (target/debug/deps/remote_future-eabf78a3e33eb4c1)
+
+running 4 tests
+test operation_specific_rights_are_enforced_on_the_owner ... ok
+test revocation_is_rechecked_before_idempotent_replay ... ok
+test exact_retry_is_idempotent_but_a_distinct_writer_loses_single_assignment ... ok
+test remote_node_owns_and_publishes_canonical_future_state ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/remote_future_kernel_bridge.rs (target/debug/deps/remote_future_kernel_bridge-30b79127d4d311ae)
+
+running 4 tests
+test a_late_remote_await_observes_settlement_and_never_parks ... ok
+test a_failure_before_contact_is_unavailable_but_loss_after_registration_is_node_lost ... ok
+test remote_resolution_wakes_a_local_continuation_without_a_local_future_copy ... ok
+test registration_and_wakeup_are_idempotent_at_an_epoch_boundary ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/remote_journal.rs (target/debug/deps/remote_journal-d3aa8bdc1288fdb7)
+
+running 5 tests
+test unavailable_and_accepted_then_lost_are_distinct ... ok
+test malformed_operation_arena_is_rejected_by_the_worker ... ok
+test exact_retry_applies_once_but_revocation_precedes_the_cache ... ok
+test a_remote_conflict_discards_journals_and_replays_the_epoch ... ok
+test an_actual_epoch_can_use_an_authenticated_remote_commit_gate ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/remote_mailbox_ingress.rs (target/debug/deps/remote_mailbox_ingress-808be6abf8640563)
+
+running 4 tests
+test identical_actor_bits_from_two_issuers_have_independent_sequence_zero ... ok
+test revocation_is_checked_before_staged_replay_and_sequence_failures_do_not_enqueue ... ok
+test two_kernels_tcp_wakes_the_real_receiver_and_applies_duplicate_once ... ok
+test urgent_ordering_and_owner_mailbox_backpressure_are_preserved ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/remote_node_runtime.rs (target/debug/deps/remote_node_runtime-a77d4f8f78e3140b)
+
+running 2 tests
+test accepted_remote_wait_becomes_node_lost_without_fabricating_progress ... ok
+test two_owner_epoch_threads_park_resolve_wake_without_a_foreign_descriptor ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/remote_node_runtime_channel.rs (target/debug/deps/remote_node_runtime_channel-ecc906aeb5756b8d)
+
+running 2 tests
+test contacted_channel_owner_loss_keeps_waiter_parked ... ok
+test two_kernel_threads_send_backpressure_wake_and_receive_from_owner_queue ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/remote_object.rs (target/debug/deps/remote_object-b68f4683573e413b)
+
+running 5 tests
+test competing_writers_cannot_both_commit_the_same_version ... ok
+test transport_distinguishes_unavailable_lost_and_protocol ... ok
+test canonical_bytes_grow_only_at_owner_and_client_creates_no_kernel_shadow ... ok
+test stale_version_does_not_overwrite_newer_bytes ... ok
+test exact_retry_is_apply_once_but_a_revoked_grant_cannot_replay ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/remote_supervision.rs (target/debug/deps/remote_supervision-2470e20a44f38bd2)
+
+running 3 tests
+test notify_and_escalate_match_local_i18_terminal_outcomes_without_shadow_child_state ... ok
+test revocation_and_node_loss_remain_distinct_and_restart_is_explicitly_owner_orchestrated ... ok
+test owner_terminal_publication_is_apply_once_and_wakes_remote_supervisor_at_next_boundary ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/remote_waiter_node_identity.rs (target/debug/deps/remote_waiter_node_identity-0821696748135817)
+
+running 2 tests
+test stale_channel_wake_from_colliding_node_does_not_wake_reparked_continuation ... ok
+test stale_future_wake_from_colliding_node_does_not_wake_reparked_continuation ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/self_tuning.rs (target/debug/deps/self_tuning-87e5d1405a10c08f)
+
+running 8 tests
+test malformed_capture_is_rejected_before_replay ... ok
+test acquisition_is_counterbalanced_and_preserves_every_trial ... ok
+test differing_configuration_outputs_invalidate_the_study ... ok
+test replay_shares_preparation_but_not_identical_observations ... ok
+test disabling_preparation_sharing_is_a_true_negative_control ... ok
+test real_cpu_search_produces_equivalent_scientific_state ... ok
+test real_native_search_is_compared_to_the_reference_oracle ... ok
+test real_metal_search_shares_compilation_and_preserves_outputs ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.37s
+
+     Running tests/semantic_order.rs (target/debug/deps/semantic_order-ac27a281ca43f52b)
+
+running 13 tests
+test delivering_a_message_before_it_is_sent_is_rejected ... ok
+test the_derived_order_is_not_empty ... ok
+test placement_neutrality_catches_a_placement_that_changes_behaviour ... ok
+test the_reference_run_is_a_linear_extension_of_its_own_order ... ok
+test moving_an_event_into_another_epoch_is_rejected ... ok
+test dropping_an_event_is_rejected ... ok
+test a_run_conforms_to_itself ... ok
+test epochs_may_not_run_backwards ... ok
+test reordering_one_continuations_own_events_is_rejected ... ok
+test two_identical_runs_conform ... ok
+test cohort_width_really_does_change_the_placement_trace ... ok
+test cohort_width_does_not_change_observable_behaviour ... ok
+test independent_events_may_be_reordered ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.44s
+
+     Running tests/semantics.rs (target/debug/deps/semantics-8531358935c30229)
+
+running 33 tests
+test a_fresh_machine_is_legal ... ok
+test i10b_catches_a_dead_capability_parent ... ok
+test i10a_catches_capability_amplification ... ok
+test i12_catches_inconsistent_accounting ... ok
+test i10c_records_grants_denials_and_authorized_effects ... ok
+test i10b_catches_multiple_mutable_authority_holders ... ok
+test i15_catches_self_supervision ... ok
+test i16_catches_a_continuation_over_its_contract_budget ... ok
+test i10c_catches_an_effect_without_an_adjacent_grant ... ok
+test i17_catches_a_module_manifest_count_mismatch ... ok
+test i15_catches_a_required_failure_that_was_not_escalated ... ok
+test i16_catches_incorrect_domain_accounting ... ok
+test i1_catches_a_dangling_reference ... ok
+test i21_catches_a_continuation_starved_past_the_bound ... ok
+test i21_catches_an_epoch_that_admitted_work_and_dispatched_none ... ok
+test i15_catches_a_restart_notice_without_its_replacement ... ok
+test i13_catches_two_mutable_continuations_started_in_one_epoch ... ok
+test i11_catches_a_non_monotonic_clock ... ok
+test i2_catches_a_continuation_left_running ... ok
+test i3_catches_a_stale_live_continuation_count ... ok
+test i3_catches_schedulable_work_on_a_terminated_process ... ok
+test i5_catches_an_overfull_mailbox ... ok
+test i6_catches_messages_delivered_out_of_send_order ... ok
+test i8_catches_two_continuations_sharing_a_frame ... ok
+test the_deferral_bound_is_what_decides_starvation ... ok
+test i7_catches_a_continuation_in_the_wrong_bin ... ok
+test i7_catches_unrunnable_work_sitting_in_a_bin ... ok
+test i4_catches_a_waiter_on_a_settled_future ... ok
+test the_live_continuation_count_tracks_a_whole_workload ... ok
+test the_expand_workload_is_legal_at_every_epoch ... ok
+test cohorting_and_fifo_modes_are_both_legal ... ok
+test the_search_workload_is_legal_at_every_epoch ... ok
+test i21_holds_across_every_partial_cohort_policy ... ok
+
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/speculative_epochs.rs (target/debug/deps/speculative_epochs-80c00dfc18dcf883)
+
+running 13 tests
+test a_future_poll_conflicts_with_resolution ... ok
+test two_senders_to_one_mailbox_conflict ... ok
+test two_future_writers_conflict_and_replay_in_plan_order ... ok
+test a_process_commit_conflict_replays_the_whole_epoch ... ok
+test disjoint_lanes_commit_the_reference_run ... ok
+test contended_allocation_falls_back_before_any_snapshot_effect_can_escape ... ok
+test user_frame_evaluators_cannot_shadow_machine_run_classes ... ok
+test an_uninstalled_native_handler_falls_back_without_partial_device_state ... ok
+test independent_mailboxes_futures_and_allocations_commit ... ok
+test arbitrary_evaluator_program_runs_as_native_compiled_continuation_handler ... ok
+test metal_conflict_decision_falls_back_before_future_writes_escape ... ok
+test arbitrary_evaluator_program_runs_as_a_metal_continuation_handler ... ok
+test actual_search_leaf_handlers_execute_and_validate_on_metal_before_commit ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.30s
+
+     Running tests/streaming_graph.rs (target/debug/deps/streaming_graph-d90501623fb1920e)
+
+running 3 tests
+test committed_prefix_survives_source_failure ... ok
+test a_small_channel_exercises_backpressure_without_dropping_work ... ok
+test bounded_stream_preserves_every_record_in_fifo_order ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/supervision.rs (target/debug/deps/supervision-107d7c83def887a0)
+
+running 5 tests
+test restart_requires_a_nonzero_budget ... ok
+test supervision_relationship_requires_the_supervisor_or_system ... ok
+test completion_and_cancellation_are_distinct_terminal_notices ... ok
+test child_failure_wakes_supervisor_and_delivers_one_notice ... ok
+test restart_replaces_identity_and_exhaustion_escalates ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/supervision_tree.rs (target/debug/deps/supervision_tree-9a2ac377b0de08c8)
+
+running 5 tests
+test escalation_propagates_one_level_and_preserves_the_sibling_branch ... ok
+test notification_only_contains_the_worker_failure ... ok
+test restart_replaces_the_failed_worker_without_failing_its_branch ... ok
+test supervision_tree_runs_are_deterministic ... ok
+test fault_free_control_does_not_escalate ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/territories.rs (target/debug/deps/territories-ff9cbd8102cc8a8f)
+
+running 7 tests
+test class_affinity_fills_cohorts_but_idles_the_machine ... ok
+test distribution_still_costs_something ... ok
+test a_single_territory_reduces_to_the_undistributed_scheduler ... ok
+test locality_blind_distribution_shreds_cohorts ... ok
+test proportional_affinity_recovers_both_fill_and_balance ... ok
+test placement_is_deterministic ... ok
+test every_arrival_is_dispatched_exactly_once ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+   Doc-tests soma
+
+running 8 tests
+test src/kernel/effects.rs - kernel::effects::Committing (line 71) - compile fail ... ok
+test src/executives/lane.rs - executives::lane::LaneView (line 102) - compile fail ... ok
+test src/executives/lane.rs - executives::lane::LaneView (line 74) - compile fail ... ok
+test src/scheduler/admission.rs - scheduler::admission::Admission (line 86) - compile fail ... ok
+test src/kernel/mod.rs - kernel::FrameEvaluatorEffect (line 242) - compile fail ... ok
+test src/executives/lane.rs - executives::lane::LaneView (line 82) - compile fail ... ok
+test src/executives/lane.rs - executives::lane::LaneView (line 66) - compile fail ... ok
+test src/executives/lane.rs - executives::lane::LaneView (line 92) ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.69s
+
+$ cargo clippy --all-targets --all-features -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.16s
+===== EXPLICIT REAL-METAL SUITES =====
+$ cargo test --all-features --test metal_backend
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running tests/metal_backend.rs (target/debug/deps/metal_backend-5c6b2e2f91b794b9)
+
+running 7 tests
+test metal_rejects_an_evaluator_it_was_never_given ... ok
+test a_gpu_batch_is_published_where_the_gpu_wrote_it ... ok
+test reinstalling_same_id_with_different_code_replaces_the_pipeline ... ok
+test every_example_body_agrees_between_metal_and_the_cpu_interpreter ... ok
+test a_reused_buffer_does_not_leak_the_previous_batch_into_a_smaller_one ... ok
+test an_epoch_publishes_exactly_what_running_its_collectives_one_at_a_time_does ... ok
+test tuning_controls_change_only_physical_execution ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.29s
+
+$ cargo test --all-features --test device_scheduler
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running tests/device_scheduler.rs (target/debug/deps/device_scheduler-4b9a26352f9cc6d5)
+
+running 19 tests
+test every_partial_policy_has_an_explicit_device_disposition ... ok
+test reference_device_admission_is_the_scheduler_rule ... ok
+test reference_lane_journal_validation_is_namespace_aware_and_order_independent ... ok
+test resident_frame_graph_cpu_oracle_emits_commit_abi_and_canonical_trace ... ok
+test sorted_lane_journal_validation_matches_the_pairwise_rule ... ok
+test dynamic_resident_frontier_rejects_unknown_device_next_class ... ok
+test resident_future_resolve_conflict_falls_back_before_canonical_commit ... ok
+test real_metal_validates_operation_records_and_arena_bounds ... ok
+test compiled_resident_frame_handler_matches_cpu_i19_and_trace ... ok
+test real_metal_lane_journal_validation_matches_the_reference ... ok
+test real_metal_scheduler_matches_the_reference_and_reuses_resident_buffers ... ok
+test resident_future_resolve_commits_canonically_and_is_i18_i19_neutral ... ok
+test resident_frame_handler_is_a_canonical_kernel_epoch_executive ... ok
+test grouped_metal_journal_validation_matches_irregular_access_sets ... ok
+test ungrouped_generic_persistent_worker_matches_cohorted_handlers ... ok
+test sorted_mutable_admission_matches_the_set_rule ... ok
+test dynamic_two_handler_frontier_quiesces_without_intermediate_host_reads ... ok
+test sorted_metal_placement_matches_irregular_non_power_of_two_epochs ... ok
+test dynamic_search_stays_on_device_across_epochs ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.34s
+
+$ cargo test --all-features --test f32_evaluator
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running tests/f32_evaluator.rs (target/debug/deps/f32_evaluator-9f50ea8bb755d167)
+
+running 10 tests
+test reference_sub_div_comparison_and_float_select_have_exact_special_semantics ... ok
+test reference_f32_is_exact_for_finite_and_special_values ... ok
+test typed_float_local_starts_at_canonical_positive_zero_and_accumulates ... ok
+test validation_rejects_integer_float_mixing_and_wrong_store_fields ... ok
+test native_float_local_loop_is_byte_identical ... ok
+test native_f32_is_byte_identical_to_reference ... ok
+test complete_native_f32_surface_is_byte_identical ... ok
+test complete_metal_f32_surface_is_byte_identical ... ok
+test metal_f32_is_byte_identical_to_reference ... ok
+test metal_float_local_loop_is_byte_identical ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.30s
+
+$ cargo test --features metal metal_resident_sync --lib
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/soma-22212d44e4f92f4f)
+
+running 7 tests
+test executives::metal_resident_sync::tests::rejects_unbounded_frames_effects_and_control_flow ... ok
+test executives::metal_resident_sync::tests::absent_previous_store_fails_boundedly ... ok
+test executives::metal_resident_sync::tests::class_zero_and_invalid_target_match_oracle ... ok
+test executives::metal_resident_sync::tests::mailbox_wake_delivery_and_authority_errors_match_cpu ... ok
+test executives::metal_resident_sync::tests::value_bearing_previous_survives_later_denial ... ok
+test executives::metal_resident_sync::tests::mailbox_waiters_wake_in_registration_not_identity_order ... ok
+test executives::metal_resident_sync::tests::width_1_and_32_match_cpu_oracle_exactly ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 2.31s
+
+===== SELECTED BOUNDED RELEASE BENCHMARKS =====
+$ cargo run --release --all-features --example resident_dynamic_bench
+   Compiling soma v0.3.0 (/Users/lulzx/work/gpu-os)
+    Finished `release` profile [optimized + debuginfo] target(s) in 8.58s
+     Running `target/release/examples/resident_dynamic_bench`
+resident_dynamic_bench: bounded 8-step two-class divergent workload; 32 useful ALU rounds/step; release samples alternate grouped/generic order
+limitation: the resident dynamic graph is one Metal submit but remains standalone; it does not perform a Kernel Phase-G final commit
+lanes,sample,first,cpu_bucket_us,grouped_us,generic_ungrouped_us,device_one_class_us,multisubmit_level_us,low_arrival_us,grouped_submits,generic_submits,level_submits,arrival_submits,exact
+1024,0,grouped,1793,485,492,462,2328,2793,1,1,8,8,true
+1024,1,generic,1716,494,473,388,2539,3074,1,1,8,8,true
+1024,2,grouped,1725,539,454,1810,2091,7008,1,1,8,8,true
+1024,3,generic,1852,550,2065,356,2117,4299,1,1,8,8,true
+1024,4,grouped,1732,564,576,501,1995,3214,1,1,8,8,true
+1024,5,generic,1794,477,517,392,2117,2823,1,1,8,8,true
+4096,0,grouped,7138,822,749,686,3242,3040,1,1,8,8,true
+4096,1,generic,6515,734,1949,616,2496,2908,1,1,8,8,true
+4096,2,grouped,6584,2345,714,614,2231,3206,1,1,8,8,true
+4096,3,generic,6483,732,1931,608,2208,2939,1,1,8,8,true
+4096,4,grouped,6543,1875,742,589,2220,2743,1,1,8,8,true
+4096,5,generic,7035,841,1402,647,2507,2921,1,1,8,8,true
+16384,0,grouped,26484,2615,2143,1735,4205,4659,1,1,8,8,true
+16384,1,generic,27085,3142,1934,2160,5340,4693,1,1,8,8,true
+16384,2,grouped,27048,2913,2621,1684,3593,6502,1,1,8,8,true
+16384,3,generic,26874,2090,1944,3347,3900,4309,1,1,8,8,true
+16384,4,grouped,27283,2182,3682,1632,4981,4247,1,1,8,8,true
+16384,5,generic,26458,2898,2407,1884,5503,4588,1,1,8,8,true
+$ cargo run --release --all-features --example ant_collective_bench -- 2
+   Compiling soma v0.3.0 (/Users/lulzx/work/gpu-os)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.52s
+     Running `target/release/examples/ant_collective_bench 2`
+SOMA ant collective wall benchmark: ants=256 epochs=40 trials=2
+timing: wall includes backend construction, colony setup, all persistent steps, and final observation
+backend: host=sensing loop; collectives=physical backend call only; host=wall-setup-backend
+host-reference   median_ms=49.462 wall_ns=49462375,36095625 setup_ns=2448000,519292 backend_ns=168333,113001 host_ns=46846042,35463332
+cpu-collective   median_ms=54.026 wall_ns=54025666,51058250 setup_ns=703917,530458 backend_ns=3999003,3787586 host_ns=49322746,46740206
+metal-collective median_ms=96.074 wall_ns=96074084,61209750 setup_ns=31862959,1534917 backend_ns=14055707,10740581 host_ns=50155418,48934252
+identical_world=true (all persistent object bytes, ant views, accounting, and pending count)
+finished_utc: 2026-08-07T09:02:51Z
+result: PASS

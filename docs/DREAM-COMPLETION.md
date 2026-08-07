@@ -84,12 +84,16 @@ apparent 16K crossover is not reproducible. Discovery and self-tuning provide
 additional equivalence controls. A qualifying end-to-end cohorting speedup is
 not yet established.
 
-## G6 — Release discipline [in progress]
+## G6 — Release discipline [complete]
 
-Default/native tests and Clippy run on Linux CI; all targets compile on macOS
-with Metal. A release requires the full suite and real-device equivalence tests,
-no undocumented stubs, frozen raw measurements, and an updated audit of every
-gate above. Capture the auditable device/toolchain record with
-`scripts/release-audit.sh` on the qualifying Mac; see
-[`RELEASE-AUDIT.md`](RELEASE-AUDIT.md) for clean-tree, checksum, quick, and
-dry-run rules.
+The clean committed revision `8f48bb6cdea2eed19470c652107fd0dc15b9dc65`
+has a qualifying physical-device capture in
+`measurements/RELEASE-AUDIT-20260807T090150Z-full.log` with an adjacent verified
+SHA-256 file. The record identifies the 16-core Apple M4 Pro, macOS 26.6,
+Rust/Cargo 1.92.0, exact commit and initially clean tree; it ends `result: PASS`
+after the complete all-feature suite, warnings-forbidden Clippy, explicit Metal
+backend/scheduler/binary32/resident-sync suites, and bounded release benchmarks.
+The benchmark outputs remain negative/unstable evidence rather than a speedup
+claim. `scripts/release-audit.sh` and [`RELEASE-AUDIT.md`](RELEASE-AUDIT.md)
+preserve clean-tree refusal, immutable log names, checksum, quick, and dry-run
+rules for subsequent release commits.

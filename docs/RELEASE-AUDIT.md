@@ -65,3 +65,13 @@ successes. Use `--output-dir DIR` for disposable preflight artifacts.
 A release audit is complete only when the default full-mode log ends in
 `result: PASS`, its checksum verifies, the initial tree was clean, and a human
 has reviewed the G1–G6 gate status in `DREAM-COMPLETION.md`.
+
+## Qualifying capture
+
+The first qualifying capture is
+`measurements/RELEASE-AUDIT-20260807T090150Z-full.log` for commit
+`8f48bb6cdea2eed19470c652107fd0dc15b9dc65`; its adjacent checksum verifies and
+the log records `tree_clean_at_start: yes`, `qualifying_release_evidence: yes`,
+and `result: PASS` on the physical 16-core Apple M4 Pro. Its resident benchmark
+ordering is still unstable and its ant Metal wall is slower, so the capture
+closes release provenance (G6), not the performance gate (G5).
