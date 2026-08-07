@@ -2,8 +2,9 @@ use soma::abi::cohorts::PartialCohortPolicy;
 use soma::abi::{Kind, Ref64, StateAccess};
 use soma::scheduler::admission::Candidate;
 use soma::scheduler::device::{
-    reference_device_schedule, reference_resident_search, ResidentSearchConfig, DEVICE_DEFERRED,
-    DEVICE_POLICY_DEFERRED, DEVICE_RUN, DEVICE_SEND_TO_CPU,
+    reference_device_schedule, reference_lane_conflicts, reference_resident_search,
+    DeviceLaneAccess, ResidentSearchConfig, DEVICE_DEFERRED, DEVICE_POLICY_DEFERRED, DEVICE_RUN,
+    DEVICE_SEND_TO_CPU,
 };
 
 fn candidate(
@@ -77,6 +78,61 @@ fn workload() -> Vec<Candidate> {
         candidate(15, 4, 7, 7, 5, StateAccess::ReadOnly),
         candidate(16, 5, 7, 7, 5, StateAccess::ReadOnly),
     ]
+}
+
+fn journal_workload() -> Vec<DeviceLaneAccess> {
+    let object = Ref64::new(30, 1, Kind::Object);
+    let same_bits_other_namespace = object;
+    let future = Ref64::new(31, 1, Kind::Future);
+    vec![
+        DeviceLaneAccess::read(0, 1, object, 0),
+        DeviceLaneAccess::read(1, 1, object, 0),
+        DeviceLaneAccess::write(2, 1, object, 0),
+        DeviceLaneAccess::write(2, 1, object, 1),
+        DeviceLaneAccess::write(3, 2, same_bits_other_namespace, 0),
+        DeviceLaneAccess::read(4, 2, future, 0),
+        DeviceLaneAccess::write(5, 2, future, 0),
+    ]
+}
+
+#[test]
+fn reference_lane_journal_validation_is_namespace_aware_and_order_independent() {
+    let expected = reference_lane_conflicts(&journal_workload(), 7);
+    assert_eq!(expected[0].first_other_lane, 2);
+    assert_eq!(expected[1].first_other_lane, 2);
+    assert_eq!(expected[2].first_other_lane, 0);
+    assert_eq!(expected[3].conflicts, 0);
+    assert_eq!(expected[4].first_other_lane, 5);
+    assert_eq!(expected[5].first_other_lane, 4);
+    assert_eq!(expected[6].conflicts, 0);
+
+    let mut reversed = journal_workload();
+    reversed.reverse();
+    assert_eq!(reference_lane_conflicts(&reversed, 7), expected);
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn real_metal_lane_journal_validation_matches_the_reference() {
+    use soma::executives::metal_scheduler::MetalDeviceScheduler;
+
+    let accesses = journal_workload();
+    let expected = reference_lane_conflicts(&accesses, 7);
+    let mut metal = MetalDeviceScheduler::new().unwrap();
+    assert_eq!(
+        metal.validate_lane_journals(&accesses, 7).unwrap(),
+        expected
+    );
+    let capacity = metal.journal_resident_capacity();
+    assert_eq!(
+        metal.validate_lane_journals(&accesses[..3], 3).unwrap(),
+        reference_lane_conflicts(&accesses[..3], 3)
+    );
+    assert_eq!(metal.journal_resident_capacity(), capacity);
+    assert_eq!(
+        metal.validate_lane_journals(&[], 3).unwrap()[2].conflicts,
+        0
+    );
 }
 
 #[test]

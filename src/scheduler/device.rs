@@ -15,6 +15,96 @@ pub const DEVICE_RUN: u32 = 1;
 pub const DEVICE_POLICY_DEFERRED: u32 = 2;
 pub const DEVICE_SEND_TO_CPU: u32 = 3;
 
+pub const DEVICE_ACCESS_READ: u32 = 1;
+pub const DEVICE_ACCESS_WRITE: u32 = 2;
+
+/// One semantic resource access emitted by a lane.
+///
+/// The representation is pointer-free and has the same layout in Rust, Metal,
+/// and the distributed journal wire format. `resource_kind` is kept separate
+/// from the reference because two resource namespaces may intentionally name
+/// the same `Ref64` bits.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeviceLaneAccess {
+    pub resource: u64,
+    pub lane: u32,
+    pub resource_kind: u32,
+    pub mode: u32,
+    pub ordinal: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<DeviceLaneAccess>() == 24);
+
+impl DeviceLaneAccess {
+    pub fn read(lane: u32, resource_kind: u32, resource: Ref64, ordinal: u32) -> Self {
+        Self {
+            resource: resource.to_u64(),
+            lane,
+            resource_kind,
+            mode: DEVICE_ACCESS_READ,
+            ordinal,
+        }
+    }
+
+    pub fn write(lane: u32, resource_kind: u32, resource: Ref64, ordinal: u32) -> Self {
+        Self {
+            resource: resource.to_u64(),
+            lane,
+            resource_kind,
+            mode: DEVICE_ACCESS_WRITE,
+            ordinal,
+        }
+    }
+}
+
+/// Conflict decision for one canonical lane.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeviceLaneConflict {
+    pub lane: u32,
+    pub conflicts: u32,
+    pub first_other_lane: u32,
+    pub reserved: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<DeviceLaneConflict>() == 16);
+
+/// Independent oracle for device-side lane-journal validation.
+///
+/// Two different lanes conflict when they name the same resource namespace
+/// and identity and at least one access is a write. Physical access order and
+/// duplicate records within one lane cannot affect the result.
+pub fn reference_lane_conflicts(
+    accesses: &[DeviceLaneAccess],
+    lane_count: u32,
+) -> Vec<DeviceLaneConflict> {
+    (0..lane_count)
+        .map(|lane| {
+            let first_other_lane = accesses
+                .iter()
+                .filter(|access| access.lane == lane)
+                .flat_map(|access| {
+                    accesses.iter().filter_map(move |other| {
+                        (other.lane != lane
+                            && other.resource == access.resource
+                            && other.resource_kind == access.resource_kind
+                            && (access.mode == DEVICE_ACCESS_WRITE
+                                || other.mode == DEVICE_ACCESS_WRITE))
+                            .then_some(other.lane)
+                    })
+                })
+                .min();
+            DeviceLaneConflict {
+                lane,
+                conflicts: u32::from(first_other_lane.is_some()),
+                first_other_lane: first_other_lane.unwrap_or(u32::MAX),
+                reserved: 0,
+            }
+        })
+        .collect()
+}
+
 /// Candidate data copied into persistent device-visible storage.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

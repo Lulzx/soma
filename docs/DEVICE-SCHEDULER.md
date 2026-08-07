@@ -41,6 +41,22 @@ is a pure function of the complete candidate array. That avoids turning the
 GPU's physical execution order into SOMA lane order and preserves I22 by
 construction.
 
+The same device now validates lane-local access journals. Each access is a
+fixed-width `(lane, resource namespace, Ref64, read/write, ordinal)` record.
+One GPU thread per canonical lane compares its journal with the complete epoch
+and reports whether it conflicts and the smallest conflicting lane. A conflict
+requires equal namespace and identity, different lanes, and at least one
+write; read/read pairs, duplicate records within a lane, and identical Ref64
+bits in different resource namespaces do not conflict. The decision is thus a
+set function and cannot depend on physical completion order.
+
+The access and result buffers grow geometrically and remain resident across
+epochs. `tests/device_scheduler.rs` compares the Metal result to an independent
+CPU oracle, reverses journal input order, exercises read/read and namespace
+negative controls, and verifies buffer reuse. This moves the conflict gate
+needed before canonical commit onto the device. It does not yet move operation
+replay or handler execution there.
+
 The current algorithm is intentionally simple and quadratic in candidate
 count. It establishes the device ABI and semantic equivalence before replacing
 the comparison scans with parallel sort/scan primitives. Scheduler-overhead
@@ -65,8 +81,8 @@ width one collapses cohort count and lane slots exactly to node count. Both
 controls still agree field-for-field with the reference accounting.
 
 This is not yet the complete persistent executive. The resident path currently
-executes the bounded search transition, while the full `LaneView` operation
-language still needs device lowering, lane-local event/effect journals, and
-canonical commit. Completion means the general lane program runs through that
-same no-round-trip graph, followed by I19 and trace comparison against the
-reference kernel.
+executes the bounded search transition. Lane read/write journals and their
+conflict decision now have device lowering, while the full `LaneView` operation
+language still needs device-side operation/event payloads and canonical replay.
+Completion means the general lane program runs through that same no-round-trip
+graph, followed by I19 and trace comparison against the reference kernel.

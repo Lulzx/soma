@@ -14,7 +14,9 @@ use metal::{
 
 use crate::abi::cohorts::PartialCohortPolicy;
 use crate::scheduler::admission::Candidate;
-use crate::scheduler::device::{DeviceCandidate, DevicePlacement, DeviceSchedule};
+use crate::scheduler::device::{
+    DeviceCandidate, DeviceLaneAccess, DeviceLaneConflict, DevicePlacement, DeviceSchedule,
+};
 use crate::scheduler::device::{ResidentSearchConfig, ResidentSearchResult};
 
 use super::batch::BackendError;
@@ -42,6 +44,21 @@ struct Placement {
     uint cohort;
     uint lane_in_cohort;
     uint input_order;
+    uint reserved;
+};
+
+struct LaneAccess {
+    ulong resource;
+    uint lane;
+    uint resource_kind;
+    uint mode;
+    uint ordinal;
+};
+
+struct LaneConflict {
+    uint lane;
+    uint conflicts;
+    uint first_other_lane;
     uint reserved;
 };
 
@@ -113,6 +130,29 @@ kernel void soma_device_place(
     placements[gid].cohort = rank / width;
     placements[gid].lane_in_cohort = rank % width;
 }
+
+kernel void soma_device_validate_journals(
+    device const LaneAccess* accesses [[buffer(0)]],
+    device LaneConflict* conflicts [[buffer(1)]],
+    constant uint& access_count [[buffer(2)]],
+    constant uint& lane_count [[buffer(3)]],
+    uint lane [[thread_position_in_grid]]
+) {
+    if (lane >= lane_count) return;
+    uint first = 0xFFFFFFFFu;
+    for (uint left = 0u; left < access_count; ++left) {
+        LaneAccess access = accesses[left];
+        if (access.lane != lane) continue;
+        for (uint right = 0u; right < access_count; ++right) {
+            LaneAccess other = accesses[right];
+            if (other.lane == lane || other.resource != access.resource
+                || other.resource_kind != access.resource_kind) continue;
+            if (access.mode == 2u || other.mode == 2u) first = min(first, other.lane);
+        }
+    }
+    LaneConflict result = {lane, first != 0xFFFFFFFFu, first, 0u};
+    conflicts[lane] = result;
+}
 "#;
 
 pub struct MetalDeviceScheduler {
@@ -120,7 +160,9 @@ pub struct MetalDeviceScheduler {
     queue: CommandQueue,
     admission: ComputePipelineState,
     placement: ComputePipelineState,
+    journal_validation: ComputePipelineState,
     resident: Option<(Buffer, Buffer, usize)>,
+    journal_resident: Option<(Buffer, Buffer, usize, usize)>,
 }
 
 impl MetalDeviceScheduler {
@@ -136,18 +178,26 @@ impl MetalDeviceScheduler {
         let placement_fn = library
             .get_function("soma_device_place", None)
             .map_err(|_| BackendError::ExecutionFailed)?;
+        let journal_validation_fn = library
+            .get_function("soma_device_validate_journals", None)
+            .map_err(|_| BackendError::ExecutionFailed)?;
         let admission = device
             .new_compute_pipeline_state_with_function(&admission_fn)
             .map_err(|_| BackendError::ExecutionFailed)?;
         let placement = device
             .new_compute_pipeline_state_with_function(&placement_fn)
             .map_err(|_| BackendError::ExecutionFailed)?;
+        let journal_validation = device
+            .new_compute_pipeline_state_with_function(&journal_validation_fn)
+            .map_err(|_| BackendError::ExecutionFailed)?;
         Ok(Self {
             device,
             queue,
             admission,
             placement,
+            journal_validation,
             resident: None,
+            journal_resident: None,
         })
     }
 
@@ -156,6 +206,13 @@ impl MetalDeviceScheduler {
             .as_ref()
             .map(|(_, _, capacity)| *capacity)
             .unwrap_or(0)
+    }
+
+    pub fn journal_resident_capacity(&self) -> (usize, usize) {
+        self.journal_resident
+            .as_ref()
+            .map(|(_, _, accesses, lanes)| (*accesses, *lanes))
+            .unwrap_or((0, 0))
     }
 
     fn buffers(&mut self, count: usize) -> (&Buffer, &Buffer) {
@@ -177,6 +234,97 @@ impl MetalDeviceScheduler {
         }
         let (candidates, placements, _) = self.resident.as_ref().expect("resident buffers");
         (candidates, placements)
+    }
+
+    fn journal_buffers(&mut self, access_count: usize, lane_count: usize) -> (&Buffer, &Buffer) {
+        let access_capacity = access_count.max(1).next_power_of_two();
+        let lane_capacity = lane_count.max(1).next_power_of_two();
+        let needs_growth = self.journal_resident.as_ref().is_none_or(
+            |(_, _, resident_accesses, resident_lanes)| {
+                *resident_accesses < access_count || *resident_lanes < lane_count
+            },
+        );
+        if needs_growth {
+            let accesses = self.device.new_buffer(
+                (access_capacity * std::mem::size_of::<DeviceLaneAccess>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let conflicts = self.device.new_buffer(
+                (lane_capacity * std::mem::size_of::<DeviceLaneConflict>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            self.journal_resident = Some((accesses, conflicts, access_capacity, lane_capacity));
+        }
+        let (accesses, conflicts, _, _) = self
+            .journal_resident
+            .as_ref()
+            .expect("resident journal buffers");
+        (accesses, conflicts)
+    }
+
+    /// Validate a complete epoch's lane access journals concurrently.
+    /// Results are indexed by canonical lane number, not device completion
+    /// order, and the buffers remain resident for later epochs.
+    pub fn validate_lane_journals(
+        &mut self,
+        accesses: &[DeviceLaneAccess],
+        lane_count: u32,
+    ) -> Result<Vec<DeviceLaneConflict>, BackendError> {
+        if accesses.len() > u32::MAX as usize
+            || accesses.iter().any(|access| access.lane >= lane_count)
+        {
+            return Err(BackendError::InvalidInput);
+        }
+        if lane_count == 0 {
+            return if accesses.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Err(BackendError::InvalidInput)
+            };
+        }
+        let access_count = accesses.len() as u32;
+        let (access_buffer, conflict_buffer) =
+            self.journal_buffers(accesses.len(), lane_count as usize);
+        if !accesses.is_empty() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    accesses.as_ptr().cast::<u8>(),
+                    access_buffer.contents().cast::<u8>(),
+                    std::mem::size_of_val(accesses),
+                );
+            }
+        }
+        let access_buffer = access_buffer.clone();
+        let conflict_buffer = conflict_buffer.clone();
+        let command = self.queue.new_command_buffer();
+        let encoder = command.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.journal_validation);
+        encoder.set_buffer(0, Some(&access_buffer), 0);
+        encoder.set_buffer(1, Some(&conflict_buffer), 0);
+        encoder.set_bytes(
+            2,
+            std::mem::size_of::<u32>() as u64,
+            (&access_count as *const u32).cast::<c_void>(),
+        );
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<u32>() as u64,
+            (&lane_count as *const u32).cast::<c_void>(),
+        );
+        dispatch(encoder, &self.journal_validation, lane_count);
+        encoder.end_encoding();
+        command.commit();
+        command.wait_until_completed();
+        if command.status() != MTLCommandBufferStatus::Completed {
+            return Err(BackendError::ExecutionFailed);
+        }
+        Ok(unsafe {
+            std::slice::from_raw_parts(
+                conflict_buffer.contents().cast::<DeviceLaneConflict>(),
+                lane_count as usize,
+            )
+        }
+        .to_vec())
     }
 
     pub fn schedule(
