@@ -49,14 +49,20 @@ benchmarks will measure where that crossover is justified.
 ## Remaining integration
 
 `MetalResidentSearch` is the first end-to-end resident execution path. It keeps
-double-buffered continuation descriptors, frontier counters, completion
-accounting, and result digests in Metal buffers while a single command graph
-runs every level of a dynamic branching search. Reset, concurrent execution,
+double-buffered continuation descriptors, a run-class-ordered execution
+frontier, counters, completion accounting, and result digests in Metal buffers
+while a single command graph runs every level of a dynamic branching search.
+Reset, stable run-class placement, cohort accounting, concurrent execution,
 child publication, and frontier swap are device phases; the host reads state
 only after the graph completes. A 7-root, three-way, depth-four test executes
 all 847 nodes over five epochs and agrees exactly with the independent CPU
-transition on node count, epoch count, wrapping checksum sum, XOR digest, and
-overflow status.
+transition on node count, epoch count, wrapping checksum sum, XOR digest,
+cohorts, lane slots, useful lanes, and overflow status.
+
+The controls distinguish scheduling from mere execution. Four run classes
+produce more physical cohorts than the one-class control at width 32, while
+width one collapses cohort count and lane slots exactly to node count. Both
+controls still agree field-for-field with the reference accounting.
 
 This is not yet the complete persistent executive. The resident path currently
 executes the bounded search transition, while the full `LaneView` operation

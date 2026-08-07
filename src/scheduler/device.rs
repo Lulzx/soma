@@ -152,6 +152,7 @@ pub struct ResidentSearchConfig {
     pub depth: u32,
     pub class_count: u32,
     pub work_iters: u32,
+    pub cohort_width: u32,
 }
 
 impl ResidentSearchConfig {
@@ -174,6 +175,9 @@ pub struct ResidentSearchResult {
     pub checksum_sum: u32,
     pub checksum_xor: u32,
     pub overflow: u32,
+    pub cohorts: u32,
+    pub lane_slots: u32,
+    pub useful_lane_slots: u32,
 }
 
 pub fn reference_resident_search(config: ResidentSearchConfig) -> ResidentSearchResult {
@@ -182,6 +186,19 @@ pub fn reference_resident_search(config: ResidentSearchConfig) -> ResidentSearch
         .collect();
     let mut result = ResidentSearchResult::default();
     while !current.is_empty() {
+        let width = config.cohort_width.max(1);
+        let mut class_counts = std::collections::BTreeMap::<u32, u32>::new();
+        for (value, _) in &current {
+            *class_counts
+                .entry((*value % u64::from(config.class_count.max(1))) as u32)
+                .or_default() += 1;
+        }
+        for count in class_counts.values() {
+            let cohorts = count.div_ceil(width);
+            result.cohorts = result.cohorts.wrapping_add(cohorts);
+            result.lane_slots = result.lane_slots.wrapping_add(cohorts.wrapping_mul(width));
+            result.useful_lane_slots = result.useful_lane_slots.wrapping_add(*count);
+        }
         let mut next = Vec::new();
         for (value, depth) in current {
             let class = (value % u64::from(config.class_count.max(1))) as u32;

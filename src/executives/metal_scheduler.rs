@@ -299,16 +299,45 @@ const RESIDENT_SEARCH_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 struct Node { ulong value; uint depth; uint branching; uint work_iters; uint class_count; };
-struct Config { uint capacity; uint branching; uint work_iters; uint class_count; };
+struct Config { uint capacity; uint branching; uint work_iters; uint class_count; uint cohort_width; };
 struct State {
     atomic_uint current_count; atomic_uint next_count; atomic_uint active_count;
     atomic_uint nodes; atomic_uint epochs; atomic_uint checksum_sum;
-    atomic_uint checksum_xor; atomic_uint overflow;
+    atomic_uint checksum_xor; atomic_uint overflow; atomic_uint cohorts;
+    atomic_uint lane_slots; atomic_uint useful_lane_slots;
 };
 kernel void resident_reset(device State& state [[buffer(0)]], uint gid [[thread_position_in_grid]]) {
     if (gid != 0u) return;
     atomic_store_explicit(&state.active_count, atomic_load_explicit(&state.current_count, memory_order_relaxed), memory_order_relaxed);
     atomic_store_explicit(&state.next_count, 0u, memory_order_relaxed);
+}
+kernel void resident_place(
+    device const Node* input [[buffer(0)]], device Node* placed [[buffer(1)]],
+    device State& state [[buffer(2)]], constant Config& config [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint count = atomic_load_explicit(&state.active_count, memory_order_relaxed);
+    if (gid >= count) return;
+    uint classes = max(input[gid].class_count, 1u);
+    uint cls = uint(input[gid].value % ulong(classes));
+    uint before_classes = 0u;
+    uint rank = 0u;
+    uint class_count = 0u;
+    for (uint other = 0u; other < count; ++other) {
+        uint other_classes = max(input[other].class_count, 1u);
+        uint other_class = uint(input[other].value % ulong(other_classes));
+        if (other_class < cls) ++before_classes;
+        if (other_class == cls) {
+            if (other < gid) ++rank;
+            ++class_count;
+        }
+    }
+    placed[before_classes + rank] = input[gid];
+    uint width = max(config.cohort_width, 1u);
+    if ((rank % width) == 0u) {
+        atomic_fetch_add_explicit(&state.cohorts, 1u, memory_order_relaxed);
+        atomic_fetch_add_explicit(&state.lane_slots, width, memory_order_relaxed);
+        atomic_fetch_add_explicit(&state.useful_lane_slots, min(width, class_count - rank), memory_order_relaxed);
+    }
 }
 kernel void resident_execute(
     device const Node* input [[buffer(0)]], device Node* output [[buffer(1)]],
@@ -363,6 +392,7 @@ struct ResidentConfig {
     branching: u32,
     work_iters: u32,
     class_count: u32,
+    cohort_width: u32,
 }
 
 /// A bounded multi-epoch command graph whose scheduler state never returns to
@@ -371,6 +401,7 @@ pub struct MetalResidentSearch {
     device: Device,
     queue: CommandQueue,
     reset: ComputePipelineState,
+    place: ComputePipelineState,
     execute: ComputePipelineState,
     finish: ComputePipelineState,
 }
@@ -392,6 +423,7 @@ impl MetalResidentSearch {
         Ok(Self {
             queue: device.new_command_queue(),
             reset: pipeline("resident_reset")?,
+            place: pipeline("resident_place")?,
             execute: pipeline("resident_execute")?,
             finish: pipeline("resident_finish")?,
             device,
@@ -414,12 +446,15 @@ impl MetalResidentSearch {
             self.device
                 .new_buffer(bytes, MTLResourceOptions::StorageModeShared),
         ];
+        let placed = self
+            .device
+            .new_buffer(bytes, MTLResourceOptions::StorageModeShared);
         let state = self
             .device
-            .new_buffer(8 * 4, MTLResourceOptions::StorageModeShared);
-        unsafe { std::ptr::write_bytes(state.contents(), 0, 8 * 4) };
+            .new_buffer(11 * 4, MTLResourceOptions::StorageModeShared);
+        unsafe { std::ptr::write_bytes(state.contents(), 0, 11 * 4) };
         unsafe {
-            let words = std::slice::from_raw_parts_mut(state.contents().cast::<u32>(), 8);
+            let words = std::slice::from_raw_parts_mut(state.contents().cast::<u32>(), 11);
             words[0] = config.roots;
             let roots = std::slice::from_raw_parts_mut(
                 buffers[0].contents().cast::<ResidentNode>(),
@@ -440,6 +475,7 @@ impl MetalResidentSearch {
             branching: config.branching,
             work_iters: config.work_iters,
             class_count: config.class_count,
+            cohort_width: config.cohort_width.max(1),
         };
         let command = self.queue.new_command_buffer();
         for epoch in 0..=config.depth {
@@ -448,9 +484,21 @@ impl MetalResidentSearch {
             reset.set_buffer(0, Some(&state), 0);
             dispatch(reset, &self.reset, 1);
             reset.end_encoding();
+            let place = command.new_compute_command_encoder();
+            place.set_compute_pipeline_state(&self.place);
+            place.set_buffer(0, Some(&buffers[(epoch & 1) as usize]), 0);
+            place.set_buffer(1, Some(&placed), 0);
+            place.set_buffer(2, Some(&state), 0);
+            place.set_bytes(
+                3,
+                std::mem::size_of::<ResidentConfig>() as u64,
+                (&constants as *const ResidentConfig).cast(),
+            );
+            dispatch(place, &self.place, capacity);
+            place.end_encoding();
             let execute = command.new_compute_command_encoder();
             execute.set_compute_pipeline_state(&self.execute);
-            execute.set_buffer(0, Some(&buffers[(epoch & 1) as usize]), 0);
+            execute.set_buffer(0, Some(&placed), 0);
             execute.set_buffer(1, Some(&buffers[((epoch + 1) & 1) as usize]), 0);
             execute.set_buffer(2, Some(&state), 0);
             execute.set_bytes(
@@ -471,13 +519,16 @@ impl MetalResidentSearch {
         if command.status() != MTLCommandBufferStatus::Completed {
             return Err(BackendError::ExecutionFailed);
         }
-        let words = unsafe { std::slice::from_raw_parts(state.contents().cast::<u32>(), 8) };
+        let words = unsafe { std::slice::from_raw_parts(state.contents().cast::<u32>(), 11) };
         Ok(ResidentSearchResult {
             nodes: words[3],
             epochs: words[4],
             checksum_sum: words[5],
             checksum_xor: words[6],
             overflow: words[7],
+            cohorts: words[8],
+            lane_slots: words[9],
+            useful_lane_slots: words[10],
         })
     }
 }

@@ -35,6 +35,7 @@ fn dynamic_search_stays_on_device_across_epochs() {
         depth: 4,
         class_count: 4,
         work_iters: 17,
+        cohort_width: 32,
     };
     let expected = reference_resident_search(config);
     let actual = MetalResidentSearch::new().unwrap().run(config).unwrap();
@@ -42,6 +43,28 @@ fn dynamic_search_stays_on_device_across_epochs() {
     assert_eq!(actual.nodes, config.node_count().unwrap());
     assert_eq!(actual.epochs, config.depth + 1);
     assert_eq!(actual.overflow, 0);
+    assert_eq!(actual.useful_lane_slots, actual.nodes);
+    assert!(actual.lane_slots >= actual.useful_lane_slots);
+
+    let uniform = ResidentSearchConfig {
+        class_count: 1,
+        ..config
+    };
+    let uniform_actual = MetalResidentSearch::new().unwrap().run(uniform).unwrap();
+    assert_eq!(uniform_actual, reference_resident_search(uniform));
+    assert!(
+        actual.cohorts > uniform_actual.cohorts,
+        "class fragmentation must cost real device cohorts"
+    );
+
+    let scalar = ResidentSearchConfig {
+        cohort_width: 1,
+        ..config
+    };
+    let scalar_actual = MetalResidentSearch::new().unwrap().run(scalar).unwrap();
+    assert_eq!(scalar_actual, reference_resident_search(scalar));
+    assert_eq!(scalar_actual.cohorts, scalar_actual.nodes);
+    assert_eq!(scalar_actual.lane_slots, scalar_actual.nodes);
 }
 
 fn workload() -> Vec<Candidate> {

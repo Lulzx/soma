@@ -303,8 +303,9 @@ Implemented now:
   and all partial-cohort dispositions, checked field-for-field against an
   independent reference schedule
 - A no-round-trip multi-epoch Metal execution graph for dynamic branching
-  search, with device-resident double-buffered continuation frontiers and exact
-  CPU agreement on work, epochs, and two order-independent result digests
+  search, with device-resident double-buffered continuation frontiers, stable
+  run-class placement, cohort accounting, and exact CPU agreement on work,
+  epochs, placement costs, and two order-independent result digests
 
 Not implemented:
 
