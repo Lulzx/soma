@@ -1533,6 +1533,29 @@ steps. The measured crossover and controls are in
 million arithmetic iterations across eight lanes and about 0.1× at one thousand
 iterations per lane.
 
+### 4.19 Discovery searches the implementation
+
+The first real Discovery target is SOMA's own evaluator path. The experiment
+searches placement, CPU thread count, epoch command grouping, Metal scratch
+reuse, and threadgroup width across light, medium, and compute-heavy bodies.
+Evaluator construction and deterministic input preparation are content-addressed
+nodes shared across configuration hypotheses. Wall-clock trials are
+`Observation` nodes and therefore retain multiplicity even when their values
+are byte-identical.
+
+Acquisition is deliberately outside replay: each configuration is warmed, then
+trials run in a deterministic rotating order. Every trial records elapsed time
+and the digest of the published output. A disagreement between configuration
+outputs invalidates the study before replay. The literal and optimized
+Discovery executors then consume the same captured evidence, and D1–D7 require
+identical terminal scientific state.
+
+This does not make wall-clock time deterministic and does not place timing in
+the SOMA semantic core. It makes the comparison scientifically controlled: one
+noisy acquisition, two executions over exactly the same observations. The
+protocol, negative controls, and M4 Pro measurements are in
+`docs/SELF-TUNING.md`.
+
 ## 5. C — distributed, trace-equivalent
 
 **Not started, and still the long pole.** Roughly the size of B and A combined.

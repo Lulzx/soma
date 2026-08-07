@@ -1,0 +1,56 @@
+SOMA self-tuning discovery study
+hardware: Apple M4 Pro, 24 GiB
+os: macOS 26.6 (25G5028f)
+rust: 1.92.0
+command: cargo run --release --features metal --example self_tuning_report
+
+trials per configuration: 11
+configurations: 11
+observations: 363
+D1-D7 all hold: true
+scientific states equal: true
+deterministic preparation: 66 logical, 6 physical
+independent observations executed: 363
+
+workload 1: 8 ALU ops, 1 x 1024 elements
+cpu/1t/single                            0.044 ms  range [0.042, 0.067]
+cpu/1t/epoch                             0.044 ms  range [0.041, 0.053]
+cpu/8t/epoch                             0.095 ms  range [0.085, 0.136]
+cpu/8t/single                            0.127 ms  range [0.086, 0.215]
+metal/tg-auto/fresh-buffers/epoch        0.173 ms  range [0.152, 1.035]
+metal/tg-auto/warm-buffers/epoch         0.176 ms  range [0.148, 0.365]
+metal/tg-64/warm-buffers/epoch           0.181 ms  range [0.144, 0.880]
+metal/tg-128/warm-buffers/epoch          0.182 ms  range [0.148, 0.919]
+metal/tg-auto/warm-buffers/single        0.206 ms  range [0.151, 1.179]
+metal/tg-32/warm-buffers/epoch           0.258 ms  range [0.143, 0.670]
+metal/tg-256/warm-buffers/epoch          0.267 ms  range [0.156, 1.055]
+
+workload 2: 256 ALU ops, 16 x 8192 elements
+metal/tg-256/warm-buffers/epoch          1.300 ms  range [0.382, 3.442]
+metal/tg-auto/warm-buffers/epoch         1.518 ms  range [0.645, 4.644]
+metal/tg-64/warm-buffers/epoch           1.553 ms  range [0.746, 5.367]
+metal/tg-auto/fresh-buffers/epoch        1.654 ms  range [0.424, 4.362]
+metal/tg-32/warm-buffers/epoch           2.713 ms  range [0.679, 6.403]
+metal/tg-128/warm-buffers/epoch          2.747 ms  range [0.778, 3.466]
+metal/tg-auto/warm-buffers/single        5.792 ms  range [3.288, 7.506]
+cpu/8t/epoch                             6.045 ms  range [4.832, 7.173]
+cpu/8t/single                            6.955 ms  range [6.155, 7.820]
+cpu/1t/epoch                            34.254 ms  range [33.785, 34.495]
+cpu/1t/single                           34.265 ms  range [33.730, 34.480]
+
+workload 3: 2048 ALU ops, 8 x 131072 elements
+metal/tg-256/warm-buffers/epoch          3.848 ms  range [2.461, 7.250]
+metal/tg-128/warm-buffers/epoch          4.367 ms  range [2.528, 7.170]
+metal/tg-auto/warm-buffers/epoch         4.655 ms  range [2.358, 7.408]
+metal/tg-auto/fresh-buffers/epoch        5.985 ms  range [3.248, 12.230]
+metal/tg-64/warm-buffers/epoch           6.084 ms  range [2.063, 8.243]
+metal/tg-32/warm-buffers/epoch           6.207 ms  range [2.592, 8.518]
+metal/tg-auto/warm-buffers/single       10.428 ms  range [4.600, 16.255]
+cpu/8t/epoch                           285.408 ms  range [276.087, 314.216]
+cpu/8t/single                          290.858 ms  range [277.985, 313.886]
+cpu/1t/single                         1973.184 ms  range [1939.926, 2018.096]
+cpu/1t/epoch                          1981.657 ms  range [1940.900, 2035.393]
+
+Interpretation boundary: CPU is the scalar reference interpreter, not native
+compiled CPU code. Wide overlapping Metal ranges make the exact explicit
+threadgroup ranking unstable; see docs/SELF-TUNING.md.

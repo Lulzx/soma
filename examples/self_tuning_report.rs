@@ -77,10 +77,12 @@ fn print_report(report: &SelfTuningReport) {
                 .find(|config| config.id == score.config_id)
                 .unwrap();
             println!(
-                "  {:<36} {:>10.3} ms  {:>6.2}x vs cpu/1t/single",
+                "  {:<36} {:>10.3} ms  {:>6.2}x  range [{:.3}, {:.3}]",
                 config.label(),
                 score.median_nanos as f64 / 1e6,
                 baseline as f64 / score.median_nanos.max(1) as f64,
+                score.minimum_nanos as f64 / 1e6,
+                score.maximum_nanos as f64 / 1e6,
             );
         }
     }

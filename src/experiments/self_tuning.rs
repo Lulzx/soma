@@ -115,7 +115,9 @@ impl Default for TuningStudy {
                     elements_per_cohort: 131_072,
                 },
             ],
-            trials: 9,
+            // The default hardware matrix has eleven candidates, so eleven
+            // trials complete one full rotation through acquisition order.
+            trials: 11,
         }
     }
 }
@@ -145,7 +147,9 @@ pub struct CapturedStudy {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfigScore {
     pub config_id: u32,
+    pub minimum_nanos: u64,
     pub median_nanos: u64,
+    pub maximum_nanos: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -528,7 +532,9 @@ pub fn rankings(captured: &CapturedStudy) -> Vec<WorkloadRanking> {
                     samples.sort_unstable();
                     ConfigScore {
                         config_id: config.id,
+                        minimum_nanos: samples[0],
                         median_nanos: samples[samples.len() / 2],
+                        maximum_nanos: samples[samples.len() - 1],
                     }
                 })
                 .collect();

@@ -10,6 +10,13 @@ mapping, and CPU/Metal reports. It deliberately changes no SOMA ABI entity.
 Start with [DISCOVERY.md](DISCOVERY.md), `tests/discovery_*`, and
 `examples/discovery_report.rs`.
 
+`experiments/self_tuning.rs` is the first real target: SOMA searches its own
+CPU/Metal evaluator policies while sharing deterministic evaluator/input
+preparation and preserving every timing trial as an independent observation.
+The protocol and measured regime map are in
+[SELF-TUNING.md](SELF-TUNING.md); run it with
+`cargo run --release --features metal --example self_tuning_report`.
+
 The default implementation trace compresses 2,184 logical requests to 910
 physical evaluator realizations and 12 dispatches with identical terminal
 scientific state. Local release smoke runs showed a modest CPU improvement and
@@ -45,6 +52,7 @@ cargo run --example streaming_report   # channel back-pressure + failure
 cargo run --example supervision_report # notification vs failure escalation
 cargo run --example multi_input_report # atomic join + skew/failure controls
 cargo run --release --example speculative_epoch_report # threaded epoch crossover
+cargo run --release --features metal --example self_tuning_report # SOMA searches itself
 ```
 
 The measurement examples are separate, want `--release`, and are documented in
