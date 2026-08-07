@@ -604,3 +604,40 @@ and 0.9889), so it supplies no stable speedup. More importantly, it is eight
 independent host-submitted graphs—not live ingress into one persistent resident
 command buffer. Raw data and source hashes are in
 `measurements/RESIDENT-IRREGULAR-HOST-QUEUE-M4-PRO-2026-08-07.txt`.
+
+
+## 13. State-rich resident controls
+
+`examples/resident_dynamic_state_rich_fair.rs` changes the regime rather than
+the backend. Each lane has a 280-byte frame: the original 24-byte control state
+plus 32 live `u64` words. On every live step every installed handler loads,
+adds a nonzero field-specific value to, and stores all 32 words; the full frame
+feeds the trace hash. With 65,536 lanes, 16 bounded steps, and `WORK=128`, two
+independent physical-M4-Pro processes produced six position-balanced batches
+whose complete frames and canonical traces matched the CPU oracle. Grouped
+one-submit versus 16 one-step submissions had median ratio **0.5256** and a
+seeded stratified-bootstrap 95% interval **[0.5196, 0.5331]**. All samples were
+above 20 ms. This is a real win for avoiding 16 full uploads/readbacks, not yet
+evidence that cohorting beats a persistent device worker.
+
+The separate `resident_dynamic_state_rich_controls` capture supplies that
+missing comparison and the required nulls on the same 280-byte schema. Across
+two new processes, six recreated-backend batches, and 72 exact rows, the
+position-stratified grouped/competent-one-submit-generic median is **1.0042**
+(IQR 1.0031--1.0070); the 20,000-draw bootstrap median is 1.0041 with 95%
+interval **[0.9979, 1.0103]**. Five of six batch estimates lose and the interval
+crosses parity. Descriptive grouped/control medians are 0.9907 for width 1,
+1.9621 for the deliberately non-equivalent specialized one-class null, 0.5737
+for 16-submit level-synchronous execution, and 0.9130 for eight sequential
+frozen chunks. The chunk path uses `STRIDE=280`, rebases lane IDs, and compares
+complete sorted traces; it is not asynchronous arrival or a resident ingress
+ring.
+
+The honest conclusion is layered: state residency and reduced host migration
+win strongly here, while state-rich grouped evaluator throughput does not beat
+the competent persistent generic worker. Neither experiment runs through
+canonical `Kernel` Phase G or accepts live device-visible ingress, so G5 remains
+open. Full raw samples, oracle hashes, source/backend hashes, hardware identity,
+and bootstrap method are frozen in
+`measurements/RESIDENT-STATE-RICH-FAIR-M4-PRO-2026-08-07.txt` and
+`measurements/RESIDENT-STATE-RICH-CONTROLS-M4-PRO-2026-08-07.txt`.

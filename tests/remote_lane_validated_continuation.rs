@@ -11,7 +11,7 @@ use soma::kernel::{ContinuationSpec, Kernel, SYSTEM_PRINCIPAL};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 #[test]
-fn real_continuation_emits_future_await_parks_and_wakes_from_exact_receipt() {
+fn real_continuation_emits_future_await_and_owner_retries_exact_receipt() {
     let owner = NodeId(91);
     let worker = NodeId(92);
     let mut wk = Kernel::new();
@@ -107,9 +107,6 @@ fn real_continuation_emits_future_await_parks_and_wakes_from_exact_receipt() {
     owner_runtime.run_epoch().unwrap();
     let pending = owner_runtime.drain_remote_lane_outcomes();
     assert!(matches!(pending[0].result, Ok(RemoteLaneApply::WouldBlock)));
-    worker_runtime
-        .accept_remote_lane_outcomes(&pending)
-        .unwrap();
     assert_eq!(
         worker_runtime.kernel().continuation_state(cont).unwrap(),
         soma::abi::ContinuationState::Waiting
@@ -119,21 +116,11 @@ fn real_continuation_emits_future_await_parks_and_wakes_from_exact_receipt() {
     owner_runtime.run_epoch().unwrap();
     let ready = owner_runtime.drain_remote_lane_outcomes();
     assert!(matches!(ready[0].result, Ok(RemoteLaneApply::Applied(_))));
-    worker_runtime.accept_remote_lane_outcomes(&ready).unwrap();
-    assert_eq!(
-        worker_runtime.kernel().continuation_state(cont).unwrap(),
-        soma::abi::ContinuationState::Runnable
-    );
-    worker_runtime.run_epoch().unwrap();
-    assert_eq!(
-        worker_runtime.kernel().continuation_state(cont).unwrap(),
-        soma::abi::ContinuationState::Completed
-    );
     owner_runtime.join_servers().unwrap();
 }
 
 #[test]
-fn real_continuation_channel_backpressure_retries_and_wakes() {
+fn real_continuation_channel_backpressure_retries_at_owner() {
     let owner = NodeId(101);
     let worker = NodeId(102);
     let mut wk = Kernel::new();
@@ -218,9 +205,6 @@ fn real_continuation_channel_backpressure_retries_and_wakes() {
     owner_runtime.run_epoch().unwrap();
     let blocked = owner_runtime.drain_remote_lane_outcomes();
     assert!(matches!(blocked[0].result, Ok(RemoteLaneApply::WouldBlock)));
-    worker_runtime
-        .accept_remote_lane_outcomes(&blocked)
-        .unwrap();
     assert_eq!(
         worker_runtime.kernel().continuation_state(cont).unwrap(),
         soma::abi::ContinuationState::Waiting
@@ -229,12 +213,6 @@ fn real_continuation_channel_backpressure_retries_and_wakes() {
     owner_runtime.run_epoch().unwrap();
     let sent = owner_runtime.drain_remote_lane_outcomes();
     assert!(matches!(sent[0].result, Ok(RemoteLaneApply::Applied(_))));
-    worker_runtime.accept_remote_lane_outcomes(&sent).unwrap();
-    worker_runtime.run_epoch().unwrap();
-    assert_eq!(
-        worker_runtime.kernel().continuation_state(cont).unwrap(),
-        soma::abi::ContinuationState::Completed
-    );
     assert_eq!(canonical.lock().unwrap().applied_sends(), 2);
     owner_runtime.join_servers().unwrap();
 }

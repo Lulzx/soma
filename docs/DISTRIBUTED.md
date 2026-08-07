@@ -144,6 +144,32 @@ journal; the worker cannot make an operation visible merely by accepting its
 bytes. This is distinct from the owner-side future/channel/object services
 above, whose state is intentionally remote.
 
+## Authenticated owner-lane outcomes
+
+The bounded `remote_lane_transport` protocol signs request and response frames
+with a configured symmetric session key using domain-separated HMAC-SHA256.
+Before a worker can wake or fault, verification binds the session, issuer and
+owner nodes, nonce, exact signed-request digest, epoch boundary, monotonically
+increasing response ordinal, and the ordered `(request_id, target)` set. The
+runtime accepts only the opaque `VerifiedRemoteLaneOutcomes` value; the older
+public raw-outcome acceptance boundary is removed.
+
+Client pending frames and owner replay positions are entry- and byte-bounded.
+The owner permanently reserves a conservative terminal-response budget before
+staging or applying an effect, so cache exhaustion cannot occur after canonical
+mutation. Exact ambiguous retries retain the same bytes, nonce, and digest;
+terminal responses and signed terminal errors replay byte-for-byte, while a
+changed digest under a used nonce is a collision. Tests cover a deliberately
+dropped terminal response with apply-once wake, MAC/body and binding tamper,
+missing/reordered outcomes, replay, collision, pre-mutation capacity refusal,
+and exact signed lane-error classes.
+
+This authenticates configured peers, not a public-key identity or TLS channel.
+It also does not widen the Kernel path: v1 still emits exactly one future-await,
+channel-send, or channel-receive operation through special dispatch. General
+signed remote `LaneView`, direct canonical remote parking, and mixed/object
+Kernel result-frame dispatch remain open.
+
 ## Failure semantics
 
 Transport failure and process failure are different outcomes.

@@ -1,0 +1,149 @@
+State-rich grouped one-submit vs level-sync 16-submit, M4 Pro, 2026-08-07
+================================================================================
+
+POSITIVE, NARROW HOST-MIGRATION REGIME (not live ingress and not Kernel Phase G)
+
+Provenance
+----------
+Base commit/worktree: 0719c8c9d1f2e4748bb4b0cb6636c1b9606e98a9 (detached clean worktree)
+Backend src/executives/metal_scheduler.rs SHA-256: 1fffe51bd0b2810fca7dd519e0b52517927af8f17004efe5184a5e6141abd4f3
+Example: examples/resident_dynamic_state_rich_fair.rs
+Example SHA-256: 36bcbb5dfa2c94d64b7f7b6cb021b887cfb32c687157f0f18bee00c0a6ee9748
+Frozen examples/resident_dynamic_stress.rs SHA-256 (unchanged): 975e1c7998db4426dab3b5b6f8a2754f6ec77f97bddec672d4fadac08ec97e5e
+Capture command, twice as independent processes (temporary example filename):
+  cargo run --release --features metal --example g5_state_rich_probe
+The retained example is byte-identical to that capture source; reproduction command:
+  cargo run --release --features metal --example resident_dynamic_state_rich_fair
+Machine/OS: Mac16,8 M4 Pro (16 GPU cores), 24 GiB, macOS 26.6 25G5028f
+
+Regime and exactness
+--------------------
+65,536 lanes, 16 bounded steps, WORK=128 useful dependent u64 ALU rounds,
+cohort width 32, and four interleaved depths 16/14/12/10. Every live epoch is
+A/B mixed. Each frame is 280 bytes: u32 remaining, u32 next class, u64
+accumulator, two u32 class flags, then 32 u64 state words. Every handler, on
+every live step, loads each of the 32 state words, adds its nonzero field index
+(5 through 36), and stores it. Thus none of the added 256 bytes is padding.
+Initial values depend on lane and field. The CPU oracle evaluates the same
+compiled handlers and hashes the complete 280-byte frame into every canonical
+trace event. Warmups and all 132 measured calls assert complete final-frame and
+complete canonical-trace equality; every exact field is true.
+
+The one-submit path uploads the full initial state once, retains it through all
+16 device epochs, submits once, and reads it back once. The competent
+level-synchronous baseline invokes the identical grouped device pack/evaluator/
+transition path with max_steps=1 sixteen times: 16 submissions, 16 full-frame
+host-to-device uploads, and 16 full-frame readbacks, rebasing epoch numbers and
+canonically sorting the complete trace. Work/pass counts and handlers are
+identical. This is deliberately the state-migration regime; it is not a claim
+that command-buffer grouping improves evaluator throughput. It is also not a
+live device-visible ingress ring: all input is a frozen host batch before the
+bounded graph starts, and no work arrives while its command buffer executes.
+
+Method and result
+-----------------
+Three recreated-backend batches/process, two warmups/batch, 11 AB/BA samples,
+and equal 25ms pre-pair cooldown. Timings include allocation, encoding,
+submit/wait and readback. All samples exceed 20ms (min grouped 59.710ms; min
+level-sync 108.394ms).
+
+Position-stratified G/L ratios (>1 means grouped loses):
+process,batch,first_ratio,second_ratio,geometric_ratio
+1,0,0.5332,0.5359,0.5346
+1,1,0.5307,0.5237,0.5272
+1,2,0.5270,0.5211,0.5240
+2,0,0.5411,0.5404,0.5407
+2,1,0.5132,0.5294,0.5212
+2,2,0.5170,0.5106,0.5138
+
+All six batch estimators favor grouped. Median G/L is 0.5256 (IQR
+0.5219--0.5327), i.e. 47.4% lower wall time / 1.90x throughput. A seeded
+(seed 20260807) 20,000-draw within-batch/call-position bootstrap has median
+0.5262 and percentile 95% interval [0.5196, 0.5331].
+
+Scope and retained negatives
+----------------------------
+This does not supersede the frozen original 24-byte-frame,
+16-step, WORK=512 result remains a material negative: median G/S 1.1883. It
+identifies a safe regime where avoiding repeated host migration pays. No backend
+optimization was made or retained. A separate 122,880-lane, 8-step, WORK=1024,
+24-byte-frame probe (two processes, six batches, all samples >20ms) remained
+negative: median grouped/level-sync 1.1726 (IQR 1.0963--1.1923); no source from
+that probe is retained. Width-one, one-class, generic-worker and arrival
+controls remain those in the frozen stress measurement; they were not rerun
+for the 280-byte schema, so this capture is evidence for the level-sync
+migration comparison, not full G5 closure.
+
+Raw process 1 CSV
+-----------------
+batch,sample,first,grouped_us,level_sync_us,grouped_submits,level_sync_submits,exact
+0,0,grouped,63086,132120,1,16,true
+0,1,level_sync,64535,123515,1,16,true
+0,2,grouped,64532,122600,1,16,true
+0,3,level_sync,62396,119068,1,16,true
+0,4,grouped,63151,118771,1,16,true
+0,5,level_sync,62557,116424,1,16,true
+0,6,grouped,62570,117224,1,16,true
+0,7,level_sync,59710,109706,1,16,true
+0,8,grouped,62586,117851,1,16,true
+0,9,level_sync,62071,116357,1,16,true
+0,10,grouped,63073,116329,1,16,true
+1,0,level_sync,61519,117462,1,16,true
+1,1,grouped,61922,120475,1,16,true
+1,2,level_sync,64111,118419,1,16,true
+1,3,grouped,62924,118204,1,16,true
+1,4,level_sync,61237,119542,1,16,true
+1,5,grouped,64142,115031,1,16,true
+1,6,level_sync,61124,112868,1,16,true
+1,7,grouped,62418,116452,1,16,true
+1,8,level_sync,62460,116942,1,16,true
+1,9,grouped,62735,122201,1,16,true
+1,10,level_sync,61036,116085,1,16,true
+2,0,grouped,66291,120064,1,16,true
+2,1,level_sync,62505,117936,1,16,true
+2,2,grouped,64017,123007,1,16,true
+2,3,level_sync,63533,121074,1,16,true
+2,4,grouped,63623,122460,1,16,true
+2,5,level_sync,62606,120943,1,16,true
+2,6,grouped,62251,120664,1,16,true
+2,7,level_sync,62746,120148,1,16,true
+2,8,grouped,63470,121348,1,16,true
+2,9,level_sync,62432,118248,1,16,true
+2,10,grouped,63907,120533,1,16,true
+
+Raw process 2 CSV
+-----------------
+batch,sample,first,grouped_us,level_sync_us,grouped_submits,level_sync_submits,exact
+0,0,grouped,66377,117966,1,16,true
+0,1,level_sync,62005,110348,1,16,true
+0,2,grouped,62387,116203,1,16,true
+0,3,level_sync,60954,108394,1,16,true
+0,4,grouped,64123,118324,1,16,true
+0,5,level_sync,63840,122503,1,16,true
+0,6,grouped,64354,117516,1,16,true
+0,7,level_sync,62455,114731,1,16,true
+0,8,grouped,61546,123215,1,16,true
+0,9,level_sync,61939,117879,1,16,true
+0,10,grouped,63722,126477,1,16,true
+1,0,level_sync,63229,123589,1,16,true
+1,1,grouped,61273,118842,1,16,true
+1,2,level_sync,60359,111553,1,16,true
+1,3,grouped,64028,118908,1,16,true
+1,4,level_sync,59823,111449,1,16,true
+1,5,grouped,60681,119393,1,16,true
+1,6,level_sync,63150,118382,1,16,true
+1,7,grouped,63270,120919,1,16,true
+1,8,level_sync,62184,120316,1,16,true
+1,9,grouped,59989,120897,1,16,true
+1,10,level_sync,63375,118364,1,16,true
+2,0,grouped,63921,120610,1,16,true
+2,1,level_sync,62414,116313,1,16,true
+2,2,grouped,62576,123552,1,16,true
+2,3,level_sync,62846,122241,1,16,true
+2,4,grouped,65656,123910,1,16,true
+2,5,level_sync,61158,119128,1,16,true
+2,6,grouped,63958,123774,1,16,true
+2,7,level_sync,64958,123261,1,16,true
+2,8,grouped,64525,124153,1,16,true
+2,9,level_sync,60839,123062,1,16,true
+2,10,grouped,64092,125779,1,16,true

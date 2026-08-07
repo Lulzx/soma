@@ -22,18 +22,37 @@ pub const RIGHT_WRITE: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResidentEffect {
-    FutureAwait { target: u32 },
-    FutureResolve { target: u32, value: u64 },
-    MailboxSend { target: u32, value: u64 },
-    MailboxReceive { target: u32 },
+    /// Non-blocking governed LaneView::future_value observation.
+    FutureObserve {
+        target: u32,
+    },
+    FutureAwait {
+        target: u32,
+    },
+    FutureResolve {
+        target: u32,
+        value: u64,
+    },
+    MailboxSend {
+        target: u32,
+        value: u64,
+    },
+    MailboxReceive {
+        target: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResidentOutcome {
     Resolved(u64),
+    /// A non-blocking future observation found the cell pending.
+    Pending,
     Registered,
     Sent,
-    Received { value: u64, sender: u64 },
+    Received {
+        value: u64,
+        sender: u64,
+    },
     CapabilityDenied,
     InvalidTarget,
     Full,
@@ -69,6 +88,8 @@ pub const HANDLER_STORE_PREVIOUS_VALUE_U64: u32 = 6;
 pub const HANDLER_IF_PREVIOUS_VALUE_NE_SKIP: u32 = 7;
 pub const HANDLER_YIELD: u32 = 8;
 pub const HANDLER_COMPLETE: u32 = 9;
+/// Emit the explicit non-blocking `OP_OBSERVE_FUTURE` ABI record.
+pub const HANDLER_EFFECT_FUTURE_OBSERVE: u32 = 10;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResidentHandlerProgram {
@@ -124,7 +145,8 @@ pub(crate) fn validate_handler_program(
         }
         let instruction = program.instructions[pc];
         match instruction.opcode {
-            HANDLER_EFFECT_FUTURE_AWAIT
+            HANDLER_EFFECT_FUTURE_OBSERVE
+            | HANDLER_EFFECT_FUTURE_AWAIT
             | HANDLER_EFFECT_FUTURE_RESOLVE
             | HANDLER_EFFECT_MAILBOX_SEND
             | HANDLER_EFFECT_MAILBOX_RECEIVE => {
@@ -178,6 +200,9 @@ fn execute_program(
         let instruction = program.instructions[pc];
         pc += 1;
         match instruction.opcode {
+            HANDLER_EFFECT_FUTURE_OBSERVE => effects.push(ResidentEffect::FutureObserve {
+                target: instruction.argument,
+            }),
             HANDLER_EFFECT_FUTURE_AWAIT => effects.push(ResidentEffect::FutureAwait {
                 target: instruction.argument,
             }),
@@ -370,6 +395,7 @@ struct Mail {
 
 fn opcode(e: ResidentEffect) -> u32 {
     match e {
+        ResidentEffect::FutureObserve { .. } => crate::scheduler::device_ops::OP_OBSERVE_FUTURE,
         ResidentEffect::FutureAwait { .. } => OP_AWAIT_FUTURE,
         ResidentEffect::FutureResolve { .. } => OP_RESOLVE_FUTURE,
         ResidentEffect::MailboxSend { .. } => OP_ENQUEUE_MESSAGE,
@@ -378,7 +404,8 @@ fn opcode(e: ResidentEffect) -> u32 {
 }
 fn target(e: ResidentEffect) -> u32 {
     match e {
-        ResidentEffect::FutureAwait { target }
+        ResidentEffect::FutureObserve { target }
+        | ResidentEffect::FutureAwait { target }
         | ResidentEffect::FutureResolve { target, .. }
         | ResidentEffect::MailboxSend { target, .. }
         | ResidentEffect::MailboxReceive { target } => target,
@@ -386,21 +413,24 @@ fn target(e: ResidentEffect) -> u32 {
 }
 fn resource(e: ResidentEffect) -> u32 {
     match e {
-        ResidentEffect::FutureAwait { .. } | ResidentEffect::FutureResolve { .. } => {
-            RESOURCE_FUTURE
-        }
+        ResidentEffect::FutureObserve { .. }
+        | ResidentEffect::FutureAwait { .. }
+        | ResidentEffect::FutureResolve { .. } => RESOURCE_FUTURE,
         _ => RESOURCE_MAILBOX,
     }
 }
 fn required_right(e: ResidentEffect) -> u32 {
     match e {
-        ResidentEffect::FutureAwait { .. } | ResidentEffect::MailboxReceive { .. } => RIGHT_READ,
+        ResidentEffect::FutureObserve { .. }
+        | ResidentEffect::FutureAwait { .. }
+        | ResidentEffect::MailboxReceive { .. } => RIGHT_READ,
         _ => RIGHT_WRITE,
     }
 }
 fn outcome_code(o: ResidentOutcome) -> u32 {
     match o {
         ResidentOutcome::Resolved(_) => 2,
+        ResidentOutcome::Pending => 1,
         ResidentOutcome::Registered => 3,
         ResidentOutcome::Sent => 0,
         ResidentOutcome::Received { .. } => 2,
@@ -568,6 +598,12 @@ pub fn run_resident_sync(
                     ResidentOutcome::CapabilityDenied
                 } else {
                     match e {
+                        ResidentEffect::FutureObserve { target } => match fs.get(target as usize) {
+                            None => ResidentOutcome::InvalidTarget,
+                            Some(f) => f
+                                .value
+                                .map_or(ResidentOutcome::Pending, ResidentOutcome::Resolved),
+                        },
                         ResidentEffect::FutureAwait { target } => match fs.get_mut(target as usize)
                         {
                             None => ResidentOutcome::InvalidTarget,
@@ -697,7 +733,11 @@ pub fn run_resident_sync(
                     lane,
                     kind,
                     u64::from(t),
-                    DEVICE_ACCESS_WRITE,
+                    if matches!(e, ResidentEffect::FutureObserve { .. }) {
+                        crate::scheduler::device::DEVICE_ACCESS_READ
+                    } else {
+                        DEVICE_ACCESS_WRITE
+                    },
                     ord as u32,
                 ));
                 let (value, aux) = match e {
@@ -1131,6 +1171,142 @@ mod tests {
             ],
         };
         assert!(!validate_handler_program(&program, 2, 8));
+    }
+
+    fn observe_case(width: u32) -> ResidentSyncResult {
+        let config = ResidentSyncConfig {
+            max_epochs: 1,
+            max_effects_per_step: 1,
+            max_frame_bytes: 8,
+            max_continuations: 4,
+            cohort_width: width,
+            futures: vec![InitialFuture::Pending, InitialFuture::Resolved(44)],
+            mailbox_capacities: vec![],
+            capabilities: vec![
+                cap(7, RESOURCE_FUTURE, 0, RIGHT_READ),
+                cap(7, RESOURCE_FUTURE, 1, RIGHT_READ),
+                // Authority is checked before bounds, making target 9 an
+                // explicit governed invalid-target outcome rather than denial.
+                cap(7, RESOURCE_FUTURE, 9, RIGHT_READ),
+            ],
+        };
+        let mut programs = BTreeMap::new();
+        for (run_class, target) in [(10, 0), (11, 1), (12, 0), (13, 9)] {
+            programs.insert(
+                run_class,
+                ResidentHandlerProgram {
+                    run_class,
+                    instructions: vec![
+                        ResidentInstruction {
+                            opcode: HANDLER_EFFECT_FUTURE_OBSERVE,
+                            argument: target,
+                            value: 0,
+                        },
+                        ResidentInstruction {
+                            opcode: HANDLER_COMPLETE,
+                            argument: 0,
+                            value: 0,
+                        },
+                    ],
+                },
+            );
+        }
+        run_resident_sync(
+            &config,
+            vec![
+                ResidentContinuation {
+                    id: 1,
+                    actor: 7,
+                    run_class: 10,
+                    frame: vec![],
+                },
+                ResidentContinuation {
+                    id: 2,
+                    actor: 7,
+                    run_class: 11,
+                    frame: vec![],
+                },
+                ResidentContinuation {
+                    id: 3,
+                    actor: 8,
+                    run_class: 12,
+                    frame: vec![],
+                },
+                ResidentContinuation {
+                    id: 4,
+                    actor: 7,
+                    run_class: 13,
+                    frame: vec![],
+                },
+            ],
+            &programs,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn observe_is_bounded_governed_and_has_exact_read_journals_width_1_32() {
+        let narrow = observe_case(1);
+        let wide = observe_case(32);
+        assert_eq!(narrow, wide);
+        assert_eq!(
+            narrow
+                .effects
+                .iter()
+                .map(|effect| effect.outcome)
+                .collect::<Vec<_>>(),
+            vec![
+                ResidentOutcome::Pending,
+                ResidentOutcome::Resolved(44),
+                ResidentOutcome::CapabilityDenied,
+                ResidentOutcome::InvalidTarget,
+            ]
+        );
+        assert!(narrow
+            .effects
+            .iter()
+            .all(|effect| { matches!(effect.effect, ResidentEffect::FutureObserve { .. }) }));
+        assert!(narrow.accesses.iter().all(|access| {
+            access.resource_kind == RESOURCE_FUTURE
+                && access.mode == crate::scheduler::device::DEVICE_ACCESS_READ
+        }));
+        let operations = narrow
+            .operations
+            .iter()
+            .flat_map(|journal| &journal.operations)
+            .collect::<Vec<_>>();
+        assert_eq!(operations.len(), 4);
+        assert!(operations.iter().all(|operation| {
+            operation.opcode == crate::scheduler::device_ops::OP_OBSERVE_FUTURE
+        }));
+        assert_eq!(
+            operations
+                .iter()
+                .map(|operation| operation.result_code)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 0x104, 0x101]
+        );
+        assert_eq!(
+            narrow
+                .trace
+                .iter()
+                .map(|entry| (entry.event, entry.word))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 2_166_136_261),
+                (0, 2_166_136_261),
+                (0, 2_166_136_261),
+                (0, 2_166_136_261),
+                (crate::scheduler::device_ops::OP_OBSERVE_FUTURE, 1),
+                (crate::scheduler::device_ops::OP_OBSERVE_FUTURE, 2),
+                (crate::scheduler::device_ops::OP_OBSERVE_FUTURE, 0x104),
+                (crate::scheduler::device_ops::OP_OBSERVE_FUTURE, 0x101),
+            ]
+        );
+        assert!(narrow
+            .final_continuations
+            .iter()
+            .all(|continuation| { continuation.completed && continuation.pending.is_none() }));
     }
 
     #[test]

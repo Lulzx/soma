@@ -32,13 +32,17 @@ references, checks strong plan fingerprints, step budgets and capability
 horizons, validates explicit invocation/disposition/wake/epoch journals, and
 replays future/mailbox operations through ordinary governed Kernel methods,
 Phase G, admission, causal trace, and full Phase-H accounting before atomic
-publication. An independent governed reference matches I18 and the complete
-scheduler/effect/admission/accounting state, including width-1/32 Metal. This is
-a canonical commit slice, but only for local unsupervised, unique-run-class,
-all-complete programs with pre-existing stable authority and initially empty
-waiter/mailbox state. Allocation, channels, supervision, device capability
-creation, admission deferral, parked final state, broader handler shapes, and
-the general canonical bridge remain to be integrated.
+publication. The bounded vocabulary now also includes nonblocking
+`FutureObserve`: pending and resolved values have exact future-read journals,
+CPU/Metal width-1/32 parity, and normal-Kernel trace equivalence; denied,
+expired, stale, or invalid shapes refuse atomically. An independent governed
+reference matches I18 and the complete scheduler/effect/admission/accounting
+state. This is a canonical commit slice, but only for local unsupervised,
+unique-run-class, all-complete programs with pre-existing stable authority and
+initially empty waiter/mailbox state. Allocation, object mutation, channels,
+supervision, device capability creation, admission deferral, parked final
+state, broader handler shapes, and the general canonical bridge remain to be
+integrated.
 
 ## G3 — Distributed ownership [in progress]
 
@@ -62,13 +66,16 @@ apply-once positions, late/collision rejection, and preserved transport error
 classes. A deliberately narrower validated Kernel dispatch can emit exactly one
 blocking future-await, channel-send, or channel-receive operation, park in
 private node-qualified state, and retry exact retained work across two real
-runtimes/TCP; it is special dispatch, not general `LaneView`, and caller-carried
-outcomes remain unsigned/trusted. Owner-side process templates provide
-content-bound create/restart receipts, terminal lifecycle observation, bounded
+runtimes/TCP; it is special dispatch, not general `LaneView`. Its bounded
+multiplexed response transport now authenticates configured peers and binds
+ordered outcomes to the exact session, issuer, owner, nonce, request digest,
+boundary, and response ordinal before any Kernel wake or fault. Owner-side
+process templates provide content-bound create/restart receipts, terminal
+lifecycle observation, bounded
 snapshot/WAL apply-once durability, and exact terminal recovery. Signed bounded
 lifecycle requests now cross TCP between two real runtimes, but responses are
 not mutually authenticated and live-state recovery remains explicitly refused.
-General remote `LaneView`, signed/bound multiplexed batch responses, direct
+General remote `LaneView`, direct
 canonical remote park, object/mixed/result-frame dispatch, durable live process
 recovery, and a real multi-resource multi-kernel application remain gates.
 
@@ -112,7 +119,16 @@ coalesced-encoder optimization stayed slower and was reverted. An eight-thread,
 eight-queue irregular host-release control has overlapping calls and exact
 combined results, but its two batch ratios reverse (1.0287 and 0.9889); it is
 explicitly frozen chunks, not live ingress into one persistent resident command
-buffer. The graph also has no canonical Kernel commit. Discovery and
+buffer. A state-rich follow-up uses a 280-byte frame with 32 additional live
+`u64` fields, 65,536 lanes, and 16 bounded steps. Every live handler loads,
+adds, and stores every field, and complete frames and traces match. Avoiding 16
+full host migrations is strongly positive (grouped/level-sync 0.5256 in the
+focused capture and 0.5737 in the broader control), but the fair one-submit
+competent-generic comparison is null/negative: median grouped/generic 1.0042,
+bootstrap 95% interval [0.9979, 1.0103]. Width-one, one-class, 16-submit, and
+eight-frozen-chunk controls are retained. Thus the result isolates migration
+avoidance rather than evaluator cohorting throughput. The graph also has no
+canonical Kernel commit or live device-visible ingress. Discovery and
 self-tuning provide additional controls. A qualifying end-to-end cohorting
 speedup is not yet established.
 

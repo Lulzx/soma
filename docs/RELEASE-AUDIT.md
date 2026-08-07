@@ -81,4 +81,7 @@ AB/BA capture gives grouped/sorted median 1.1883 (bootstrap 95% [1.1031,
 1.2384]) and the path is not canonical Kernel execution. These are preserved in
 `measurements/RESIDENT-DYNAMIC-STRESS-M4-PRO-2026-08-07.txt` and
 `measurements/RESIDENT-GROUPED-SORTED-FAIR-M4-PRO-2026-08-07.txt` as
-non-release, partial/negative performance evidence only.
+non-release, partial/negative performance evidence only. Later state-rich
+captures likewise show a strong host-migration result but a null/negative
+competent-generic control; their dirty-wave source hashes and raw samples are
+frozen separately and do not amend the qualifying clean release record.

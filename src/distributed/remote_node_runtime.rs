@@ -30,6 +30,7 @@ use super::remote_lane_effect::{
     RemoteLaneError, RemoteLaneOperation, RemoteLaneOutcome, RemoteLaneProgram,
     RemoteLaneRequestId,
 };
+use super::remote_lane_transport::VerifiedRemoteLaneOutcomes;
 use super::remote_mailbox_ingress::{
     RemoteMailboxApplyOutcome, RemoteMailboxError, RemoteMailboxIngress, RemoteMailboxServer,
 };
@@ -227,11 +228,17 @@ impl RemoteNodeRuntime {
     pub fn pending_outbound_remote_lane(&self) -> Vec<KernelRemoteLaneEmission> {
         self.outbound_remote_lane.clone()
     }
-    /// Deliver owner-boundary receipts. Exact request identity wakes only the
-    /// continuation parked for that node-qualified dependency. This v1 API
-    /// trusts its caller: responses are not yet signed/bound by authenticated
-    /// batch transport, so fabricated `Applied` is possible at this boundary.
-    pub fn accept_remote_lane_outcomes(
+    /// Accept only outcomes authenticated and content-bound by the remote-lane
+    /// session transport. Verification happens before this method can observe a
+    /// receipt, and therefore before any continuation is woken or faulted.
+    pub fn accept_authenticated_remote_lane_outcomes(
+        &mut self,
+        outcomes: VerifiedRemoteLaneOutcomes,
+    ) -> Result<(), RemoteNodeRuntimeError> {
+        self.apply_remote_lane_outcomes(&outcomes.into_outcomes())
+    }
+
+    fn apply_remote_lane_outcomes(
         &mut self,
         outcomes: &[RemoteLaneOutcome],
     ) -> Result<(), RemoteNodeRuntimeError> {

@@ -1,0 +1,168 @@
+State-rich grouped controls, M4 Pro, 2026-08-07
+==================================================
+
+NEGATIVE FOR THE G5 GROUPED/GENERIC CLAIM; POSITIVE ONLY FOR HOST-MIGRATION AVOIDANCE
+(not canonical Kernel Phase G and not live ingress)
+
+Provenance
+----------
+Base commit/worktree: 0719c8c9d1f2e4748bb4b0cb6636c1b9606e98a9 (detached clean worktree)
+Backend src/executives/metal_scheduler.rs SHA-256: 1fffe51bd0b2810fca7dd519e0b52517927af8f17004efe5184a5e6141abd4f3
+Example: examples/resident_dynamic_state_rich_controls.rs
+Example SHA-256: 7e9d2c75bbab7efd64ea6d0690fe01d6848e10a107a8cd35b7f5712a9f32509a
+Frozen examples/resident_dynamic_stress.rs SHA-256 (unchanged): 975e1c7998db4426dab3b5b6f8a2754f6ec77f97bddec672d4fadac08ec97e5e
+Commands (two independent processes):
+  cargo run --release --features metal --example resident_dynamic_state_rich_controls
+Raw process-1 CSV SHA-256: 354abfc6d38af5cd95f808b0846d4d7bda660e1bedc06001db5d450c5d1d28aa
+Raw process-2 CSV SHA-256: b3d2a5336db1f6ff3416546ca1f3a02823320e26a07b0bafd37ca11a9700e3f9
+Machine: Mac16,8 M4 Pro, 12 CPU / 16 GPU cores, 24 GiB
+OS/toolchain: macOS 26.6 (25G5028f), rustc 1.92.0
+
+Exact regime and controls
+-------------------------
+65,536 lanes, 16 bounded steps, WORK=128 dependent u64 ALU rounds, four
+interleaved depths 16/14/12/10, and A/B mixed at every live epoch. The exact
+frame schema is 280 bytes: u32 remaining, u32 next class, u64 accumulator, two
+u32 class flags, and 32 u64 state words. On every live step every handler,
+including the competent generic and one-class specialized handler, generates a
+load, nonzero add (field indices 5..36), and store for every added u64. Initial
+state depends on lane and field. This is executable state, not padding.
+
+The independently evaluated CPU oracle covers the entire frame and canonical
+trace. All 72 measured rows (and warmups) assert exact complete frames and
+canonical traces for grouped width 32, competent one-submit generic persistent
+worker, grouped width 1, 16-submit level sync, and eight sequential frozen-chunk
+"low arrival". Chunk traces are lane-rebased and canonically sorted before the
+full comparison. The specialized one-class API is checked against its full CPU
+ResidentFrameGraphResult: frames, accesses, operation journals, and canonical
+trace. Oracle hashes (canonical little-endian trace fields) are:
+  mixed final frames: f946425b13a7dbd009d6901bf8eb1e7237460c7b594aa1a77cb87458175b1b7b
+  mixed dynamic trace: 207e6ae087197b058da4b1d371433c03dceeb81f8e97bfb4df200d42ed4001ef
+  one-class final frames: 36d35fbd1d77edd9087383eb9d9e3caf24cee2c41a36e79881fa62b900a74f93
+  one-class canonical trace: 1693a6214476ff4a9d5e520829dd6114df2208a4d42836f254b6432c1a5390e0
+
+Each process has three recreated-backend batches, two warmups per batch, and 12
+samples. Grouped/generic order is AB/BA balanced (six observations in each call
+position per batch); a common 25 ms pre-pair cooldown is used. All measured GPU
+calls qualify above 20 ms: minima grouped 60.175 ms, generic 59.513 ms, width-1
+58.379 ms, one-class 31.019 ms, level-sync 100.904 ms, low-arrival 67.408 ms.
+Timings include allocation, encoding, submission/wait, and final readback.
+Controls follow the balanced primary pair and therefore their ratios below are
+descriptive controls, not separately call-position-randomized causal estimates.
+
+Exact outcomes
+--------------
+The primary grouped/generic result is NEGATIVE/NULL. Six position-stratified
+batch estimates give median grouped/generic 1.0042 (IQR 1.0031--1.0070): grouped
+is 0.4% slower, not a material win. A seed-20260807, 20,000-draw within-batch and
+call-position bootstrap gives median 1.0041, percentile 95% CI [0.9979, 1.0103].
+Five of six batch estimators lose; the interval crosses parity.
+
+process,batch,grouped-first ratio,generic-first ratio,geometric ratio
+1,0,0.973117,1.043204,1.007551
+1,1,0.981262,1.025519,1.003147
+1,2,0.984031,1.022622,1.003141
+2,0,0.987009,1.033086,1.009785
+2,1,0.985791,1.025119,1.005263
+2,2,0.989823,1.008439,0.999087
+
+Descriptive median-of-six-batch ratios (grouped/control; bootstrap 95% CI):
+  width 32 / width 1:       0.9907; bootstrap [0.9844, 0.9975] (width 32 faster)
+  mixed / specialized one: 1.9621; bootstrap [1.9429, 1.9819] (one-class faster)
+  grouped / 16-submit:      0.5737; bootstrap [0.5703, 0.5878] (grouped positive)
+  grouped / 8 chunks:       0.9130; bootstrap [0.9082, 0.9204] (grouped positive)
+The one-class row is deliberately a non-equivalent null workload and is not a
+speedup claim. "Low arrival" is eight sequential frozen chunk submissions; it
+is neither asynchronous arrival nor device-visible ingress. The level-sync and
+chunk positives show migration/packing regimes, while the exact competent
+one-submit generic comparison fails to reproduce a grouped advantage on this
+280-byte schema.
+
+Scope guard
+-----------
+This standalone MetalResidentSearch graph starts from one frozen host batch.
+It does not publish through the canonical Kernel executive, is not Kernel Phase
+G, has no live device-visible ingress while the command buffer runs, and does
+not close G5. It supplements rather than replaces the frozen 24-byte stress
+record and the separate state-rich grouped/level-sync capture. No kernel,
+distributed, resident-sync, or backend source was changed.
+
+Raw process 1 CSV
+-----------------
+batch,sample,first,cpu_bucket_us,grouped_us,generic_us,width1_us,one_class_us,level_sync_us,low_arrival_us,grouped_submits,generic_submits,width1_submits,one_submits,level_submits,arrival_submits,exact
+0,0,grouped,1932258,62639,62536,62061,36549,116058,72527,1,1,1,1,16,8,true
+0,1,generic,1932258,65577,62320,63527,33457,112026,69656,1,1,1,1,16,8,true
+0,2,grouped,1932258,63243,66852,64499,33894,111597,69119,1,1,1,1,16,8,true
+0,3,generic,1932258,65859,62737,65961,33051,109929,68845,1,1,1,1,16,8,true
+0,4,grouped,1932258,62290,65330,65243,32366,111601,68517,1,1,1,1,16,8,true
+0,5,generic,1932258,65565,63245,65100,32256,112162,68873,1,1,1,1,16,8,true
+0,6,grouped,1932258,63054,65768,64508,32563,111594,69144,1,1,1,1,16,8,true
+0,7,generic,1932258,65283,62301,65850,32876,112648,69805,1,1,1,1,16,8,true
+0,8,grouped,1932258,63286,64311,64976,33252,109833,69244,1,1,1,1,16,8,true
+0,9,generic,1932258,64720,62692,65105,32572,110492,69048,1,1,1,1,16,8,true
+0,10,grouped,1932258,63346,64456,65461,32555,110910,69133,1,1,1,1,16,8,true
+0,11,generic,1932258,65280,63922,65764,32708,114540,69975,1,1,1,1,16,8,true
+1,0,generic,1938331,63775,62346,61824,31762,112155,70528,1,1,1,1,16,8,true
+1,1,grouped,1938331,63432,63351,64074,32387,110220,70559,1,1,1,1,16,8,true
+1,2,generic,1938331,64568,64205,65346,32615,104556,68858,1,1,1,1,16,8,true
+1,3,grouped,1938331,60214,61896,63324,31399,103759,67991,1,1,1,1,16,8,true
+1,4,generic,1938331,62738,62027,63294,31190,103082,67635,1,1,1,1,16,8,true
+1,5,grouped,1938331,61564,62691,61727,32683,109682,70128,1,1,1,1,16,8,true
+1,6,generic,1938331,64306,62299,63301,32047,110672,68902,1,1,1,1,16,8,true
+1,7,grouped,1938331,62495,63283,62422,32122,110609,68911,1,1,1,1,16,8,true
+1,8,generic,1938331,64398,63272,64064,32525,110194,70018,1,1,1,1,16,8,true
+1,9,grouped,1938331,63019,64628,64674,32804,111233,70231,1,1,1,1,16,8,true
+1,10,generic,1938331,64128,62892,64162,31688,111909,70045,1,1,1,1,16,8,true
+1,11,grouped,1938331,60257,63145,62494,33102,102542,68496,1,1,1,1,16,8,true
+2,0,grouped,1951166,60959,62913,61898,32618,103065,70378,1,1,1,1,16,8,true
+2,1,generic,1951166,62966,60162,62208,31643,102002,68876,1,1,1,1,16,8,true
+2,2,grouped,1951166,61504,61436,61340,32104,103528,68161,1,1,1,1,16,8,true
+2,3,generic,1951166,61311,60544,62179,31460,102108,67800,1,1,1,1,16,8,true
+2,4,grouped,1951166,62204,61282,61819,31343,102197,67537,1,1,1,1,16,8,true
+2,5,generic,1951166,62531,61186,62797,31720,102381,67849,1,1,1,1,16,8,true
+2,6,grouped,1951166,60175,62012,62639,32070,104501,67836,1,1,1,1,16,8,true
+2,7,generic,1951166,62377,59986,61687,31520,102696,67408,1,1,1,1,16,8,true
+2,8,grouped,1951166,60440,62679,61440,31807,103438,68025,1,1,1,1,16,8,true
+2,9,generic,1951166,61290,60535,61442,32070,102442,68965,1,1,1,1,16,8,true
+2,10,grouped,1951166,60683,61604,62248,32242,101623,68862,1,1,1,1,16,8,true
+2,11,generic,1951166,61441,60564,62790,31614,100904,67803,1,1,1,1,16,8,true
+
+Raw process 2 CSV
+-----------------
+batch,sample,first,cpu_bucket_us,grouped_us,generic_us,width1_us,one_class_us,level_sync_us,low_arrival_us,grouped_submits,generic_submits,width1_submits,one_submits,level_submits,arrival_submits,exact
+0,0,grouped,1942180,60490,59513,58379,35265,112900,71651,1,1,1,1,16,8,true
+0,1,generic,1942180,65420,61389,64323,33171,112920,69290,1,1,1,1,16,8,true
+0,2,grouped,1942180,63211,65323,64483,33576,110924,69007,1,1,1,1,16,8,true
+0,3,generic,1942180,65432,62983,65292,32559,110623,69794,1,1,1,1,16,8,true
+0,4,grouped,1942180,63061,63176,64577,31793,111347,69548,1,1,1,1,16,8,true
+0,5,generic,1942180,64554,63194,64087,32212,113692,68584,1,1,1,1,16,8,true
+0,6,grouped,1942180,63390,64987,65362,32051,110792,69540,1,1,1,1,16,8,true
+0,7,generic,1942180,63653,61963,64673,32539,109198,68844,1,1,1,1,16,8,true
+0,8,grouped,1942180,62305,63287,64369,32159,111834,68749,1,1,1,1,16,8,true
+0,9,generic,1942180,63254,62112,64239,31809,110654,69735,1,1,1,1,16,8,true
+0,10,grouped,1942180,64162,64647,64804,31704,112335,68458,1,1,1,1,16,8,true
+0,11,generic,1942180,62637,61989,64744,31643,111164,69215,1,1,1,1,16,8,true
+1,0,generic,1932832,63355,63465,65183,31678,113103,70953,1,1,1,1,16,8,true
+1,1,grouped,1932832,63352,63953,64396,32535,110383,68662,1,1,1,1,16,8,true
+1,2,generic,1932832,64908,61329,63604,31298,110505,69950,1,1,1,1,16,8,true
+1,3,grouped,1932832,63336,63281,62647,32005,109382,68720,1,1,1,1,16,8,true
+1,4,generic,1932832,63317,62499,63780,32415,110656,68623,1,1,1,1,16,8,true
+1,5,grouped,1932832,62286,63019,63927,32605,110005,68550,1,1,1,1,16,8,true
+1,6,generic,1932832,63872,62765,63473,31848,111167,68662,1,1,1,1,16,8,true
+1,7,grouped,1932832,61857,64274,63524,32259,111830,69942,1,1,1,1,16,8,true
+1,8,generic,1932832,64437,62666,64208,32566,111081,68680,1,1,1,1,16,8,true
+1,9,grouped,1932832,62476,63902,62882,32248,110991,69057,1,1,1,1,16,8,true
+1,10,generic,1932832,64550,62142,64066,32381,109502,68887,1,1,1,1,16,8,true
+1,11,grouped,1932832,63033,63416,64112,31883,112470,69912,1,1,1,1,16,8,true
+2,0,grouped,1940506,61038,62528,62874,31442,103492,68855,1,1,1,1,16,8,true
+2,1,generic,1940506,62410,62168,62843,31794,103334,67491,1,1,1,1,16,8,true
+2,2,grouped,1940506,61022,62768,63234,31892,105425,68753,1,1,1,1,16,8,true
+2,3,generic,1940506,62742,62220,63096,32154,104570,69053,1,1,1,1,16,8,true
+2,4,grouped,1940506,63076,62360,62528,32285,110951,70233,1,1,1,1,16,8,true
+2,5,generic,1940506,62972,63144,63966,32244,105330,68301,1,1,1,1,16,8,true
+2,6,grouped,1940506,62579,63115,63209,31019,107864,68532,1,1,1,1,16,8,true
+2,7,generic,1940506,63176,62103,62976,31394,108508,68790,1,1,1,1,16,8,true
+2,8,grouped,1940506,63512,62088,62973,31169,104281,69625,1,1,1,1,16,8,true
+2,9,generic,1940506,62641,62442,64309,31553,101537,68225,1,1,1,1,16,8,true
+2,10,grouped,1940506,60627,62188,62899,31193,101531,68700,1,1,1,1,16,8,true
+2,11,generic,1940506,64835,62518,64107,32929,107730,68839,1,1,1,1,16,8,true

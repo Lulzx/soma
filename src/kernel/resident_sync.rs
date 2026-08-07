@@ -23,8 +23,8 @@ use crate::abi::{EventKind, FutureState, Kind, Ref64, Rights};
 use crate::executives::resident_sync::{
     InitialFuture, ResidentCapability, ResidentEffect, ResidentHandlerProgram, ResidentInstruction,
     ResidentSyncConfig, ResidentSyncResult, HANDLER_EFFECT_FUTURE_AWAIT,
-    HANDLER_EFFECT_FUTURE_RESOLVE, HANDLER_EFFECT_MAILBOX_RECEIVE, HANDLER_EFFECT_MAILBOX_SEND,
-    RESOURCE_FUTURE, RESOURCE_MAILBOX, RIGHT_READ, RIGHT_WRITE,
+    HANDLER_EFFECT_FUTURE_OBSERVE, HANDLER_EFFECT_FUTURE_RESOLVE, HANDLER_EFFECT_MAILBOX_RECEIVE,
+    HANDLER_EFFECT_MAILBOX_SEND, RESOURCE_FUTURE, RESOURCE_MAILBOX, RIGHT_READ, RIGHT_WRITE,
 };
 use crate::kernel::Kernel;
 use crate::scheduler::device::reference_lane_conflicts;
@@ -542,13 +542,16 @@ impl KernelResidentSyncPlan {
             for instruction in &program.instructions {
                 let effect = matches!(
                     instruction.opcode,
-                    HANDLER_EFFECT_FUTURE_AWAIT
+                    HANDLER_EFFECT_FUTURE_OBSERVE
+                        | HANDLER_EFFECT_FUTURE_AWAIT
                         | HANDLER_EFFECT_FUTURE_RESOLVE
                         | HANDLER_EFFECT_MAILBOX_SEND
                         | HANDLER_EFFECT_MAILBOX_RECEIVE
                 );
                 let argument = match instruction.opcode {
-                    HANDLER_EFFECT_FUTURE_AWAIT | HANDLER_EFFECT_FUTURE_RESOLVE => *future_index
+                    HANDLER_EFFECT_FUTURE_OBSERVE
+                    | HANDLER_EFFECT_FUTURE_AWAIT
+                    | HANDLER_EFFECT_FUTURE_RESOLVE => *future_index
                         .get(&instruction.target)
                         .ok_or(KernelResidentSyncError::InvalidProgram)?,
                     HANDLER_EFFECT_MAILBOX_SEND | HANDLER_EFFECT_MAILBOX_RECEIVE => *mailbox_index
@@ -581,7 +584,9 @@ impl KernelResidentSyncPlan {
                     argument,
                     value: if matches!(
                         instruction.opcode,
-                        HANDLER_EFFECT_FUTURE_AWAIT | HANDLER_EFFECT_MAILBOX_RECEIVE
+                        HANDLER_EFFECT_FUTURE_OBSERVE
+                            | HANDLER_EFFECT_FUTURE_AWAIT
+                            | HANDLER_EFFECT_MAILBOX_RECEIVE
                     ) {
                         0
                     } else {
@@ -741,7 +746,9 @@ impl KernelResidentSyncPlan {
             let p = &packed_programs[&c.run_class];
             for i in &p.instructions {
                 let (kind, right) = match i.opcode {
-                    HANDLER_EFFECT_FUTURE_AWAIT => (RESOURCE_FUTURE, RIGHT_READ),
+                    HANDLER_EFFECT_FUTURE_OBSERVE | HANDLER_EFFECT_FUTURE_AWAIT => {
+                        (RESOURCE_FUTURE, RIGHT_READ)
+                    }
                     HANDLER_EFFECT_FUTURE_RESOLVE => (RESOURCE_FUTURE, RIGHT_WRITE),
                     HANDLER_EFFECT_MAILBOX_RECEIVE => (RESOURCE_MAILBOX, RIGHT_READ),
                     HANDLER_EFFECT_MAILBOX_SEND => (RESOURCE_MAILBOX, RIGHT_WRITE),
@@ -851,7 +858,8 @@ impl KernelResidentSyncPlan {
 
     fn translate_target(&self, e: ResidentEffect) -> Option<Ref64> {
         match e {
-            ResidentEffect::FutureAwait { target }
+            ResidentEffect::FutureObserve { target }
+            | ResidentEffect::FutureAwait { target }
             | ResidentEffect::FutureResolve { target, .. } => {
                 self.futures.get(target as usize).copied()
             }
@@ -1061,6 +1069,12 @@ impl KernelResidentSyncPlan {
             result.effects.iter().zip(&result.accesses).zip(operations)
         {
             let (kind, target, opcode, value) = match effect.effect {
+                ResidentEffect::FutureObserve { target } => (
+                    RESOURCE_FUTURE,
+                    target,
+                    crate::scheduler::device_ops::OP_OBSERVE_FUTURE,
+                    0,
+                ),
                 ResidentEffect::FutureAwait { target } => (
                     RESOURCE_FUTURE,
                     target,
@@ -1128,7 +1142,8 @@ impl KernelResidentSyncPlan {
                     return Err(KernelResidentSyncError::InvalidDeviceResult);
                 }
                 let target = match op.opcode {
-                    crate::scheduler::device_ops::OP_AWAIT_FUTURE
+                    crate::scheduler::device_ops::OP_OBSERVE_FUTURE
+                    | crate::scheduler::device_ops::OP_AWAIT_FUTURE
                     | crate::scheduler::device_ops::OP_RESOLVE_FUTURE => {
                         self.futures.get(op.target as usize)
                     }
@@ -1260,6 +1275,24 @@ impl KernelResidentSyncPlan {
                         .translate_target(effect.effect)
                         .ok_or(KernelResidentSyncError::InvalidDeviceResult)?;
                     match effect.effect {
+                        ResidentEffect::FutureObserve { .. } => {
+                            let observed = k
+                                .observe_future(actor, target)
+                                .map_err(|_| KernelResidentSyncError::InvalidDeviceResult)?;
+                            match (observed, effect.outcome) {
+                                (
+                                    None,
+                                    crate::executives::resident_sync::ResidentOutcome::Pending,
+                                ) => {}
+                                (
+                                    Some(value),
+                                    crate::executives::resident_sync::ResidentOutcome::Resolved(
+                                        expected,
+                                    ),
+                                ) if value.to_u64() == expected => {}
+                                _ => return Err(KernelResidentSyncError::InvalidDeviceResult),
+                            }
+                        }
                         ResidentEffect::FutureAwait { .. } => {
                             let outcome =
                                 k.await_future(actor, cont, target, inv.next_run_class)
@@ -1515,6 +1548,118 @@ mod tests {
         let d = k.create_continuation(sender, sender, mk(send_rc)).unwrap();
         let plan = k.plan_resident_sync(16, 1, 8, width).unwrap();
         (k, plan, a, b, c, d)
+    }
+
+    fn observe_setup(
+        width: u32,
+        resolved: bool,
+    ) -> (Kernel, KernelResidentSyncPlan, Ref64, Ref64, Option<Ref64>) {
+        let mut k = Kernel::new();
+        let process = k.create_process(Ref64::NULL, ProcessMode::Pure);
+        let future = k.create_future(process);
+        let value = resolved.then(|| {
+            let value = k.create_object(process, ObjectKind::RawBytes, vec![44]);
+            k.resolve_future(process, future, value).unwrap();
+            value
+        });
+        let run_class = 1300;
+        k.install_resident_sync_program(KernelResidentProgram {
+            run_class,
+            instructions: vec![
+                KernelResidentInstruction::effect(
+                    HANDLER_EFFECT_FUTURE_OBSERVE,
+                    future,
+                    Ref64::NULL,
+                ),
+                KernelResidentInstruction::plain(HANDLER_COMPLETE, 0, 0),
+            ],
+        })
+        .unwrap();
+        let continuation = k
+            .create_continuation(
+                process,
+                process,
+                ContinuationSpec::new(StateAccess::ReadOnly, run_class, 0, vec![0; 8], 2),
+            )
+            .unwrap();
+        let plan = k.plan_resident_sync(2, 1, 8, width).unwrap();
+        (k, plan, continuation, future, value)
+    }
+
+    #[test]
+    fn governed_observe_future_pending_and_resolved_match_normal_kernel_reference() {
+        for resolved in [false, true] {
+            let (mut bridged, plan, continuation, future, expected) = observe_setup(1, resolved);
+            let mut normal = bridged.clone();
+            let actor = normal.continuations.get(continuation).unwrap().process;
+            normal.current_lane = 1;
+            assert_eq!(normal.observe_future(actor, future).unwrap(), expected);
+            normal.drain_lane_trace();
+            let normal_observation = normal
+                .trace_events()
+                .iter()
+                .find(|event| event.event_kind == EventKind::FutureStateObserved)
+                .copied()
+                .unwrap();
+
+            assert_eq!(bridged.run_resident_sync_cpu_reference(plan).unwrap(), 1);
+            assert_eq!(
+                bridged.continuation_state(continuation).unwrap(),
+                ContinuationState::Completed
+            );
+            let observed: Vec<_> = bridged
+                .trace_events()
+                .iter()
+                .filter(|event| event.event_kind == EventKind::FutureStateObserved)
+                .collect();
+            assert_eq!(observed.len(), 1);
+            assert_eq!(
+                (
+                    observed[0].process,
+                    observed[0].subject,
+                    observed[0].causal,
+                    observed[0].auxiliary
+                ),
+                (
+                    normal_observation.process,
+                    normal_observation.subject,
+                    normal_observation.causal,
+                    normal_observation.auxiliary
+                )
+            );
+            assert_eq!(bridged.accounting.epochs, 1);
+            assert_eq!(bridged.accounting.steps, 1);
+            assert_eq!(bridged.admission_log.len(), 1);
+            assert!(crate::semantics::invariants::check(&bridged).is_empty());
+        }
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn metal_observe_future_pending_resolved_width_1_32_match_cpu_reference() {
+        for resolved in [false, true] {
+            let mut width_results = Vec::new();
+            for width in [1, 32] {
+                let (mut cpu, cpu_plan, cpu_continuation, _, _) = observe_setup(width, resolved);
+                cpu.run_resident_sync_cpu_reference(cpu_plan).unwrap();
+                let (mut metal, metal_plan, metal_continuation, _, _) =
+                    observe_setup(width, resolved);
+                metal.run_resident_sync_metal(metal_plan).unwrap();
+                assert_eq!(
+                    cpu.continuation_state(cpu_continuation),
+                    metal.continuation_state(metal_continuation)
+                );
+                assert_eq!(cpu.effect_log, metal.effect_log);
+                assert_eq!(cpu.admission_log, metal.admission_log);
+                assert_eq!(cpu.accounting, metal.accounting);
+                assert_eq!(cpu.log_accounting(), metal.log_accounting());
+                assert!(crate::semantics::order::conforms(&cpu, &metal).is_empty());
+                assert!(crate::semantics::order::conforms(&metal, &cpu).is_empty());
+                width_results.push((cpu, metal));
+            }
+            assert_eq!(width_results[0].0.effect_log, width_results[1].0.effect_log);
+            assert_eq!(width_results[0].1.effect_log, width_results[1].1.effect_log);
+        }
     }
 
     #[test]
@@ -1798,6 +1943,116 @@ mod tests {
         );
         assert_eq!(KernelResidentSyncPlan::fingerprint(&k), changed);
         assert_eq!(k.trace_events().len(), trace_len);
+    }
+
+    fn assert_refusal_preserves_kernel(
+        kernel: &Kernel,
+        fingerprint: [u8; 32],
+        trace_len: usize,
+        accounting: &crate::kernel::accounting::Accounting,
+        admission_len: usize,
+        effect_len: usize,
+    ) {
+        assert_eq!(KernelResidentSyncPlan::fingerprint(kernel), fingerprint);
+        assert_eq!(kernel.trace_events().len(), trace_len);
+        assert_eq!(&kernel.accounting, accounting);
+        assert_eq!(kernel.admission_log.len(), admission_len);
+        assert_eq!(kernel.effect_log.len(), effect_len);
+    }
+
+    #[test]
+    fn observe_denied_expired_and_invalid_target_refuse_atomically() {
+        for case in 0..3 {
+            let mut kernel = Kernel::new();
+            let owner = kernel.create_process(Ref64::NULL, ProcessMode::Pure);
+            let observer = kernel.create_process(Ref64::NULL, ProcessMode::Pure);
+            let future = kernel.create_future(owner);
+            if case == 1 {
+                let capability = kernel
+                    .grant_capability(owner, observer, future, Rights::AWAIT, 0, 0)
+                    .unwrap();
+                kernel
+                    .capability_spaces
+                    .get_mut(&observer.key())
+                    .unwrap()
+                    .get_mut(capability)
+                    .unwrap()
+                    .valid_until_epoch = 0;
+            }
+            let run_class = 1400;
+            kernel
+                .install_resident_sync_program(KernelResidentProgram {
+                    run_class,
+                    instructions: vec![
+                        KernelResidentInstruction::effect(
+                            HANDLER_EFFECT_FUTURE_OBSERVE,
+                            if case == 2 {
+                                Ref64::from_u64(u64::MAX)
+                            } else {
+                                future
+                            },
+                            Ref64::NULL,
+                        ),
+                        KernelResidentInstruction::plain(HANDLER_COMPLETE, 0, 0),
+                    ],
+                })
+                .unwrap();
+            kernel
+                .create_continuation(
+                    observer,
+                    observer,
+                    ContinuationSpec::new(StateAccess::ReadOnly, run_class, 0, vec![], 1),
+                )
+                .unwrap();
+            let fingerprint = KernelResidentSyncPlan::fingerprint(&kernel);
+            let trace_len = kernel.trace_events().len();
+            let accounting = kernel.accounting;
+            let admission_len = kernel.admission_log.len();
+            let effect_len = kernel.effect_log.len();
+            assert!(matches!(
+                kernel.plan_resident_sync(1, 1, 8, 1),
+                Err(KernelResidentSyncError::UnsupportedShape)
+                    | Err(KernelResidentSyncError::InvalidProgram)
+            ));
+            assert_refusal_preserves_kernel(
+                &kernel,
+                fingerprint,
+                trace_len,
+                &accounting,
+                admission_len,
+                effect_len,
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_observe_device_target_refuses_import_atomically() {
+        let (kernel, plan, ..) = observe_setup(1, false);
+        let mut kernel = kernel;
+        let mut result = crate::executives::resident_sync::run_resident_sync(
+            &plan.config,
+            plan.continuations.clone(),
+            &plan.programs,
+        )
+        .unwrap();
+        result.effects[0].effect = ResidentEffect::FutureObserve { target: u32::MAX };
+        let fingerprint = KernelResidentSyncPlan::fingerprint(&kernel);
+        let trace_len = kernel.trace_events().len();
+        let accounting = kernel.accounting;
+        let admission_len = kernel.admission_log.len();
+        let effect_len = kernel.effect_log.len();
+        assert_eq!(
+            plan.validate_and_import(&mut kernel, result),
+            Err(KernelResidentSyncError::InvalidDeviceResult)
+        );
+        assert_refusal_preserves_kernel(
+            &kernel,
+            fingerprint,
+            trace_len,
+            &accounting,
+            admission_len,
+            effect_len,
+        );
     }
 
     #[test]

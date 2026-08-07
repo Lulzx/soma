@@ -11,6 +11,7 @@ pub mod remote_channel;
 pub mod remote_future;
 pub mod remote_journal;
 pub mod remote_lane_effect;
+pub mod remote_lane_transport;
 pub mod remote_mailbox_ingress;
 pub mod remote_node_runtime;
 pub mod remote_object;

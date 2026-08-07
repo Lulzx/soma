@@ -278,8 +278,9 @@ is `measurements/RESIDENT-IRREGULAR-HOST-QUEUE-M4-PRO-2026-08-07.txt`.
 
 `executives::resident_sync` defines the standalone CPU oracle and bounded,
 pointer-free handler bytecode for the next functional slice. Installed state
-machines emit future await/resolve and mailbox send/receive effects; an
-executive-owned resource table applies them in canonical lane order, parks and
+machines emit nonblocking future observe, future await/resolve, and mailbox
+send/receive effects; an executive-owned resource table applies them in
+canonical lane order, parks and
 wakes continuations across logical epochs, and records exact
 operation/access/trace journals. `executives::metal_resident_sync` lowers that
 contract to one real command buffer with device-owned frames, effects,
@@ -299,8 +300,14 @@ Phase-G effect application, admission, trace drain, and full Phase-H accounting
 before atomically swapping the clone. An independent governed-Kernel fixture
 matches I18 trace order, resources, scheduler/effect/admission logs, counters,
 continuation fields, and accounting; CPU and width-1/32 Metal bridge results are
-exact. A domain-separated SHA-256 plan fingerprint covers all relevant public
-and private commit state, and stale/invalid plans refuse without mutation.
+exact. The same bounded ABI now carries `FutureObserve` as a nonblocking
+future-read operation. Pending and resolved observations produce exact
+`OP_OBSERVE_FUTURE` operations, accesses, outcomes, and trace words across the
+CPU oracle and Metal widths 1/32; normal governed `Kernel::observe_future`
+provides the independent trace reference. Capability-denied, expired, stale,
+and invalid-target plans/results refuse before publication with fingerprint,
+trace, accounting, admission, and effect logs unchanged. A domain-separated
+SHA-256 plan fingerprint covers all relevant public and private commit state.
 
 This closes canonical commit only for local unsupervised, unique-run-class,
 all-complete future/mailbox programs with initially empty waiters/mailboxes,

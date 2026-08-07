@@ -158,10 +158,10 @@ struct Invocation { uint epoch,lane; ulong continuation; uint run_class,disposit
 struct Wake { uint epoch,lane,cause_opcode,target; ulong cause_continuation,continuation; uint run_class,ticket,ordinal,reserved; };
 struct EpochRecord { uint epoch,invocations,runnable_after,completed_after; };
 constant uint RUNNABLE=1, PARKED=2, COMPLETE=3;
-constant uint AWAIT=1, RESOLVE=2, SEND=3, RECEIVE=4;
-constant uint OUT_RESOLVED=1, OUT_REGISTERED=2, OUT_SENT=3, OUT_RECEIVED=4, OUT_DENIED=5, OUT_INVALID=6, OUT_FULL=7, OUT_EMPTY=8, OUT_DOUBLE=9;
-inline uint outcome_code(uint o) { if(o==OUT_RESOLVED||o==OUT_RECEIVED)return 2; if(o==OUT_REGISTERED)return 3; if(o==OUT_EMPTY)return 1; if(o==OUT_INVALID)return 0x101; if(o==OUT_DENIED)return 0x104; if(o==OUT_FULL)return 0x10c; if(o==OUT_DOUBLE)return 0x111; return 0; }
-inline uint journal_opcode(uint op) { return op==AWAIT?11:(op==RESOLVE?10:(op==SEND?8:9)); }
+constant uint AWAIT=1, RESOLVE=2, SEND=3, RECEIVE=4, OBSERVE=10;
+constant uint OUT_RESOLVED=1, OUT_REGISTERED=2, OUT_SENT=3, OUT_RECEIVED=4, OUT_DENIED=5, OUT_INVALID=6, OUT_FULL=7, OUT_EMPTY=8, OUT_DOUBLE=9, OUT_PENDING=10;
+inline uint outcome_code(uint o) { if(o==OUT_RESOLVED||o==OUT_RECEIVED)return 2; if(o==OUT_REGISTERED)return 3; if(o==OUT_EMPTY||o==OUT_PENDING)return 1; if(o==OUT_INVALID)return 0x101; if(o==OUT_DENIED)return 0x104; if(o==OUT_FULL)return 0x10c; if(o==OUT_DOUBLE)return 0x111; return 0; }
+inline uint journal_opcode(uint op) { return op==OBSERVE?1:(op==AWAIT?11:(op==RESOLVE?10:(op==SEND?8:9))); }
 inline uint hash_frame(device uchar* f,uint n){uint h=2166136261u;for(uint i=0;i<n;i++)h=(h^uint(f[i]))*16777619u;return h;}
 inline bool allowed(device const Capability* caps,uint n,ulong actor,uint kind,uint target,uint right){for(uint i=0;i<n;i++){Capability c=caps[i];if(c.actor==actor&&c.kind==kind&&c.target==target&&(c.rights&right)!=0)return true;}return false;}
 inline void add_trace(device Trace* traces,device Status* s,constant Config& cfg,uint epoch,uint lane,Cont c,uint event,uint word){if(s->trace_count>=cfg.trace_capacity){s->error=2;return;}Trace t={epoch,lane,c.id,c.run_class,event,word};traces[s->trace_count++]=t;}
@@ -196,7 +196,7 @@ kernel void resident_sync(
      if(op==7){if((input_previous_kind!=OUT_RESOLVED&&input_previous_kind!=OUT_RECEIVED)||input_previous_value!=val)pc+=arg;continue;}
      if(op==8){disposition=1;next_class=arg;break;}if(op==9){disposition=2;next_class=0;break;}
     }
-    if(op<1||op>4||emitted>=cfg.max_effects||status->effect_count>=cfg.effect_capacity){status->error=5;return;}
+    if(!((op>=1&&op<=4)||op==OBSERVE)||emitted>=cfg.max_effects||status->effect_count>=cfg.effect_capacity){status->error=5;return;}
     EffectRecord r={epoch,lane,emitted,journal_opcode(op),c.id,arg,0,val,0,0,c.run_class,0};records[status->effect_count++]=r;emitted++;
    }
    if(disposition==0){status->error=7;return;}
@@ -207,10 +207,11 @@ kernel void resident_sync(
   for(uint li=0;li<lane;li++){
    Stage st=stages[li];Cont c=cs[st.continuation_index];bool parked=false;
    for(uint ri=st.effect_offset;ri<st.effect_offset+st.effect_count;ri++){
-    EffectRecord r=records[ri];uint op=r.opcode==11?AWAIT:(r.opcode==10?RESOLVE:(r.opcode==8?SEND:RECEIVE));uint arg=r.target;ulong val=r.value;
-    uint kind=op<=2?2:3;uint right=(op==AWAIT||op==RECEIVE)?1:2;uint outcome=0;ulong result_value=0,result_sender=0;
+    EffectRecord r=records[ri];uint op=r.opcode==1?OBSERVE:(r.opcode==11?AWAIT:(r.opcode==10?RESOLVE:(r.opcode==8?SEND:RECEIVE)));uint arg=r.target;ulong val=r.value;
+    uint kind=(op<=2||op==OBSERVE)?2:3;uint right=(op==OBSERVE||op==AWAIT||op==RECEIVE)?1:2;uint outcome=0;ulong result_value=0,result_sender=0;
     if(!allowed(caps,cfg.capability_count,c.actor,kind,arg,right))outcome=OUT_DENIED;
     else if((kind==2&&arg>=cfg.future_count)||(kind==3&&arg>=cfg.mailbox_count))outcome=OUT_INVALID;
+    else if(op==OBSERVE){if(futures[arg].resolved!=0){outcome=OUT_RESOLVED;result_value=futures[arg].value;}else outcome=OUT_PENDING;}
     else if(op==AWAIT){if(futures[arg].resolved!=0){outcome=OUT_RESOLVED;result_value=futures[arg].value;}else{outcome=OUT_REGISTERED;parked=true;c.pending_opcode=AWAIT;c.pending_target=arg;}}
     else if(op==RESOLVE){if(futures[arg].resolved!=0)outcome=OUT_DOUBLE;else{futures[arg].resolved=1;futures[arg].value=val;outcome=OUT_RESOLVED;result_value=val;wake_future(cs,cfg.continuation_count,arg,val,epoch,li,c.id,r.ordinal,wakes,status,cfg);}}
     else if(op==SEND){Mailbox m=mails[arg];if(m.count>=m.capacity){outcome=OUT_FULL;parked=true;c.pending_opcode=SEND;c.pending_target=arg;c.pending_value=val;}else{uint slot=arg*cfg.mailbox_stride+(m.head+m.count)%cfg.mailbox_stride;MailEntry ne={c.actor,val};entries[slot]=ne;m.count++;mails[arg]=m;outcome=OUT_SENT;wake_one(cs,cfg.continuation_count,RECEIVE,arg,epoch,li,8,c.id,r.ordinal,wakes,status,cfg);}}
@@ -582,11 +583,15 @@ fn raw_outcome(r: &GpuEffectRecord) -> Result<ResidentOutcome, BackendError> {
         7 => ResidentOutcome::Full,
         8 => ResidentOutcome::Empty,
         9 => ResidentOutcome::DoubleResolve,
+        10 => ResidentOutcome::Pending,
         _ => return Err(BackendError::ExecutionFailed),
     })
 }
 fn raw_effect(r: &GpuEffectRecord) -> Result<ResidentEffect, BackendError> {
     Ok(match r.opcode {
+        crate::scheduler::device_ops::OP_OBSERVE_FUTURE => {
+            ResidentEffect::FutureObserve { target: r.target }
+        }
         crate::scheduler::device_ops::OP_AWAIT_FUTURE => {
             ResidentEffect::FutureAwait { target: r.target }
         }
@@ -640,13 +645,17 @@ fn decode(
         result.accesses.push(DeviceLaneAccess::new(
             record.lane,
             match effect {
-                ResidentEffect::FutureAwait { .. } | ResidentEffect::FutureResolve { .. } => {
-                    RESOURCE_FUTURE
-                }
+                ResidentEffect::FutureObserve { .. }
+                | ResidentEffect::FutureAwait { .. }
+                | ResidentEffect::FutureResolve { .. } => RESOURCE_FUTURE,
                 _ => RESOURCE_MAILBOX,
             },
             u64::from(record.target),
-            DEVICE_ACCESS_WRITE,
+            if matches!(effect, ResidentEffect::FutureObserve { .. }) {
+                crate::scheduler::device::DEVICE_ACCESS_READ
+            } else {
+                DEVICE_ACCESS_WRITE
+            },
             record.ordinal,
         ));
         let actor = specs
@@ -668,7 +677,7 @@ fn decode(
                 result_code: match outcome {
                     ResidentOutcome::Resolved(_) | ResidentOutcome::Received { .. } => 2,
                     ResidentOutcome::Registered => 3,
-                    ResidentOutcome::Empty => 1,
+                    ResidentOutcome::Empty | ResidentOutcome::Pending => 1,
                     ResidentOutcome::InvalidTarget => 0x101,
                     ResidentOutcome::CapabilityDenied => 0x104,
                     ResidentOutcome::Full => 0x10c,
@@ -842,6 +851,99 @@ mod tests {
             },
         );
         (config, continuations, programs)
+    }
+
+    fn observe_input(
+        width: u32,
+    ) -> (
+        ResidentSyncConfig,
+        Vec<ResidentContinuation>,
+        BTreeMap<u32, ResidentHandlerProgram>,
+    ) {
+        let config = ResidentSyncConfig {
+            max_epochs: 1,
+            max_effects_per_step: 1,
+            max_frame_bytes: 8,
+            max_continuations: 4,
+            cohort_width: width,
+            futures: vec![InitialFuture::Pending, InitialFuture::Resolved(44)],
+            mailbox_capacities: vec![],
+            capabilities: vec![
+                cap(7, RESOURCE_FUTURE, 0, RIGHT_READ),
+                cap(7, RESOURCE_FUTURE, 1, RIGHT_READ),
+                cap(7, RESOURCE_FUTURE, 9, RIGHT_READ),
+            ],
+        };
+        let continuations = [(1, 7, 10, 0), (2, 7, 11, 1), (3, 8, 12, 0), (4, 7, 13, 9)]
+            .into_iter()
+            .map(|(id, actor, run_class, _)| ResidentContinuation {
+                id,
+                actor,
+                run_class,
+                frame: vec![],
+            })
+            .collect();
+        let programs = [(10, 0), (11, 1), (12, 0), (13, 9)]
+            .into_iter()
+            .map(|(run_class, target)| {
+                (
+                    run_class,
+                    ResidentHandlerProgram {
+                        run_class,
+                        instructions: vec![
+                            ResidentInstruction {
+                                opcode: HANDLER_EFFECT_FUTURE_OBSERVE,
+                                argument: target,
+                                value: 0,
+                            },
+                            ResidentInstruction {
+                                opcode: HANDLER_COMPLETE,
+                                argument: 0,
+                                value: 0,
+                            },
+                        ],
+                    },
+                )
+            })
+            .collect();
+        (config, continuations, programs)
+    }
+
+    #[test]
+    fn observe_pending_resolved_denied_invalid_width_1_32_match_cpu_exactly() {
+        let metal = MetalResidentSync::new().unwrap();
+        let mut results = Vec::new();
+        for width in [1, 32] {
+            let (config, continuations, programs) = observe_input(width);
+            let cpu = run_resident_sync(&config, continuations.clone(), &programs).unwrap();
+            let gpu = metal.run(&config, continuations, &programs).unwrap();
+            assert_eq!(gpu, cpu);
+            assert_eq!(
+                gpu.effects
+                    .iter()
+                    .map(|effect| effect.outcome)
+                    .collect::<Vec<_>>(),
+                vec![
+                    ResidentOutcome::Pending,
+                    ResidentOutcome::Resolved(44),
+                    ResidentOutcome::CapabilityDenied,
+                    ResidentOutcome::InvalidTarget,
+                ]
+            );
+            assert!(gpu
+                .accesses
+                .iter()
+                .all(|access| { access.mode == crate::scheduler::device::DEVICE_ACCESS_READ }));
+            assert!(gpu
+                .operations
+                .iter()
+                .flat_map(|journal| &journal.operations)
+                .all(
+                    |operation| operation.opcode == crate::scheduler::device_ops::OP_OBSERVE_FUTURE
+                ));
+            results.push(gpu);
+        }
+        assert_eq!(results[0], results[1]);
     }
 
     #[test]
