@@ -54,7 +54,9 @@ ordinary-Kernel waiter queues. Ordinary resolution, receive, or enqueue wakes
 the imported waiter in FIFO order; CPU and actual Metal widths 1/32 agree, and
 metadata tampering refuses atomically. This is still a bounded canonical commit
 slice: only local unsupervised programs with pre-existing stable authority and
-initially empty waiter/mailbox state are admitted. Initial nonempty mailboxes,
+initially empty waiter queues are admitted. Existing mailbox entries are
+snapshotted exactly on CPU and Metal, allowing an ordinary enqueue wake followed
+by resident receive retry and completion. Pre-existing waiter queues,
 allocation/resizing, channels, supervision, device capability creation,
 admission deferral, multiple mutable continuations per process, broader handler
 shapes, and the general canonical bridge remain to be integrated.

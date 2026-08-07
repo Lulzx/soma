@@ -498,11 +498,20 @@ impl MetalResidentSync {
         let mailboxes: Vec<GpuMailbox> = config
             .mailbox_capacities
             .iter()
-            .map(|capacity| GpuMailbox {
+            .zip(&config.mailbox_messages)
+            .map(|(capacity, messages)| GpuMailbox {
                 capacity: *capacity,
+                count: messages.len() as u32,
                 ..Default::default()
             })
             .collect();
+        let mut mailbox_entries = vec![GpuMailEntry::default(); entry_count];
+        for (mailbox, messages) in config.mailbox_messages.iter().enumerate() {
+            for (offset, (sender, value)) in messages.iter().copied().enumerate() {
+                mailbox_entries[mailbox * config.max_continuations as usize + offset] =
+                    GpuMailEntry { sender, value };
+            }
+        }
         let capabilities: Vec<GpuCapability> = config
             .capabilities
             .iter()
@@ -577,7 +586,7 @@ impl MetalResidentSync {
         let ins_b = self.buffer_from(&instructions);
         let futures_b = self.buffer_from(&futures);
         let mail_b = self.buffer_from(&mailboxes);
-        let entries_b = self.zero_buffer::<GpuMailEntry>(entry_count);
+        let entries_b = self.buffer_from(&mailbox_entries);
         let caps_b = self.buffer_from(&capabilities);
         let effects_b = self.zero_buffer::<GpuEffectRecord>(effect_capacity);
         let traces_b = self.zero_buffer::<ResidentSyncTrace>(trace_capacity);
@@ -769,11 +778,15 @@ fn validate(
         })
         || u32::try_from(config.futures.len()).is_err()
         || u32::try_from(config.mailbox_capacities.len()).is_err()
+        || config.mailbox_messages.len() != config.mailbox_capacities.len()
         || u32::try_from(config.capabilities.len()).is_err()
         || config
             .mailbox_capacities
             .iter()
-            .any(|capacity| *capacity > config.max_continuations)
+            .zip(&config.mailbox_messages)
+            .any(|(capacity, messages)| {
+                *capacity > config.max_continuations || messages.len() > *capacity as usize
+            })
     {
         return Err(BackendError::InvalidInput);
     }
@@ -1091,6 +1104,7 @@ mod tests {
             object_capabilities: vec![],
             futures: vec![InitialFuture::Pending],
             mailbox_capacities: vec![],
+            mailbox_messages: vec![],
             capabilities: vec![
                 cap(10, RESOURCE_FUTURE, 0, RIGHT_READ),
                 cap(20, RESOURCE_FUTURE, 0, RIGHT_WRITE),
@@ -1197,6 +1211,7 @@ mod tests {
             object_capabilities: vec![],
             futures: vec![InitialFuture::Pending, InitialFuture::Resolved(44)],
             mailbox_capacities: vec![],
+            mailbox_messages: vec![],
             capabilities: vec![
                 cap(7, RESOURCE_FUTURE, 0, RIGHT_READ),
                 cap(7, RESOURCE_FUTURE, 1, RIGHT_READ),
@@ -1322,6 +1337,7 @@ mod tests {
             object_capabilities: vec![],
             futures: vec![],
             mailbox_capacities: vec![1],
+            mailbox_messages: vec![vec![]],
             capabilities: vec![
                 cap(10, RESOURCE_MAILBOX, 0, RIGHT_READ),
                 cap(20, RESOURCE_MAILBOX, 0, RIGHT_WRITE),
@@ -1463,6 +1479,7 @@ mod tests {
             object_capabilities: vec![],
             futures: vec![],
             mailbox_capacities: vec![2],
+            mailbox_messages: vec![vec![]],
             capabilities: vec![
                 cap(10, RESOURCE_MAILBOX, 0, RIGHT_READ),
                 cap(20, RESOURCE_MAILBOX, 0, RIGHT_READ),
@@ -1565,6 +1582,7 @@ mod tests {
             object_capabilities: vec![],
             futures: vec![InitialFuture::Pending],
             mailbox_capacities: vec![1],
+            mailbox_messages: vec![vec![]],
             capabilities: vec![cap(7, RESOURCE_FUTURE, 0, RIGHT_WRITE)],
         };
         let continuations = vec![ResidentContinuation {
@@ -1660,6 +1678,7 @@ mod tests {
             object_capabilities: vec![],
             futures: vec![],
             mailbox_capacities: vec![],
+            mailbox_messages: vec![],
             capabilities: vec![cap(7, RESOURCE_FUTURE, 9, RIGHT_WRITE)],
         };
         let continuations = vec![ResidentContinuation {
@@ -1710,6 +1729,7 @@ mod tests {
             object_capabilities: vec![],
             futures: vec![],
             mailbox_capacities: vec![],
+            mailbox_messages: vec![],
             capabilities: vec![],
         };
         let continuations = vec![ResidentContinuation {
@@ -1789,6 +1809,7 @@ mod tests {
                 }],
                 futures: vec![],
                 mailbox_capacities: vec![],
+                mailbox_messages: vec![],
                 capabilities: vec![],
             };
             let continuations = vec![ResidentContinuation {
@@ -1884,6 +1905,7 @@ mod tests {
             object_capabilities,
             futures: vec![],
             mailbox_capacities: vec![],
+            mailbox_messages: vec![],
             capabilities: vec![],
         };
         let assert_refused = |config: ResidentSyncConfig| {
@@ -1954,6 +1976,7 @@ mod tests {
             object_capabilities: vec![],
             futures: vec![InitialFuture::Pending],
             mailbox_capacities: vec![],
+            mailbox_messages: vec![],
             capabilities: vec![cap(7, RESOURCE_FUTURE, 0, RIGHT_READ | RIGHT_WRITE)],
         };
         let continuations = vec![ResidentContinuation {
@@ -2012,6 +2035,7 @@ mod tests {
             object_capabilities: vec![],
             futures: vec![InitialFuture::Pending],
             mailbox_capacities: vec![],
+            mailbox_messages: vec![],
             capabilities: vec![
                 cap(1, RESOURCE_FUTURE, 0, RIGHT_READ),
                 cap(2, RESOURCE_FUTURE, 0, RIGHT_READ),
@@ -2109,6 +2133,7 @@ mod tests {
                 }],
                 futures: vec![InitialFuture::Resolved(19), InitialFuture::Pending],
                 mailbox_capacities: vec![5],
+                mailbox_messages: vec![vec![]],
                 capabilities: vec![
                     cap(1, RESOURCE_MAILBOX, 0, RIGHT_WRITE),
                     cap(1, RESOURCE_FUTURE, 1, RIGHT_READ),

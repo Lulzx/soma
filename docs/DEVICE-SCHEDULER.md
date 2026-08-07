@@ -329,12 +329,13 @@ refuses atomically.
 Shared installed run classes now form exact canonical cohorts rather than being
 refused, while the per-process mutable-admission exclusion remains. This closes
 canonical commit only for local unsupervised, completed-or-locally-parked
-future/mailbox/fixed-range-object programs with initially empty
-waiters/mailboxes, stable pre-existing capabilities, host-backed object
-payloads, `RunClassBins`, and `RunPartial`. Initial nonempty mailboxes remain
-unsupported, so an imported receive waiter can be woken by ordinary enqueue but
-a new resident plan is still refused until that queued mail is consumed.
-Supervision, channels, allocation or resizing, foreign resources, device
+future/mailbox/fixed-range-object programs with initially empty waiter queues,
+stable pre-existing capabilities, host-backed object payloads,
+`RunClassBins`, and `RunPartial`. Existing mailbox entries are snapshotted as
+exact FIFO `(sender,payload)` pairs on both CPU and Metal, so an imported empty
+receive waiter can be woken by ordinary enqueue and then finish through a new
+resident plan without a host-side mailbox shadow. Pre-existing waiter queues,
+supervision, channels, allocation or resizing, foreign resources, device
 capability creation, admission deferral, multiple mutable continuations per
 process, sub-full-range ordinary Kernel object authorization, and broader
 handler/effect shapes refuse. The general G2 executive therefore remains open.

@@ -344,6 +344,9 @@ pub struct ResidentSyncConfig {
     pub object_capabilities: Vec<ResidentObjectCapability>,
     pub futures: Vec<InitialFuture>,
     pub mailbox_capacities: Vec<u32>,
+    /// Canonical FIFO `(sender, value)` entries present at the resident boundary.
+    /// The outer vector is exactly parallel to `mailbox_capacities`.
+    pub mailbox_messages: Vec<Vec<(u64, u64)>>,
     pub capabilities: Vec<ResidentCapability>,
 }
 
@@ -565,6 +568,12 @@ pub fn run_resident_sync(
                     .checked_add(cap.length)
                     .is_none_or(|end| end > object.bytes.len() as u64)
         })
+        || config.mailbox_messages.len() != config.mailbox_capacities.len()
+        || config
+            .mailbox_messages
+            .iter()
+            .zip(&config.mailbox_capacities)
+            .any(|(messages, capacity)| messages.len() > *capacity as usize)
         || continuations.len() > config.max_continuations as usize
         || continuations.iter().any(|continuation| {
             continuation.frame.len() > config.max_frame_bytes as usize
@@ -612,9 +621,10 @@ pub fn run_resident_sync(
     let mut ms: Vec<Mail> = config
         .mailbox_capacities
         .iter()
-        .map(|c| Mail {
-            capacity: *c as usize,
-            queue: VecDeque::new(),
+        .zip(&config.mailbox_messages)
+        .map(|(capacity, messages)| Mail {
+            capacity: *capacity as usize,
+            queue: messages.iter().copied().collect(),
             receivers: vec![],
             senders: vec![],
         })
@@ -1031,6 +1041,7 @@ mod tests {
             object_capabilities: vec![],
             futures: vec![InitialFuture::Pending],
             mailbox_capacities: vec![],
+            mailbox_messages: vec![],
             capabilities: vec![
                 cap(10, RESOURCE_FUTURE, 0, RIGHT_READ),
                 cap(20, RESOURCE_FUTURE, 0, RIGHT_WRITE),
@@ -1147,6 +1158,7 @@ mod tests {
             object_capabilities: vec![],
             futures: vec![],
             mailbox_capacities: vec![1],
+            mailbox_messages: vec![vec![]],
             capabilities: vec![
                 cap(10, RESOURCE_MAILBOX, 0, RIGHT_READ),
                 cap(20, RESOURCE_MAILBOX, 0, RIGHT_WRITE),
@@ -1270,6 +1282,7 @@ mod tests {
             object_capabilities: vec![],
             futures: vec![InitialFuture::Pending],
             mailbox_capacities: vec![],
+            mailbox_messages: vec![],
             capabilities: vec![cap(7, RESOURCE_FUTURE, 0, RIGHT_WRITE)],
         };
         let mut programs = BTreeMap::new();
@@ -1416,6 +1429,7 @@ mod tests {
             object_capabilities: vec![],
             futures: vec![InitialFuture::Pending, InitialFuture::Resolved(44)],
             mailbox_capacities: vec![],
+            mailbox_messages: vec![],
             capabilities: vec![
                 cap(7, RESOURCE_FUTURE, 0, RIGHT_READ),
                 cap(7, RESOURCE_FUTURE, 1, RIGHT_READ),
@@ -1560,6 +1574,7 @@ mod tests {
             object_capabilities: vec![],
             futures: vec![InitialFuture::Resolved(1)],
             mailbox_capacities: vec![0],
+            mailbox_messages: vec![vec![]],
             capabilities: vec![
                 cap(7, RESOURCE_FUTURE, 0, RIGHT_WRITE),
                 cap(7, RESOURCE_FUTURE, 9, RIGHT_WRITE),

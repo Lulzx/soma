@@ -584,12 +584,15 @@ impl KernelResidentSyncPlan {
             .epoch
             .checked_add(max_epochs)
             .ok_or(KernelResidentSyncError::UnsupportedShape)?;
-        // This slice begins at a clean resident boundary. Initial waiter and
-        // mailbox import is intentionally not claimed yet.
+        // This slice begins at a clean resident boundary. Existing FIFO
+        // mailbox entries are snapshotted exactly; pre-existing waiter queues
+        // remain unsupported because their pending handler state is not part of
+        // this admission shape.
         if kernel.future_waiters.values().any(|w| !w.is_empty())
-            || kernel.mailboxes.values().any(|m| {
-                !m.entries.is_empty() || !m.recv_waiters.is_empty() || !m.full_waiters.is_empty()
-            })
+            || kernel
+                .mailboxes
+                .values()
+                .any(|m| !m.recv_waiters.is_empty() || !m.full_waiters.is_empty())
             || !kernel.remote_waiter_dependencies.is_empty()
         {
             return Err(KernelResidentSyncError::UnsupportedShape);
@@ -610,6 +613,20 @@ impl KernelResidentSyncPlan {
             .processes
             .iter()
             .any(|(_, p)| p.node_id != kernel.local_node)
+            || mailboxes.iter().any(|process| {
+                kernel.mailboxes[&process.key()]
+                    .entries
+                    .iter()
+                    .any(|message| {
+                        message.receiver != *process
+                            || kernel.processes.get(message.sender).is_err()
+                            || kernel.objects.get(message.payload).is_err()
+                            || kernel
+                                .object_payloads
+                                .get(&message.payload.key())
+                                .is_none_or(|payload| payload.provenance() != "host")
+                    })
+            })
         {
             return Err(KernelResidentSyncError::UnsupportedShape);
         }
@@ -1027,7 +1044,20 @@ impl KernelResidentSyncPlan {
             .collect::<Result<Vec<_>, _>>()?;
         let capacities: Vec<u32> = mailboxes
             .iter()
-            .map(|p| kernel.mailboxes[&p.key()].capacity as u32)
+            .map(|process| {
+                u32::try_from(kernel.mailboxes[&process.key()].capacity)
+                    .map_err(|_| KernelResidentSyncError::UnsupportedShape)
+            })
+            .collect::<Result<_, _>>()?;
+        let mailbox_messages: Vec<Vec<(u64, u64)>> = mailboxes
+            .iter()
+            .map(|process| {
+                kernel.mailboxes[&process.key()]
+                    .entries
+                    .iter()
+                    .map(|message| (message.sender.to_u64(), message.payload.to_u64()))
+                    .collect()
+            })
             .collect();
         Ok(Self {
             config: ResidentSyncConfig {
@@ -1051,6 +1081,7 @@ impl KernelResidentSyncPlan {
                 object_capabilities,
                 futures: initial_futures,
                 mailbox_capacities: capacities,
+                mailbox_messages,
                 capabilities,
             },
             continuations,
@@ -3267,11 +3298,25 @@ mod tests {
             receive
                 .enqueue_message(sender, mailbox, payload, Ref64::NULL)
                 .unwrap();
+            let retained = receive.create_object(sender, ObjectKind::MessagePayload, vec![10]);
+            receive
+                .enqueue_message(sender, mailbox, retained, Ref64::NULL)
+                .unwrap();
             assert_eq!(
                 receive.continuation_state(continuation),
                 Ok(ContinuationState::Runnable)
             );
             assert_eq!(receive.mailbox_recv_waiter_count(mailbox), 0);
+            let retry = receive.plan_resident_sync(8, 1, 8, width).unwrap();
+            assert_eq!(receive.run_resident_sync_cpu_reference(retry), Ok(2));
+            assert_eq!(
+                receive.continuation_state(continuation),
+                Ok(ContinuationState::Completed)
+            );
+            assert_eq!(
+                receive.mailbox_entries(mailbox).unwrap()[0].payload,
+                retained
+            );
             assert!(crate::semantics::invariants::check(&receive).is_empty());
             receive_runs.push(receive);
 
@@ -3375,11 +3420,31 @@ mod tests {
             let mut runs = Vec::new();
             for width in [1, 32] {
                 if receive {
-                    let (mut kernel, plan, continuation, _, _) = final_mailbox_receive_setup(width);
+                    let (mut kernel, plan, continuation, sender, payload) =
+                        final_mailbox_receive_setup(width);
                     assert_eq!(kernel.run_resident_sync_metal(plan), Ok(1));
                     assert_eq!(
                         kernel.continuation_state(continuation),
                         Ok(ContinuationState::Waiting)
+                    );
+                    let mailbox = kernel.continuations.get(continuation).unwrap().process;
+                    kernel
+                        .enqueue_message(sender, mailbox, payload, Ref64::NULL)
+                        .unwrap();
+                    let retained =
+                        kernel.create_object(sender, ObjectKind::MessagePayload, vec![10]);
+                    kernel
+                        .enqueue_message(sender, mailbox, retained, Ref64::NULL)
+                        .unwrap();
+                    let retry = kernel.plan_resident_sync(8, 1, 8, width).unwrap();
+                    assert_eq!(kernel.run_resident_sync_metal(retry), Ok(2));
+                    assert_eq!(
+                        kernel.continuation_state(continuation),
+                        Ok(ContinuationState::Completed)
+                    );
+                    assert_eq!(
+                        kernel.mailbox_entries(mailbox).unwrap()[0].payload,
+                        retained
                     );
                     runs.push(kernel);
                 } else {
