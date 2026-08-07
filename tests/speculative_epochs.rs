@@ -9,6 +9,7 @@ use soma::compiler::state_machine_lowering::{
 use soma::experiments::dynamic_search::{build, ControlKnobs};
 use soma::kernel::speculation::EpochExecutive;
 use soma::kernel::{ContinuationSpec, Kernel, SYSTEM_PRINCIPAL};
+use soma::scheduler::device_ops::{ALL_OPERATION_KINDS, OP_CREATE_PROCESS, OP_ENQUEUE_MESSAGE};
 use soma::semantics::invariants::assert_legal;
 use soma::semantics::order::conforms_traces;
 
@@ -134,6 +135,10 @@ fn contended_allocation_falls_back_before_any_snapshot_effect_can_escape() {
     let stats = speculative.speculation_stats();
     assert_eq!(stats.fallback_epochs, 1);
     assert_eq!(stats.conflict_fallbacks, 1);
+    assert_ne!(
+        stats.device_operation_kinds & (1 << (OP_CREATE_PROCESS - 1)),
+        0
+    );
     assert!(conforms_traces(&reference.trace_snapshot(), &speculative.trace_snapshot()).is_empty());
     assert_legal(&speculative);
 }
@@ -159,6 +164,7 @@ fn independent_mailboxes_futures_and_allocations_commit() {
     let stats = speculative.speculation_stats();
     assert!(stats.committed_epochs >= 2, "{stats:?}");
     assert!(stats.committed_lanes >= 8, "{stats:?}");
+    assert_eq!(stats.device_operation_kinds, ALL_OPERATION_KINDS);
     let disagreements = conforms_traces(&reference.trace_snapshot(), &speculative.trace_snapshot());
     assert!(disagreements.is_empty(), "{disagreements:#?}");
     assert_legal(&speculative);
@@ -335,6 +341,10 @@ fn two_senders_to_one_mailbox_conflict() {
     speculative.run_epoch();
 
     assert_eq!(speculative.speculation_stats().conflict_fallbacks, 1);
+    assert_ne!(
+        speculative.speculation_stats().device_operation_kinds & (1 << (OP_ENQUEUE_MESSAGE - 1)),
+        0
+    );
     let disagreements = conforms_traces(&reference.trace_snapshot(), &speculative.trace_snapshot());
     assert!(disagreements.is_empty(), "{disagreements:#?}");
 }

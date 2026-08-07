@@ -13,8 +13,10 @@
 //!    (`compiler`, `experiments`) that prove resumable continuations run
 //!    deterministically.
 //!
-//! The Metal backend is a collective-level implementation, not a persistent
-//! device-resident scheduler.
+//! Metal includes both collective evaluation and a concurrent resident
+//! scheduler. General continuation handlers still execute through the
+//! speculative CPU snapshots before their device-ready journals are validated
+//! and canonically replayed.
 
 pub mod abi;
 pub mod compiler;

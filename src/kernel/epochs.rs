@@ -15,11 +15,17 @@ use crate::abi::{EventKind, ProcessState, Ref64, StepKind, StepResult};
 use crate::executives::cpu_scalar;
 use crate::kernel::commit;
 use crate::kernel::payload::Payload;
-use crate::kernel::speculation::{EpochExecutive, LaneJournal, LaneOperation, Resource};
+use crate::kernel::speculation::{EpochExecutive, LaneJournal, Resource};
 use crate::kernel::Kernel;
 use crate::scheduler::admission::{admit, AdmissionRecord, Candidate};
 use crate::scheduler::cohorts::{build_cohorts, CohortPlan};
 use crate::scheduler::device::{reference_lane_conflicts, LaneConflictValidator};
+use crate::scheduler::device_ops::{
+    await_result, decode_spec, message_result, object_kind, observe_result, process_mode,
+    ref_result, unit_result, DeviceOperationJournal, OP_AWAIT_FUTURE, OP_CREATE_CONTINUATION,
+    OP_CREATE_FUTURE, OP_CREATE_OBJECT, OP_CREATE_PROCESS, OP_ENQUEUE_MESSAGE, OP_OBSERVE_FUTURE,
+    OP_READ_OBJECT, OP_RECEIVE_MESSAGE, OP_RESOLVE_FUTURE, OP_WRITE_OBJECT, RESULT_OK,
+};
 
 #[derive(Clone, Copy, Debug)]
 struct EvaluatedStep {
@@ -34,6 +40,7 @@ struct SpeculativeLane {
     process: Ref64,
     evaluated: EvaluatedStep,
     journal: LaneJournal,
+    device_operations: DeviceOperationJournal,
     payloads: Vec<(Ref64, Vec<u8>)>,
 }
 
@@ -456,6 +463,7 @@ impl Kernel {
                         if evaluated.result.kind == StepKind::Fault {
                             journal.unsupported = true;
                         }
+                        let device_operations = journal.device_operations(lane)?;
                         let payloads = journal
                             .mutated_objects
                             .iter()
@@ -472,6 +480,7 @@ impl Kernel {
                             process,
                             evaluated,
                             journal,
+                            device_operations,
                             payloads,
                         })
                     })
@@ -488,6 +497,15 @@ impl Kernel {
             self.speculation_stats.unsupported_fallbacks += 1;
             return None;
         };
+
+        for operation in outcomes
+            .iter()
+            .flat_map(|outcome| &outcome.device_operations.operations)
+        {
+            if (1..=32).contains(&operation.opcode) {
+                self.speculation_stats.device_operation_kinds |= 1 << (operation.opcode - 1);
+            }
+        }
 
         if outcomes.iter().any(|outcome| outcome.journal.unsupported) {
             self.speculation_stats.fallback_epochs += 1;
@@ -584,7 +602,7 @@ impl Kernel {
             if let Ok(process) = self.processes.get_mut(outcome.process) {
                 process.active_continuation = outcome.continuation;
             }
-            if !self.replay_lane_operations(&outcome.journal.operations) {
+            if !self.replay_device_operations(&outcome.device_operations) {
                 return None;
             }
             if let Ok(process) = self.processes.get_mut(outcome.process) {
@@ -601,72 +619,88 @@ impl Kernel {
         Some(steps)
     }
 
-    fn replay_lane_operations(&mut self, operations: &[LaneOperation]) -> bool {
-        operations.iter().all(|operation| match operation {
-            LaneOperation::ObserveFuture {
-                actor,
-                future,
-                result,
-            } => self.observe_future(*actor, *future) == *result,
-            LaneOperation::ReadObject { actor, object } => {
-                let _ = self.object_bytes(*actor, *object);
-                true
+    fn replay_device_operations(&mut self, journal: &DeviceOperationJournal) -> bool {
+        let mut lane = None;
+        for (ordinal, operation) in journal.operations.iter().copied().enumerate() {
+            if operation.ordinal != ordinal as u32
+                || lane.is_some_and(|expected| expected != operation.lane)
+            {
+                return false;
             }
-            LaneOperation::CreateProcess {
-                actor,
-                mode,
-                result,
-            } => self.try_create_process(*actor, *mode) == *result,
-            LaneOperation::CreateContinuation {
-                actor,
-                process,
-                spec,
-                result,
-            } => self.create_continuation(*actor, *process, spec.clone()) == *result,
-            LaneOperation::CreateFuture { actor, result } => self.create_future(*actor) == *result,
-            LaneOperation::CreateObject {
-                actor,
-                kind,
-                bytes,
-                result,
-            } => self.create_object(*actor, *kind, bytes.clone()) == *result,
-            LaneOperation::WriteObject {
-                actor,
-                object,
-                growable,
-            } => {
-                if *growable {
-                    let _ = self.host_payload_mut(*actor, *object);
-                } else {
-                    let _ = self.object_bytes_mut(*actor, *object);
+            lane = Some(operation.lane);
+            let actor = Ref64::from_u64(operation.actor);
+            let target = Ref64::from_u64(operation.target);
+            let value = Ref64::from_u64(operation.value);
+            let payload = match journal.payload(operation) {
+                Some(payload) => payload,
+                None => return false,
+            };
+            let matches = match operation.opcode {
+                OP_OBSERVE_FUTURE => {
+                    let actual = observe_result(&self.observe_future(actor, target));
+                    actual == (operation.result_code, operation.result_ref) && payload.is_empty()
                 }
-                true
+                OP_READ_OBJECT => {
+                    let _ = self.object_bytes(actor, target);
+                    payload.is_empty()
+                }
+                OP_CREATE_PROCESS => process_mode(operation.flags).is_some_and(|mode| {
+                    ref_result(&self.try_create_process(actor, mode))
+                        == (operation.result_code, operation.result_ref)
+                        && payload.is_empty()
+                }),
+                OP_CREATE_CONTINUATION => decode_spec(payload).is_some_and(|spec| {
+                    ref_result(&self.create_continuation(actor, target, spec))
+                        == (operation.result_code, operation.result_ref)
+                }),
+                OP_CREATE_FUTURE => {
+                    operation.result_code == RESULT_OK
+                        && self.create_future(actor).to_u64() == operation.result_ref
+                        && payload.is_empty()
+                }
+                OP_CREATE_OBJECT => object_kind(operation.flags).is_some_and(|kind| {
+                    operation.result_code == RESULT_OK
+                        && self.create_object(actor, kind, payload.to_vec()).to_u64()
+                            == operation.result_ref
+                }),
+                OP_WRITE_OBJECT => {
+                    if operation.flags == 0 {
+                        let _ = self.object_bytes_mut(actor, target);
+                    } else if operation.flags == 1 {
+                        let _ = self.host_payload_mut(actor, target);
+                    } else {
+                        return false;
+                    }
+                    payload.is_empty()
+                }
+                OP_ENQUEUE_MESSAGE => {
+                    unit_result(&self.enqueue_message(
+                        actor,
+                        target,
+                        value,
+                        Ref64::from_u64(operation.auxiliary),
+                    )) == operation.result_code
+                        && payload.is_empty()
+                }
+                OP_RECEIVE_MESSAGE => {
+                    let (code, bytes) = message_result(&self.receive_message(actor, target));
+                    code == operation.result_code && bytes == payload
+                }
+                OP_RESOLVE_FUTURE => {
+                    unit_result(&self.resolve_future(actor, target, value)) == operation.result_code
+                        && payload.is_empty()
+                }
+                OP_AWAIT_FUTURE => {
+                    await_result(&self.await_future(actor, target, value, operation.flags))
+                        == (operation.result_code, operation.result_aux)
+                        && payload.is_empty()
+                }
+                _ => false,
+            };
+            if !matches {
+                return false;
             }
-            LaneOperation::EnqueueMessage {
-                actor,
-                receiver,
-                payload,
-                sender_continuation,
-                result,
-            } => self.enqueue_message(*actor, *receiver, *payload, *sender_continuation) == *result,
-            LaneOperation::ReceiveMessage {
-                actor,
-                continuation,
-                result,
-            } => self.receive_message(*actor, *continuation) == *result,
-            LaneOperation::ResolveFuture {
-                actor,
-                future,
-                value,
-                result,
-            } => self.resolve_future(*actor, *future, *value) == *result,
-            LaneOperation::AwaitFuture {
-                actor,
-                continuation,
-                future,
-                next_run_class,
-                result,
-            } => self.await_future(*actor, *continuation, *future, *next_run_class) == *result,
-        })
+        }
+        true
     }
 }

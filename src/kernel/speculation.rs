@@ -10,6 +10,12 @@ use std::collections::HashSet;
 use crate::abi::{MessageDescriptor, ObjectKind, ProcessMode, Ref64};
 use crate::kernel::{AwaitOutcome, ContinuationSpec, RuntimeError};
 use crate::scheduler::device::{DeviceLaneAccess, DEVICE_ACCESS_READ, DEVICE_ACCESS_WRITE};
+use crate::scheduler::device_ops::{
+    await_result, encode_spec, message_result, observe_result, ref_result, unit_result,
+    DeviceLaneOperation, DeviceOperationJournal, OP_AWAIT_FUTURE, OP_CREATE_CONTINUATION,
+    OP_CREATE_FUTURE, OP_CREATE_OBJECT, OP_CREATE_PROCESS, OP_ENQUEUE_MESSAGE, OP_OBSERVE_FUTURE,
+    OP_READ_OBJECT, OP_RECEIVE_MESSAGE, OP_RESOLVE_FUTURE, OP_WRITE_OBJECT, RESULT_OK,
+};
 
 /// How Phase F executes admitted lanes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -32,6 +38,10 @@ pub struct SpeculationStats {
     pub committed_lanes: u64,
     pub conflict_fallbacks: u64,
     pub unsupported_fallbacks: u64,
+    /// Bit `opcode - 1` for every internal lane operation successfully lowered
+    /// to the fixed-width device ABI, including epochs later rejected for a
+    /// semantic conflict.
+    pub device_operation_kinds: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -162,6 +172,150 @@ impl LaneJournal {
                 DeviceLaneAccess::new(lane, resource_kind, resource, mode, ordinal as u32)
             })
             .collect()
+    }
+
+    pub(crate) fn device_operations(&self, lane: u32) -> Option<DeviceOperationJournal> {
+        let mut journal = DeviceOperationJournal::default();
+        for (ordinal, operation) in self.operations.iter().enumerate() {
+            let mut record = DeviceLaneOperation {
+                lane,
+                ordinal: ordinal.try_into().ok()?,
+                ..DeviceLaneOperation::default()
+            };
+            let payload = match operation {
+                LaneOperation::ObserveFuture {
+                    actor,
+                    future,
+                    result,
+                } => {
+                    record.opcode = OP_OBSERVE_FUTURE;
+                    record.actor = actor.to_u64();
+                    record.target = future.to_u64();
+                    (record.result_code, record.result_ref) = observe_result(result);
+                    None
+                }
+                LaneOperation::ReadObject { actor, object } => {
+                    record.opcode = OP_READ_OBJECT;
+                    record.actor = actor.to_u64();
+                    record.target = object.to_u64();
+                    None
+                }
+                LaneOperation::CreateProcess {
+                    actor,
+                    mode,
+                    result,
+                } => {
+                    record.opcode = OP_CREATE_PROCESS;
+                    record.actor = actor.to_u64();
+                    record.flags = *mode as u32;
+                    (record.result_code, record.result_ref) = ref_result(result);
+                    None
+                }
+                LaneOperation::CreateContinuation {
+                    actor,
+                    process,
+                    spec,
+                    result,
+                } => {
+                    record.opcode = OP_CREATE_CONTINUATION;
+                    record.actor = actor.to_u64();
+                    record.target = process.to_u64();
+                    (record.result_code, record.result_ref) = ref_result(result);
+                    Some(encode_spec(spec))
+                }
+                LaneOperation::CreateFuture { actor, result } => {
+                    record.opcode = OP_CREATE_FUTURE;
+                    record.actor = actor.to_u64();
+                    record.result_code = RESULT_OK;
+                    record.result_ref = result.to_u64();
+                    None
+                }
+                LaneOperation::CreateObject {
+                    actor,
+                    kind,
+                    bytes,
+                    result,
+                } => {
+                    record.opcode = OP_CREATE_OBJECT;
+                    record.actor = actor.to_u64();
+                    record.flags = *kind as u32;
+                    record.result_code = RESULT_OK;
+                    record.result_ref = result.to_u64();
+                    Some(bytes.clone())
+                }
+                LaneOperation::WriteObject {
+                    actor,
+                    object,
+                    growable,
+                } => {
+                    record.opcode = OP_WRITE_OBJECT;
+                    record.actor = actor.to_u64();
+                    record.target = object.to_u64();
+                    record.flags = u32::from(*growable);
+                    None
+                }
+                LaneOperation::EnqueueMessage {
+                    actor,
+                    receiver,
+                    payload,
+                    sender_continuation,
+                    result,
+                } => {
+                    record.opcode = OP_ENQUEUE_MESSAGE;
+                    record.actor = actor.to_u64();
+                    record.target = receiver.to_u64();
+                    record.value = payload.to_u64();
+                    record.auxiliary = sender_continuation.to_u64();
+                    record.result_code = unit_result(result);
+                    None
+                }
+                LaneOperation::ReceiveMessage {
+                    actor,
+                    continuation,
+                    result,
+                } => {
+                    record.opcode = OP_RECEIVE_MESSAGE;
+                    record.actor = actor.to_u64();
+                    record.target = continuation.to_u64();
+                    let (code, bytes) = message_result(result);
+                    record.result_code = code;
+                    (!bytes.is_empty()).then_some(bytes)
+                }
+                LaneOperation::ResolveFuture {
+                    actor,
+                    future,
+                    value,
+                    result,
+                } => {
+                    record.opcode = OP_RESOLVE_FUTURE;
+                    record.actor = actor.to_u64();
+                    record.target = future.to_u64();
+                    record.value = value.to_u64();
+                    record.result_code = unit_result(result);
+                    None
+                }
+                LaneOperation::AwaitFuture {
+                    actor,
+                    continuation,
+                    future,
+                    next_run_class,
+                    result,
+                } => {
+                    record.opcode = OP_AWAIT_FUTURE;
+                    record.actor = actor.to_u64();
+                    record.target = continuation.to_u64();
+                    record.value = future.to_u64();
+                    record.flags = *next_run_class;
+                    (record.result_code, record.result_aux) = await_result(result);
+                    None
+                }
+            };
+            if let Some(payload) = payload {
+                (record.payload_offset, record.payload_len) = journal.append_payload(&payload)?;
+            }
+            journal.operations.push(record);
+        }
+        Some(journal)
     }
 }
 

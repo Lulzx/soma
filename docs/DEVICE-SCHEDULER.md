@@ -77,6 +77,30 @@ independent oracle at that boundary. This moves the conflict gate needed before
 canonical commit onto the device. It does not yet move operation replay or
 handler execution there.
 
+## Device operation journal and canonical replay
+
+The complete `LaneView` call surface now has one pointer-free output ABI.
+`DeviceLaneOperation` is a fixed 72-byte record containing canonical lane and
+ordinal, opcode, flags, actor/target/value references, result code, and an
+offset into one byte arena. Continuation frames, created object bytes, and
+received-message evidence use that arena; no record contains a Rust pointer or
+implementation enum.
+
+All eleven operation shapes are covered: governed future/object reads, process,
+continuation, future, and object creation, frame/object writes, message enqueue
+and receive, and future resolve and await. Runtime and ABI errors have stable
+codes, while complex results retain enough evidence for replay to reject a
+different answer.
+
+This is not a dormant format. Snapshot handlers lower into it before conflict
+validation, and accepted epochs canonically replay these records against the
+real kernel. The previous replay over the internal Rust `LaneOperation` enum is
+gone. `SpeculationStats::device_operation_kinds` proves the independent expand
+workload lowered every opcode; allocation and mailbox conflict controls prove
+rejected journals still leave no state behind. This establishes the exact ABI
+a Metal handler must emit and removes host data-model design from the remaining
+device lowering.
+
 Read-only admission takes the constant path. Small mutable sets retain the
 bounded quadratic comparison path; large mutable sets and placement use
 `O(n log² n)` sorting plus `O(n log n)` bound lookup. Irregular randomized
@@ -103,8 +127,9 @@ width one collapses cohort count and lane slots exactly to node count. Both
 controls still agree field-for-field with the reference accounting.
 
 This is not yet the complete persistent executive. The resident path currently
-executes the bounded search transition. Lane read/write journals and their
-conflict decision now have device lowering, while the full `LaneView` operation
-language still needs device-side operation/event payloads and canonical replay.
-Completion means the general lane program runs through that same no-round-trip
-graph, followed by I19 and trace comparison against the reference kernel.
+executes the bounded search transition. Lane access journals, operation
+payloads, conflict validation, and canonical replay now share device-ready
+ABIs; handler evaluation and lane-local trace emission still need Metal
+lowering. Completion means the general lane program runs through that same
+no-round-trip graph, followed by I19 and trace comparison against the reference
+kernel.
