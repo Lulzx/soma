@@ -31,6 +31,19 @@ state and replay through the deterministic reference loop. See
 [docs/SPECULATIVE-EPOCHS.md](docs/SPECULATIVE-EPOCHS.md) and run
 `cargo run --release --example speculative_epoch_report`.
 
+## Compiled continuation handlers
+
+Validated evaluator programs can also be installed as user continuation run
+classes. A private frame is one evaluator element; the interpreter, Cranelift
+JIT, and generated Metal code all execute the same typed integer, gather,
+structured-loop, and divergent-break IR. Native and Metal epochs return only
+pointer-free results and frame arenas, then pass through the ordinary operation
+journal validation, dry replay, and canonical commit. A backend may decline a
+body or mixed batch without changing state, in which case the reference path
+runs it. `tests/speculative_epochs.rs` checks trace and exact frame-byte
+equivalence, including a gathering body whose lanes must not see one another's
+private frames.
+
 Stable Rust. The semantic core has no dependencies. The optional macOS Metal
 backend is enabled with `--features metal`.
 

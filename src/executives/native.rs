@@ -17,6 +17,11 @@ use cranelift_module::{default_libcall_names, Linkage, Module};
 
 use super::batch::{AuxArray, BackendError, BackendKind, BatchBackend};
 use crate::compiler::body::{EvaluatorProgram, FieldWidth, Op};
+use crate::scheduler::device::{
+    reference_lane_conflicts, DeviceEpochBackend, DeviceEvaluation, DeviceEvaluatorLane,
+    DeviceEvaluatorResult, DeviceLaneAccess, DeviceLaneConflict, LaneConflictValidator,
+    LaneValidationError,
+};
 
 type NativeEvaluator =
     unsafe extern "C" fn(*const u8, *mut u8, u32, u32, *const u8, u32, u32, u32, u32);
@@ -46,6 +51,108 @@ pub struct NativeCpuBackend {
     module: JITModule,
     evaluators: HashMap<u32, CompiledEvaluator>,
     threads: usize,
+}
+
+/// Cranelift-backed continuation evaluator plus the reference journal
+/// validator. This makes the native lowering available at the same canonical
+/// epoch boundary as Metal rather than only through batch collectives.
+pub struct NativeEpochBackend {
+    evaluator: NativeCpuBackend,
+    handlers: HashMap<u32, (u32, u32)>,
+}
+
+impl NativeEpochBackend {
+    pub fn new() -> Result<Self, BackendError> {
+        Ok(Self {
+            evaluator: NativeCpuBackend::new()?,
+            handlers: HashMap::new(),
+        })
+    }
+
+    pub fn install_frame_evaluator(
+        &mut self,
+        run_class: u32,
+        program: &EvaluatorProgram,
+    ) -> Result<(), BackendError> {
+        if run_class < 1024 || program.binds_aux() || program.stride() == 0 {
+            return Err(BackendError::InvalidInput);
+        }
+        self.evaluator.install(program)?;
+        self.handlers
+            .insert(run_class, (program.id(), program.stride()));
+        Ok(())
+    }
+}
+
+impl LaneConflictValidator for NativeEpochBackend {
+    fn validate_lane_journals(
+        &mut self,
+        accesses: &[DeviceLaneAccess],
+        lane_count: u32,
+    ) -> Result<Vec<DeviceLaneConflict>, LaneValidationError> {
+        if accesses.iter().any(|access| access.lane >= lane_count) {
+            return Err(LaneValidationError::InvalidInput);
+        }
+        Ok(reference_lane_conflicts(accesses, lane_count))
+    }
+}
+
+impl DeviceEpochBackend for NativeEpochBackend {
+    fn evaluate_lanes(
+        &mut self,
+        lanes: &[DeviceEvaluatorLane],
+        frames: &[u8],
+    ) -> Result<DeviceEvaluation, LaneValidationError> {
+        if lanes.is_empty() {
+            return Ok(DeviceEvaluation::default());
+        }
+        let run_class = lanes[0].run_class;
+        let (program, stride) = self
+            .handlers
+            .get(&run_class)
+            .copied()
+            .ok_or(LaneValidationError::InvalidInput)?;
+        let packed = lanes.iter().enumerate().all(|(index, lane)| {
+            lane.run_class == run_class
+                && lane.frame_len == stride
+                && lane.frame_offset as usize == index * stride as usize
+        });
+        if !packed || lanes.len().checked_mul(stride as usize) != Some(frames.len()) {
+            return Err(LaneValidationError::InvalidInput);
+        }
+        let mut output = Vec::with_capacity(frames.len());
+        for lane in lanes {
+            let start = lane.frame_offset as usize;
+            let end = start
+                .checked_add(stride as usize)
+                .ok_or(LaneValidationError::InvalidInput)?;
+            let frame = frames
+                .get(start..end)
+                .ok_or(LaneValidationError::InvalidInput)?;
+            output.extend_from_slice(
+                &self
+                    .evaluator
+                    .evaluate(program, frame, 1, stride)
+                    .map_err(|_| LaneValidationError::ExecutionFailed)?,
+            );
+        }
+        let results = lanes
+            .iter()
+            .map(|lane| DeviceEvaluatorResult {
+                lane: lane.lane,
+                status: 1,
+                step_kind: 1,
+                consumed_steps: 1,
+                frame_offset: lane.frame_offset,
+                frame_len: lane.frame_len,
+                ..DeviceEvaluatorResult::default()
+            })
+            .collect();
+        Ok(DeviceEvaluation {
+            results,
+            frames: output,
+        })
+    }
 }
 
 impl NativeCpuBackend {

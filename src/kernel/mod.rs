@@ -328,6 +328,10 @@ pub struct Kernel {
     supervision_queues: HashMap<u64, SupervisionQueue>,
     restart_blueprints: HashMap<u64, RestartBlueprint>,
     module_evaluators: HashMap<u64, Vec<(u32, u32)>>,
+    /// User run classes lowered from the same total evaluator IR used by
+    /// batch backends. The frame is one element; the handler stores its result
+    /// back into that private frame and completes.
+    frame_evaluators: HashMap<u32, crate::compiler::body::EvaluatorProgram>,
     /// Physical owner assigned to newly created processes.
     local_node: u64,
     /// Loss declarations are monotonic and idempotent.
@@ -421,6 +425,7 @@ impl Kernel {
             supervision_queues: HashMap::new(),
             restart_blueprints: HashMap::new(),
             module_evaluators: HashMap::new(),
+            frame_evaluators: HashMap::new(),
             local_node: 0,
             lost_nodes: HashSet::new(),
             scheduler,
@@ -483,6 +488,22 @@ impl Kernel {
     /// Select the normative reference loop or the optimistic concurrent loop.
     pub fn configure_epoch_executive(&mut self, executive: speculation::EpochExecutive) {
         self.epoch_executive = executive;
+    }
+
+    /// Install a validated evaluator body as a continuation handler. User
+    /// classes start at 1024 so a module cannot shadow the built-in machine
+    /// state handlers, and aux-array bodies are excluded because a private
+    /// continuation frame binds exactly one byte array.
+    pub fn install_frame_evaluator(
+        &mut self,
+        run_class: u32,
+        program: crate::compiler::body::EvaluatorProgram,
+    ) -> Result<(), RuntimeError> {
+        if run_class < 1024 || program.binds_aux() || program.stride() == 0 {
+            return Err(RuntimeError::InvalidModule);
+        }
+        self.frame_evaluators.insert(run_class, program);
+        Ok(())
     }
 
     pub fn epoch_executive(&self) -> speculation::EpochExecutive {

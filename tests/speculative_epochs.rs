@@ -97,6 +97,130 @@ fn actual_search_leaf_handlers_execute_and_validate_on_metal_before_commit() {
     assert_legal(&device_validated);
 }
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn arbitrary_evaluator_program_runs_as_a_metal_continuation_handler() {
+    use soma::compiler::examples;
+    use soma::executives::metal_scheduler::MetalDeviceScheduler;
+
+    const RUN_CLASS: u32 = 1024;
+    let module = examples::module();
+    let program = module.program(examples::RUN_LENGTH).unwrap().clone();
+    let build = || {
+        let mut kernel = Kernel::new();
+        kernel
+            .install_frame_evaluator(RUN_CLASS, program.clone())
+            .unwrap();
+        let mut lanes = Vec::new();
+        for (left, right) in [(1u32, 2u32), (17, 31), (u32::MAX, 9), (55, 55)] {
+            let process = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+            let mut frame = left.to_le_bytes().to_vec();
+            frame.extend_from_slice(&right.to_le_bytes());
+            let continuation = kernel
+                .create_continuation(
+                    SYSTEM_PRINCIPAL,
+                    process,
+                    ContinuationSpec::new(
+                        StateAccess::ReadOnly,
+                        RUN_CLASS,
+                        0,
+                        frame,
+                        DEFAULT_MAX_STEPS,
+                    ),
+                )
+                .unwrap();
+            lanes.push((process, continuation));
+        }
+        (kernel, lanes)
+    };
+
+    let (mut reference, lanes) = build();
+    let (mut device, _) = build();
+    device.configure_epoch_executive(EpochExecutive::Speculative { max_lanes: 8 });
+    let mut metal = MetalDeviceScheduler::new().unwrap();
+    metal.install_frame_evaluator(RUN_CLASS, &program).unwrap();
+
+    reference.run_epoch();
+    device.run_epoch_with_device_backend(&mut metal);
+
+    let stats = device.speculation_stats();
+    assert_eq!(stats.device_evaluated_epochs, 1);
+    assert_eq!(stats.device_evaluated_lanes, lanes.len() as u64);
+    assert!(conforms_traces(&reference.trace_snapshot(), &device.trace_snapshot()).is_empty());
+    for (process, continuation) in lanes {
+        let expected = reference.continuation_frame(continuation).unwrap();
+        let actual = device.continuation_frame(continuation).unwrap();
+        assert_eq!(
+            reference.object_bytes(process, expected).unwrap(),
+            device.object_bytes(process, actual).unwrap()
+        );
+    }
+    assert_legal(&device);
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn arbitrary_evaluator_program_runs_as_native_compiled_continuation_handler() {
+    use soma::compiler::examples;
+    use soma::executives::native::NativeEpochBackend;
+
+    const RUN_CLASS: u32 = 1025;
+    let module = examples::module();
+    let program = module.program(examples::RUN_LENGTH).unwrap().clone();
+    let build = || {
+        let mut kernel = Kernel::new();
+        kernel
+            .install_frame_evaluator(RUN_CLASS, program.clone())
+            .unwrap();
+        let mut lanes = Vec::new();
+        for (left, right) in [(1u32, 2u32), (17, 17), (u32::MAX, 1), (0, 0)] {
+            let process = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);
+            let mut frame = left.to_le_bytes().to_vec();
+            frame.extend_from_slice(&right.to_le_bytes());
+            let continuation = kernel
+                .create_continuation(
+                    SYSTEM_PRINCIPAL,
+                    process,
+                    ContinuationSpec::new(
+                        StateAccess::ReadOnly,
+                        RUN_CLASS,
+                        0,
+                        frame,
+                        DEFAULT_MAX_STEPS,
+                    ),
+                )
+                .unwrap();
+            lanes.push((process, continuation));
+        }
+        (kernel, lanes)
+    };
+
+    let (mut reference, lanes) = build();
+    let (mut native, _) = build();
+    native.configure_epoch_executive(EpochExecutive::Speculative { max_lanes: 8 });
+    let mut backend = NativeEpochBackend::new().unwrap();
+    backend
+        .install_frame_evaluator(RUN_CLASS, &program)
+        .unwrap();
+
+    reference.run_epoch();
+    native.run_epoch_with_device_backend(&mut backend);
+
+    let stats = native.speculation_stats();
+    assert_eq!(stats.device_evaluated_epochs, 1);
+    assert_eq!(stats.device_evaluated_lanes, lanes.len() as u64);
+    assert!(conforms_traces(&reference.trace_snapshot(), &native.trace_snapshot()).is_empty());
+    for (process, continuation) in lanes {
+        let expected = reference.continuation_frame(continuation).unwrap();
+        let actual = native.continuation_frame(continuation).unwrap();
+        assert_eq!(
+            reference.object_bytes(process, expected).unwrap(),
+            native.object_bytes(process, actual).unwrap()
+        );
+    }
+    assert_legal(&native);
+}
+
 fn two_leaves_in_one_process() -> Kernel {
     let mut kernel = Kernel::new();
     let process = kernel.create_process(SYSTEM_PRINCIPAL, ProcessMode::Serial);

@@ -13,10 +13,11 @@
 //!    (`compiler`, `experiments`) that prove resumable continuations run
 //!    deterministically.
 //!
-//! Metal includes both collective evaluation and a concurrent resident
-//! scheduler. General continuation handlers still execute through the
-//! speculative CPU snapshots before their device-ready journals are validated
-//! and canonically replayed.
+//! Metal includes collective evaluation, a concurrent resident scheduler, and
+//! continuation-body execution through the same validated evaluator IR used by
+//! the reference interpreter and native Cranelift backend. Unsupported built-in
+//! handlers still use speculative CPU snapshots; every accepted lane converges
+//! on the same fixed journal validation and canonical replay boundary.
 
 pub mod abi;
 pub mod compiler;

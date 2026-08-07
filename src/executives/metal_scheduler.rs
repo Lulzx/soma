@@ -5,6 +5,7 @@
 //! in one command buffer, so the device reaches the scheduling decision without
 //! an intervening host read or round trip.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 
 use metal::{
@@ -25,6 +26,7 @@ use crate::scheduler::device_ops::{
 };
 
 use super::batch::BackendError;
+use crate::compiler::body::EvaluatorProgram;
 
 const SOURCE: &str = r#"
 #include <metal_stdlib>
@@ -366,6 +368,7 @@ pub struct MetalDeviceScheduler {
     journal_validation: ComputePipelineState,
     operation_validation: ComputePipelineState,
     evaluator: ComputePipelineState,
+    handler_pipelines: HashMap<u32, (ComputePipelineState, u32)>,
     resident: Option<(Buffer, Buffer, Buffer, usize)>,
     journal_resident: Option<(Buffer, Buffer, usize, usize)>,
     operation_resident: Option<(Buffer, Buffer, Buffer, usize, usize)>,
@@ -437,6 +440,7 @@ impl MetalDeviceScheduler {
             journal_validation,
             operation_validation,
             evaluator,
+            handler_pipelines: HashMap::new(),
             resident: None,
             journal_resident: None,
             operation_resident: None,
@@ -448,6 +452,32 @@ impl MetalDeviceScheduler {
             .as_ref()
             .map(|(_, _, _, capacity)| *capacity)
             .unwrap_or(0)
+    }
+
+    /// Compile one total evaluator program as a user continuation handler.
+    /// Its element layout is the frame layout and one lane is one element.
+    pub fn install_frame_evaluator(
+        &mut self,
+        run_class: u32,
+        program: &EvaluatorProgram,
+    ) -> Result<(), BackendError> {
+        if run_class < 1024 || program.binds_aux() || program.stride() == 0 {
+            return Err(BackendError::InvalidInput);
+        }
+        let library = self
+            .device
+            .new_library_with_source(&program.metal_source(), &CompileOptions::new())
+            .map_err(|_| BackendError::UnsupportedEvaluator)?;
+        let function = library
+            .get_function(&program.metal_entry_point(), None)
+            .map_err(|_| BackendError::UnsupportedEvaluator)?;
+        let pipeline = self
+            .device
+            .new_compute_pipeline_state_with_function(&function)
+            .map_err(|_| BackendError::UnsupportedEvaluator)?;
+        self.handler_pipelines
+            .insert(run_class, (pipeline, program.stride()));
+        Ok(())
     }
 
     pub fn journal_resident_capacity(&self) -> (usize, usize) {
@@ -944,6 +974,81 @@ impl DeviceEpochBackend for MetalDeviceScheduler {
         }
         if lanes.len() > u32::MAX as usize || frames.len() > u32::MAX as usize {
             return Err(LaneValidationError::InvalidInput);
+        }
+        let run_class = lanes[0].run_class;
+        if let Some((pipeline, stride)) = self.handler_pipelines.get(&run_class).cloned() {
+            let packed = lanes.iter().enumerate().all(|(index, lane)| {
+                lane.run_class == run_class
+                    && lane.frame_len == stride
+                    && lane.frame_offset as usize == index * stride as usize
+            });
+            let required = lanes.len().checked_mul(stride as usize);
+            if !packed || required != Some(frames.len()) {
+                return Err(LaneValidationError::InvalidInput);
+            }
+            let count = 1u32;
+            let input = self.device.new_buffer(
+                frames.len().max(1) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let output = self.device.new_buffer(
+                frames.len().max(1) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    frames.as_ptr(),
+                    input.contents().cast::<u8>(),
+                    frames.len(),
+                );
+            }
+            let command = self.queue.new_command_buffer();
+            // A frame is a private one-element array. Binding the whole epoch
+            // as one array would let `Gather` cross continuation boundaries.
+            // Separate encoders retain that isolation while sharing one GPU
+            // command-buffer submission and completion wait.
+            for lane in lanes {
+                let encoder = command.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(&pipeline);
+                encoder.set_buffer(0, Some(&input), u64::from(lane.frame_offset));
+                encoder.set_buffer(1, Some(&output), u64::from(lane.frame_offset));
+                encoder.set_bytes(
+                    2,
+                    std::mem::size_of::<u32>() as u64,
+                    (&count as *const u32).cast::<c_void>(),
+                );
+                encoder.set_bytes(
+                    3,
+                    std::mem::size_of::<u32>() as u64,
+                    (&stride as *const u32).cast::<c_void>(),
+                );
+                dispatch(encoder, &pipeline, count);
+                encoder.end_encoding();
+            }
+            command.commit();
+            command.wait_until_completed();
+            if command.status() != MTLCommandBufferStatus::Completed {
+                return Err(LaneValidationError::ExecutionFailed);
+            }
+            let output_frames =
+                unsafe { std::slice::from_raw_parts(output.contents().cast::<u8>(), frames.len()) }
+                    .to_vec();
+            let results = lanes
+                .iter()
+                .map(|lane| DeviceEvaluatorResult {
+                    lane: lane.lane,
+                    status: 1,
+                    step_kind: 1,
+                    consumed_steps: 1,
+                    frame_offset: lane.frame_offset,
+                    frame_len: lane.frame_len,
+                    ..DeviceEvaluatorResult::default()
+                })
+                .collect();
+            return Ok(DeviceEvaluation {
+                results,
+                frames: output_frames,
+            });
         }
         let lane_count = lanes.len() as u32;
         let frame_bytes = frames.len() as u32;

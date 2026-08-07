@@ -400,9 +400,30 @@ impl Kernel {
         // `dispatch` used to read back out of the descriptor for itself, and
         // nothing between that read and the one above can change it — which is
         // why §4.17 could take the read away without changing a run.
+        let frame_evaluator = self.frame_evaluators.get(&run_class).cloned();
         let result = {
             let mut lane = crate::executives::lane::LaneView::new(self, frame);
-            cpu_scalar::dispatch(&mut lane, cont, process, run_class)
+            if let Some(program) = frame_evaluator {
+                let input = lane
+                    .object_bytes(process, frame)
+                    .map(|bytes| bytes.to_vec());
+                match input {
+                    Ok(input) if input.len() == program.stride() as usize => {
+                        let mut output = input.clone();
+                        program.evaluate_at(&input, 1, 0, &mut output);
+                        match lane.host_payload_mut(process, frame) {
+                            Ok(payload) => {
+                                *payload = output;
+                                StepResult::complete()
+                            }
+                            Err(_) => StepResult::fault(process, run_class),
+                        }
+                    }
+                    _ => StepResult::fault(process, run_class),
+                }
+            } else {
+                cpu_scalar::dispatch(&mut lane, cont, process, run_class)
+            }
         };
         if let Ok(descriptor) = self.processes.get_mut(process) {
             descriptor.active_continuation = Ref64::NULL;
