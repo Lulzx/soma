@@ -6,7 +6,7 @@ use super::AbiHeader;
 /// Message descriptor (§11). Phase-1 guarantees: at-most-once delivery, ordered
 /// delivery per sender–receiver pair, release on committed send, acquire on
 /// receive.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MessageDescriptor {
     pub header: AbiHeader,
 

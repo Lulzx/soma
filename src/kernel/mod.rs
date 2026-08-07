@@ -494,6 +494,10 @@ impl Kernel {
         self.speculation_journal.take().unwrap_or_default()
     }
 
+    pub(crate) fn is_speculative_recording(&self) -> bool {
+        self.speculation_journal.is_some()
+    }
+
     pub(crate) fn record_speculative_read(&mut self, resource: speculation::Resource) {
         if let Some(journal) = &mut self.speculation_journal {
             journal.read(resource);
@@ -517,6 +521,34 @@ impl Kernel {
         if let Some(journal) = &mut self.speculation_journal {
             journal.unsupported = true;
         }
+    }
+
+    pub(crate) fn record_speculative_operation(
+        &mut self,
+        operation: speculation::LaneOperation,
+    ) {
+        if let Some(journal) = &mut self.speculation_journal {
+            journal.push(operation);
+        }
+    }
+
+    pub(crate) fn record_speculative_allocation(&mut self) {
+        let partition = self.active_partition;
+        self.record_speculative_write(speculation::Resource::Allocation(partition));
+    }
+
+    pub(crate) fn record_speculative_process_creation(&mut self, actor: Ref64) {
+        let domain = if actor == SYSTEM_PRINCIPAL {
+            self.root_domain
+        } else {
+            self.processes
+                .get(actor)
+                .map(|process| process.domain)
+                .unwrap_or(self.root_domain)
+        };
+        self.record_speculative_allocation();
+        self.record_speculative_write(speculation::Resource::Domain(domain));
+        self.record_speculative_write(speculation::Resource::Process(actor));
     }
 
     pub fn set_allocation_partitions(&mut self, partitions: u8) {

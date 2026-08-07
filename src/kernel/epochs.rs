@@ -11,11 +11,11 @@
 
 use crate::abi::cohorts::PartialCohortPolicy;
 use crate::abi::continuations::ContinuationState;
-use crate::abi::{ProcessState, Ref64, StepKind, StepResult, TraceEvent};
+use crate::abi::{EventKind, ProcessState, Ref64, StepKind, StepResult};
 use crate::executives::cpu_scalar;
 use crate::kernel::commit;
 use crate::kernel::payload::Payload;
-use crate::kernel::speculation::{EpochExecutive, LaneJournal, Resource};
+use crate::kernel::speculation::{EpochExecutive, LaneJournal, LaneOperation, Resource};
 use crate::kernel::Kernel;
 use crate::scheduler::admission::{admit, AdmissionRecord, Candidate};
 use crate::scheduler::cohorts::{build_cohorts, CohortPlan};
@@ -26,7 +26,7 @@ struct EvaluatedStep {
     executed: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct SpeculativeLane {
     lane: u32,
     continuation: Ref64,
@@ -34,7 +34,6 @@ struct SpeculativeLane {
     evaluated: EvaluatedStep,
     journal: LaneJournal,
     payloads: Vec<(Ref64, Vec<u8>)>,
-    trace: Vec<TraceEvent>,
 }
 
 impl Kernel {
@@ -454,7 +453,6 @@ impl Kernel {
                             evaluated,
                             journal,
                             payloads,
-                            trace: std::mem::take(&mut snapshot.lane_trace),
                         })
                     })
                 })
@@ -492,17 +490,59 @@ impl Kernel {
         // Execution order is deliberately discarded here. Lane number is the
         // canonical position assigned by the epoch plan.
         outcomes.sort_by_key(|outcome| outcome.lane);
+        // Validate replay against a disposable copy before touching the real
+        // kernel. A mismatch means an access declaration was incomplete; no
+        // partial canonical commit may escape in that case.
+        let mut validation = self.clone();
+        if validation.commit_speculative_lanes(&outcomes).is_none() {
+            self.speculation_stats.fallback_epochs += 1;
+            self.speculation_stats.unsupported_fallbacks += 1;
+            return None;
+        }
+        let steps = self
+            .commit_speculative_lanes(&outcomes)
+            .expect("validated speculative replay must remain deterministic");
+        self.speculation_stats.committed_epochs += 1;
+        self.speculation_stats.committed_lanes += lanes.len() as u64;
+        Some(steps)
+    }
+
+    fn commit_speculative_lanes(&mut self, outcomes: &[SpeculativeLane]) -> Option<usize> {
         let mut steps = 0;
         for outcome in outcomes {
             self.enter_lane(outcome.lane);
-            for _ in &outcome.trace {
-                self.trace_counters.emit();
+            let (run_class, dependency) = self
+                .continuations
+                .get(outcome.continuation)
+                .map(|continuation| (continuation.run_class, continuation.dependency))
+                .ok()?;
+            if dependency.kind == crate::abi::Kind::Future
+                && !dependency.is_null()
+                && self
+                    .authorize(outcome.process, crate::abi::Rights::AWAIT, dependency)
+                    .is_err()
+            {
+                return None;
             }
-            self.lane_sequence = outcome.trace.len() as u32;
-            self.lane_trace = outcome.trace;
-            for (object, bytes) in outcome.payloads {
+            self.trace(
+                EventKind::ContinuationStarted,
+                outcome.process,
+                outcome.continuation,
+                run_class,
+                0,
+            );
+            if let Ok(process) = self.processes.get_mut(outcome.process) {
+                process.active_continuation = outcome.continuation;
+            }
+            if !self.replay_lane_operations(&outcome.journal.operations) {
+                return None;
+            }
+            if let Ok(process) = self.processes.get_mut(outcome.process) {
+                process.active_continuation = Ref64::NULL;
+            }
+            for (object, bytes) in &outcome.payloads {
                 self.object_payloads
-                    .insert(object.key(), Payload::Host(bytes));
+                    .insert(object.key(), Payload::Host(bytes.clone()));
             }
             steps += self.commit_evaluated(
                 outcome.continuation,
@@ -511,8 +551,81 @@ impl Kernel {
             );
             self.leave_lane();
         }
-        self.speculation_stats.committed_epochs += 1;
-        self.speculation_stats.committed_lanes += lanes.len() as u64;
         Some(steps)
+    }
+
+    fn replay_lane_operations(&mut self, operations: &[LaneOperation]) -> bool {
+        operations.iter().all(|operation| match operation {
+            LaneOperation::ObserveFuture {
+                actor,
+                future,
+                result,
+            } => self.observe_future(*actor, *future) == *result,
+            LaneOperation::ReadObject { actor, object } => {
+                let _ = self.object_bytes(*actor, *object);
+                true
+            }
+            LaneOperation::CreateProcess {
+                actor,
+                mode,
+                result,
+            } => self.try_create_process(*actor, *mode) == *result,
+            LaneOperation::CreateContinuation {
+                actor,
+                process,
+                spec,
+                result,
+            } => self.create_continuation(*actor, *process, spec.clone()) == *result,
+            LaneOperation::CreateFuture { actor, result } => {
+                self.create_future(*actor) == *result
+            }
+            LaneOperation::CreateObject {
+                actor,
+                kind,
+                bytes,
+                result,
+            } => self.create_object(*actor, *kind, bytes.clone()) == *result,
+            LaneOperation::WriteObject {
+                actor,
+                object,
+                growable,
+            } => {
+                if *growable {
+                    let _ = self.host_payload_mut(*actor, *object);
+                } else {
+                    let _ = self.object_bytes_mut(*actor, *object);
+                }
+                true
+            }
+            LaneOperation::EnqueueMessage {
+                actor,
+                receiver,
+                payload,
+                sender_continuation,
+                result,
+            } => {
+                self.enqueue_message(*actor, *receiver, *payload, *sender_continuation) == *result
+            }
+            LaneOperation::ReceiveMessage {
+                actor,
+                continuation,
+                result,
+            } => self.receive_message(*actor, *continuation) == *result,
+            LaneOperation::ResolveFuture {
+                actor,
+                future,
+                value,
+                result,
+            } => self.resolve_future(*actor, *future, *value) == *result,
+            LaneOperation::AwaitFuture {
+                actor,
+                continuation,
+                future,
+                next_run_class,
+                result,
+            } => {
+                self.await_future(*actor, *continuation, *future, *next_run_class) == *result
+            }
+        })
     }
 }
