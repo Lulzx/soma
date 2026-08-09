@@ -367,6 +367,7 @@ pub struct Kernel {
     /// back into that private frame and completes.
     frame_evaluators: HashMap<u32, crate::compiler::body::EvaluatorProgram>,
     resident_sync_programs: std::collections::BTreeMap<u32, resident_sync::KernelResidentProgram>,
+    resident_child_templates: Vec<resident_sync::KernelResidentChildTemplate>,
     pub(crate) frame_evaluator_effects: HashMap<u32, FrameEvaluatorEffect>,
     remote_lane_programs: HashMap<u32, crate::distributed::remote_lane_effect::RemoteLaneProgram>,
     remote_lane_emissions: Vec<crate::distributed::remote_lane_effect::KernelRemoteLaneEmission>,
@@ -482,6 +483,7 @@ impl Kernel {
             module_evaluators: HashMap::new(),
             frame_evaluators: HashMap::new(),
             resident_sync_programs: std::collections::BTreeMap::new(),
+            resident_child_templates: Vec::new(),
             frame_evaluator_effects: HashMap::new(),
             remote_lane_programs: HashMap::new(),
             remote_lane_emissions: Vec::new(),

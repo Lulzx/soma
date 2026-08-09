@@ -11,8 +11,8 @@
 use crate::scheduler::device::{DeviceLaneAccess, DEVICE_ACCESS_WRITE};
 use crate::scheduler::device_ops::{
     DeviceLaneOperation, DeviceOperationJournal, OP_AWAIT_FUTURE, OP_CHANNEL_RECEIVE,
-    OP_CHANNEL_SEND, OP_ENQUEUE_MESSAGE, OP_READ_OBJECT, OP_RECEIVE_MESSAGE, OP_RESOLVE_FUTURE,
-    OP_WRITE_OBJECT,
+    OP_CHANNEL_SEND, OP_ENQUEUE_MESSAGE, OP_PUBLISH_CHILD, OP_READ_OBJECT, OP_RECEIVE_MESSAGE,
+    OP_RESOLVE_FUTURE, OP_SUPERVISION_RECEIVE, OP_WRITE_OBJECT,
 };
 use std::collections::{BTreeMap, VecDeque};
 
@@ -20,6 +20,7 @@ pub const RESOURCE_OBJECT: u32 = 1;
 pub const RESOURCE_FUTURE: u32 = 2;
 pub const RESOURCE_MAILBOX: u32 = 3;
 pub const RESOURCE_CHANNEL: u32 = 4;
+pub const RESOURCE_PROCESS: u32 = 5;
 pub const RIGHT_READ: u32 = 1;
 pub const RIGHT_WRITE: u32 = 2;
 /// Hard device-plan bounds, checked before CPU cloning or Metal arena allocation.
@@ -67,6 +68,17 @@ pub enum ResidentEffect {
     ChannelReceive {
         target: u32,
     },
+    /// Publish one pre-registered child template into the resident frontier.
+    /// `target` is the dense child-template index; the child process and entry
+    /// continuation are created canonically by the Kernel import.
+    PublishChild {
+        target: u32,
+    },
+    /// Receive (or park for) one typed terminal notice from a direct child.
+    /// `target` is the dense local process index of the supervisor.
+    SupervisionReceive {
+        target: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +99,18 @@ pub enum ResidentOutcome {
     Full,
     Empty,
     DoubleResolve,
+    /// A child publication was accepted. Deliberately non-value-bearing so a
+    /// handler cannot observe its own publication.
+    Published,
+    /// A direct child's terminal notice was delivered.
+    Notice {
+        child: u64,
+        reason: u32,
+        failure_count: u32,
+    },
+    /// The supervisor's control queue had no notice, and the continuation
+    /// registered as its waiter.
+    NoNotice,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,6 +164,12 @@ pub const HANDLER_YIELD_IF_FRAME_ZERO_U64: u32 = 17;
 pub const HANDLER_EFFECT_CHANNEL_SEND: u32 = 18;
 /// Exact bounded channel receive; `target` is the dense channel index.
 pub const HANDLER_EFFECT_CHANNEL_RECEIVE: u32 = 19;
+/// Publish a pre-registered child template; `argument` is the dense template
+/// index and `value` is the exact little-endian supervisor process reference.
+pub const HANDLER_EFFECT_PUBLISH_CHILD: u32 = 20;
+/// Receive one direct-child terminal notice; `argument` is the dense local
+/// process index of the supervisor.
+pub const HANDLER_EFFECT_SUPERVISION_RECEIVE: u32 = 21;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResidentHandlerProgram {
@@ -159,6 +189,7 @@ fn previous_value(previous: &[ResidentOutcome]) -> Option<u64> {
         ResidentOutcome::Resolved(value)
         | ResidentOutcome::ObjectRead(value)
         | ResidentOutcome::Received { value, .. } => Some(value),
+        ResidentOutcome::Notice { child, .. } => Some(child),
         _ => None,
     })
 }
@@ -182,6 +213,7 @@ pub(crate) fn validate_handler_program(
                     | HANDLER_EFFECT_MAILBOX_RECEIVE
                     | HANDLER_EFFECT_CHANNEL_SEND
                     | HANDLER_EFFECT_CHANNEL_RECEIVE
+                    | HANDLER_EFFECT_SUPERVISION_RECEIVE
             )
         })
         .count();
@@ -207,7 +239,9 @@ pub(crate) fn validate_handler_program(
             | HANDLER_EFFECT_MAILBOX_SEND
             | HANDLER_EFFECT_MAILBOX_RECEIVE
             | HANDLER_EFFECT_CHANNEL_SEND
-            | HANDLER_EFFECT_CHANNEL_RECEIVE => {
+            | HANDLER_EFFECT_CHANNEL_RECEIVE
+            | HANDLER_EFFECT_PUBLISH_CHILD
+            | HANDLER_EFFECT_SUPERVISION_RECEIVE => {
                 let next_effects = effects.saturating_add(1);
                 if next_effects > max_effects {
                     return false;
@@ -325,6 +359,14 @@ fn execute_program(
             HANDLER_EFFECT_CHANNEL_RECEIVE => effects.push(ResidentEffect::ChannelReceive {
                 target: instruction.argument,
             }),
+            HANDLER_EFFECT_PUBLISH_CHILD => effects.push(ResidentEffect::PublishChild {
+                target: instruction.argument,
+            }),
+            HANDLER_EFFECT_SUPERVISION_RECEIVE => {
+                effects.push(ResidentEffect::SupervisionReceive {
+                    target: instruction.argument,
+                })
+            }
             HANDLER_STORE_IMMEDIATE_U64 | HANDLER_STORE_PREVIOUS_VALUE_U64 => {
                 let at = instruction.argument as usize;
                 let end = at.checked_add(8)?;
@@ -459,7 +501,42 @@ pub struct ResidentObjectCapability {
     pub object_version: u32,
     pub valid_until_epoch: u32,
 }
+
+/// One pre-registered direct child. The Kernel bridge turns this into a fresh
+/// supervised process and its entry continuation at the canonical publication
+/// position; the standalone oracle only records the publication.
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResidentChildTemplate {
+    /// `ProcessMode` code (Serial=1, Pure=2, System=3).
+    pub mode: u32,
+    /// Exact little-endian supervisor process reference.
+    pub supervisor: u64,
+    pub run_class: u32,
+    /// `StateAccess` code (ReadOnly=1, Mutable=2).
+    pub state_access: u32,
+    pub max_steps: u32,
+    pub frame: Vec<u8>,
+}
+
+/// Canonical child publication produced by one lane in one epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidentChildPublicationRecord {
+    pub epoch: u32,
+    pub lane: u32,
+    pub ordinal: u32,
+    pub parent: u64,
+    pub template: u32,
+}
+
+/// One typed terminal notice on a supervisor's control queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidentSupervisionNoticeRecord {
+    pub child: u64,
+    pub reason: u32,
+    pub failure_count: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResidentSyncConfig {
     pub max_epochs: u32,
     pub max_effects_per_step: u32,
@@ -482,6 +559,19 @@ pub struct ResidentSyncConfig {
     /// Canonical FIFO `(sender, value)` entries present at the resident boundary.
     /// The outer vector is exactly parallel to `channel_capacities`.
     pub channel_messages: Vec<Vec<(u64, u64)>>,
+    /// Exact local process references. The outer supervision result vectors
+    /// are exactly parallel to this and to `mailbox_capacities`.
+    pub process_ids: Vec<u64>,
+    /// Exact FIFO terminal notices present at the resident boundary, parallel
+    /// to `process_ids`.
+    pub initial_supervision_notices: Vec<Vec<ResidentSupervisionNoticeRecord>>,
+    /// Exact FIFO supervision waiters present at the resident boundary,
+    /// parallel to `process_ids`.
+    pub initial_supervision_waiters: Vec<Vec<u64>>,
+    /// Child continuation id -> dense local process index of its supervisor.
+    pub supervisors: BTreeMap<u64, u32>,
+    /// Pre-registered child templates addressable by `PublishChild`.
+    pub child_templates: Vec<ResidentChildTemplate>,
     pub capabilities: Vec<ResidentCapability>,
 }
 
@@ -526,6 +616,8 @@ pub struct ResidentFinalContinuation {
     pub id: u64,
     pub run_class: u32,
     pub completed: bool,
+    /// Whether the continuation was ever published into the resident frontier.
+    pub published: bool,
     pub pending: Option<ResidentEffect>,
     /// Monotonic registration ticket used to reconstruct mailbox FIFO waiters.
     pub waiter_order: u32,
@@ -583,6 +675,14 @@ pub struct ResidentSyncResult {
     pub invocations: Vec<ResidentInvocationRecord>,
     pub wakes: Vec<ResidentWakeRecord>,
     pub epoch_records: Vec<ResidentEpochRecord>,
+    /// Extra runnable continuations created by waking supervisors whose
+    /// waiters are outside this resident plan, per logical epoch.
+    pub external_wakes: Vec<u32>,
+    pub published_children: Vec<ResidentChildPublicationRecord>,
+    /// Exact FIFO terminal notices per local process.
+    pub supervision_notices: Vec<Vec<ResidentSupervisionNoticeRecord>>,
+    /// Exact FIFO supervision waiters (continuation ids) per local process.
+    pub supervision_waiters: Vec<Vec<u64>>,
 }
 
 #[derive(Clone)]
@@ -610,6 +710,10 @@ struct Chan {
     receivers: Vec<u64>,
     senders: Vec<u64>,
 }
+struct Supervision {
+    notices: VecDeque<ResidentSupervisionNoticeRecord>,
+    waiters: VecDeque<u64>,
+}
 
 fn opcode(e: ResidentEffect) -> u32 {
     match e {
@@ -622,6 +726,8 @@ fn opcode(e: ResidentEffect) -> u32 {
         ResidentEffect::MailboxReceive { .. } => OP_RECEIVE_MESSAGE,
         ResidentEffect::ChannelSend { .. } => crate::scheduler::device_ops::OP_CHANNEL_SEND,
         ResidentEffect::ChannelReceive { .. } => crate::scheduler::device_ops::OP_CHANNEL_RECEIVE,
+        ResidentEffect::PublishChild { .. } => OP_PUBLISH_CHILD,
+        ResidentEffect::SupervisionReceive { .. } => OP_SUPERVISION_RECEIVE,
     }
 }
 fn target(e: ResidentEffect) -> u32 {
@@ -634,7 +740,9 @@ fn target(e: ResidentEffect) -> u32 {
         | ResidentEffect::MailboxSend { target, .. }
         | ResidentEffect::MailboxReceive { target }
         | ResidentEffect::ChannelSend { target, .. }
-        | ResidentEffect::ChannelReceive { target } => target,
+        | ResidentEffect::ChannelReceive { target }
+        | ResidentEffect::SupervisionReceive { target } => target,
+        ResidentEffect::PublishChild { target } => target,
     }
 }
 fn resource(e: ResidentEffect) -> u32 {
@@ -649,6 +757,8 @@ fn resource(e: ResidentEffect) -> u32 {
         ResidentEffect::ChannelSend { .. } | ResidentEffect::ChannelReceive { .. } => {
             RESOURCE_CHANNEL
         }
+        ResidentEffect::PublishChild { .. } => RESOURCE_PROCESS,
+        ResidentEffect::SupervisionReceive { .. } => RESOURCE_PROCESS,
     }
 }
 fn required_right(e: ResidentEffect) -> u32 {
@@ -658,23 +768,23 @@ fn required_right(e: ResidentEffect) -> u32 {
         ResidentEffect::FutureObserve { .. }
         | ResidentEffect::FutureAwait { .. }
         | ResidentEffect::MailboxReceive { .. }
-        | ResidentEffect::ChannelReceive { .. } => RIGHT_READ,
+        | ResidentEffect::ChannelReceive { .. }
+        | ResidentEffect::SupervisionReceive { .. } => RIGHT_READ,
         _ => RIGHT_WRITE,
     }
 }
 fn outcome_code(o: ResidentOutcome) -> u32 {
     match o {
         ResidentOutcome::ObjectRead(_) => 2,
-        ResidentOutcome::ObjectWritten => 0,
+        ResidentOutcome::ObjectWritten | ResidentOutcome::Sent | ResidentOutcome::Published => 0,
         ResidentOutcome::Resolved(_) => 2,
-        ResidentOutcome::Pending => 1,
+        ResidentOutcome::Pending | ResidentOutcome::Empty | ResidentOutcome::NoNotice => 1,
         ResidentOutcome::Registered => 3,
-        ResidentOutcome::Sent => 0,
         ResidentOutcome::Received { .. } => 2,
+        ResidentOutcome::Notice { .. } => 2,
         ResidentOutcome::CapabilityDenied => 0x104,
         ResidentOutcome::InvalidTarget => 0x101,
         ResidentOutcome::Full => 0x10c,
-        ResidentOutcome::Empty => 1,
         ResidentOutcome::DoubleResolve => 0x111,
     }
 }
@@ -732,10 +842,26 @@ pub fn run_resident_sync(
             .iter()
             .zip(&config.channel_capacities)
             .any(|(messages, capacity)| messages.len() > *capacity as usize)
+        || config.initial_supervision_notices.len() != config.process_ids.len()
+        || config.initial_supervision_waiters.len() != config.process_ids.len()
+        || config.supervisors.values().any(|process| {
+            *process as usize >= config.process_ids.len()
+                || config
+                    .child_templates
+                    .iter()
+                    .any(|template| template.supervisor != config.process_ids[*process as usize])
+        })
         || continuations.len() > config.max_continuations as usize
         || continuations.iter().any(|continuation| {
             continuation.frame.len() > config.max_frame_bytes as usize
                 || !handlers.contains_key(&continuation.run_class)
+        })
+        || config.child_templates.iter().any(|template| {
+            template.frame.len() > config.max_frame_bytes as usize
+                || !handlers.contains_key(&template.run_class)
+                || template.max_steps == 0
+                || template.mode == 0
+                || template.supervisor == 0
         })
         || handlers.iter().any(|(run_class, program)| {
             *run_class != program.run_class
@@ -798,6 +924,23 @@ pub fn run_resident_sync(
             senders: vec![],
         })
         .collect();
+    let mut sv: Vec<Supervision> = config
+        .process_ids
+        .iter()
+        .enumerate()
+        .map(|(index, _)| Supervision {
+            notices: config
+                .initial_supervision_notices
+                .get(index)
+                .map(|notices| notices.iter().copied().collect())
+                .unwrap_or_default(),
+            waiters: config
+                .initial_supervision_waiters
+                .get(index)
+                .map(|waiters| waiters.iter().copied().collect())
+                .unwrap_or_default(),
+        })
+        .collect();
     let allowed = |actor: u64, kind: u32, t: u32, right: u32| {
         config.capabilities.iter().any(|c| {
             c.actor == actor && c.resource_kind == kind && c.target == t && (c.rights & right) != 0
@@ -821,6 +964,7 @@ pub fn run_resident_sync(
     let mut result = ResidentSyncResult::default();
     let mut waiter_order = 0u32;
     for epoch in 0..config.max_epochs {
+        let mut external_this_epoch = 0u32;
         let mut mutable_winners: BTreeMap<u64, (u32, u64)> = BTreeMap::new();
         for continuation in cs
             .values()
@@ -922,6 +1066,13 @@ pub fn run_resident_sync(
                         right,
                         config.initial_epoch.saturating_add(epoch),
                     ),
+                    ResidentEffect::PublishChild { target } => config
+                        .child_templates
+                        .get(target as usize)
+                        .is_some_and(|template| template.supervisor == actor),
+                    ResidentEffect::SupervisionReceive { target } => {
+                        config.process_ids.get(target as usize) == Some(&actor)
+                    }
                     _ => allowed(actor, kind, t, right),
                 };
                 let outcome = if !authorized {
@@ -1158,12 +1309,68 @@ pub fn run_resident_sync(
                                 }
                             }
                         }
+                        ResidentEffect::PublishChild { target } => {
+                            if config
+                                .child_templates
+                                .get(target as usize)
+                                .is_some_and(|template| template.supervisor == actor)
+                            {
+                                result
+                                    .published_children
+                                    .push(ResidentChildPublicationRecord {
+                                        epoch,
+                                        lane,
+                                        ordinal: ord as u32,
+                                        parent: id,
+                                        template: target,
+                                    });
+                                ResidentOutcome::Published
+                            } else {
+                                ResidentOutcome::CapabilityDenied
+                            }
+                        }
+                        ResidentEffect::SupervisionReceive { target } => {
+                            if config.process_ids.get(target as usize) != Some(&actor) {
+                                ResidentOutcome::CapabilityDenied
+                            } else if let Some(notice) = sv
+                                .get_mut(target as usize)
+                                .and_then(|s| s.notices.pop_front())
+                            {
+                                ResidentOutcome::Notice {
+                                    child: notice.child,
+                                    reason: notice.reason,
+                                    failure_count: notice.failure_count,
+                                }
+                            } else {
+                                match sv.get_mut(target as usize) {
+                                    Some(s) => {
+                                        if !s.waiters.contains(&id) {
+                                            s.waiters.push_back(id)
+                                        }
+                                        cs.get_mut(&id).unwrap().pending = Some(e);
+                                        parked = true;
+                                        waiter_order = waiter_order.saturating_add(1);
+                                        cs.get_mut(&id).unwrap().waiter_order = waiter_order;
+                                        ResidentOutcome::NoNotice
+                                    }
+                                    None => ResidentOutcome::InvalidTarget,
+                                }
+                            }
+                        }
                     }
                 };
                 result.accesses.push(DeviceLaneAccess::new(
                     lane,
                     kind,
-                    u64::from(t),
+                    if matches!(
+                        e,
+                        ResidentEffect::PublishChild { .. }
+                            | ResidentEffect::SupervisionReceive { .. }
+                    ) {
+                        actor
+                    } else {
+                        u64::from(t)
+                    },
                     if matches!(
                         e,
                         ResidentEffect::FutureObserve { .. } | ResidentEffect::ObjectRead { .. }
@@ -1202,6 +1409,7 @@ pub fn run_resident_sync(
                     result_ref: match outcome {
                         ResidentOutcome::ObjectRead(v) | ResidentOutcome::Resolved(v) => v,
                         ResidentOutcome::Received { value, .. } => value,
+                        ResidentOutcome::Notice { child, .. } => child,
                         _ => 0,
                     },
                     ..Default::default()
@@ -1224,7 +1432,10 @@ pub fn run_resident_sync(
                 });
                 if !matches!(
                     outcome,
-                    ResidentOutcome::Registered | ResidentOutcome::Full | ResidentOutcome::Empty
+                    ResidentOutcome::Registered
+                        | ResidentOutcome::Full
+                        | ResidentOutcome::Empty
+                        | ResidentOutcome::NoNotice
                 ) {
                     cs.get_mut(&id).unwrap().previous.push(outcome)
                 }
@@ -1242,6 +1453,7 @@ pub fn run_resident_sync(
                 }
             }
             let c = cs.get_mut(&id).unwrap();
+            let mut completed_now = false;
             if !parked {
                 match disp {
                     ResidentDisposition::Yield(rc) => {
@@ -1250,7 +1462,47 @@ pub fn run_resident_sync(
                     }
                     ResidentDisposition::Complete => {
                         c.completed = true;
-                        result.completed.push(id)
+                        result.completed.push(id);
+                        completed_now = true;
+                    }
+                }
+            }
+            let _ = c;
+            if completed_now {
+                if let Some(&supervisor) = config.supervisors.get(&id) {
+                    let reason = 1; // ExitReason::Completed
+                    if let Some(s) = sv.get_mut(supervisor as usize) {
+                        let child_process = cs[&id].spec.actor;
+                        s.notices.push_back(ResidentSupervisionNoticeRecord {
+                            child: child_process,
+                            reason,
+                            failure_count: 0,
+                        });
+                        if let Some(w) = s.waiters.pop_front() {
+                            if let Some(c) = cs.get_mut(&w) {
+                                result.wakes.push(ResidentWakeRecord {
+                                    epoch,
+                                    lane,
+                                    cause_opcode: OP_SUPERVISION_RECEIVE,
+                                    target: supervisor,
+                                    continuation: w,
+                                    run_class: c.spec.run_class,
+                                    ticket: c.waiter_order,
+                                    ordinal: 0,
+                                    cause_continuation: id,
+                                    reserved: 0,
+                                });
+                                c.runnable = true;
+                                c.pending = None;
+                                c.previous.push(ResidentOutcome::Notice {
+                                    child: child_process,
+                                    reason,
+                                    failure_count: 0,
+                                });
+                            } else {
+                                external_this_epoch = external_this_epoch.saturating_add(1);
+                            }
+                        }
                     }
                 }
             }
@@ -1259,9 +1511,15 @@ pub fn run_resident_sync(
         result.epoch_records.push(ResidentEpochRecord {
             epoch,
             invocations: lanes.len() as u32,
-            runnable_after: cs.values().filter(|c| c.runnable && !c.completed).count() as u32,
+            runnable_after: cs.values().filter(|c| c.runnable && !c.completed).count() as u32
+                + result
+                    .published_children
+                    .iter()
+                    .filter(|publication| publication.epoch == epoch)
+                    .count() as u32,
             completed_after: cs.values().filter(|c| c.completed).count() as u32,
         });
+        result.external_wakes.push(external_this_epoch);
     }
     result.quiescent = cs.values().all(|c| !c.runnable || c.completed);
     result.final_continuations = cs
@@ -1270,6 +1528,7 @@ pub fn run_resident_sync(
             id: c.spec.id,
             run_class: c.spec.run_class,
             completed: c.completed,
+            published: true,
             pending: c.pending,
             waiter_order: c.pending.map_or(0, |_| c.waiter_order),
         })
@@ -1284,6 +1543,14 @@ pub fn run_resident_sync(
     result.channels = chs
         .into_iter()
         .map(|ch| ch.queue.into_iter().collect())
+        .collect();
+    result.supervision_notices = sv
+        .iter()
+        .map(|s| s.notices.iter().copied().collect())
+        .collect();
+    result.supervision_waiters = sv
+        .iter()
+        .map(|s| s.waiters.iter().copied().collect())
         .collect();
     Some(result)
 }
@@ -1353,6 +1620,7 @@ mod tests {
                 cap(10, RESOURCE_FUTURE, 0, RIGHT_READ),
                 cap(20, RESOURCE_FUTURE, 0, RIGHT_WRITE),
             ],
+            ..Default::default()
         };
         let mut hs: BTreeMap<u32, ResidentHandlerProgram> = BTreeMap::new();
         hs.insert(
@@ -1476,6 +1744,7 @@ mod tests {
                 cap(10, RESOURCE_MAILBOX, 0, RIGHT_READ),
                 cap(20, RESOURCE_MAILBOX, 0, RIGHT_WRITE),
             ],
+            ..Default::default()
         };
         let mut programs = BTreeMap::new();
         programs.insert(
@@ -1603,6 +1872,7 @@ mod tests {
             channel_capacities: vec![],
             channel_messages: vec![],
             capabilities: vec![cap(7, RESOURCE_FUTURE, 0, RIGHT_WRITE)],
+            ..Default::default()
         };
         let mut programs = BTreeMap::new();
         // The resolve emitted here must not make the following IF true in the
@@ -1760,6 +2030,7 @@ mod tests {
                 // explicit governed invalid-target outcome rather than denial.
                 cap(7, RESOURCE_FUTURE, 9, RIGHT_READ),
             ],
+            ..Default::default()
         };
         let mut programs = BTreeMap::new();
         for (run_class, target) in [(10, 0), (11, 1), (12, 0), (13, 9)] {
@@ -1913,6 +2184,7 @@ mod tests {
                 cap(7, RESOURCE_FUTURE, 9, RIGHT_WRITE),
                 cap(7, RESOURCE_MAILBOX, 0, RIGHT_READ | RIGHT_WRITE),
             ],
+            ..Default::default()
         };
         let mut programs = BTreeMap::new();
         programs.insert(

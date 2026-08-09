@@ -20,6 +20,10 @@ pub const OP_RESOLVE_FUTURE: u32 = 10;
 pub const OP_AWAIT_FUTURE: u32 = 11;
 pub const OP_CHANNEL_SEND: u32 = 12;
 pub const OP_CHANNEL_RECEIVE: u32 = 13;
+/// Publish a pre-registered child continuation into the resident frontier.
+pub const OP_PUBLISH_CHILD: u32 = 14;
+/// Receive (or park for) one typed direct-child terminal notice.
+pub const OP_SUPERVISION_RECEIVE: u32 = 15;
 /// All opcodes the speculative expand workload can emit (channel operations
 /// are resident-sync vocabulary and live above this mask).
 pub const ALL_OPERATION_KINDS: u32 = (1 << OP_AWAIT_FUTURE) - 1;

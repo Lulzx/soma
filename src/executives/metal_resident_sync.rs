@@ -43,6 +43,9 @@ struct GpuConfig {
     object_count: u32,
     object_capability_count: u32,
     object_stride: u32,
+    child_count: u32,
+    process_count: u32,
+    supervision_stride: u32,
     initial_epoch: u32,
 }
 #[repr(C)]
@@ -58,6 +61,7 @@ struct GpuContinuation {
     pending_opcode: u32,
     pending_target: u32,
     reserved: u32,
+    supervisor: u32,
     mutable_access: u32,
     waiting_since: u32,
     actor_next: u32,
@@ -116,6 +120,32 @@ struct GpuObjectCapability {
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
+struct GpuSupervision {
+    actor: u64,
+    head: u32,
+    count: u32,
+    wait_head: u32,
+    wait_count: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GpuSupervisionEntry {
+    child: u64,
+    reason: u32,
+    failure_count: u32,
+    reserved: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GpuChildTemplate {
+    supervisor: u64,
+    mode: u32,
+    run_class: u32,
+    state_access: u32,
+    reserved: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct GpuCapability {
     actor: u64,
     kind: u32,
@@ -171,8 +201,8 @@ struct GpuStatus {
 const SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
-struct Config { uint continuation_count, handler_count, instruction_count, future_count; uint mailbox_count, channel_count, capability_count, max_epochs, max_effects; uint frame_stride, effect_capacity, trace_capacity, mailbox_stride, channel_stride; uint invocation_capacity,wake_capacity,epoch_capacity,object_count; uint object_capability_count,object_stride,initial_epoch; };
-struct Cont { ulong id, actor; uint run_class, frame_len, state, last_epoch; uint previous_kind, pending_opcode, pending_target, reserved; uint mutable_access,waiting_since,actor_next,actor_head,admitted,reserved2; ulong previous_value, previous_sender, pending_value; };
+struct Config { uint continuation_count, handler_count, instruction_count, future_count; uint mailbox_count, channel_count, capability_count, max_epochs, max_effects; uint frame_stride, effect_capacity, trace_capacity, mailbox_stride, channel_stride; uint invocation_capacity,wake_capacity,epoch_capacity,object_count; uint object_capability_count,object_stride,child_count; uint process_count,supervision_stride,initial_epoch; };
+struct Cont { ulong id, actor; uint run_class, frame_len, state, last_epoch; uint previous_kind, pending_opcode, pending_target, reserved; uint supervisor, mutable_access,waiting_since,actor_next,actor_head,admitted,reserved2; ulong previous_value, previous_sender, pending_value; };
 struct Handler { uint run_class, instruction_offset, instruction_count, reserved; };
 struct Instruction { uint opcode, argument, target, reserved; ulong value; };
 struct Future { uint resolved, reserved; ulong value; };
@@ -181,6 +211,9 @@ struct MailEntry { ulong sender, value; };
 struct Capability { ulong actor; uint kind, target, rights, reserved; };
 struct Object { uint len,version; };
 struct ObjectCapability { ulong actor,offset,length; uint target,rights,object_version,valid_until_epoch; };
+struct Supervision { ulong actor; uint head,count,wait_head,wait_count; };
+struct SupervisionEntry { ulong child; uint reason,failure_count,reserved; };
+struct ChildTemplate { ulong supervisor; uint mode,run_class,state_access,reserved; };
 struct EffectRecord { uint epoch, lane, ordinal, opcode; ulong continuation; uint target, outcome; ulong value, result_value, result_sender; uint run_class, reserved; };
 struct Trace { uint epoch, lane; ulong continuation; uint run_class, event, word; };
 struct Status { uint effect_count, trace_count, completed_count, epochs; uint quiescent,error,invocation_count,wake_count; uint epoch_count,ticket,reserved0,reserved1; };
@@ -189,10 +222,10 @@ struct Invocation { uint epoch,lane; ulong continuation; uint run_class,disposit
 struct Wake { uint epoch,lane,cause_opcode,target; ulong cause_continuation,continuation; uint run_class,ticket,ordinal,reserved; };
 struct EpochRecord { uint epoch,invocations,runnable_after,completed_after; };
 constant uint RUNNABLE=1, PARKED=2, COMPLETE=3;
-constant uint AWAIT=1, RESOLVE=2, SEND=3, RECEIVE=4, OBSERVE=10, OBJECT_READ=11, OBJECT_WRITE=12, ADD_FRAME=13, COMPLETE_IF_FRAME_EQ=14, YIELD_FRAME=15, ADD_FRAME_WORD=16, YIELD_IF_FRAME_ZERO=17, CHANNEL_SEND=18, CHANNEL_RECEIVE=19;
-constant uint OUT_RESOLVED=1, OUT_REGISTERED=2, OUT_SENT=3, OUT_RECEIVED=4, OUT_DENIED=5, OUT_INVALID=6, OUT_FULL=7, OUT_EMPTY=8, OUT_DOUBLE=9, OUT_PENDING=10, OUT_OBJECT_READ=11, OUT_OBJECT_WRITTEN=12;
-inline uint outcome_code(uint o) { if(o==OUT_RESOLVED||o==OUT_RECEIVED||o==OUT_OBJECT_READ)return 2; if(o==OUT_REGISTERED)return 3; if(o==OUT_EMPTY||o==OUT_PENDING)return 1; if(o==OUT_INVALID)return 0x101; if(o==OUT_DENIED)return 0x104; if(o==OUT_FULL)return 0x10c; if(o==OUT_DOUBLE)return 0x111; return 0; }
-inline uint journal_opcode(uint op) { return op==OBJECT_READ?2:(op==OBJECT_WRITE?7:(op==OBSERVE?1:(op==AWAIT?11:(op==RESOLVE?10:(op==CHANNEL_SEND?12:(op==CHANNEL_RECEIVE?13:(op==SEND?8:9))))))); }
+constant uint AWAIT=1, RESOLVE=2, SEND=3, RECEIVE=4, OBSERVE=10, OBJECT_READ=11, OBJECT_WRITE=12, ADD_FRAME=13, COMPLETE_IF_FRAME_EQ=14, YIELD_FRAME=15, ADD_FRAME_WORD=16, YIELD_IF_FRAME_ZERO=17, CHANNEL_SEND=18, CHANNEL_RECEIVE=19, PUBLISH_CHILD=20, SUPERVISION_RECEIVE=21;
+constant uint OUT_RESOLVED=1, OUT_REGISTERED=2, OUT_SENT=3, OUT_RECEIVED=4, OUT_DENIED=5, OUT_INVALID=6, OUT_FULL=7, OUT_EMPTY=8, OUT_DOUBLE=9, OUT_PENDING=10, OUT_OBJECT_READ=11, OUT_OBJECT_WRITTEN=12, OUT_PUBLISHED=13, OUT_NOTICE=14, OUT_NO_NOTICE=15;
+inline uint outcome_code(uint o) { if(o==OUT_RESOLVED||o==OUT_RECEIVED||o==OUT_OBJECT_READ||o==OUT_NOTICE)return 2; if(o==OUT_REGISTERED)return 3; if(o==OUT_EMPTY||o==OUT_PENDING||o==OUT_NO_NOTICE)return 1; if(o==OUT_INVALID)return 0x101; if(o==OUT_DENIED)return 0x104; if(o==OUT_FULL)return 0x10c; if(o==OUT_DOUBLE)return 0x111; return 0; }
+inline uint journal_opcode(uint op) { return op==OBJECT_READ?2:(op==OBJECT_WRITE?7:(op==OBSERVE?1:(op==AWAIT?11:(op==RESOLVE?10:(op==CHANNEL_SEND?12:(op==CHANNEL_RECEIVE?13:(op==PUBLISH_CHILD?14:(op==SUPERVISION_RECEIVE?15:(op==SEND?8:9))))))))); }
 inline uint hash_frame(device uchar* f,uint n){uint h=2166136261u;for(uint i=0;i<n;i++)h=(h^uint(f[i]))*16777619u;return h;}
 inline bool allowed(device const Capability* caps,uint n,ulong actor,uint kind,uint target,uint right){for(uint i=0;i<n;i++){Capability c=caps[i];if(c.actor==actor&&c.kind==kind&&c.target==target&&(c.rights&right)!=0)return true;}return false;}
 inline bool object_allowed(device const ObjectCapability* caps,uint n,device const Object* objects,uint object_count,ulong actor,uint target,uint offset,uint right,uint epoch){if(target>=object_count)return false;ulong end=ulong(offset)+8;for(uint i=0;i<n;i++){ObjectCapability c=caps[i];if(c.actor==actor&&c.target==target&&(c.rights&right)!=0&&c.object_version==objects[target].version&&c.valid_until_epoch>=epoch&&ulong(offset)>=c.offset&&end>=ulong(offset)&&end<=c.offset+c.length)return true;}return false;}
@@ -200,11 +233,12 @@ inline void add_trace(device Trace* traces,device Status* s,constant Config& cfg
 inline void add_wake(device Wake* wakes,device Status* s,constant Config& cfg,uint epoch,uint lane,uint cause,uint target,ulong cause_continuation,uint ordinal,Cont c){if(s->wake_count>=cfg.wake_capacity){s->error=8;return;}Wake w={epoch,lane,cause,target,cause_continuation,c.id,c.run_class,c.reserved,ordinal,0};wakes[s->wake_count++]=w;}
 inline void wake_future(device Cont* cs,uint n,uint target,ulong value,uint epoch,uint lane,ulong cause_continuation,uint ordinal,device Wake* wakes,device Status* s,constant Config& cfg){while(true){uint best=0xffffffffu;for(uint i=0;i<n;i++)if(cs[i].state==PARKED&&cs[i].pending_opcode==AWAIT&&cs[i].pending_target==target&&(best==0xffffffffu||cs[i].reserved<cs[best].reserved||(cs[i].reserved==cs[best].reserved&&cs[i].id<cs[best].id)))best=i;if(best==0xffffffffu)break;add_wake(wakes,s,cfg,epoch,lane,10,target,cause_continuation,ordinal,cs[best]);cs[best].state=RUNNABLE;cs[best].last_epoch=epoch;cs[best].pending_opcode=0;cs[best].previous_kind=OUT_RESOLVED;cs[best].previous_value=value;}}
 inline void wake_one(device Cont* cs,uint n,uint opcode,uint target,uint epoch,uint lane,uint cause,ulong cause_continuation,uint ordinal,device Wake* wakes,device Status* s,constant Config& cfg){uint best=0xffffffffu;for(uint i=0;i<n;i++)if(cs[i].state==PARKED&&cs[i].pending_opcode==opcode&&cs[i].pending_target==target&&(best==0xffffffffu||cs[i].reserved<cs[best].reserved||(cs[i].reserved==cs[best].reserved&&cs[i].id<cs[best].id)))best=i;if(best!=0xffffffffu){add_wake(wakes,s,cfg,epoch,lane,cause,target,cause_continuation,ordinal,cs[best]);cs[best].state=RUNNABLE;cs[best].last_epoch=epoch;}}
+inline uint notify_supervisor(device Cont* cs,device Supervision* sups,device ulong* waiters,device SupervisionEntry* entries,device Wake* wakes,device Status* s,constant Config& cfg,uint supervisor,ulong child,uint epoch,uint lane,uint ordinal){if(supervisor==0xffffffffu||supervisor>=cfg.process_count)return 0;Supervision q=sups[supervisor];if(q.count>=cfg.supervision_stride){s->error=11;return 0;}uint slot=supervisor*cfg.supervision_stride+(q.head+q.count)%cfg.supervision_stride;SupervisionEntry e={child,1,0,0};entries[slot]=e;q.count++;if(q.wait_count>0){uint wslot=supervisor*cfg.supervision_stride+q.wait_head%cfg.supervision_stride;ulong waiter=waiters[wslot];q.wait_head=(q.wait_head+1)%cfg.supervision_stride;q.wait_count--;sups[supervisor]=q;uint at=0xffffffffu;for(uint i=0;i<cfg.continuation_count;i++)if(cs[i].id==waiter){at=i;break;}if(at!=0xffffffffu){Cont c=cs[at];add_wake(wakes,s,cfg,epoch,lane,SUPERVISION_RECEIVE,supervisor,child,ordinal,c);c.state=RUNNABLE;c.last_epoch=epoch;c.pending_opcode=0;c.previous_kind=OUT_NOTICE;c.previous_value=child;c.previous_sender=1;cs[at]=c;return 0;}return 1;}else{sups[supervisor]=q;}return 0;}
 kernel void resident_sync(
  constant Config& cfg [[buffer(0)]], device Cont* cs [[buffer(1)]], device uchar* frames [[buffer(2)]],
  device const Handler* handlers [[buffer(3)]], device const Instruction* ins [[buffer(4)]], device Future* futures [[buffer(5)]],
  device Mailbox* mails [[buffer(6)]], device MailEntry* entries [[buffer(7)]], device const Capability* caps [[buffer(8)]],
- device EffectRecord* records [[buffer(9)]], device Trace* traces [[buffer(10)]], device ulong* completed [[buffer(11)]], device Status* status [[buffer(12)]], device Stage* stages [[buffer(13)]], device Invocation* invocations [[buffer(14)]], device Wake* wakes [[buffer(15)]], device EpochRecord* epoch_records [[buffer(16)]], device Object* objects [[buffer(17)]], device uchar* object_bytes [[buffer(18)]], device const ObjectCapability* object_caps [[buffer(19)]], device EffectRecord* scratch [[buffer(20)]], device uint* evaluation_counts [[buffer(21)]], device Mailbox* chans [[buffer(22)]], device MailEntry* chan_entries [[buffer(23)]], uint tid [[thread_index_in_threadgroup]], uint3 tpg [[threads_per_threadgroup]]) {
+device EffectRecord* records [[buffer(9)]], device Trace* traces [[buffer(10)]], device ulong* completed [[buffer(11)]], device Status* status [[buffer(12)]], device Stage* stages [[buffer(13)]], device Invocation* invocations [[buffer(14)]], device Wake* wakes [[buffer(15)]], device EpochRecord* epoch_records [[buffer(16)]], device Object* objects [[buffer(17)]], device uchar* object_bytes [[buffer(18)]], device const ObjectCapability* object_caps [[buffer(19)]], device EffectRecord* scratch [[buffer(20)]], device uint* evaluation_counts [[buffer(21)]], device Mailbox* chans [[buffer(22)]], device MailEntry* chan_entries [[buffer(23)]], device Supervision* sups [[buffer(24)]], device SupervisionEntry* sup_entries [[buffer(25)]], device ulong* sup_waiters [[buffer(26)]], device const ChildTemplate* child_templates [[buffer(27)]], device uint* external_wakes [[buffer(28)]], uint tid [[thread_index_in_threadgroup]], uint3 tpg [[threads_per_threadgroup]]) {
  threadgroup uint selected[32];
  threadgroup uint cohort_count;
  threadgroup uint epoch_lanes;
@@ -212,13 +246,14 @@ kernel void resident_sync(
  threadgroup uint selection_cursor;
  threadgroup uint selection_class_active;
  threadgroup uint stop;
+ threadgroup uint external_wake_count;
  if(tid==0){Status s={0,0,0,0,0,0,0,0,0,0,0,0};*status=s;stop=0;}
  evaluation_counts[tid]=0;
  threadgroup_barrier(mem_flags::mem_device|mem_flags::mem_threadgroup);
  if(cfg.continuation_count==0){if(tid==0)status->quiescent=1;return;}
  for(uint epoch=0;epoch<cfg.max_epochs;epoch++){
   if(tid==0){
-   epoch_lanes=0;selection_class_active=0;selection_cursor=0;
+   epoch_lanes=0;selection_class_active=0;selection_cursor=0;external_wake_count=0;
    for(uint i=0;i<cfg.continuation_count;i++)cs[i].admitted=cs[i].mutable_access==0?1:0;
    for(uint i=0;i<cfg.continuation_count;i++)if(cs[i].actor_head!=0){
     uint best=0xffffffffu;
@@ -278,7 +313,7 @@ kernel void resident_sync(
       if(op==7){if((input_previous_kind!=OUT_RESOLVED&&input_previous_kind!=OUT_RECEIVED&&input_previous_kind!=OUT_OBJECT_READ)||input_previous_value!=val)pc+=arg;continue;}
       if(op==8){disposition=1;next_class=arg;break;}if(op==YIELD_FRAME){if(arg+4>c.frame_len){error=4;break;}next_class=0;for(uint bb=0;bb<4;bb++)next_class|=uint(frames[at*cfg.frame_stride+arg+bb])<<(bb*8);if(next_class==0){error=4;break;}disposition=1;break;}if(op==YIELD_IF_FRAME_ZERO){if(arg+8>c.frame_len){error=4;break;}ulong predicate=0;for(uint bb=0;bb<8;bb++)predicate|=ulong(frames[at*cfg.frame_stride+arg+bb])<<(bb*8);next_class=predicate==0?uint(val):uint(val>>32);if(next_class==0){error=4;break;}disposition=1;break;}if(op==9){disposition=2;next_class=0;break;}
      }
-     if(!((op>=1&&op<=4)||op==OBSERVE||op==OBJECT_READ||op==OBJECT_WRITE||op==CHANNEL_SEND||op==CHANNEL_RECEIVE)||emitted>=cfg.max_effects){error=5;break;}
+     if(!((op>=1&&op<=4)||op==OBSERVE||op==OBJECT_READ||op==OBJECT_WRITE||op==CHANNEL_SEND||op==CHANNEL_RECEIVE||op==PUBLISH_CHILD||op==SUPERVISION_RECEIVE)||emitted>=cfg.max_effects){error=5;break;}
      uint scratch_at=lane*cfg.max_effects+emitted;
      EffectRecord r={epoch,lane,emitted,journal_opcode(op),c.id,target,0,val,0,0,c.run_class,(op==OBJECT_READ||op==OBJECT_WRITE)?arg:0};scratch[scratch_at]=r;emitted++;
     }
@@ -314,11 +349,11 @@ kernel void resident_sync(
   if(tid==0)for(uint li=0;li<epoch_lanes;li++){
    Stage st=stages[li];Cont c=cs[st.continuation_index];bool parked=false;
    for(uint ri=st.effect_offset;ri<st.effect_offset+st.effect_count;ri++){
-    EffectRecord r=records[ri];uint ch=(r.opcode==12||r.opcode==13);uint op=r.opcode==2?OBJECT_READ:(r.opcode==7?OBJECT_WRITE:(r.opcode==1?OBSERVE:(r.opcode==11?AWAIT:(r.opcode==10?RESOLVE:(ch?(r.opcode==12?SEND:RECEIVE):(r.opcode==8?SEND:RECEIVE))))));uint arg=r.target;uint offset=r.reserved;ulong val=r.value;
-    uint kind=(op==OBJECT_READ||op==OBJECT_WRITE)?1:((op<=2||op==OBSERVE)?2:(ch?4:3));uint right=(op==OBJECT_READ||op==OBSERVE||op==AWAIT||op==RECEIVE)?1:2;uint outcome=0;ulong result_value=0,result_sender=0;
-    bool authorized=kind==1?object_allowed(object_caps,cfg.object_capability_count,objects,cfg.object_count,c.actor,arg,offset,right,cfg.initial_epoch+epoch):allowed(caps,cfg.capability_count,c.actor,kind,arg,right);
+    EffectRecord r=records[ri];uint ch=(r.opcode==12||r.opcode==13);uint op=r.opcode==2?OBJECT_READ:(r.opcode==7?OBJECT_WRITE:(r.opcode==1?OBSERVE:(r.opcode==11?AWAIT:(r.opcode==10?RESOLVE:(r.opcode==14?PUBLISH_CHILD:(r.opcode==15?SUPERVISION_RECEIVE:(ch?(r.opcode==12?SEND:RECEIVE):(r.opcode==8?SEND:RECEIVE))))))));uint arg=r.target;uint offset=r.reserved;ulong val=r.value;
+    uint kind=(op==OBJECT_READ||op==OBJECT_WRITE)?1:((op<=2||op==OBSERVE)?2:(op==PUBLISH_CHILD||op==SUPERVISION_RECEIVE?5:(ch?4:3)));uint right=(op==OBJECT_READ||op==OBSERVE||op==AWAIT||op==RECEIVE||op==SUPERVISION_RECEIVE)?1:2;uint outcome=0;ulong result_value=0,result_sender=0;
+    bool authorized=kind==1?object_allowed(object_caps,cfg.object_capability_count,objects,cfg.object_count,c.actor,arg,offset,right,cfg.initial_epoch+epoch):(kind==5?(op==PUBLISH_CHILD?(arg<cfg.child_count&&child_templates[arg].supervisor==c.actor):(arg<cfg.process_count&&sups[arg].actor==c.actor)):allowed(caps,cfg.capability_count,c.actor,kind,arg,right));
     if(!authorized)outcome=OUT_DENIED;
-    else if((kind==1&&arg>=cfg.object_count)||(kind==2&&arg>=cfg.future_count)||(kind==3&&arg>=cfg.mailbox_count)||(kind==4&&arg>=cfg.channel_count))outcome=OUT_INVALID;
+    else if((kind==1&&arg>=cfg.object_count)||(kind==2&&arg>=cfg.future_count)||(kind==3&&arg>=cfg.mailbox_count)||(kind==4&&arg>=cfg.channel_count)||(kind==5&&op==PUBLISH_CHILD&&arg>=cfg.child_count)||(kind==5&&op==SUPERVISION_RECEIVE&&arg>=cfg.process_count))outcome=OUT_INVALID;
     else if(kind==1&&(ulong(offset)+8>objects[arg].len||ulong(offset)+8<ulong(offset)))outcome=OUT_INVALID;
     else if(op==OBJECT_READ){uint base=arg*cfg.object_stride+offset;for(uint bb=0;bb<8;bb++)result_value|=ulong(object_bytes[base+bb])<<(bb*8);outcome=OUT_OBJECT_READ;}
     else if(op==OBJECT_WRITE){uint base=arg*cfg.object_stride+offset;for(uint bb=0;bb<8;bb++)object_bytes[base+bb]=uchar(val>>(bb*8));result_value=val;outcome=OUT_OBJECT_WRITTEN;}
@@ -328,21 +363,25 @@ kernel void resident_sync(
     else if(kind==3&&op==SEND){Mailbox m=mails[arg];if(m.count>=m.capacity){outcome=OUT_FULL;parked=true;c.pending_opcode=SEND;c.pending_target=arg;c.pending_value=val;}else{uint slot=arg*cfg.mailbox_stride+(m.head+m.count)%cfg.mailbox_stride;MailEntry ne={c.actor,val};entries[slot]=ne;m.count++;mails[arg]=m;outcome=OUT_SENT;wake_one(cs,cfg.continuation_count,RECEIVE,arg,epoch,li,8,c.id,r.ordinal,wakes,status,cfg);}}
     else if(kind==3&&op==RECEIVE){Mailbox m=mails[arg];if(m.count==0){outcome=OUT_EMPTY;parked=true;c.pending_opcode=RECEIVE;c.pending_target=arg;}else{uint slot=arg*cfg.mailbox_stride+m.head;MailEntry e=entries[slot];m.head=(m.head+1)%cfg.mailbox_stride;m.count--;mails[arg]=m;outcome=OUT_RECEIVED;result_value=e.value;result_sender=e.sender;c.pending_opcode=0;wake_one(cs,cfg.continuation_count,SEND,arg,epoch,li,9,c.id,r.ordinal,wakes,status,cfg);}}
     else if(kind==4&&op==SEND){Mailbox m=chans[arg];if(m.count>=m.capacity){outcome=OUT_FULL;parked=true;c.pending_opcode=CHANNEL_SEND;c.pending_target=arg;c.pending_value=val;}else{uint slot=arg*cfg.channel_stride+(m.head+m.count)%cfg.channel_stride;MailEntry ne={c.actor,val};chan_entries[slot]=ne;m.count++;chans[arg]=m;outcome=OUT_SENT;wake_one(cs,cfg.continuation_count,CHANNEL_RECEIVE,arg,epoch,li,12,c.id,r.ordinal,wakes,status,cfg);}}
-    else{Mailbox m=chans[arg];if(m.count==0){outcome=OUT_EMPTY;parked=true;c.pending_opcode=CHANNEL_RECEIVE;c.pending_target=arg;}else{uint slot=arg*cfg.channel_stride+m.head;MailEntry e=chan_entries[slot];m.head=(m.head+1)%cfg.channel_stride;m.count--;chans[arg]=m;outcome=OUT_RECEIVED;result_value=e.value;result_sender=e.sender;c.pending_opcode=0;wake_one(cs,cfg.continuation_count,CHANNEL_SEND,arg,epoch,li,13,c.id,r.ordinal,wakes,status,cfg);}}
-    if(outcome==OUT_REGISTERED||outcome==OUT_FULL||outcome==OUT_EMPTY){c.reserved=++status->ticket;c.state=PARKED;cs[st.continuation_index]=c;}
+    else if(kind==4){Mailbox m=chans[arg];if(m.count==0){outcome=OUT_EMPTY;parked=true;c.pending_opcode=CHANNEL_RECEIVE;c.pending_target=arg;}else{uint slot=arg*cfg.channel_stride+m.head;MailEntry e=chan_entries[slot];m.head=(m.head+1)%cfg.channel_stride;m.count--;chans[arg]=m;outcome=OUT_RECEIVED;result_value=e.value;result_sender=e.sender;c.pending_opcode=0;wake_one(cs,cfg.continuation_count,CHANNEL_SEND,arg,epoch,li,13,c.id,r.ordinal,wakes,status,cfg);}}
+    else if(op==PUBLISH_CHILD){outcome=OUT_PUBLISHED;}
+    else if(op==SUPERVISION_RECEIVE){Supervision q=sups[arg];if(q.count>0){uint slot=arg*cfg.supervision_stride+q.head;SupervisionEntry e=sup_entries[slot];q.head=(q.head+1)%cfg.supervision_stride;q.count--;sups[arg]=q;outcome=OUT_NOTICE;result_value=e.child;result_sender=1;}else{if(q.wait_count>=cfg.supervision_stride){status->error=12;}else{sup_waiters[arg*cfg.supervision_stride+q.wait_count]=c.id;q.wait_count++;sups[arg]=q;outcome=OUT_NO_NOTICE;parked=true;c.pending_opcode=SUPERVISION_RECEIVE;c.pending_target=arg;}}}
+    if(outcome==OUT_REGISTERED||outcome==OUT_FULL||outcome==OUT_EMPTY||outcome==OUT_NO_NOTICE){c.reserved=++status->ticket;c.state=PARKED;cs[st.continuation_index]=c;}
     r.outcome=outcome;r.result_value=result_value;r.result_sender=result_sender;records[ri]=r;add_trace(traces,status,cfg,epoch,li,c,r.opcode,outcome_code(outcome));
     // A later effect in this same lane may wake an effect that parked above.
     // Reconcile the lane-local copy with that authoritative wake before the
     // final disposition write, otherwise it would overwrite RUNNABLE/pending.
     Cont authoritative=cs[st.continuation_index];if(c.state==PARKED&&authoritative.state==RUNNABLE){c.state=RUNNABLE;c.pending_opcode=authoritative.pending_opcode;c.pending_target=authoritative.pending_target;c.pending_value=authoritative.pending_value;c.previous_kind=authoritative.previous_kind;c.previous_value=authoritative.previous_value;c.previous_sender=authoritative.previous_sender;}
-    if(outcome==OUT_RESOLVED||outcome==OUT_RECEIVED||outcome==OUT_OBJECT_READ){c.previous_kind=outcome;c.previous_value=result_value;c.previous_sender=result_sender;}
+    if(outcome==OUT_RESOLVED||outcome==OUT_RECEIVED||outcome==OUT_OBJECT_READ||outcome==OUT_NOTICE){c.previous_kind=outcome;c.previous_value=result_value;c.previous_sender=result_sender;}
    }
+   if(!parked&&st.disposition==2&&c.supervisor!=0xffffffffu)external_wake_count+=notify_supervisor(cs,sups,sup_waiters,sup_entries,wakes,status,cfg,c.supervisor,c.actor,epoch,li,st.effect_count);
    if(parked){if(c.state!=RUNNABLE)c.state=PARKED;invocations[st.reserved0].disposition=3;invocations[st.reserved0].next_run_class=c.run_class;}else if(st.disposition==1){c.state=RUNNABLE;c.run_class=st.next_run_class;}else{c.state=COMPLETE;completed[status->completed_count++]=c.id;}cs[st.continuation_index]=c;
   }
   threadgroup_barrier(mem_flags::mem_device|mem_flags::mem_threadgroup);
   if(tid==0){
    if(status->error!=0){stop=1;}else{
     status->epochs=epoch+1;uint runnable_after=0,completed_after=0;for(uint i=0;i<cfg.continuation_count;i++){if(cs[i].state==RUNNABLE)runnable_after++;if(cs[i].state==COMPLETE)completed_after++;}
+    external_wakes[epoch]=external_wake_count;
     if(status->epoch_count>=cfg.epoch_capacity){status->error=10;stop=1;}else{EpochRecord er={epoch,epoch_lanes,runnable_after,completed_after};epoch_records[status->epoch_count++]=er;if(runnable_after==0){status->quiescent=1;stop=1;}}
    }
   }
@@ -446,6 +485,12 @@ impl MetalResidentSync {
             .len()
             .checked_mul(config.max_continuations as usize)
             .ok_or(BackendError::InvalidInput)?;
+        let supervision_stride = (config.max_continuations as usize).max(1);
+        let supervision_entry_count = config
+            .process_ids
+            .len()
+            .checked_mul(supervision_stride)
+            .ok_or(BackendError::InvalidInput)?;
         let object_byte_count = config
             .objects
             .len()
@@ -463,6 +508,7 @@ impl MetalResidentSync {
             channel_entry_count,
             object_byte_count,
             scratch_count,
+            supervision_entry_count,
         ] {
             u32::try_from(count).map_err(|_| BackendError::InvalidInput)?;
         }
@@ -476,6 +522,11 @@ impl MetalResidentSync {
         self.check_buffer::<GpuMailEntry>(entry_count)?;
         self.check_buffer::<GpuMailbox>(config.channel_capacities.len())?;
         self.check_buffer::<GpuMailEntry>(channel_entry_count)?;
+        self.check_buffer::<GpuSupervision>(config.process_ids.len())?;
+        self.check_buffer::<GpuSupervisionEntry>(supervision_entry_count)?;
+        self.check_buffer::<u64>(supervision_entry_count)?;
+        self.check_buffer::<GpuChildTemplate>(config.child_templates.len())?;
+        self.check_buffer::<u32>(config.max_epochs as usize)?;
         self.check_buffer::<GpuCapability>(config.capabilities.len())?;
         self.check_buffer::<GpuEffectRecord>(effect_capacity)?;
         self.check_buffer::<ResidentSyncTrace>(trace_capacity)?;
@@ -499,6 +550,7 @@ impl MetalResidentSync {
                 frame_len: c.frame.len() as u32,
                 state: 1,
                 last_epoch: u32::MAX,
+                supervisor: config.supervisors.get(&c.id).copied().unwrap_or(u32::MAX),
                 mutable_access: u32::from(c.mutable_access),
                 waiting_since: c.waiting_since,
                 actor_next: u32::MAX,
@@ -595,6 +647,54 @@ impl MetalResidentSync {
                 reserved: 0,
             })
             .collect();
+        let sups: Vec<GpuSupervision> = config
+            .process_ids
+            .iter()
+            .enumerate()
+            .map(|(index, actor)| GpuSupervision {
+                actor: *actor,
+                head: 0,
+                count: config
+                    .initial_supervision_notices
+                    .get(index)
+                    .map(|notices| notices.len() as u32)
+                    .unwrap_or(0),
+                wait_head: 0,
+                wait_count: config
+                    .initial_supervision_waiters
+                    .get(index)
+                    .map(|waiters| waiters.len() as u32)
+                    .unwrap_or(0),
+            })
+            .collect();
+        let mut sup_entries = vec![GpuSupervisionEntry::default(); supervision_entry_count];
+        for (index, notices) in config.initial_supervision_notices.iter().enumerate() {
+            for (offset, notice) in notices.iter().enumerate() {
+                sup_entries[index * supervision_stride + offset] = GpuSupervisionEntry {
+                    child: notice.child,
+                    reason: notice.reason,
+                    failure_count: notice.failure_count,
+                    reserved: 0,
+                };
+            }
+        }
+        let mut sup_waiters = vec![0u64; supervision_entry_count];
+        for (index, waiters) in config.initial_supervision_waiters.iter().enumerate() {
+            for (offset, waiter) in waiters.iter().enumerate() {
+                sup_waiters[index * supervision_stride + offset] = *waiter;
+            }
+        }
+        let child_templates: Vec<GpuChildTemplate> = config
+            .child_templates
+            .iter()
+            .map(|template| GpuChildTemplate {
+                supervisor: template.supervisor,
+                mode: template.mode,
+                run_class: template.run_class,
+                state_access: template.state_access,
+                reserved: 0,
+            })
+            .collect();
         let object_stride = config.max_frame_bytes as usize;
         if config
             .objects
@@ -651,6 +751,9 @@ impl MetalResidentSync {
             object_count: objects.len() as u32,
             object_capability_count: object_capabilities.len() as u32,
             object_stride: object_stride as u32,
+            child_count: child_templates.len() as u32,
+            process_count: sups.len() as u32,
+            supervision_stride: supervision_stride as u32,
             initial_epoch: config.initial_epoch,
         };
         let cfg_b = self.buffer_from(std::slice::from_ref(&cfg));
@@ -663,6 +766,11 @@ impl MetalResidentSync {
         let entries_b = self.buffer_from(&mailbox_entries);
         let chans_b = self.buffer_from(&channels);
         let chan_entries_b = self.buffer_from(&channel_entries);
+        let sups_b = self.buffer_from(&sups);
+        let sup_entries_b = self.buffer_from(&sup_entries);
+        let sup_waiters_b = self.buffer_from(&sup_waiters);
+        let child_templates_b = self.buffer_from(&child_templates);
+        let external_wakes_b = self.zero_buffer::<u32>(config.max_epochs as usize);
         let caps_b = self.buffer_from(&capabilities);
         let effects_b = self.zero_buffer::<GpuEffectRecord>(effect_capacity);
         let traces_b = self.zero_buffer::<ResidentSyncTrace>(trace_capacity);
@@ -710,6 +818,11 @@ impl MetalResidentSync {
             &evaluation_counts_b,
             &chans_b,
             &chan_entries_b,
+            &sups_b,
+            &sup_entries_b,
+            &sup_waiters_b,
+            &child_templates_b,
+            &external_wakes_b,
         ]
         .iter()
         .enumerate()
@@ -735,6 +848,11 @@ impl MetalResidentSync {
         let final_entries: Vec<GpuMailEntry> = read_vec(&entries_b, entry_count);
         let final_chans: Vec<GpuMailbox> = read_vec(&chans_b, channels.len());
         let final_chan_entries: Vec<GpuMailEntry> = read_vec(&chan_entries_b, channel_entry_count);
+        let final_sups: Vec<GpuSupervision> = read_vec(&sups_b, sups.len());
+        let final_sup_entries: Vec<GpuSupervisionEntry> =
+            read_vec(&sup_entries_b, supervision_entry_count);
+        let final_sup_waiters: Vec<u64> = read_vec(&sup_waiters_b, supervision_entry_count);
+        let external_wakes: Vec<u32> = read_vec(&external_wakes_b, config.max_epochs as usize);
         let status: GpuStatus = read_vec(&status_b, 1)[0];
         if status.error != 0
             || status.effect_count as usize > effect_capacity
@@ -764,6 +882,10 @@ impl MetalResidentSync {
             &final_entries,
             &final_chans,
             &final_chan_entries,
+            &final_sups,
+            &final_sup_entries,
+            &final_sup_waiters,
+            external_wakes,
             raw_effects,
             trace,
             completed,
@@ -863,6 +985,20 @@ fn validate(
         || config.mailbox_messages.len() != config.mailbox_capacities.len()
         || u32::try_from(config.channel_capacities.len()).is_err()
         || config.channel_messages.len() != config.channel_capacities.len()
+        || u32::try_from(config.process_ids.len()).is_err()
+        || u32::try_from(config.child_templates.len()).is_err()
+        || config.initial_supervision_notices.len() != config.process_ids.len()
+        || config.initial_supervision_waiters.len() != config.process_ids.len()
+        || config
+            .supervisors
+            .values()
+            .any(|process| *process as usize >= config.process_ids.len())
+        || config.child_templates.iter().any(|template| {
+            template.frame.len() > config.max_frame_bytes as usize
+                || template.mode == 0
+                || template.max_steps == 0
+                || template.supervisor == 0
+        })
         || u32::try_from(config.capabilities.len()).is_err()
         || config
             .mailbox_capacities
@@ -951,6 +1087,13 @@ fn raw_outcome(r: &GpuEffectRecord) -> Result<ResidentOutcome, BackendError> {
         10 => ResidentOutcome::Pending,
         11 => ResidentOutcome::ObjectRead(r.result_value),
         12 => ResidentOutcome::ObjectWritten,
+        13 => ResidentOutcome::Published,
+        14 => ResidentOutcome::Notice {
+            child: r.result_value,
+            reason: r.result_sender as u32,
+            failure_count: 0,
+        },
+        15 => ResidentOutcome::NoNotice,
         _ => return Err(BackendError::ExecutionFailed),
     })
 }
@@ -989,6 +1132,12 @@ fn raw_effect(r: &GpuEffectRecord) -> Result<ResidentEffect, BackendError> {
         crate::scheduler::device_ops::OP_CHANNEL_RECEIVE => {
             ResidentEffect::ChannelReceive { target: r.target }
         }
+        crate::scheduler::device_ops::OP_PUBLISH_CHILD => {
+            ResidentEffect::PublishChild { target: r.target }
+        }
+        crate::scheduler::device_ops::OP_SUPERVISION_RECEIVE => {
+            ResidentEffect::SupervisionReceive { target: r.target }
+        }
         _ => return Err(BackendError::ExecutionFailed),
     })
 }
@@ -1004,6 +1153,10 @@ fn decode(
     entries: &[GpuMailEntry],
     chans: &[GpuMailbox],
     chan_entries: &[GpuMailEntry],
+    sups: &[GpuSupervision],
+    sup_entries: &[GpuSupervisionEntry],
+    sup_waiters: &[u64],
+    external_wakes: Vec<u32>,
     raw: Vec<GpuEffectRecord>,
     trace: Vec<ResidentSyncTrace>,
     completed: Vec<u64>,
@@ -1036,6 +1189,11 @@ fn decode(
     for record in raw {
         let effect = raw_effect(&record)?;
         let outcome = raw_outcome(&record)?;
+        let actor = specs
+            .iter()
+            .find(|continuation| continuation.id == record.continuation)
+            .ok_or(BackendError::ExecutionFailed)?
+            .actor;
         result.accesses.push(DeviceLaneAccess::new(
             record.lane,
             match effect {
@@ -1051,8 +1209,18 @@ fn decode(
                 ResidentEffect::ChannelSend { .. } | ResidentEffect::ChannelReceive { .. } => {
                     RESOURCE_CHANNEL
                 }
+                ResidentEffect::PublishChild { .. } | ResidentEffect::SupervisionReceive { .. } => {
+                    RESOURCE_PROCESS
+                }
             },
-            u64::from(record.target),
+            if matches!(
+                effect,
+                ResidentEffect::PublishChild { .. } | ResidentEffect::SupervisionReceive { .. }
+            ) {
+                actor
+            } else {
+                u64::from(record.target)
+            },
             if matches!(
                 effect,
                 ResidentEffect::FutureObserve { .. } | ResidentEffect::ObjectRead { .. }
@@ -1063,11 +1231,6 @@ fn decode(
             },
             record.ordinal,
         ));
-        let actor = specs
-            .iter()
-            .find(|continuation| continuation.id == record.continuation)
-            .ok_or(BackendError::ExecutionFailed)?
-            .actor;
         let journal = journals
             .get_mut(&(record.epoch, record.lane))
             .ok_or(BackendError::ExecutionFailed)?;
@@ -1101,11 +1264,14 @@ fn decode(
                 ResidentOutcome::Full => 0x10c,
                 ResidentOutcome::DoubleResolve => 0x111,
                 ResidentOutcome::Sent => 0,
+                ResidentOutcome::Published => 0,
+                ResidentOutcome::Notice { .. } => 2,
+                ResidentOutcome::NoNotice => 1,
             },
-            result_ref: if matches!(outcome, ResidentOutcome::ObjectWritten) {
-                0
-            } else {
-                record.result_value
+            result_ref: match outcome {
+                ResidentOutcome::Notice { child, .. } => child,
+                ResidentOutcome::ObjectWritten => 0,
+                _ => record.result_value,
             },
             ..Default::default()
         });
@@ -1117,6 +1283,17 @@ fn decode(
             effect,
             outcome,
         });
+        if let ResidentEffect::PublishChild { target } = effect {
+            result
+                .published_children
+                .push(ResidentChildPublicationRecord {
+                    epoch: record.epoch,
+                    lane: record.lane,
+                    ordinal: record.ordinal,
+                    parent: record.continuation,
+                    template: target,
+                });
+        }
     }
     result.operations = journals.into_values().collect();
     result.trace = trace;
@@ -1124,12 +1301,26 @@ fn decode(
     result.invocations = invocations;
     result.wakes = wakes;
     result.epoch_records = epoch_records;
+    result.external_wakes = external_wakes
+        .into_iter()
+        .take(status.epochs as usize)
+        .collect();
+    for record in &mut result.epoch_records {
+        record.runnable_after = record.runnable_after.saturating_add(
+            result
+                .published_children
+                .iter()
+                .filter(|publication| publication.epoch == record.epoch)
+                .count() as u32,
+        );
+    }
     result.final_continuations = cs
         .iter()
         .map(|continuation| ResidentFinalContinuation {
             id: continuation.id,
             run_class: continuation.run_class,
             completed: continuation.state == 3,
+            published: continuation.state != 0,
             pending: match continuation.pending_opcode {
                 0 => None,
                 1 => Some(ResidentEffect::FutureAwait {
@@ -1147,6 +1338,9 @@ fn decode(
                     value: continuation.pending_value,
                 }),
                 19 => Some(ResidentEffect::ChannelReceive {
+                    target: continuation.pending_target,
+                }),
+                21 => Some(ResidentEffect::SupervisionReceive {
                     target: continuation.pending_target,
                 }),
                 _ => None,
@@ -1186,6 +1380,35 @@ fn decode(
                     let entry = chan_entries[index * config.max_continuations as usize
                         + ((channel.head + offset) % config.max_continuations) as usize];
                     (entry.sender, entry.value)
+                })
+                .collect()
+        })
+        .collect();
+    result.supervision_notices = sups
+        .iter()
+        .enumerate()
+        .map(|(index, queue)| {
+            (0..queue.count)
+                .map(|offset| {
+                    let entry = sup_entries[index * config.max_continuations as usize
+                        + ((queue.head + offset) % config.max_continuations) as usize];
+                    ResidentSupervisionNoticeRecord {
+                        child: entry.child,
+                        reason: entry.reason,
+                        failure_count: entry.failure_count,
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    result.supervision_waiters = sups
+        .iter()
+        .enumerate()
+        .map(|(index, queue)| {
+            (0..queue.wait_count)
+                .map(|offset| {
+                    sup_waiters[index * config.max_continuations as usize
+                        + ((queue.wait_head + offset) % config.max_continuations) as usize]
                 })
                 .collect()
         })
@@ -1241,6 +1464,7 @@ mod tests {
                 cap(10, RESOURCE_FUTURE, 0, RIGHT_READ),
                 cap(20, RESOURCE_FUTURE, 0, RIGHT_WRITE),
             ],
+            ..Default::default()
         };
         let continuations = vec![
             ResidentContinuation {
@@ -1355,6 +1579,7 @@ mod tests {
                 cap(7, RESOURCE_FUTURE, 1, RIGHT_READ),
                 cap(7, RESOURCE_FUTURE, 9, RIGHT_READ),
             ],
+            ..Default::default()
         };
         let continuations = [(1, 7, 10, 0), (2, 7, 11, 1), (3, 8, 12, 0), (4, 7, 13, 9)]
             .into_iter()
@@ -1484,6 +1709,7 @@ mod tests {
                 cap(10, RESOURCE_MAILBOX, 0, RIGHT_READ),
                 cap(20, RESOURCE_MAILBOX, 0, RIGHT_WRITE),
             ],
+            ..Default::default()
         };
         let continuations = vec![
             ResidentContinuation {
@@ -1635,6 +1861,7 @@ mod tests {
                 cap(20, RESOURCE_MAILBOX, 0, RIGHT_READ),
                 cap(30, RESOURCE_MAILBOX, 0, RIGHT_WRITE),
             ],
+            ..Default::default()
         };
         let continuations = vec![
             ResidentContinuation {
@@ -1742,6 +1969,7 @@ mod tests {
             channel_capacities: vec![],
             channel_messages: vec![],
             capabilities: vec![cap(7, RESOURCE_FUTURE, 0, RIGHT_WRITE)],
+            ..Default::default()
         };
         let continuations = vec![ResidentContinuation {
             id: 1,
@@ -1842,6 +2070,7 @@ mod tests {
             channel_capacities: vec![],
             channel_messages: vec![],
             capabilities: vec![cap(7, RESOURCE_FUTURE, 9, RIGHT_WRITE)],
+            ..Default::default()
         };
         let continuations = vec![ResidentContinuation {
             id: 1,
@@ -1897,6 +2126,7 @@ mod tests {
             channel_capacities: vec![],
             channel_messages: vec![],
             capabilities: vec![],
+            ..Default::default()
         };
         let continuations = vec![ResidentContinuation {
             id: 1,
@@ -1981,6 +2211,7 @@ mod tests {
                 channel_capacities: vec![],
                 channel_messages: vec![],
                 capabilities: vec![],
+                ..Default::default()
             };
             let continuations = vec![ResidentContinuation {
                 id: 9,
@@ -2081,6 +2312,7 @@ mod tests {
             channel_capacities: vec![],
             channel_messages: vec![],
             capabilities: vec![],
+            ..Default::default()
         };
         let assert_refused = |config: ResidentSyncConfig| {
             let programs = BTreeMap::new();
@@ -2154,6 +2386,7 @@ mod tests {
             channel_capacities: vec![],
             channel_messages: vec![],
             capabilities: vec![cap(7, RESOURCE_FUTURE, 0, RIGHT_READ | RIGHT_WRITE)],
+            ..Default::default()
         };
         let continuations = vec![ResidentContinuation {
             id: 11,
@@ -2221,6 +2454,7 @@ mod tests {
                 cap(2, RESOURCE_FUTURE, 0, RIGHT_READ),
                 cap(3, RESOURCE_FUTURE, 0, RIGHT_WRITE),
             ],
+            ..Default::default()
         };
         // Identity order is 1, 9, but class order registers 9 before 1.
         let continuations = vec![
@@ -2327,6 +2561,7 @@ mod tests {
                     cap(1, RESOURCE_FUTURE, 1, RIGHT_READ),
                     cap(2, RESOURCE_FUTURE, 1, RIGHT_READ),
                 ],
+                ..Default::default()
             };
             let continuations = (1..=256u64)
                 .rev()

@@ -1,18 +1,20 @@
 //! Kernel-owned bounded resident synchronization bridge.
 //!
 //! This deliberately narrow G2 slice supports local futures, exact FIFO local
-//! process mailboxes, exact live host-backed Object `Ref64` values, and governed
-//! fixed 8-byte object range reads/in-place writes. Installed pointer-free
-//! bytecode executes once on Metal; after final readback, validated journals are
-//! replayed through ordinary governed Kernel operations on a clone and
+//! process mailboxes, exact live host-backed Object `Ref64` values, governed
+//! fixed 8-byte object range reads/in-place writes, pre-registered child
+//! publication, and direct-child terminal supervision. Installed pointer-free
+//! bytecode executes once on Metal; after final readback, validated journals
+//! are replayed through ordinary governed Kernel operations on a clone and
 //! published atomically.
 //!
-//! The admitted subset is intentionally strict: local unsupervised processes,
-//! RunClassBins + RunPartial, no foreign payloads, no pre-existing waiter
-//! queues, and no object growth/allocation. Canonical final future-await and
-//! mailbox parks are supported. Competing mutable continuations use the exact
-//! longest-waiting/identity admission rule and ordinary canonical deferral
-//! replay; unsupported shapes refuse before submission.
+//! The admitted subset is intentionally strict: local notify-only supervised
+//! processes, `RunClassBins` + `RunPartial`, no foreign payloads, no touched
+//! non-supervision waiter queues, and no object growth/allocation. Canonical
+//! final future-await and mailbox parks are supported. A handler may publish a
+//! pre-registered child template and park or consume one typed terminal notice
+//! on its supervisor queue; restart/escalation and unsupported shapes refuse
+//! before submission.
 //!
 //! Exact invocation/applied-disposition, wake, and per-epoch records drive
 //! normal Phase-G effects, trace causality, Phase-H accounting, and admission
@@ -25,15 +27,16 @@ use crate::abi::channels::ChannelDescriptor;
 use crate::abi::continuations::ContinuationState;
 use crate::abi::{EventKind, FutureState, Kind, Ref64, Rights};
 use crate::executives::resident_sync::{
-    InitialFuture, ResidentCapability, ResidentEffect, ResidentHandlerProgram, ResidentInstruction,
-    ResidentObject, ResidentObjectCapability, ResidentSyncConfig, ResidentSyncResult,
+    InitialFuture, ResidentCapability, ResidentChildTemplate, ResidentEffect,
+    ResidentHandlerProgram, ResidentInstruction, ResidentObject, ResidentObjectCapability,
+    ResidentSupervisionNoticeRecord, ResidentSyncConfig, ResidentSyncResult,
     HANDLER_ADD_FRAME_IMMEDIATE_U64, HANDLER_ADD_FRAME_U64, HANDLER_COMPLETE_IF_FRAME_U64_EQ,
-    HANDLER_EFFECT_CHANNEL_RECEIVE, HANDLER_EFFECT_CHANNEL_SEND,
-    HANDLER_EFFECT_FUTURE_AWAIT, HANDLER_EFFECT_FUTURE_OBSERVE, HANDLER_EFFECT_FUTURE_RESOLVE,
-    HANDLER_EFFECT_MAILBOX_RECEIVE, HANDLER_EFFECT_MAILBOX_SEND, HANDLER_EFFECT_OBJECT_READ,
-    HANDLER_EFFECT_OBJECT_WRITE, HANDLER_STORE_IMMEDIATE_U64, HANDLER_YIELD_FRAME_U32,
-    HANDLER_YIELD_IF_FRAME_ZERO_U64, RESOURCE_CHANNEL, RESOURCE_FUTURE, RESOURCE_MAILBOX,
-    RESOURCE_OBJECT, RIGHT_READ, RIGHT_WRITE,
+    HANDLER_EFFECT_CHANNEL_RECEIVE, HANDLER_EFFECT_CHANNEL_SEND, HANDLER_EFFECT_FUTURE_AWAIT,
+    HANDLER_EFFECT_FUTURE_OBSERVE, HANDLER_EFFECT_FUTURE_RESOLVE, HANDLER_EFFECT_MAILBOX_RECEIVE,
+    HANDLER_EFFECT_MAILBOX_SEND, HANDLER_EFFECT_OBJECT_READ, HANDLER_EFFECT_OBJECT_WRITE,
+    HANDLER_EFFECT_PUBLISH_CHILD, HANDLER_EFFECT_SUPERVISION_RECEIVE, HANDLER_STORE_IMMEDIATE_U64,
+    HANDLER_YIELD_FRAME_U32, HANDLER_YIELD_IF_FRAME_ZERO_U64, RESOURCE_CHANNEL, RESOURCE_FUTURE,
+    RESOURCE_MAILBOX, RESOURCE_OBJECT, RESOURCE_PROCESS, RIGHT_READ, RIGHT_WRITE,
 };
 use crate::kernel::Kernel;
 use crate::scheduler::device::reference_lane_conflicts;
@@ -107,6 +110,17 @@ impl KernelResidentInstruction {
             u64::from(zero_class) | (u64::from(nonzero_class) << 32),
         )
     }
+    pub fn publish_child(template: u32) -> Self {
+        Self {
+            opcode: HANDLER_EFFECT_PUBLISH_CHILD,
+            argument: template,
+            target: Ref64::NULL,
+            value: 0,
+        }
+    }
+    pub fn supervision_receive(supervisor: Ref64) -> Self {
+        Self::effect(HANDLER_EFFECT_SUPERVISION_RECEIVE, supervisor, Ref64::NULL)
+    }
     pub fn plain(opcode: u32, argument: u32, value: u64) -> Self {
         Self {
             opcode,
@@ -123,6 +137,20 @@ pub struct KernelResidentProgram {
     pub instructions: Vec<KernelResidentInstruction>,
 }
 
+/// Pre-registered direct child published by a resident handler. The bridge
+/// creates a fresh supervised process and entry continuation at import time,
+/// so no device allocation table is needed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KernelResidentChildTemplate {
+    /// The exact supervisor process that publishes this child.
+    pub supervisor: Ref64,
+    pub mode: crate::abi::ProcessMode,
+    pub run_class: u32,
+    pub state_access: crate::abi::StateAccess,
+    pub max_steps: u32,
+    pub frame: Vec<u8>,
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct KernelResidentSyncPlan {
@@ -135,6 +163,7 @@ pub struct KernelResidentSyncPlan {
     futures: Vec<Ref64>,
     mailboxes: Vec<Ref64>,
     channels: Vec<Ref64>,
+    child_templates: Vec<ResidentChildTemplate>,
     initial_future_waiters: BTreeMap<u64, Vec<Ref64>>,
     initial_full_waiters: BTreeMap<u64, Vec<Ref64>>,
     initial_recv_waiters: BTreeMap<u64, Vec<Ref64>>,
@@ -160,6 +189,27 @@ impl Kernel {
         self.resident_sync_programs
             .insert(program.run_class, program);
         Ok(())
+    }
+
+    /// Install a bounded child publication template. Installation does not
+    /// create the child; a resident `PublishChild` effect publishes it.
+    pub fn install_resident_child_template(
+        &mut self,
+        template: KernelResidentChildTemplate,
+    ) -> Result<u32, KernelResidentSyncError> {
+        if template.run_class < 1024
+            || template.frame.len()
+                > crate::executives::resident_sync::MAX_RESIDENT_OBJECT_ARENA_BYTES
+            || template.max_steps == 0
+            || template.supervisor.is_null()
+            || template.supervisor.kind != crate::abi::Kind::Process
+        {
+            return Err(KernelResidentSyncError::InvalidProgram);
+        }
+        let index = u32::try_from(self.resident_child_templates.len())
+            .map_err(|_| KernelResidentSyncError::InvalidProgram)?;
+        self.resident_child_templates.push(template);
+        Ok(index)
     }
 
     /// Snapshot all currently runnable, resident-supported work into one fixed
@@ -544,6 +594,17 @@ impl KernelResidentSyncPlan {
                 n!(i.value)
             }
         }
+        tag!(b"resident-child-templates");
+        n!(k.resident_child_templates.len() as u64);
+        for (index, template) in k.resident_child_templates.iter().enumerate() {
+            n!(index as u64);
+            n!(template.mode as u8);
+            n!(template.run_class);
+            n!(template.state_access as u8);
+            n!(template.max_steps);
+            n!(template.frame.len() as u64);
+            h.update(template.frame.as_slice());
+        }
         tag!(b"trace-log");
         n!(k.trace.len() as u64);
         for e in &k.trace {
@@ -668,6 +729,7 @@ impl KernelResidentSyncPlan {
                     | HANDLER_EFFECT_MAILBOX_RECEIVE
                     | HANDLER_EFFECT_CHANNEL_SEND
                     | HANDLER_EFFECT_CHANNEL_RECEIVE
+                    | HANDLER_EFFECT_SUPERVISION_RECEIVE
             ) {
                 touched_wait_resources.insert(instruction.target.key());
             }
@@ -718,7 +780,6 @@ impl KernelResidentSyncPlan {
             .filter(|(_, queue)| !queue.receive_waiters.is_empty())
             .map(|(target, queue)| (*target, queue.receive_waiters.iter().copied().collect()))
             .collect();
-
         let mut futures: Vec<Ref64> = kernel.futures.iter().map(|(r, _)| r).collect();
         futures.sort_by_key(Ref64::to_u64);
         let mut mailboxes: Vec<Ref64> = kernel
@@ -853,6 +914,8 @@ impl KernelResidentSyncPlan {
                         | HANDLER_EFFECT_MAILBOX_RECEIVE
                         | HANDLER_EFFECT_CHANNEL_SEND
                         | HANDLER_EFFECT_CHANNEL_RECEIVE
+                        | HANDLER_EFFECT_PUBLISH_CHILD
+                        | HANDLER_EFFECT_SUPERVISION_RECEIVE
                 );
                 let argument = match instruction.opcode {
                     HANDLER_EFFECT_OBJECT_READ | HANDLER_EFFECT_OBJECT_WRITE => {
@@ -869,6 +932,12 @@ impl KernelResidentSyncPlan {
                     HANDLER_EFFECT_CHANNEL_SEND | HANDLER_EFFECT_CHANNEL_RECEIVE => *channel_index
                         .get(&instruction.target)
                         .ok_or(KernelResidentSyncError::InvalidProgram)?,
+                    HANDLER_EFFECT_PUBLISH_CHILD => instruction.argument,
+                    HANDLER_EFFECT_SUPERVISION_RECEIVE => {
+                        *mailbox_index
+                            .get(&instruction.target)
+                            .ok_or(KernelResidentSyncError::InvalidProgram)?
+                    }
                     _ => instruction.argument,
                 };
                 let packed_target = match instruction.opcode {
@@ -886,9 +955,22 @@ impl KernelResidentSyncPlan {
                     HANDLER_EFFECT_CHANNEL_SEND | HANDLER_EFFECT_CHANNEL_RECEIVE => *channel_index
                         .get(&instruction.target)
                         .ok_or(KernelResidentSyncError::InvalidProgram)?,
+                    HANDLER_EFFECT_SUPERVISION_RECEIVE => {
+                        *mailbox_index
+                            .get(&instruction.target)
+                            .ok_or(KernelResidentSyncError::InvalidProgram)?
+                    }
                     _ => 0,
                 };
-                if effect && instruction.target.is_null() {
+                if effect
+                    && !matches!(instruction.opcode, HANDLER_EFFECT_PUBLISH_CHILD)
+                    && instruction.target.is_null()
+                {
+                    return Err(KernelResidentSyncError::InvalidProgram);
+                }
+                if matches!(instruction.opcode, HANDLER_EFFECT_PUBLISH_CHILD)
+                    && instruction.argument as usize >= kernel.resident_child_templates.len()
+                {
                     return Err(KernelResidentSyncError::InvalidProgram);
                 }
                 // The bounded value form is an exact, already-live local object.
@@ -922,6 +1004,7 @@ impl KernelResidentSyncPlan {
                             | HANDLER_EFFECT_FUTURE_AWAIT
                             | HANDLER_EFFECT_MAILBOX_RECEIVE
                             | HANDLER_EFFECT_CHANNEL_RECEIVE
+                            | HANDLER_EFFECT_SUPERVISION_RECEIVE
                     ) {
                         0
                     } else {
@@ -941,6 +1024,7 @@ impl KernelResidentSyncPlan {
         let mut continuations = Vec::new();
         let mut continuations_by_id = BTreeMap::new();
         let mut actors_by_id = BTreeMap::new();
+        let mut supervisors_by_continuation = BTreeMap::new();
         for (r, c) in kernel.continuations.iter() {
             if c.status != ContinuationState::Runnable {
                 continue;
@@ -953,11 +1037,17 @@ impl KernelResidentSyncPlan {
                 .get(c.process)
                 .map_err(|_| KernelResidentSyncError::UnsupportedShape)?;
             if process.node_id != kernel.local_node
-                || !process.supervisor.is_null()
+                || process.supervision_policy != crate::abi::SupervisionPolicy::Notify
                 || !process.restart_of.is_null()
                 || c.frame.kind != Kind::Object
             {
                 return Err(KernelResidentSyncError::UnsupportedShape);
+            }
+            if !process.supervisor.is_null() {
+                let supervisor = *mailbox_index
+                    .get(&process.supervisor)
+                    .ok_or(KernelResidentSyncError::UnsupportedShape)?;
+                supervisors_by_continuation.insert(r.to_u64(), supervisor);
             }
             let frame = kernel
                 .object_payloads
@@ -1146,9 +1236,30 @@ impl KernelResidentSyncPlan {
                     HANDLER_EFFECT_MAILBOX_SEND => (RESOURCE_MAILBOX, RIGHT_WRITE),
                     HANDLER_EFFECT_CHANNEL_RECEIVE => (RESOURCE_CHANNEL, RIGHT_READ),
                     HANDLER_EFFECT_CHANNEL_SEND => (RESOURCE_CHANNEL, RIGHT_WRITE),
+                    HANDLER_EFFECT_PUBLISH_CHILD => {
+                        let Some(template) =
+                            kernel.resident_child_templates.get(i.argument as usize)
+                        else {
+                            return Err(KernelResidentSyncError::InvalidProgram);
+                        };
+                        if template.supervisor.to_u64() != c.actor {
+                            return Err(KernelResidentSyncError::UnsupportedShape);
+                        }
+                        continue;
+                    }
+                    HANDLER_EFFECT_SUPERVISION_RECEIVE => (RESOURCE_PROCESS, RIGHT_READ),
                     _ => continue,
                 };
-                let authorized = if kind == RESOURCE_OBJECT {
+                let authorized = if kind == RESOURCE_PROCESS {
+                    mailboxes.get(i.target as usize) == Some(&Ref64::from_u64(c.actor))
+                        && kernel
+                            .find_authorized_capability(
+                                Ref64::from_u64(c.actor),
+                                crate::abi::Rights::RECEIVE,
+                                Ref64::from_u64(c.actor),
+                            )
+                            .is_some()
+                } else if kind == RESOURCE_OBJECT {
                     let object = kernel
                         .objects
                         .get(objects[i.target as usize])
@@ -1213,6 +1324,37 @@ impl KernelResidentSyncPlan {
             )
         }) {
             return Err(KernelResidentSyncError::InvalidProgram);
+        }
+        for template in &kernel.resident_child_templates {
+            if template.frame.len() > max_frame as usize
+                || !packed_programs.contains_key(&template.run_class)
+                || (template.mode == crate::abi::ProcessMode::Pure
+                    && template.state_access == crate::abi::StateAccess::Mutable)
+            {
+                return Err(KernelResidentSyncError::UnsupportedShape);
+            }
+            let supervisor = kernel
+                .processes
+                .get(template.supervisor)
+                .map_err(|_| KernelResidentSyncError::UnsupportedShape)?;
+            if supervisor.node_id != kernel.local_node
+                || matches!(
+                    supervisor.status,
+                    value
+                        if value == crate::abi::ProcessState::Failed as u32
+                            || value == crate::abi::ProcessState::Terminated as u32
+                            || value == crate::abi::ProcessState::Cancelled as u32
+                )
+            {
+                return Err(KernelResidentSyncError::UnsupportedShape);
+            }
+            let domain = kernel
+                .domains
+                .get(supervisor.domain)
+                .map_err(|_| KernelResidentSyncError::UnsupportedShape)?;
+            if domain.max_processes != 0 && domain.processes_created >= domain.max_processes {
+                return Err(KernelResidentSyncError::UnsupportedShape);
+            }
         }
         let initial_futures = futures
             .iter()
@@ -1307,6 +1449,44 @@ impl KernelResidentSyncPlan {
                 mailbox_messages,
                 channel_capacities,
                 channel_messages,
+                process_ids: mailboxes.iter().map(|process| process.to_u64()).collect(),
+                initial_supervision_notices: mailboxes
+                    .iter()
+                    .map(|process| {
+                        kernel.supervision_queues[&process.key()]
+                            .notices
+                            .iter()
+                            .map(|notice| ResidentSupervisionNoticeRecord {
+                                child: notice.child.to_u64(),
+                                reason: notice.reason as u32,
+                                failure_count: notice.failure_count,
+                            })
+                            .collect()
+                    })
+                    .collect(),
+                initial_supervision_waiters: mailboxes
+                    .iter()
+                    .map(|process| {
+                        kernel.supervision_queues[&process.key()]
+                            .waiters
+                            .iter()
+                            .map(|waiter| waiter.to_u64())
+                            .collect()
+                    })
+                    .collect(),
+                supervisors: supervisors_by_continuation,
+                child_templates: kernel
+                    .resident_child_templates
+                    .iter()
+                    .map(|template| ResidentChildTemplate {
+                        mode: template.mode as u32,
+                        supervisor: template.supervisor.to_u64(),
+                        run_class: template.run_class,
+                        state_access: template.state_access as u32,
+                        max_steps: template.max_steps,
+                        frame: template.frame.clone(),
+                    })
+                    .collect(),
                 capabilities,
             },
             continuations,
@@ -1317,6 +1497,18 @@ impl KernelResidentSyncPlan {
             futures,
             mailboxes,
             channels,
+            child_templates: kernel
+                .resident_child_templates
+                .iter()
+                .map(|template| ResidentChildTemplate {
+                    mode: template.mode as u32,
+                    supervisor: template.supervisor.to_u64(),
+                    run_class: template.run_class,
+                    state_access: template.state_access as u32,
+                    max_steps: template.max_steps,
+                    frame: template.frame.clone(),
+                })
+                .collect(),
             initial_future_waiters,
             initial_full_waiters,
             initial_recv_waiters,
@@ -1357,6 +1549,10 @@ impl KernelResidentSyncPlan {
             | ResidentEffect::ChannelReceive { target } => {
                 self.channels.get(target as usize).copied()
             }
+            ResidentEffect::SupervisionReceive { target } => {
+                self.mailboxes.get(target as usize).copied()
+            }
+            ResidentEffect::PublishChild { .. } => None,
         }
     }
 
@@ -1376,6 +1572,9 @@ impl KernelResidentSyncPlan {
             || result.object_values.len() != self.objects.len()
             || result.future_values.len() != self.futures.len()
             || result.mailboxes.len() != self.mailboxes.len()
+            || result.supervision_notices.len() != self.mailboxes.len()
+            || result.supervision_waiters.len() != self.mailboxes.len()
+            || result.external_wakes.len() != result.epochs as usize
         {
             return Err(KernelResidentSyncError::InvalidDeviceResult);
         }
@@ -1411,6 +1610,7 @@ impl KernelResidentSyncPlan {
                                     | ResidentEffect::MailboxReceive { .. }
                                     | ResidentEffect::ChannelSend { .. }
                                     | ResidentEffect::ChannelReceive { .. }
+                                    | ResidentEffect::SupervisionReceive { .. }
                             )
                         ))
                     || (continuation.completed && continuation.waiter_order != 0)
@@ -1432,6 +1632,7 @@ impl KernelResidentSyncPlan {
                     crate::executives::resident_sync::ResidentOutcome::Registered
                         | crate::executives::resident_sync::ResidentOutcome::Full
                         | crate::executives::resident_sync::ResidentOutcome::Empty
+                        | crate::executives::resident_sync::ResidentOutcome::NoNotice
                 )
             })
             .collect::<Vec<_>>();
@@ -1465,6 +1666,9 @@ impl KernelResidentSyncPlan {
                 }
                 ResidentEffect::ChannelReceive { .. } => {
                     crate::executives::resident_sync::ResidentOutcome::Empty
+                }
+                ResidentEffect::SupervisionReceive { .. } => {
+                    crate::executives::resident_sync::ResidentOutcome::NoNotice
                 }
                 _ => return Err(KernelResidentSyncError::InvalidDeviceResult),
             };
@@ -1588,6 +1792,26 @@ impl KernelResidentSyncPlan {
         }) {
             return Err(KernelResidentSyncError::InvalidDeviceResult);
         }
+        let publish_effects = result
+            .effects
+            .iter()
+            .filter(|effect| matches!(effect.effect, ResidentEffect::PublishChild { .. }))
+            .count();
+        if result.published_children.len() != publish_effects
+            || result.published_children.iter().any(|publication| {
+                publication.template as usize >= self.child_templates.len()
+                    || !self.continuations_by_id.contains_key(&publication.parent)
+                    || !result.effects.iter().any(|effect| {
+                        effect.epoch == publication.epoch
+                            && effect.lane == publication.lane
+                            && effect.ordinal == publication.ordinal
+                            && effect.continuation == publication.parent
+                            && matches!(effect.effect, ResidentEffect::PublishChild { .. })
+                    })
+            })
+        {
+            return Err(KernelResidentSyncError::InvalidDeviceResult);
+        }
         let mut invocations: BTreeMap<u64, u32> = BTreeMap::new();
         for invocation in &result.invocations {
             let count = invocations.entry(invocation.continuation).or_default();
@@ -1627,39 +1851,50 @@ impl KernelResidentSyncPlan {
                 || wake.epoch >= result.epochs
                 || !wake_positions.insert((wake.epoch, wake.lane, wake.ordinal, wake.continuation))
                 || !self.continuations_by_id.contains_key(&wake.continuation)
-                || !result.effects.iter().any(|effect| {
-                    effect.epoch == wake.epoch
-                        && effect.lane == wake.lane
-                        && effect.ordinal == wake.ordinal
-                        && effect.continuation == wake.cause_continuation
-                        && match effect.effect {
-                            ResidentEffect::FutureResolve { target, .. } => {
-                                wake.cause_opcode == crate::scheduler::device_ops::OP_RESOLVE_FUTURE
-                                    && target == wake.target
+                || (wake.cause_opcode == crate::scheduler::device_ops::OP_SUPERVISION_RECEIVE
+                    && (self.config.supervisors.get(&wake.cause_continuation)
+                        != Some(&wake.target)
+                        || !result.completed.contains(&wake.cause_continuation)))
+                || (wake.cause_opcode != crate::scheduler::device_ops::OP_SUPERVISION_RECEIVE
+                    && !result.effects.iter().any(|effect| {
+                        effect.epoch == wake.epoch
+                            && effect.lane == wake.lane
+                            && effect.ordinal == wake.ordinal
+                            && effect.continuation == wake.cause_continuation
+                            && match effect.effect {
+                                ResidentEffect::FutureResolve { target, .. } => {
+                                    wake.cause_opcode
+                                        == crate::scheduler::device_ops::OP_RESOLVE_FUTURE
+                                        && target == wake.target
+                                }
+                                ResidentEffect::MailboxSend { target, .. } => {
+                                    wake.cause_opcode
+                                        == crate::scheduler::device_ops::OP_ENQUEUE_MESSAGE
+                                        && target == wake.target
+                                }
+                                ResidentEffect::MailboxReceive { target } => {
+                                    wake.cause_opcode
+                                        == crate::scheduler::device_ops::OP_RECEIVE_MESSAGE
+                                        && target == wake.target
+                                }
+                                ResidentEffect::ChannelSend { target, .. } => {
+                                    wake.cause_opcode
+                                        == crate::scheduler::device_ops::OP_CHANNEL_SEND
+                                        && target == wake.target
+                                }
+                                ResidentEffect::ChannelReceive { target } => {
+                                    wake.cause_opcode
+                                        == crate::scheduler::device_ops::OP_CHANNEL_RECEIVE
+                                        && target == wake.target
+                                }
+                                ResidentEffect::SupervisionReceive { target } => {
+                                    wake.cause_opcode
+                                        == crate::scheduler::device_ops::OP_SUPERVISION_RECEIVE
+                                        && target == wake.target
+                                }
+                                _ => false,
                             }
-                            ResidentEffect::MailboxSend { target, .. } => {
-                                wake.cause_opcode
-                                    == crate::scheduler::device_ops::OP_ENQUEUE_MESSAGE
-                                    && target == wake.target
-                            }
-                            ResidentEffect::MailboxReceive { target } => {
-                                wake.cause_opcode
-                                    == crate::scheduler::device_ops::OP_RECEIVE_MESSAGE
-                                    && target == wake.target
-                            }
-                            ResidentEffect::ChannelSend { target, .. } => {
-                                wake.cause_opcode
-                                    == crate::scheduler::device_ops::OP_CHANNEL_SEND
-                                    && target == wake.target
-                            }
-                            ResidentEffect::ChannelReceive { target } => {
-                                wake.cause_opcode
-                                    == crate::scheduler::device_ops::OP_CHANNEL_RECEIVE
-                                    && target == wake.target
-                            }
-                            _ => false,
-                        }
-                })
+                    }))
             {
                 return Err(KernelResidentSyncError::InvalidDeviceResult);
             }
@@ -1670,9 +1905,12 @@ impl KernelResidentSyncPlan {
                 .get(&effect.continuation)
                 .ok_or(KernelResidentSyncError::InvalidDeviceResult)?;
             let actor = self.actors_by_id[&effect.continuation];
-            let target = self
-                .translate_target(effect.effect)
-                .ok_or(KernelResidentSyncError::InvalidDeviceResult)?;
+            let target = match effect.effect {
+                ResidentEffect::PublishChild { .. } => Ref64::NULL,
+                _ => self
+                    .translate_target(effect.effect)
+                    .ok_or(KernelResidentSyncError::InvalidDeviceResult)?,
+            };
             let _ = (cont, actor, target);
             if matches!(
                 effect.outcome,
@@ -1790,6 +2028,20 @@ impl KernelResidentSyncPlan {
                     0,
                     0,
                 ),
+                ResidentEffect::PublishChild { target } => (
+                    RESOURCE_PROCESS,
+                    target,
+                    crate::scheduler::device_ops::OP_PUBLISH_CHILD,
+                    0,
+                    0,
+                ),
+                ResidentEffect::SupervisionReceive { target } => (
+                    RESOURCE_PROCESS,
+                    target,
+                    crate::scheduler::device_ops::OP_SUPERVISION_RECEIVE,
+                    0,
+                    0,
+                ),
             };
             let (expected_code, expected_ref) = match effect.outcome {
                 crate::executives::resident_sync::ResidentOutcome::ObjectRead(read) => (2, read),
@@ -1808,6 +2060,11 @@ impl KernelResidentSyncPlan {
                 crate::executives::resident_sync::ResidentOutcome::InvalidTarget => (0x101, 0),
                 crate::executives::resident_sync::ResidentOutcome::Full => (0x10c, 0),
                 crate::executives::resident_sync::ResidentOutcome::DoubleResolve => (0x111, 0),
+                crate::executives::resident_sync::ResidentOutcome::Published => (0, 0),
+                crate::executives::resident_sync::ResidentOutcome::Notice { child, .. } => {
+                    (2, child)
+                }
+                crate::executives::resident_sync::ResidentOutcome::NoNotice => (1, 0),
             };
             let expected_mode = if matches!(
                 effect.effect,
@@ -1820,7 +2077,13 @@ impl KernelResidentSyncPlan {
             if access.lane != effect.lane
                 || access.ordinal != effect.ordinal
                 || access.resource_kind != kind
-                || access.resource != u64::from(target)
+                || (match effect.effect {
+                    ResidentEffect::PublishChild { .. }
+                    | ResidentEffect::SupervisionReceive { .. } => {
+                        access.resource != self.actors_by_id[&effect.continuation].to_u64()
+                    }
+                    _ => access.resource != u64::from(target),
+                })
                 || access.mode != expected_mode
                 || operation.lane != effect.lane
                 || operation.ordinal != effect.ordinal
@@ -1855,10 +2118,15 @@ impl KernelResidentSyncPlan {
             .map(|a| {
                 let mut x = *a;
                 x.resource = match a.resource_kind {
-                    RESOURCE_OBJECT => self.objects.get(a.resource as usize),
-                    RESOURCE_FUTURE => self.futures.get(a.resource as usize),
-                    RESOURCE_MAILBOX => self.mailboxes.get(a.resource as usize),
-                    RESOURCE_CHANNEL => self.channels.get(a.resource as usize),
+                    RESOURCE_OBJECT => self.objects.get(a.resource as usize).copied(),
+                    RESOURCE_FUTURE => self.futures.get(a.resource as usize).copied(),
+                    RESOURCE_MAILBOX => self.mailboxes.get(a.resource as usize).copied(),
+                    RESOURCE_CHANNEL => self.channels.get(a.resource as usize).copied(),
+                    RESOURCE_PROCESS => self
+                        .actors_by_id
+                        .values()
+                        .find(|actor| actor.to_u64() == a.resource)
+                        .copied(),
                     _ => None,
                 }
                 .ok_or(KernelResidentSyncError::InvalidDeviceResult)?
@@ -1886,6 +2154,7 @@ impl KernelResidentSyncPlan {
                     return Err(KernelResidentSyncError::InvalidDeviceResult);
                 }
                 let target = match op.opcode {
+                    crate::scheduler::device_ops::OP_PUBLISH_CHILD => None,
                     crate::scheduler::device_ops::OP_READ_OBJECT
                     | crate::scheduler::device_ops::OP_WRITE_OBJECT => {
                         self.objects.get(op.target as usize)
@@ -1903,9 +2172,14 @@ impl KernelResidentSyncPlan {
                     | crate::scheduler::device_ops::OP_CHANNEL_RECEIVE => {
                         self.channels.get(op.target as usize)
                     }
+                    crate::scheduler::device_ops::OP_SUPERVISION_RECEIVE => {
+                        self.mailboxes.get(op.target as usize)
+                    }
                     _ => None,
-                }
-                .ok_or(KernelResidentSyncError::InvalidDeviceResult)?;
+                };
+                let Some(target) = target else {
+                    continue;
+                };
                 if target.is_null() {
                     return Err(KernelResidentSyncError::InvalidDeviceResult);
                 }
@@ -1915,8 +2189,6 @@ impl KernelResidentSyncPlan {
         self.import_resident_state_transaction(&mut staged, &result)?;
         let violations = crate::semantics::invariants::check(&staged);
         if !violations.is_empty() {
-            #[cfg(test)]
-            eprintln!("resident invariant violations: {violations:#?}");
             return Err(KernelResidentSyncError::InvariantViolation);
         }
         *kernel = staged;
@@ -2063,6 +2335,50 @@ impl KernelResidentSyncPlan {
                 effects.sort_by_key(|effect| effect.ordinal);
                 let mut parked = None;
                 for effect in effects {
+                    if let ResidentEffect::PublishChild { target } = effect.effect {
+                        if effect.outcome
+                            != crate::executives::resident_sync::ResidentOutcome::Published
+                        {
+                            return Err(KernelResidentSyncError::InvalidDeviceResult);
+                        }
+                        let template = self
+                            .child_templates
+                            .get(target as usize)
+                            .ok_or(KernelResidentSyncError::InvalidDeviceResult)?;
+                        if template.supervisor != actor.to_u64() {
+                            return Err(KernelResidentSyncError::InvalidDeviceResult);
+                        }
+                        let supervisor = Ref64::from_u64(template.supervisor);
+                        let mode = match template.mode {
+                            1 => crate::abi::ProcessMode::Serial,
+                            2 => crate::abi::ProcessMode::Pure,
+                            3 => crate::abi::ProcessMode::System,
+                            _ => return Err(KernelResidentSyncError::InvalidDeviceResult),
+                        };
+                        let state_access = match template.state_access {
+                            1 => crate::abi::StateAccess::ReadOnly,
+                            2 => crate::abi::StateAccess::Mutable,
+                            _ => return Err(KernelResidentSyncError::InvalidDeviceResult),
+                        };
+                        let child = k
+                            .create_supervised_process_with_policy(
+                                supervisor,
+                                supervisor,
+                                mode,
+                                crate::abi::SupervisionPolicy::Notify,
+                            )
+                            .map_err(|_| KernelResidentSyncError::InvalidDeviceResult)?;
+                        let spec = crate::kernel::ContinuationSpec::new(
+                            state_access,
+                            template.run_class,
+                            0,
+                            template.frame.clone(),
+                            template.max_steps,
+                        );
+                        k.create_continuation(child, child, spec)
+                            .map_err(|_| KernelResidentSyncError::InvalidDeviceResult)?;
+                        continue;
+                    }
                     let target = self
                         .translate_target(effect.effect)
                         .ok_or(KernelResidentSyncError::InvalidDeviceResult)?;
@@ -2195,7 +2511,8 @@ impl KernelResidentSyncPlan {
                             }
                         }
                         ResidentEffect::ChannelSend { value, .. } => {
-                            let applied = k.send_channel(actor, target, Ref64::from_u64(value), cont);
+                            let applied =
+                                k.send_channel(actor, target, Ref64::from_u64(value), cont);
                             match (applied, effect.outcome) {
                                 (
                                     Ok(()),
@@ -2226,6 +2543,31 @@ impl KernelResidentSyncPlan {
                                 _ => return Err(KernelResidentSyncError::InvalidDeviceResult),
                             }
                         }
+                        ResidentEffect::SupervisionReceive { .. } => {
+                            let applied = k
+                                .receive_supervision(actor, cont)
+                                .map_err(|_| KernelResidentSyncError::InvalidDeviceResult)?;
+                            match (applied, effect.outcome) {
+                                (
+                                    Some(notice),
+                                    crate::executives::resident_sync::ResidentOutcome::Notice {
+                                        child,
+                                        reason,
+                                        failure_count,
+                                    },
+                                ) if notice.child.to_u64() == child
+                                    && notice.reason as u32 == reason
+                                    && notice.failure_count == failure_count => {}
+                                (
+                                    None,
+                                    crate::executives::resident_sync::ResidentOutcome::NoNotice,
+                                ) => parked = Some(target),
+                                _ => return Err(KernelResidentSyncError::InvalidDeviceResult),
+                            }
+                        }
+                        ResidentEffect::PublishChild { .. } => {
+                            return Err(KernelResidentSyncError::InvalidDeviceResult);
+                        }
                     }
                 }
                 let step = if let Some(target) = parked {
@@ -2255,9 +2597,12 @@ impl KernelResidentSyncPlan {
                         .is_ok_and(|descriptor| descriptor.status == ContinuationState::Completed)
                 })
                 .count();
-            if runnable != epoch_record.runnable_after as usize
-                || completed != epoch_record.completed_after as usize
-            {
+            let expected_runnable = r
+                .external_wakes
+                .get(epoch_record.epoch as usize)
+                .map_or(0, |count| *count as usize)
+                + epoch_record.runnable_after as usize;
+            if runnable != expected_runnable || completed != epoch_record.completed_after as usize {
                 return Err(KernelResidentSyncError::InvalidDeviceResult);
             }
             k.epoch_runnable.push(runnable);
@@ -2322,7 +2667,12 @@ impl KernelResidentSyncPlan {
                 .ok_or(KernelResidentSyncError::InvalidDeviceResult)?
                 .entries
                 .iter()
-                .map(|entry| (entry.descriptor.sender.to_u64(), entry.descriptor.payload.to_u64()))
+                .map(|entry| {
+                    (
+                        entry.descriptor.sender.to_u64(),
+                        entry.descriptor.payload.to_u64(),
+                    )
+                })
                 .collect::<Vec<_>>();
             let expected = &r.channels[index];
             if actual != *expected {
@@ -2349,6 +2699,7 @@ impl KernelResidentSyncPlan {
         let mut expected_recv_waiters = seed_waiters(&self.initial_recv_waiters);
         let mut expected_channel_send_waiters = seed_waiters(&self.initial_send_waiters);
         let mut expected_channel_recv_waiters = seed_waiters(&self.initial_recv_channel_waiters);
+        let mut expected_supervision_waiters: BTreeMap<u64, Vec<(u32, Ref64)>> = BTreeMap::new();
         for final_c in &r.final_continuations {
             let continuation = self.continuations_by_id[&final_c.id];
             let descriptor = k
@@ -2356,6 +2707,9 @@ impl KernelResidentSyncPlan {
                 .get(continuation)
                 .map_err(|_| KernelResidentSyncError::InvalidDeviceResult)?;
             if descriptor.run_class != final_c.run_class {
+                return Err(KernelResidentSyncError::InvalidDeviceResult);
+            }
+            if !final_c.published {
                 return Err(KernelResidentSyncError::InvalidDeviceResult);
             }
             if final_c.completed {
@@ -2411,6 +2765,14 @@ impl KernelResidentSyncPlan {
                         .ok_or(KernelResidentSyncError::InvalidDeviceResult)?;
                     (channel, Ref64::NULL, &mut expected_channel_recv_waiters)
                 }
+                ResidentEffect::SupervisionReceive { target } => {
+                    let process = self
+                        .mailboxes
+                        .get(target as usize)
+                        .copied()
+                        .ok_or(KernelResidentSyncError::InvalidDeviceResult)?;
+                    (process, Ref64::NULL, &mut expected_supervision_waiters)
+                }
                 _ => return Err(KernelResidentSyncError::InvalidDeviceResult),
             };
             if descriptor.status != ContinuationState::Waiting
@@ -2427,6 +2789,26 @@ impl KernelResidentSyncPlan {
                 .or_default()
                 .push((final_c.waiter_order, continuation));
         }
+        expected_supervision_waiters = self
+            .mailboxes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, process)| {
+                let waiters = r.supervision_waiters.get(index)?;
+                (!waiters.is_empty()).then(|| {
+                    (
+                        process.key(),
+                        waiters
+                            .iter()
+                            .enumerate()
+                            .map(|(order, continuation)| {
+                                (order as u32, Ref64::from_u64(*continuation))
+                            })
+                            .collect(),
+                    )
+                })
+            })
+            .collect();
         fn ordered_waiters(waiters: BTreeMap<u64, Vec<(u32, Ref64)>>) -> BTreeMap<u64, Vec<Ref64>> {
             waiters
                 .into_iter()
@@ -2472,11 +2854,47 @@ impl KernelResidentSyncPlan {
             .filter(|(_, queue)| !queue.receive_waiters.is_empty())
             .map(|(channel, queue)| (*channel, queue.receive_waiters.iter().copied().collect()))
             .collect();
+        let actual_supervision_waiters: BTreeMap<u64, Vec<Ref64>> = k
+            .supervision_queues()
+            .iter()
+            .filter(|(_, queue)| !queue.waiters.is_empty())
+            .map(|(process, queue)| (*process, queue.waiters.iter().copied().collect()))
+            .collect();
+        let actual_supervision_notices: BTreeMap<u64, Vec<ResidentSupervisionNoticeRecord>> = k
+            .supervision_queues()
+            .iter()
+            .filter(|(_, queue)| !queue.notices.is_empty())
+            .map(|(process, queue)| {
+                (
+                    *process,
+                    queue
+                        .notices
+                        .iter()
+                        .map(|notice| ResidentSupervisionNoticeRecord {
+                            child: notice.child.to_u64(),
+                            reason: notice.reason as u32,
+                            failure_count: notice.failure_count,
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let expected_supervision_notices: BTreeMap<u64, Vec<ResidentSupervisionNoticeRecord>> =
+            self.mailboxes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, process)| {
+                    let notices = r.supervision_notices.get(index)?;
+                    (!notices.is_empty()).then(|| (process.key(), notices.clone()))
+                })
+                .collect();
         if actual_future_waiters != ordered_waiters(expected_future_waiters)
             || actual_full_waiters != ordered_waiters(expected_full_waiters)
             || actual_recv_waiters != ordered_waiters(expected_recv_waiters)
             || actual_channel_send_waiters != ordered_waiters(expected_channel_send_waiters)
             || actual_channel_recv_waiters != ordered_waiters(expected_channel_recv_waiters)
+            || actual_supervision_waiters != ordered_waiters(expected_supervision_waiters)
+            || actual_supervision_notices != expected_supervision_notices
         {
             return Err(KernelResidentSyncError::InvalidDeviceResult);
         }
@@ -4490,7 +4908,15 @@ mod tests {
         prefill: bool,
         receiver_first: bool,
         drain_receiver: bool,
-    ) -> (Kernel, KernelResidentSyncPlan, Ref64, Ref64, Ref64, Ref64, Ref64) {
+    ) -> (
+        Kernel,
+        KernelResidentSyncPlan,
+        Ref64,
+        Ref64,
+        Ref64,
+        Ref64,
+        Ref64,
+    ) {
         let mut k = Kernel::new();
         let creator = k.create_process(Ref64::NULL, ProcessMode::Pure);
         let sender = k.create_process(Ref64::NULL, ProcessMode::Pure);
@@ -4555,7 +4981,9 @@ mod tests {
         })
         .unwrap();
         let mk = |rc| ContinuationSpec::new(StateAccess::ReadOnly, rc, 0, vec![0; 8], 16);
-        let recv_cont = k.create_continuation(receiver, receiver, mk(recv_rc)).unwrap();
+        let recv_cont = k
+            .create_continuation(receiver, receiver, mk(recv_rc))
+            .unwrap();
         let send_cont = k.create_continuation(sender, sender, mk(send_rc)).unwrap();
         // `receiver_first` controls which run class is lower, and therefore which
         // party runs on lane zero; the returned handles always name their roles.
@@ -4571,7 +4999,15 @@ mod tests {
     fn channel_sender_park_setup(
         width: u32,
         capacity: u32,
-    ) -> (Kernel, KernelResidentSyncPlan, Ref64, Ref64, Ref64, Ref64, Ref64) {
+    ) -> (
+        Kernel,
+        KernelResidentSyncPlan,
+        Ref64,
+        Ref64,
+        Ref64,
+        Ref64,
+        Ref64,
+    ) {
         let mut k = Kernel::new();
         let creator = k.create_process(Ref64::NULL, ProcessMode::Pure);
         let sender = k.create_process(Ref64::NULL, ProcessMode::Pure);
@@ -4611,7 +5047,12 @@ mod tests {
             .unwrap()
             .entries
             .iter()
-            .map(|entry| (entry.descriptor.sender.to_u64(), entry.descriptor.payload.to_u64()))
+            .map(|entry| {
+                (
+                    entry.descriptor.sender.to_u64(),
+                    entry.descriptor.payload.to_u64(),
+                )
+            })
             .collect()
     }
 
@@ -4677,7 +5118,10 @@ mod tests {
                 metal.continuation_state(r).unwrap(),
                 ContinuationState::Completed
             );
-            assert_eq!(channel_queue_entries(&metal, ch), channel_queue_entries(&cpu, channel));
+            assert_eq!(
+                channel_queue_entries(&metal, ch),
+                channel_queue_entries(&cpu, channel)
+            );
             assert!(metal
                 .trace_events()
                 .iter()
@@ -4812,7 +5256,10 @@ mod tests {
         );
         assert_eq!(
             channel_queue_entries(&k, channel),
-            vec![(k.continuations.get(send_cont).unwrap().process.to_u64(), pre_payload.to_u64())]
+            vec![(
+                k.continuations.get(send_cont).unwrap().process.to_u64(),
+                pre_payload.to_u64()
+            )]
         );
         // Ordinary receive transfers the prefill escrow and wakes the parked
         // resident sender, exactly as the canonical resident receive does.
@@ -4849,7 +5296,10 @@ mod tests {
             .is_empty());
         assert_eq!(
             channel_queue_entries(&k, channel),
-            vec![(k.continuations.get(send_cont).unwrap().process.to_u64(), payload.to_u64())]
+            vec![(
+                k.continuations.get(send_cont).unwrap().process.to_u64(),
+                payload.to_u64()
+            )]
         );
         assert!(crate::semantics::invariants::check(&k).is_empty());
     }
@@ -4955,7 +5405,9 @@ mod tests {
         let payload = k.create_object(sender, ObjectKind::MessagePayload, vec![1, 2, 3, 4]);
         // Expire the payload transfer capability before the plan horizon so the
         // resident send has no stable transfer authority to escrow.
-        let cap = k.find_capability(sender, payload, Rights::TRANSFER).unwrap();
+        let cap = k
+            .find_capability(sender, payload, Rights::TRANSFER)
+            .unwrap();
         k.capability_spaces
             .get_mut(&sender.key())
             .unwrap()
@@ -4980,5 +5432,176 @@ mod tests {
             k.plan_resident_sync(4, 1, 8, 1),
             Err(KernelResidentSyncError::UnsupportedShape)
         ));
+    }
+
+    fn supervision_setup(width: u32) -> (Kernel, KernelResidentSyncPlan, Ref64, Ref64, Ref64, u32) {
+        let mut kernel = Kernel::new();
+        let supervisor = kernel.create_process(Ref64::NULL, ProcessMode::Pure);
+        let child_template = kernel
+            .install_resident_child_template(KernelResidentChildTemplate {
+                supervisor,
+                mode: ProcessMode::Pure,
+                run_class: 1810,
+                state_access: StateAccess::ReadOnly,
+                max_steps: 1,
+                frame: vec![],
+            })
+            .unwrap();
+        kernel
+            .install_resident_sync_program(KernelResidentProgram {
+                run_class: 1800,
+                instructions: vec![
+                    KernelResidentInstruction::publish_child(child_template),
+                    KernelResidentInstruction::plain(HANDLER_COMPLETE, 0, 0),
+                ],
+            })
+            .unwrap();
+        kernel
+            .install_resident_sync_program(KernelResidentProgram {
+                run_class: 1810,
+                instructions: vec![KernelResidentInstruction::plain(HANDLER_COMPLETE, 0, 0)],
+            })
+            .unwrap();
+        kernel
+            .install_resident_sync_program(KernelResidentProgram {
+                run_class: 1801,
+                instructions: vec![
+                    KernelResidentInstruction::supervision_receive(supervisor),
+                    KernelResidentInstruction::plain(HANDLER_COMPLETE, 0, 0),
+                ],
+            })
+            .unwrap();
+        let publisher = kernel
+            .create_continuation(
+                supervisor,
+                supervisor,
+                ContinuationSpec::new(StateAccess::ReadOnly, 1800, 0, vec![0; 8], 8),
+            )
+            .unwrap();
+        let consumer = kernel
+            .create_continuation(
+                supervisor,
+                supervisor,
+                ContinuationSpec::new(StateAccess::ReadOnly, 1801, 0, vec![0; 8], 8),
+            )
+            .unwrap();
+        assert_eq!(
+            kernel.receive_supervision(supervisor, consumer).unwrap(),
+            None
+        );
+        kernel.scheduler.remove(consumer);
+        kernel.continuations.get_mut(consumer).unwrap().status = ContinuationState::Waiting;
+        let plan = kernel.plan_resident_sync(4, 2, 8, width).unwrap();
+        (
+            kernel,
+            plan,
+            supervisor,
+            publisher,
+            consumer,
+            child_template,
+        )
+    }
+
+    fn run_supervision_sequence(kernel: &mut Kernel, width: u32) {
+        let plan = kernel.plan_resident_sync(4, 2, 8, width).unwrap();
+        assert_eq!(kernel.run_resident_sync_cpu_reference(plan), Ok(1));
+        let plan = kernel.plan_resident_sync(4, 2, 8, width).unwrap();
+        assert_eq!(kernel.run_resident_sync_cpu_reference(plan), Ok(1));
+        let plan = kernel.plan_resident_sync(4, 2, 8, width).unwrap();
+        assert_eq!(kernel.run_resident_sync_cpu_reference(plan), Ok(1));
+    }
+
+    #[test]
+    fn supervised_child_publication_delivers_one_notice_cpu_width_1_32() {
+        let mut runs = Vec::new();
+        for width in [1, 32] {
+            let (mut kernel, _, supervisor, publisher, consumer, _) = supervision_setup(width);
+            run_supervision_sequence(&mut kernel, width);
+            assert_eq!(
+                kernel.continuation_state(publisher).unwrap(),
+                ContinuationState::Completed
+            );
+            assert_eq!(
+                kernel.continuation_state(consumer).unwrap(),
+                ContinuationState::Completed
+            );
+            assert_eq!(kernel.pending_supervision_notices(supervisor), 0);
+            assert_eq!(
+                kernel
+                    .processes
+                    .iter()
+                    .filter(|(_, process)| process.supervisor == supervisor)
+                    .count(),
+                1
+            );
+            assert!(crate::semantics::invariants::check(&kernel).is_empty());
+            runs.push(kernel);
+        }
+        assert!(crate::semantics::order::placement_neutral(&[&runs[0], &runs[1]]).is_empty());
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn supervised_child_publication_actual_metal_width_1_32_matches_cpu() {
+        let mut metal_runs = Vec::new();
+        for width in [1, 32] {
+            let (mut cpu, _, _supervisor, _publisher, _consumer, _) = supervision_setup(width);
+            run_supervision_sequence(&mut cpu, width);
+            let (mut kernel, plan, supervisor, publisher, consumer, _) = supervision_setup(width);
+            assert_eq!(kernel.run_resident_sync_metal(plan), Ok(1));
+            let plan = kernel.plan_resident_sync(4, 2, 8, width).unwrap();
+            assert_eq!(kernel.run_resident_sync_metal(plan), Ok(1));
+            let plan = kernel.plan_resident_sync(4, 2, 8, width).unwrap();
+            assert_eq!(kernel.run_resident_sync_metal(plan), Ok(1));
+            assert_eq!(
+                kernel.continuation_state(publisher).unwrap(),
+                ContinuationState::Completed
+            );
+            assert_eq!(
+                kernel.continuation_state(consumer).unwrap(),
+                ContinuationState::Completed
+            );
+            assert_eq!(kernel.pending_supervision_notices(supervisor), 0);
+            assert_eq!(
+                KernelResidentSyncPlan::fingerprint(&kernel),
+                KernelResidentSyncPlan::fingerprint(&cpu)
+            );
+            assert!(crate::semantics::invariants::check(&kernel).is_empty());
+            metal_runs.push(kernel);
+        }
+        assert!(
+            crate::semantics::order::placement_neutral(&[&metal_runs[0], &metal_runs[1]])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn supervised_publication_tamper_refuses_atomically() {
+        let (kernel, plan, _, _, _, _) = supervision_setup(1);
+        let mut result = crate::executives::resident_sync::run_resident_sync(
+            &plan.config,
+            plan.continuations.clone(),
+            &plan.programs,
+        )
+        .unwrap();
+        result.published_children[0].template = 999;
+        let mut candidate = kernel.clone();
+        let fingerprint = KernelResidentSyncPlan::fingerprint(&candidate);
+        let trace_len = candidate.trace_events().len();
+        let accounting = candidate.accounting;
+        let admission_len = candidate.admission_log.len();
+        let effect_len = candidate.effect_log.len();
+        assert_eq!(
+            plan.validate_and_import(&mut candidate, result),
+            Err(KernelResidentSyncError::InvalidDeviceResult)
+        );
+        assert_refusal_preserves_kernel(
+            &candidate,
+            fingerprint,
+            trace_len,
+            &accounting,
+            admission_len,
+            effect_len,
+        );
     }
 }

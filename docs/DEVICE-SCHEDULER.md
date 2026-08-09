@@ -363,7 +363,21 @@ sender fills and wakes, receiver retries and receives), prefill delivery, and
 sender-full-park (receiver drains, wakes the sender, which delivers across the
 epoch boundary) flows match the ordinary Kernel exactly on CPU and actual-Metal
 widths 1/32; tampered tickets, outcomes, and dispositions refuse atomically, as
-does a pending effect outside the channel vocabulary. Supervision, allocation or
-resizing, foreign resources, device capability creation, sub-full-range ordinary
-Kernel object authorization, and general loop/gather or broader effect shapes
-still refuse. The general G2 executive therefore remains open.
+does a pending effect outside the channel vocabulary.
+
+Child publication and supervision now form one bounded canonical slice through
+the same ABI. A resident handler can `PublishChild` a pre-registered template;
+the CPU oracle records the publication and the Kernel import creates the fresh
+supervised process and entry continuation at that exact lane/ordinal position.
+A resident `SupervisionReceive` parks on the supervisor's reliable control queue
+or consumes the oldest typed notice when one is already present. A resident
+supervised child completion publishes exactly one `Completed` notice and wakes
+one waiter, including a waiter outside the current resident plan; that external
+wake is returned as an epoch-level runnable adjustment so Phase-H accounting
+matches the ordinary Kernel. Pre-existing supervision waiters and notices
+survive and resume across plans on CPU and actual-Metal widths 1/32, tampered
+publication records, outcomes, and dispositions refuse atomically, and
+restart/escalation supervision, allocation/resizing, foreign resources, device
+capability creation, sub-full-range ordinary Kernel object authorization, and
+general loop/gather or broader effect shapes still refuse. The general G2
+executive therefore remains open.

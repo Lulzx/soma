@@ -74,9 +74,14 @@ single pending effect with `Yield` disposition, and `Sent` kept non-value-bearin
 so a sender can never observe its own send. Receiver-empty-park, prefill
 delivery, and sender-full-park-with-across-epoch-retry flows all match the
 reference Kernel on CPU and actual-Metal widths 1/32; tamper and admission
-refusals stay atomic. Allocation/resizing, supervision, device capability
-creation, general loop/gather handlers, broader effects, and the general
-canonical bridge remain to be integrated.
+refusals stay atomic. Canonical child publication now creates a pre-registered
+supervised child at the exact publishing lane/ordinal, and resident
+`SupervisionReceive` parks or consumes one typed terminal notice; supervised
+child completion publishes one notice and wakes one waiter, including waiters
+outside the resident plan, with CPU and actual-Metal width-1/32 agreement and
+atomic tamper refusals. Restart/escalation supervision, allocation/resizing,
+device capability creation, general loop/gather handlers, broader effects, and
+the general canonical bridge remain to be integrated.
 
 ## G3 — Distributed ownership [in progress]
 
