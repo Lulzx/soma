@@ -1,2 +1,5 @@
 /target
 viz/data
+
+# macOS Finder/Spotlight sidecar artifacts
+.freebuff/

@@ -28,6 +28,7 @@ struct GpuConfig {
     instruction_count: u32,
     future_count: u32,
     mailbox_count: u32,
+    channel_count: u32,
     capability_count: u32,
     max_epochs: u32,
     max_effects: u32,
@@ -35,6 +36,7 @@ struct GpuConfig {
     effect_capacity: u32,
     trace_capacity: u32,
     mailbox_stride: u32,
+    channel_stride: u32,
     invocation_capacity: u32,
     wake_capacity: u32,
     epoch_capacity: u32,
@@ -169,7 +171,7 @@ struct GpuStatus {
 const SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
-struct Config { uint continuation_count, handler_count, instruction_count, future_count; uint mailbox_count, capability_count, max_epochs, max_effects; uint frame_stride, effect_capacity, trace_capacity, mailbox_stride; uint invocation_capacity,wake_capacity,epoch_capacity,object_count; uint object_capability_count,object_stride,initial_epoch; };
+struct Config { uint continuation_count, handler_count, instruction_count, future_count; uint mailbox_count, channel_count, capability_count, max_epochs, max_effects; uint frame_stride, effect_capacity, trace_capacity, mailbox_stride, channel_stride; uint invocation_capacity,wake_capacity,epoch_capacity,object_count; uint object_capability_count,object_stride,initial_epoch; };
 struct Cont { ulong id, actor; uint run_class, frame_len, state, last_epoch; uint previous_kind, pending_opcode, pending_target, reserved; uint mutable_access,waiting_since,actor_next,actor_head,admitted,reserved2; ulong previous_value, previous_sender, pending_value; };
 struct Handler { uint run_class, instruction_offset, instruction_count, reserved; };
 struct Instruction { uint opcode, argument, target, reserved; ulong value; };
@@ -187,10 +189,10 @@ struct Invocation { uint epoch,lane; ulong continuation; uint run_class,disposit
 struct Wake { uint epoch,lane,cause_opcode,target; ulong cause_continuation,continuation; uint run_class,ticket,ordinal,reserved; };
 struct EpochRecord { uint epoch,invocations,runnable_after,completed_after; };
 constant uint RUNNABLE=1, PARKED=2, COMPLETE=3;
-constant uint AWAIT=1, RESOLVE=2, SEND=3, RECEIVE=4, OBSERVE=10, OBJECT_READ=11, OBJECT_WRITE=12, ADD_FRAME=13, COMPLETE_IF_FRAME_EQ=14, YIELD_FRAME=15, ADD_FRAME_WORD=16, YIELD_IF_FRAME_ZERO=17;
+constant uint AWAIT=1, RESOLVE=2, SEND=3, RECEIVE=4, OBSERVE=10, OBJECT_READ=11, OBJECT_WRITE=12, ADD_FRAME=13, COMPLETE_IF_FRAME_EQ=14, YIELD_FRAME=15, ADD_FRAME_WORD=16, YIELD_IF_FRAME_ZERO=17, CHANNEL_SEND=18, CHANNEL_RECEIVE=19;
 constant uint OUT_RESOLVED=1, OUT_REGISTERED=2, OUT_SENT=3, OUT_RECEIVED=4, OUT_DENIED=5, OUT_INVALID=6, OUT_FULL=7, OUT_EMPTY=8, OUT_DOUBLE=9, OUT_PENDING=10, OUT_OBJECT_READ=11, OUT_OBJECT_WRITTEN=12;
 inline uint outcome_code(uint o) { if(o==OUT_RESOLVED||o==OUT_RECEIVED||o==OUT_OBJECT_READ)return 2; if(o==OUT_REGISTERED)return 3; if(o==OUT_EMPTY||o==OUT_PENDING)return 1; if(o==OUT_INVALID)return 0x101; if(o==OUT_DENIED)return 0x104; if(o==OUT_FULL)return 0x10c; if(o==OUT_DOUBLE)return 0x111; return 0; }
-inline uint journal_opcode(uint op) { return op==OBJECT_READ?2:(op==OBJECT_WRITE?7:(op==OBSERVE?1:(op==AWAIT?11:(op==RESOLVE?10:(op==SEND?8:9))))); }
+inline uint journal_opcode(uint op) { return op==OBJECT_READ?2:(op==OBJECT_WRITE?7:(op==OBSERVE?1:(op==AWAIT?11:(op==RESOLVE?10:(op==CHANNEL_SEND?12:(op==CHANNEL_RECEIVE?13:(op==SEND?8:9))))))); }
 inline uint hash_frame(device uchar* f,uint n){uint h=2166136261u;for(uint i=0;i<n;i++)h=(h^uint(f[i]))*16777619u;return h;}
 inline bool allowed(device const Capability* caps,uint n,ulong actor,uint kind,uint target,uint right){for(uint i=0;i<n;i++){Capability c=caps[i];if(c.actor==actor&&c.kind==kind&&c.target==target&&(c.rights&right)!=0)return true;}return false;}
 inline bool object_allowed(device const ObjectCapability* caps,uint n,device const Object* objects,uint object_count,ulong actor,uint target,uint offset,uint right,uint epoch){if(target>=object_count)return false;ulong end=ulong(offset)+8;for(uint i=0;i<n;i++){ObjectCapability c=caps[i];if(c.actor==actor&&c.target==target&&(c.rights&right)!=0&&c.object_version==objects[target].version&&c.valid_until_epoch>=epoch&&ulong(offset)>=c.offset&&end>=ulong(offset)&&end<=c.offset+c.length)return true;}return false;}
@@ -202,7 +204,7 @@ kernel void resident_sync(
  constant Config& cfg [[buffer(0)]], device Cont* cs [[buffer(1)]], device uchar* frames [[buffer(2)]],
  device const Handler* handlers [[buffer(3)]], device const Instruction* ins [[buffer(4)]], device Future* futures [[buffer(5)]],
  device Mailbox* mails [[buffer(6)]], device MailEntry* entries [[buffer(7)]], device const Capability* caps [[buffer(8)]],
- device EffectRecord* records [[buffer(9)]], device Trace* traces [[buffer(10)]], device ulong* completed [[buffer(11)]], device Status* status [[buffer(12)]], device Stage* stages [[buffer(13)]], device Invocation* invocations [[buffer(14)]], device Wake* wakes [[buffer(15)]], device EpochRecord* epoch_records [[buffer(16)]], device Object* objects [[buffer(17)]], device uchar* object_bytes [[buffer(18)]], device const ObjectCapability* object_caps [[buffer(19)]], device EffectRecord* scratch [[buffer(20)]], device uint* evaluation_counts [[buffer(21)]], uint tid [[thread_index_in_threadgroup]], uint3 tpg [[threads_per_threadgroup]]) {
+ device EffectRecord* records [[buffer(9)]], device Trace* traces [[buffer(10)]], device ulong* completed [[buffer(11)]], device Status* status [[buffer(12)]], device Stage* stages [[buffer(13)]], device Invocation* invocations [[buffer(14)]], device Wake* wakes [[buffer(15)]], device EpochRecord* epoch_records [[buffer(16)]], device Object* objects [[buffer(17)]], device uchar* object_bytes [[buffer(18)]], device const ObjectCapability* object_caps [[buffer(19)]], device EffectRecord* scratch [[buffer(20)]], device uint* evaluation_counts [[buffer(21)]], device Mailbox* chans [[buffer(22)]], device MailEntry* chan_entries [[buffer(23)]], uint tid [[thread_index_in_threadgroup]], uint3 tpg [[threads_per_threadgroup]]) {
  threadgroup uint selected[32];
  threadgroup uint cohort_count;
  threadgroup uint epoch_lanes;
@@ -276,7 +278,7 @@ kernel void resident_sync(
       if(op==7){if((input_previous_kind!=OUT_RESOLVED&&input_previous_kind!=OUT_RECEIVED&&input_previous_kind!=OUT_OBJECT_READ)||input_previous_value!=val)pc+=arg;continue;}
       if(op==8){disposition=1;next_class=arg;break;}if(op==YIELD_FRAME){if(arg+4>c.frame_len){error=4;break;}next_class=0;for(uint bb=0;bb<4;bb++)next_class|=uint(frames[at*cfg.frame_stride+arg+bb])<<(bb*8);if(next_class==0){error=4;break;}disposition=1;break;}if(op==YIELD_IF_FRAME_ZERO){if(arg+8>c.frame_len){error=4;break;}ulong predicate=0;for(uint bb=0;bb<8;bb++)predicate|=ulong(frames[at*cfg.frame_stride+arg+bb])<<(bb*8);next_class=predicate==0?uint(val):uint(val>>32);if(next_class==0){error=4;break;}disposition=1;break;}if(op==9){disposition=2;next_class=0;break;}
      }
-     if(!((op>=1&&op<=4)||op==OBSERVE||op==OBJECT_READ||op==OBJECT_WRITE)||emitted>=cfg.max_effects){error=5;break;}
+     if(!((op>=1&&op<=4)||op==OBSERVE||op==OBJECT_READ||op==OBJECT_WRITE||op==CHANNEL_SEND||op==CHANNEL_RECEIVE)||emitted>=cfg.max_effects){error=5;break;}
      uint scratch_at=lane*cfg.max_effects+emitted;
      EffectRecord r={epoch,lane,emitted,journal_opcode(op),c.id,target,0,val,0,0,c.run_class,(op==OBJECT_READ||op==OBJECT_WRITE)?arg:0};scratch[scratch_at]=r;emitted++;
     }
@@ -312,19 +314,21 @@ kernel void resident_sync(
   if(tid==0)for(uint li=0;li<epoch_lanes;li++){
    Stage st=stages[li];Cont c=cs[st.continuation_index];bool parked=false;
    for(uint ri=st.effect_offset;ri<st.effect_offset+st.effect_count;ri++){
-    EffectRecord r=records[ri];uint op=r.opcode==2?OBJECT_READ:(r.opcode==7?OBJECT_WRITE:(r.opcode==1?OBSERVE:(r.opcode==11?AWAIT:(r.opcode==10?RESOLVE:(r.opcode==8?SEND:RECEIVE)))));uint arg=r.target;uint offset=r.reserved;ulong val=r.value;
-    uint kind=(op==OBJECT_READ||op==OBJECT_WRITE)?1:((op<=2||op==OBSERVE)?2:3);uint right=(op==OBJECT_READ||op==OBSERVE||op==AWAIT||op==RECEIVE)?1:2;uint outcome=0;ulong result_value=0,result_sender=0;
+    EffectRecord r=records[ri];uint ch=(r.opcode==12||r.opcode==13);uint op=r.opcode==2?OBJECT_READ:(r.opcode==7?OBJECT_WRITE:(r.opcode==1?OBSERVE:(r.opcode==11?AWAIT:(r.opcode==10?RESOLVE:(ch?(r.opcode==12?SEND:RECEIVE):(r.opcode==8?SEND:RECEIVE))))));uint arg=r.target;uint offset=r.reserved;ulong val=r.value;
+    uint kind=(op==OBJECT_READ||op==OBJECT_WRITE)?1:((op<=2||op==OBSERVE)?2:(ch?4:3));uint right=(op==OBJECT_READ||op==OBSERVE||op==AWAIT||op==RECEIVE)?1:2;uint outcome=0;ulong result_value=0,result_sender=0;
     bool authorized=kind==1?object_allowed(object_caps,cfg.object_capability_count,objects,cfg.object_count,c.actor,arg,offset,right,cfg.initial_epoch+epoch):allowed(caps,cfg.capability_count,c.actor,kind,arg,right);
     if(!authorized)outcome=OUT_DENIED;
-    else if((kind==1&&arg>=cfg.object_count)||(kind==2&&arg>=cfg.future_count)||(kind==3&&arg>=cfg.mailbox_count))outcome=OUT_INVALID;
+    else if((kind==1&&arg>=cfg.object_count)||(kind==2&&arg>=cfg.future_count)||(kind==3&&arg>=cfg.mailbox_count)||(kind==4&&arg>=cfg.channel_count))outcome=OUT_INVALID;
     else if(kind==1&&(ulong(offset)+8>objects[arg].len||ulong(offset)+8<ulong(offset)))outcome=OUT_INVALID;
     else if(op==OBJECT_READ){uint base=arg*cfg.object_stride+offset;for(uint bb=0;bb<8;bb++)result_value|=ulong(object_bytes[base+bb])<<(bb*8);outcome=OUT_OBJECT_READ;}
     else if(op==OBJECT_WRITE){uint base=arg*cfg.object_stride+offset;for(uint bb=0;bb<8;bb++)object_bytes[base+bb]=uchar(val>>(bb*8));result_value=val;outcome=OUT_OBJECT_WRITTEN;}
     else if(op==OBSERVE){if(futures[arg].resolved!=0){outcome=OUT_RESOLVED;result_value=futures[arg].value;}else outcome=OUT_PENDING;}
     else if(op==AWAIT){if(futures[arg].resolved!=0){outcome=OUT_RESOLVED;result_value=futures[arg].value;}else{outcome=OUT_REGISTERED;parked=true;c.pending_opcode=AWAIT;c.pending_target=arg;}}
     else if(op==RESOLVE){if(futures[arg].resolved!=0)outcome=OUT_DOUBLE;else{futures[arg].resolved=1;futures[arg].value=val;outcome=OUT_RESOLVED;result_value=val;wake_future(cs,cfg.continuation_count,arg,val,epoch,li,c.id,r.ordinal,wakes,status,cfg);}}
-    else if(op==SEND){Mailbox m=mails[arg];if(m.count>=m.capacity){outcome=OUT_FULL;parked=true;c.pending_opcode=SEND;c.pending_target=arg;c.pending_value=val;}else{uint slot=arg*cfg.mailbox_stride+(m.head+m.count)%cfg.mailbox_stride;MailEntry ne={c.actor,val};entries[slot]=ne;m.count++;mails[arg]=m;outcome=OUT_SENT;wake_one(cs,cfg.continuation_count,RECEIVE,arg,epoch,li,8,c.id,r.ordinal,wakes,status,cfg);}}
-    else{Mailbox m=mails[arg];if(m.count==0){outcome=OUT_EMPTY;parked=true;c.pending_opcode=RECEIVE;c.pending_target=arg;}else{uint slot=arg*cfg.mailbox_stride+m.head;MailEntry e=entries[slot];m.head=(m.head+1)%cfg.mailbox_stride;m.count--;mails[arg]=m;outcome=OUT_RECEIVED;result_value=e.value;result_sender=e.sender;c.pending_opcode=0;wake_one(cs,cfg.continuation_count,SEND,arg,epoch,li,9,c.id,r.ordinal,wakes,status,cfg);}}
+    else if(kind==3&&op==SEND){Mailbox m=mails[arg];if(m.count>=m.capacity){outcome=OUT_FULL;parked=true;c.pending_opcode=SEND;c.pending_target=arg;c.pending_value=val;}else{uint slot=arg*cfg.mailbox_stride+(m.head+m.count)%cfg.mailbox_stride;MailEntry ne={c.actor,val};entries[slot]=ne;m.count++;mails[arg]=m;outcome=OUT_SENT;wake_one(cs,cfg.continuation_count,RECEIVE,arg,epoch,li,8,c.id,r.ordinal,wakes,status,cfg);}}
+    else if(kind==3&&op==RECEIVE){Mailbox m=mails[arg];if(m.count==0){outcome=OUT_EMPTY;parked=true;c.pending_opcode=RECEIVE;c.pending_target=arg;}else{uint slot=arg*cfg.mailbox_stride+m.head;MailEntry e=entries[slot];m.head=(m.head+1)%cfg.mailbox_stride;m.count--;mails[arg]=m;outcome=OUT_RECEIVED;result_value=e.value;result_sender=e.sender;c.pending_opcode=0;wake_one(cs,cfg.continuation_count,SEND,arg,epoch,li,9,c.id,r.ordinal,wakes,status,cfg);}}
+    else if(kind==4&&op==SEND){Mailbox m=chans[arg];if(m.count>=m.capacity){outcome=OUT_FULL;parked=true;c.pending_opcode=CHANNEL_SEND;c.pending_target=arg;c.pending_value=val;}else{uint slot=arg*cfg.channel_stride+(m.head+m.count)%cfg.channel_stride;MailEntry ne={c.actor,val};chan_entries[slot]=ne;m.count++;chans[arg]=m;outcome=OUT_SENT;wake_one(cs,cfg.continuation_count,CHANNEL_RECEIVE,arg,epoch,li,12,c.id,r.ordinal,wakes,status,cfg);}}
+    else{Mailbox m=chans[arg];if(m.count==0){outcome=OUT_EMPTY;parked=true;c.pending_opcode=CHANNEL_RECEIVE;c.pending_target=arg;}else{uint slot=arg*cfg.channel_stride+m.head;MailEntry e=chan_entries[slot];m.head=(m.head+1)%cfg.channel_stride;m.count--;chans[arg]=m;outcome=OUT_RECEIVED;result_value=e.value;result_sender=e.sender;c.pending_opcode=0;wake_one(cs,cfg.continuation_count,CHANNEL_SEND,arg,epoch,li,13,c.id,r.ordinal,wakes,status,cfg);}}
     if(outcome==OUT_REGISTERED||outcome==OUT_FULL||outcome==OUT_EMPTY){c.reserved=++status->ticket;c.state=PARKED;cs[st.continuation_index]=c;}
     r.outcome=outcome;r.result_value=result_value;r.result_sender=result_sender;records[ri]=r;add_trace(traces,status,cfg,epoch,li,c,r.opcode,outcome_code(outcome));
     // A later effect in this same lane may wake an effect that parked above.
@@ -437,6 +441,11 @@ impl MetalResidentSync {
             .len()
             .checked_mul(config.max_continuations as usize)
             .ok_or(BackendError::InvalidInput)?;
+        let channel_entry_count = config
+            .channel_capacities
+            .len()
+            .checked_mul(config.max_continuations as usize)
+            .ok_or(BackendError::InvalidInput)?;
         let object_byte_count = config
             .objects
             .len()
@@ -448,7 +457,13 @@ impl MetalResidentSync {
             .ok_or(BackendError::InvalidInput)?;
         // Every device offset in the shader is u32. Refuse padded arenas whose
         // element counts would wrap even when the host usize multiplication fits.
-        for count in [frame_count, entry_count, object_byte_count, scratch_count] {
+        for count in [
+            frame_count,
+            entry_count,
+            channel_entry_count,
+            object_byte_count,
+            scratch_count,
+        ] {
             u32::try_from(count).map_err(|_| BackendError::InvalidInput)?;
         }
         self.check_buffer::<GpuConfig>(1)?;
@@ -459,6 +474,8 @@ impl MetalResidentSync {
         self.check_buffer::<GpuFuture>(config.futures.len())?;
         self.check_buffer::<GpuMailbox>(config.mailbox_capacities.len())?;
         self.check_buffer::<GpuMailEntry>(entry_count)?;
+        self.check_buffer::<GpuMailbox>(config.channel_capacities.len())?;
+        self.check_buffer::<GpuMailEntry>(channel_entry_count)?;
         self.check_buffer::<GpuCapability>(config.capabilities.len())?;
         self.check_buffer::<GpuEffectRecord>(effect_capacity)?;
         self.check_buffer::<ResidentSyncTrace>(trace_capacity)?;
@@ -550,6 +567,23 @@ impl MetalResidentSync {
                     GpuMailEntry { sender, value };
             }
         }
+        let channels: Vec<GpuMailbox> = config
+            .channel_capacities
+            .iter()
+            .zip(&config.channel_messages)
+            .map(|(capacity, messages)| GpuMailbox {
+                capacity: *capacity,
+                count: messages.len() as u32,
+                ..Default::default()
+            })
+            .collect();
+        let mut channel_entries = vec![GpuMailEntry::default(); channel_entry_count];
+        for (channel, messages) in config.channel_messages.iter().enumerate() {
+            for (offset, (sender, value)) in messages.iter().copied().enumerate() {
+                channel_entries[channel * config.max_continuations as usize + offset] =
+                    GpuMailEntry { sender, value };
+            }
+        }
         let capabilities: Vec<GpuCapability> = config
             .capabilities
             .iter()
@@ -602,6 +636,7 @@ impl MetalResidentSync {
             instruction_count: instructions.len() as u32,
             future_count: futures.len() as u32,
             mailbox_count: mailboxes.len() as u32,
+            channel_count: channels.len() as u32,
             capability_count: capabilities.len() as u32,
             max_epochs: config.max_epochs,
             max_effects: config.max_effects_per_step,
@@ -609,6 +644,7 @@ impl MetalResidentSync {
             effect_capacity: effect_capacity as u32,
             trace_capacity: trace_capacity as u32,
             mailbox_stride: config.max_continuations,
+            channel_stride: config.max_continuations,
             invocation_capacity: invocation_capacity as u32,
             wake_capacity: invocation_capacity as u32,
             epoch_capacity: config.max_epochs,
@@ -625,6 +661,8 @@ impl MetalResidentSync {
         let futures_b = self.buffer_from(&futures);
         let mail_b = self.buffer_from(&mailboxes);
         let entries_b = self.buffer_from(&mailbox_entries);
+        let chans_b = self.buffer_from(&channels);
+        let chan_entries_b = self.buffer_from(&channel_entries);
         let caps_b = self.buffer_from(&capabilities);
         let effects_b = self.zero_buffer::<GpuEffectRecord>(effect_capacity);
         let traces_b = self.zero_buffer::<ResidentSyncTrace>(trace_capacity);
@@ -670,6 +708,8 @@ impl MetalResidentSync {
             &object_caps_b,
             &scratch_b,
             &evaluation_counts_b,
+            &chans_b,
+            &chan_entries_b,
         ]
         .iter()
         .enumerate()
@@ -693,6 +733,8 @@ impl MetalResidentSync {
         let final_futures: Vec<GpuFuture> = read_vec(&futures_b, futures.len());
         let final_mails: Vec<GpuMailbox> = read_vec(&mail_b, mailboxes.len());
         let final_entries: Vec<GpuMailEntry> = read_vec(&entries_b, entry_count);
+        let final_chans: Vec<GpuMailbox> = read_vec(&chans_b, channels.len());
+        let final_chan_entries: Vec<GpuMailEntry> = read_vec(&chan_entries_b, channel_entry_count);
         let status: GpuStatus = read_vec(&status_b, 1)[0];
         if status.error != 0
             || status.effect_count as usize > effect_capacity
@@ -720,6 +762,8 @@ impl MetalResidentSync {
             &final_futures,
             &final_mails,
             &final_entries,
+            &final_chans,
+            &final_chan_entries,
             raw_effects,
             trace,
             completed,
@@ -817,11 +861,20 @@ fn validate(
         || u32::try_from(config.futures.len()).is_err()
         || u32::try_from(config.mailbox_capacities.len()).is_err()
         || config.mailbox_messages.len() != config.mailbox_capacities.len()
+        || u32::try_from(config.channel_capacities.len()).is_err()
+        || config.channel_messages.len() != config.channel_capacities.len()
         || u32::try_from(config.capabilities.len()).is_err()
         || config
             .mailbox_capacities
             .iter()
             .zip(&config.mailbox_messages)
+            .any(|(capacity, messages)| {
+                *capacity > config.max_continuations || messages.len() > *capacity as usize
+            })
+        || config
+            .channel_capacities
+            .iter()
+            .zip(&config.channel_messages)
             .any(|(capacity, messages)| {
                 *capacity > config.max_continuations || messages.len() > *capacity as usize
             })
@@ -862,6 +915,11 @@ fn validate(
     u32::try_from(trace_capacity).map_err(|_| BackendError::InvalidInput)?;
     config
         .mailbox_capacities
+        .len()
+        .checked_mul(config.max_continuations as usize)
+        .ok_or(BackendError::InvalidInput)?;
+    config
+        .channel_capacities
         .len()
         .checked_mul(config.max_continuations as usize)
         .ok_or(BackendError::InvalidInput)?;
@@ -924,6 +982,13 @@ fn raw_effect(r: &GpuEffectRecord) -> Result<ResidentEffect, BackendError> {
         crate::scheduler::device_ops::OP_RECEIVE_MESSAGE => {
             ResidentEffect::MailboxReceive { target: r.target }
         }
+        crate::scheduler::device_ops::OP_CHANNEL_SEND => ResidentEffect::ChannelSend {
+            target: r.target,
+            value: r.value,
+        },
+        crate::scheduler::device_ops::OP_CHANNEL_RECEIVE => {
+            ResidentEffect::ChannelReceive { target: r.target }
+        }
         _ => return Err(BackendError::ExecutionFailed),
     })
 }
@@ -937,6 +1002,8 @@ fn decode(
     futures: &[GpuFuture],
     mails: &[GpuMailbox],
     entries: &[GpuMailEntry],
+    chans: &[GpuMailbox],
+    chan_entries: &[GpuMailEntry],
     raw: Vec<GpuEffectRecord>,
     trace: Vec<ResidentSyncTrace>,
     completed: Vec<u64>,
@@ -978,7 +1045,12 @@ fn decode(
                 ResidentEffect::FutureObserve { .. }
                 | ResidentEffect::FutureAwait { .. }
                 | ResidentEffect::FutureResolve { .. } => RESOURCE_FUTURE,
-                _ => RESOURCE_MAILBOX,
+                ResidentEffect::MailboxSend { .. } | ResidentEffect::MailboxReceive { .. } => {
+                    RESOURCE_MAILBOX
+                }
+                ResidentEffect::ChannelSend { .. } | ResidentEffect::ChannelReceive { .. } => {
+                    RESOURCE_CHANNEL
+                }
             },
             u64::from(record.target),
             if matches!(
@@ -1070,6 +1142,13 @@ fn decode(
                 4 => Some(ResidentEffect::MailboxReceive {
                     target: continuation.pending_target,
                 }),
+                18 => Some(ResidentEffect::ChannelSend {
+                    target: continuation.pending_target,
+                    value: continuation.pending_value,
+                }),
+                19 => Some(ResidentEffect::ChannelReceive {
+                    target: continuation.pending_target,
+                }),
                 _ => None,
             },
             waiter_order: if continuation.pending_opcode == 0 {
@@ -1093,6 +1172,19 @@ fn decode(
                 .map(|offset| {
                     let entry = entries[index * config.max_continuations as usize
                         + ((mailbox.head + offset) % config.max_continuations) as usize];
+                    (entry.sender, entry.value)
+                })
+                .collect()
+        })
+        .collect();
+    result.channels = chans
+        .iter()
+        .enumerate()
+        .map(|(index, channel)| {
+            (0..channel.count)
+                .map(|offset| {
+                    let entry = chan_entries[index * config.max_continuations as usize
+                        + ((channel.head + offset) % config.max_continuations) as usize];
                     (entry.sender, entry.value)
                 })
                 .collect()
@@ -1143,6 +1235,8 @@ mod tests {
             futures: vec![InitialFuture::Pending],
             mailbox_capacities: vec![],
             mailbox_messages: vec![],
+            channel_capacities: vec![],
+            channel_messages: vec![],
             capabilities: vec![
                 cap(10, RESOURCE_FUTURE, 0, RIGHT_READ),
                 cap(20, RESOURCE_FUTURE, 0, RIGHT_WRITE),
@@ -1254,6 +1348,8 @@ mod tests {
             futures: vec![InitialFuture::Pending, InitialFuture::Resolved(44)],
             mailbox_capacities: vec![],
             mailbox_messages: vec![],
+            channel_capacities: vec![],
+            channel_messages: vec![],
             capabilities: vec![
                 cap(7, RESOURCE_FUTURE, 0, RIGHT_READ),
                 cap(7, RESOURCE_FUTURE, 1, RIGHT_READ),
@@ -1382,6 +1478,8 @@ mod tests {
             futures: vec![],
             mailbox_capacities: vec![1],
             mailbox_messages: vec![vec![]],
+            channel_capacities: vec![],
+            channel_messages: vec![],
             capabilities: vec![
                 cap(10, RESOURCE_MAILBOX, 0, RIGHT_READ),
                 cap(20, RESOURCE_MAILBOX, 0, RIGHT_WRITE),
@@ -1530,6 +1628,8 @@ mod tests {
             futures: vec![],
             mailbox_capacities: vec![2],
             mailbox_messages: vec![vec![]],
+            channel_capacities: vec![],
+            channel_messages: vec![],
             capabilities: vec![
                 cap(10, RESOURCE_MAILBOX, 0, RIGHT_READ),
                 cap(20, RESOURCE_MAILBOX, 0, RIGHT_READ),
@@ -1639,6 +1739,8 @@ mod tests {
             futures: vec![InitialFuture::Pending],
             mailbox_capacities: vec![1],
             mailbox_messages: vec![vec![]],
+            channel_capacities: vec![],
+            channel_messages: vec![],
             capabilities: vec![cap(7, RESOURCE_FUTURE, 0, RIGHT_WRITE)],
         };
         let continuations = vec![ResidentContinuation {
@@ -1737,6 +1839,8 @@ mod tests {
             futures: vec![],
             mailbox_capacities: vec![],
             mailbox_messages: vec![],
+            channel_capacities: vec![],
+            channel_messages: vec![],
             capabilities: vec![cap(7, RESOURCE_FUTURE, 9, RIGHT_WRITE)],
         };
         let continuations = vec![ResidentContinuation {
@@ -1790,6 +1894,8 @@ mod tests {
             futures: vec![],
             mailbox_capacities: vec![],
             mailbox_messages: vec![],
+            channel_capacities: vec![],
+            channel_messages: vec![],
             capabilities: vec![],
         };
         let continuations = vec![ResidentContinuation {
@@ -1872,6 +1978,8 @@ mod tests {
                 futures: vec![],
                 mailbox_capacities: vec![],
                 mailbox_messages: vec![],
+                channel_capacities: vec![],
+                channel_messages: vec![],
                 capabilities: vec![],
             };
             let continuations = vec![ResidentContinuation {
@@ -1970,6 +2078,8 @@ mod tests {
             futures: vec![],
             mailbox_capacities: vec![],
             mailbox_messages: vec![],
+            channel_capacities: vec![],
+            channel_messages: vec![],
             capabilities: vec![],
         };
         let assert_refused = |config: ResidentSyncConfig| {
@@ -2041,6 +2151,8 @@ mod tests {
             futures: vec![InitialFuture::Pending],
             mailbox_capacities: vec![],
             mailbox_messages: vec![],
+            channel_capacities: vec![],
+            channel_messages: vec![],
             capabilities: vec![cap(7, RESOURCE_FUTURE, 0, RIGHT_READ | RIGHT_WRITE)],
         };
         let continuations = vec![ResidentContinuation {
@@ -2102,6 +2214,8 @@ mod tests {
             futures: vec![InitialFuture::Pending],
             mailbox_capacities: vec![],
             mailbox_messages: vec![],
+            channel_capacities: vec![],
+            channel_messages: vec![],
             capabilities: vec![
                 cap(1, RESOURCE_FUTURE, 0, RIGHT_READ),
                 cap(2, RESOURCE_FUTURE, 0, RIGHT_READ),
@@ -2206,6 +2320,8 @@ mod tests {
                 futures: vec![InitialFuture::Resolved(19), InitialFuture::Pending],
                 mailbox_capacities: vec![5],
                 mailbox_messages: vec![vec![]],
+                channel_capacities: vec![],
+                channel_messages: vec![],
                 capabilities: vec![
                     cap(1, RESOURCE_MAILBOX, 0, RIGHT_WRITE),
                     cap(1, RESOURCE_FUTURE, 1, RIGHT_READ),

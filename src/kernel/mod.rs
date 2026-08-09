@@ -284,6 +284,15 @@ pub struct Kernel {
     /// separate so host events keep their order across an epoch's lanes.
     lane_sequence: u32,
     host_sequence: u32,
+    /// When set, `wake_waiting_continuation` records the woken continuation
+    /// here instead of tracing `ContinuationReady` at the acting lane. A wake
+    /// is an epoch-boundary effect — the woken continuation runs in a later
+    /// epoch — so the resident bridge defers the event to the start of that
+    /// epoch's host phase. The ordinary kernel never sets this (it runs every
+    /// operation on `HOST_LANE`, where the immediate trace is already the
+    /// boundary). Entries are `(process, continuation, run_class)`.
+    defer_wake_traces: bool,
+    pending_wake_traces: Vec<(Ref64, Ref64, u32)>,
     /// Total runnable continuations at the end of each epoch, for accounting.
     epoch_runnable: Vec<usize>,
     /// Each epoch's admission candidates and the decision taken over them, kept
@@ -438,6 +447,8 @@ impl Kernel {
             current_lane: crate::abi::traces::HOST_LANE,
             lane_sequence: 0,
             host_sequence: 0,
+            defer_wake_traces: false,
+            pending_wake_traces: Vec::new(),
             epoch_runnable: Vec::new(),
             admission_log: Vec::new(),
             lane_effects: Vec::new(),
@@ -3582,6 +3593,16 @@ impl Kernel {
             continuation,
             run_class,
         });
+        if self.defer_wake_traces {
+            // The resident executive applies this wake at the epoch boundary and
+            // the woken continuation runs next epoch, so the resident bridge
+            // traces it in that epoch's host phase rather than in the acting
+            // lane. Tracing it here would join the woken continuation's own
+            // history in a lane it never ran in, fabricating a cross-lane
+            // park-to-ready program-order edge (I25).
+            self.pending_wake_traces.push((process, continuation, run_class));
+            return;
+        }
         self.trace(
             EventKind::ContinuationReady,
             process,
@@ -3589,6 +3610,22 @@ impl Kernel {
             run_class,
             0,
         );
+    }
+
+    /// Flush wakes deferred by a resident run into the current epoch's host
+    /// phase. `current_lane` must be `HOST_LANE`; the events are emitted in
+    /// FIFO order so two wakes of one continuation keep the order they were
+    /// produced in.
+    fn flush_deferred_wake_traces(&mut self) {
+        for (process, continuation, run_class) in std::mem::take(&mut self.pending_wake_traces) {
+            self.trace(
+                EventKind::ContinuationReady,
+                process,
+                continuation,
+                run_class,
+                0,
+            );
+        }
     }
 
     // ---- collectives -----------------------------------------------------

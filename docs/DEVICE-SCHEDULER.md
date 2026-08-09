@@ -329,8 +329,8 @@ refuses atomically.
 Shared installed run classes now form exact canonical cohorts rather than being
 refused, while the per-process mutable-admission exclusion remains. This closes
 canonical commit only for local unsupervised, completed-or-locally-parked
-future/mailbox/fixed-range-object programs with initially empty waiter queues,
-stable pre-existing capabilities, host-backed object payloads,
+future/mailbox/fixed-range-object programs with no pre-existing waiter queue on
+a resource the resident bytecode can touch, stable pre-existing capabilities, host-backed object payloads,
 `RunClassBins`, and `RunPartial`. Existing mailbox entries are snapshotted as
 exact FIFO `(sender,payload)` pairs on both CPU and Metal, so an imported empty
 receive waiter can be woken by ordinary enqueue and then finish through a new
@@ -344,7 +344,26 @@ frame-to-frame word addition, frame-equality completion, frame-selected dynamic
 next classes, and zero/nonzero frame-conditional next classes. Private
 arithmetic state can therefore drive bounded multi-handler, multi-epoch
 completion identically on CPU and actual Metal; zero or uninstalled dynamic
-classes refuse transactionally. Pre-existing
-waiter queues, supervision, channels, allocation or resizing, foreign resources,
-device capability creation, sub-full-range ordinary Kernel object authorization,
-and general loop/gather or broader effect shapes still refuse. The general G2 executive therefore remains open.
+classes refuse transactionally. Disjoint ordinary future/mailbox waiter queues
+now survive a resident run exactly on CPU and actual Metal, while device
+participation by those parked continuations or touching their queued resource
+still refuses.
+
+Channel send and receive are now canonical resident effects through the same
+bounded ABI. The device journal carries `OP_CHANNEL_SEND`/`OP_CHANNEL_RECEIVE`,
+the Metal shader applies channel send/receive and wakes exactly one parked send
+or receive waiter, and the Kernel primitives park a sender on a full channel or
+a receiver on an empty one with exact FIFO waiter queues. A wake is an
+epoch-boundary effect, so it is traced at the start of the next epoch's host
+phase, and a parked continuation re-executes only its single pending effect with
+`Yield` disposition rather than replaying its whole handler. `Sent` stays
+non-value-bearing, so a sender can never observe its own successful send and
+re-parks correctly on a still-full channel. Receiver-empty-park (receiver parks,
+sender fills and wakes, receiver retries and receives), prefill delivery, and
+sender-full-park (receiver drains, wakes the sender, which delivers across the
+epoch boundary) flows match the ordinary Kernel exactly on CPU and actual-Metal
+widths 1/32; tampered tickets, outcomes, and dispositions refuse atomically, as
+does a pending effect outside the channel vocabulary. Supervision, allocation or
+resizing, foreign resources, device capability creation, sub-full-range ordinary
+Kernel object authorization, and general loop/gather or broader effect shapes
+still refuse. The general G2 executive therefore remains open.

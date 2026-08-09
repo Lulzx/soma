@@ -18,6 +18,10 @@ pub const OP_ENQUEUE_MESSAGE: u32 = 8;
 pub const OP_RECEIVE_MESSAGE: u32 = 9;
 pub const OP_RESOLVE_FUTURE: u32 = 10;
 pub const OP_AWAIT_FUTURE: u32 = 11;
+pub const OP_CHANNEL_SEND: u32 = 12;
+pub const OP_CHANNEL_RECEIVE: u32 = 13;
+/// All opcodes the speculative expand workload can emit (channel operations
+/// are resident-sync vocabulary and live above this mask).
 pub const ALL_OPERATION_KINDS: u32 = (1 << OP_AWAIT_FUTURE) - 1;
 
 pub const RESULT_OK: u32 = 0;

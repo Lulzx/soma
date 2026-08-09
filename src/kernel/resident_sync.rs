@@ -21,17 +21,19 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use crate::abi::channels::ChannelDescriptor;
 use crate::abi::continuations::ContinuationState;
 use crate::abi::{EventKind, FutureState, Kind, Ref64, Rights};
 use crate::executives::resident_sync::{
     InitialFuture, ResidentCapability, ResidentEffect, ResidentHandlerProgram, ResidentInstruction,
     ResidentObject, ResidentObjectCapability, ResidentSyncConfig, ResidentSyncResult,
     HANDLER_ADD_FRAME_IMMEDIATE_U64, HANDLER_ADD_FRAME_U64, HANDLER_COMPLETE_IF_FRAME_U64_EQ,
+    HANDLER_EFFECT_CHANNEL_RECEIVE, HANDLER_EFFECT_CHANNEL_SEND,
     HANDLER_EFFECT_FUTURE_AWAIT, HANDLER_EFFECT_FUTURE_OBSERVE, HANDLER_EFFECT_FUTURE_RESOLVE,
     HANDLER_EFFECT_MAILBOX_RECEIVE, HANDLER_EFFECT_MAILBOX_SEND, HANDLER_EFFECT_OBJECT_READ,
     HANDLER_EFFECT_OBJECT_WRITE, HANDLER_STORE_IMMEDIATE_U64, HANDLER_YIELD_FRAME_U32,
-    HANDLER_YIELD_IF_FRAME_ZERO_U64, RESOURCE_FUTURE, RESOURCE_MAILBOX, RESOURCE_OBJECT,
-    RIGHT_READ, RIGHT_WRITE,
+    HANDLER_YIELD_IF_FRAME_ZERO_U64, RESOURCE_CHANNEL, RESOURCE_FUTURE, RESOURCE_MAILBOX,
+    RESOURCE_OBJECT, RIGHT_READ, RIGHT_WRITE,
 };
 use crate::kernel::Kernel;
 use crate::scheduler::device::reference_lane_conflicts;
@@ -132,6 +134,12 @@ pub struct KernelResidentSyncPlan {
     objects: Vec<Ref64>,
     futures: Vec<Ref64>,
     mailboxes: Vec<Ref64>,
+    channels: Vec<Ref64>,
+    initial_future_waiters: BTreeMap<u64, Vec<Ref64>>,
+    initial_full_waiters: BTreeMap<u64, Vec<Ref64>>,
+    initial_recv_waiters: BTreeMap<u64, Vec<Ref64>>,
+    initial_send_waiters: BTreeMap<u64, Vec<Ref64>>,
+    initial_recv_channel_waiters: BTreeMap<u64, Vec<Ref64>>,
     initial_epoch: u32,
     initial_pending: usize,
     fingerprint: [u8; 32],
@@ -481,6 +489,40 @@ impl KernelResidentSyncPlan {
                 r!(*waiter)
             }
         }
+        let mut channel_queues: Vec<_> = k.channel_queues.iter().collect();
+        channel_queues.sort_by_key(|(key, _)| **key);
+        n!(channel_queues.len() as u64);
+        // Queues are keyed by `Ref64::key()` (partition<<32 | slot), which drops
+        // generation/kind; recover the live descriptors from `k.channels` where
+        // the actual `Ref64` encodings live, so capacity/closed hash exactly.
+        let descriptors_by_key: HashMap<u64, &ChannelDescriptor> = k
+            .channels
+            .iter()
+            .map(|(channel, descriptor)| (channel.key(), descriptor))
+            .collect();
+        for (key, queue) in channel_queues {
+            n!(*key);
+            let descriptor = descriptors_by_key.get(key);
+            n!(descriptor.map_or(u64::MAX, |d| d.capacity as u64));
+            n!(descriptor.map_or(u64::MAX, |d| d.closed as u64));
+            n!(queue.entries.len() as u64);
+            n!(queue.send_waiters.len() as u64);
+            n!(queue.receive_waiters.len() as u64);
+            n!(queue.next_sequence);
+            for entry in &queue.entries {
+                r!(entry.descriptor.sender);
+                r!(entry.descriptor.receiver);
+                r!(entry.descriptor.payload);
+                r!(entry.descriptor.transferred_capability);
+                n!(entry.descriptor.sender_sequence);
+            }
+            for waiter in &queue.send_waiters {
+                r!(*waiter)
+            }
+            for waiter in &queue.receive_waiters {
+                r!(*waiter)
+            }
+        }
         let mut sequences: Vec<_> = k.send_sequences.iter().collect();
         sequences.sort_by_key(|(key, _)| **key);
         n!(sequences.len() as u64);
@@ -608,19 +650,74 @@ impl KernelResidentSyncPlan {
             .epoch
             .checked_add(max_epochs)
             .ok_or(KernelResidentSyncError::UnsupportedShape)?;
-        // This slice begins at a clean resident boundary. Existing FIFO
-        // mailbox entries are snapshotted exactly; pre-existing waiter queues
-        // remain unsupported because their pending handler state is not part of
-        // this admission shape.
-        if kernel.future_waiters.values().any(|w| !w.is_empty())
-            || kernel
-                .mailboxes
-                .values()
-                .any(|m| !m.recv_waiters.is_empty() || !m.full_waiters.is_empty())
+        // Existing waiters may coexist only when resident bytecode cannot touch
+        // their dependency. They remain ordinary Kernel state and are included
+        // in the transactional final waiter comparison. A touched queue still
+        // refuses because its parked handler state is not device-resident yet.
+        let mut touched_wait_resources = BTreeSet::new();
+        for instruction in kernel
+            .resident_sync_programs
+            .values()
+            .flat_map(|program| program.instructions.iter())
+        {
+            if matches!(
+                instruction.opcode,
+                HANDLER_EFFECT_FUTURE_AWAIT
+                    | HANDLER_EFFECT_FUTURE_RESOLVE
+                    | HANDLER_EFFECT_MAILBOX_SEND
+                    | HANDLER_EFFECT_MAILBOX_RECEIVE
+                    | HANDLER_EFFECT_CHANNEL_SEND
+                    | HANDLER_EFFECT_CHANNEL_RECEIVE
+            ) {
+                touched_wait_resources.insert(instruction.target.key());
+            }
+        }
+        if kernel
+            .future_waiters
+            .iter()
+            .any(|(target, waiters)| !waiters.is_empty() && touched_wait_resources.contains(target))
+            || kernel.mailboxes.iter().any(|(target, mailbox)| {
+                (!mailbox.recv_waiters.is_empty() || !mailbox.full_waiters.is_empty())
+                    && touched_wait_resources.contains(target)
+            })
+            || kernel.channel_queues.iter().any(|(target, queue)| {
+                (!queue.send_waiters.is_empty() || !queue.receive_waiters.is_empty())
+                    && touched_wait_resources.contains(target)
+            })
             || !kernel.remote_waiter_dependencies.is_empty()
         {
             return Err(KernelResidentSyncError::UnsupportedShape);
         }
+        let initial_future_waiters = kernel
+            .future_waiters
+            .iter()
+            .filter(|(_, waiters)| !waiters.is_empty())
+            .map(|(target, waiters)| (*target, waiters.clone()))
+            .collect();
+        let initial_full_waiters = kernel
+            .mailboxes
+            .iter()
+            .filter(|(_, mailbox)| !mailbox.full_waiters.is_empty())
+            .map(|(target, mailbox)| (*target, mailbox.full_waiters.iter().copied().collect()))
+            .collect();
+        let initial_recv_waiters = kernel
+            .mailboxes
+            .iter()
+            .filter(|(_, mailbox)| !mailbox.recv_waiters.is_empty())
+            .map(|(target, mailbox)| (*target, mailbox.recv_waiters.iter().copied().collect()))
+            .collect();
+        let initial_send_waiters = kernel
+            .channel_queues
+            .iter()
+            .filter(|(_, queue)| !queue.send_waiters.is_empty())
+            .map(|(target, queue)| (*target, queue.send_waiters.iter().copied().collect()))
+            .collect();
+        let initial_recv_channel_waiters = kernel
+            .channel_queues
+            .iter()
+            .filter(|(_, queue)| !queue.receive_waiters.is_empty())
+            .map(|(target, queue)| (*target, queue.receive_waiters.iter().copied().collect()))
+            .collect();
 
         let mut futures: Vec<Ref64> = kernel.futures.iter().map(|(r, _)| r).collect();
         futures.sort_by_key(Ref64::to_u64);
@@ -651,6 +748,35 @@ impl KernelResidentSyncPlan {
                                 .is_none_or(|payload| payload.provenance() != "host")
                     })
             })
+        {
+            return Err(KernelResidentSyncError::UnsupportedShape);
+        }
+        let mut channels: Vec<Ref64> = kernel
+            .channels
+            .iter()
+            .filter_map(|(channel, _)| {
+                kernel
+                    .channel_queues
+                    .contains_key(&channel.key())
+                    .then_some(channel)
+            })
+            .collect();
+        channels.sort_by_key(Ref64::to_u64);
+        if kernel.channels.iter().any(|(channel, descriptor)| {
+            descriptor.closed != 0
+                || kernel
+                    .channel_queues
+                    .get(&channel.key())
+                    .is_none_or(|queue| {
+                        queue.entries.iter().any(|entry| {
+                            kernel.objects.get(entry.descriptor.payload).is_err()
+                                || kernel
+                                    .object_payloads
+                                    .get(&entry.descriptor.payload.key())
+                                    .is_none_or(|payload| payload.provenance() != "host")
+                        })
+                    })
+        }) || channels.len() > crate::executives::resident_sync::MAX_RESIDENT_OBJECTS
         {
             return Err(KernelResidentSyncError::UnsupportedShape);
         }
@@ -706,6 +832,11 @@ impl KernelResidentSyncPlan {
             .enumerate()
             .map(|(i, r)| (*r, i as u32))
             .collect();
+        let channel_index: HashMap<Ref64, u32> = channels
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (*r, i as u32))
+            .collect();
 
         let mut packed_programs = BTreeMap::new();
         for (&rc, program) in &kernel.resident_sync_programs {
@@ -720,6 +851,8 @@ impl KernelResidentSyncPlan {
                         | HANDLER_EFFECT_FUTURE_RESOLVE
                         | HANDLER_EFFECT_MAILBOX_SEND
                         | HANDLER_EFFECT_MAILBOX_RECEIVE
+                        | HANDLER_EFFECT_CHANNEL_SEND
+                        | HANDLER_EFFECT_CHANNEL_RECEIVE
                 );
                 let argument = match instruction.opcode {
                     HANDLER_EFFECT_OBJECT_READ | HANDLER_EFFECT_OBJECT_WRITE => {
@@ -731,6 +864,9 @@ impl KernelResidentSyncPlan {
                         .get(&instruction.target)
                         .ok_or(KernelResidentSyncError::InvalidProgram)?,
                     HANDLER_EFFECT_MAILBOX_SEND | HANDLER_EFFECT_MAILBOX_RECEIVE => *mailbox_index
+                        .get(&instruction.target)
+                        .ok_or(KernelResidentSyncError::InvalidProgram)?,
+                    HANDLER_EFFECT_CHANNEL_SEND | HANDLER_EFFECT_CHANNEL_RECEIVE => *channel_index
                         .get(&instruction.target)
                         .ok_or(KernelResidentSyncError::InvalidProgram)?,
                     _ => instruction.argument,
@@ -747,6 +883,9 @@ impl KernelResidentSyncPlan {
                     HANDLER_EFFECT_MAILBOX_SEND | HANDLER_EFFECT_MAILBOX_RECEIVE => *mailbox_index
                         .get(&instruction.target)
                         .ok_or(KernelResidentSyncError::InvalidProgram)?,
+                    HANDLER_EFFECT_CHANNEL_SEND | HANDLER_EFFECT_CHANNEL_RECEIVE => *channel_index
+                        .get(&instruction.target)
+                        .ok_or(KernelResidentSyncError::InvalidProgram)?,
                     _ => 0,
                 };
                 if effect && instruction.target.is_null() {
@@ -756,7 +895,9 @@ impl KernelResidentSyncPlan {
                 // No device allocation and no foreign payload may enter the plan.
                 if matches!(
                     instruction.opcode,
-                    HANDLER_EFFECT_FUTURE_RESOLVE | HANDLER_EFFECT_MAILBOX_SEND
+                    HANDLER_EFFECT_FUTURE_RESOLVE
+                        | HANDLER_EFFECT_MAILBOX_SEND
+                        | HANDLER_EFFECT_CHANNEL_SEND
                 ) {
                     let value = Ref64::from_u64(instruction.value);
                     if value.kind != Kind::Object
@@ -780,6 +921,7 @@ impl KernelResidentSyncPlan {
                             | HANDLER_EFFECT_FUTURE_OBSERVE
                             | HANDLER_EFFECT_FUTURE_AWAIT
                             | HANDLER_EFFECT_MAILBOX_RECEIVE
+                            | HANDLER_EFFECT_CHANNEL_RECEIVE
                     ) {
                         0
                     } else {
@@ -918,6 +1060,37 @@ impl KernelResidentSyncPlan {
                         });
                     }
                 }
+                if let Some(&target) = channel_index.get(&cap.target) {
+                    let mut rights = 0;
+                    if cap.rights & Rights::RECEIVE != 0 {
+                        rights |= RIGHT_READ
+                    };
+                    if cap.rights & Rights::SEND != 0 {
+                        rights |= RIGHT_WRITE
+                    };
+                    if rights & RIGHT_READ != 0
+                        && kernel
+                            .find_authorized_capability(actor, Rights::RECEIVE, cap.target)
+                            .is_none()
+                    {
+                        rights &= !RIGHT_READ;
+                    }
+                    if rights & RIGHT_WRITE != 0
+                        && kernel
+                            .find_authorized_capability(actor, Rights::SEND, cap.target)
+                            .is_none()
+                    {
+                        rights &= !RIGHT_WRITE;
+                    }
+                    if rights != 0 {
+                        capabilities.push(ResidentCapability {
+                            actor: actor.to_u64(),
+                            resource_kind: RESOURCE_CHANNEL,
+                            target,
+                            rights,
+                        });
+                    }
+                }
             }
         }
         let mut object_capabilities = Vec::new();
@@ -971,6 +1144,8 @@ impl KernelResidentSyncPlan {
                     HANDLER_EFFECT_FUTURE_RESOLVE => (RESOURCE_FUTURE, RIGHT_WRITE),
                     HANDLER_EFFECT_MAILBOX_RECEIVE => (RESOURCE_MAILBOX, RIGHT_READ),
                     HANDLER_EFFECT_MAILBOX_SEND => (RESOURCE_MAILBOX, RIGHT_WRITE),
+                    HANDLER_EFFECT_CHANNEL_RECEIVE => (RESOURCE_CHANNEL, RIGHT_READ),
+                    HANDLER_EFFECT_CHANNEL_SEND => (RESOURCE_CHANNEL, RIGHT_WRITE),
                     _ => continue,
                 };
                 let authorized = if kind == RESOURCE_OBJECT {
@@ -1000,7 +1175,10 @@ impl KernelResidentSyncPlan {
                 if !authorized {
                     return Err(KernelResidentSyncError::UnsupportedShape);
                 }
-                if i.opcode == HANDLER_EFFECT_MAILBOX_SEND {
+                if matches!(
+                    i.opcode,
+                    HANDLER_EFFECT_MAILBOX_SEND | HANDLER_EFFECT_CHANNEL_SEND
+                ) {
                     let value = Ref64::from_u64(i.value);
                     let actor = Ref64::from_u64(c.actor);
                     let object = kernel
@@ -1073,13 +1251,44 @@ impl KernelResidentSyncPlan {
                     .collect()
             })
             .collect();
+        let channel_capacities: Vec<u32> = channels
+            .iter()
+            .map(|channel| {
+                kernel
+                    .channels
+                    .get(*channel)
+                    .map_err(|_| KernelResidentSyncError::UnsupportedShape)
+                    .map(|descriptor| descriptor.capacity)
+            })
+            .collect::<Result<_, _>>()?;
+        let channel_messages: Vec<Vec<(u64, u64)>> = channels
+            .iter()
+            .map(|channel| {
+                kernel.channel_queues[&channel.key()]
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        (
+                            entry.descriptor.sender.to_u64(),
+                            entry.descriptor.payload.to_u64(),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
         Ok(Self {
             config: ResidentSyncConfig {
                 max_epochs,
                 max_effects_per_step: max_effects,
                 max_frame_bytes: max_frame,
-                max_continuations: (continuations.len() as u32)
-                    .max(capacities.iter().copied().max().unwrap_or(0)),
+                max_continuations: (continuations.len() as u32).max(
+                    capacities
+                        .iter()
+                        .chain(channel_capacities.iter())
+                        .copied()
+                        .max()
+                        .unwrap_or(0),
+                ),
                 cohort_width: width,
                 initial_epoch: kernel.epoch,
                 objects: objects
@@ -1096,6 +1305,8 @@ impl KernelResidentSyncPlan {
                 futures: initial_futures,
                 mailbox_capacities: capacities,
                 mailbox_messages,
+                channel_capacities,
+                channel_messages,
                 capabilities,
             },
             continuations,
@@ -1105,6 +1316,12 @@ impl KernelResidentSyncPlan {
             objects,
             futures,
             mailboxes,
+            channels,
+            initial_future_waiters,
+            initial_full_waiters,
+            initial_recv_waiters,
+            initial_send_waiters,
+            initial_recv_channel_waiters,
             initial_epoch: kernel.epoch,
             initial_pending: kernel.scheduler.total_pending(),
             fingerprint: Self::fingerprint(kernel),
@@ -1136,6 +1353,10 @@ impl KernelResidentSyncPlan {
             | ResidentEffect::MailboxReceive { target } => {
                 self.mailboxes.get(target as usize).copied()
             }
+            ResidentEffect::ChannelSend { target, .. }
+            | ResidentEffect::ChannelReceive { target } => {
+                self.channels.get(target as usize).copied()
+            }
         }
     }
 
@@ -1158,10 +1379,9 @@ impl KernelResidentSyncPlan {
         {
             return Err(KernelResidentSyncError::InvalidDeviceResult);
         }
-        // A quiescent resident graph may contain a strictly canonical parked
-        // future await. Mailbox parking remains outside this publication slice:
-        // unlike a future waiter, its FIFO identity also depends on mailbox
-        // capacity and sender/receiver queue ordering.
+        // A quiescent resident graph may end with strictly canonical parked
+        // future awaits, mailbox enqueue/receive waits, or channel
+        // send/receive waits; anything else is not a park at all.
         let all_ids: BTreeSet<_> = self.continuations_by_id.keys().copied().collect();
         let final_ids: BTreeSet<_> = result
             .final_continuations
@@ -1189,6 +1409,8 @@ impl KernelResidentSyncPlan {
                                 ResidentEffect::FutureAwait { .. }
                                     | ResidentEffect::MailboxSend { .. }
                                     | ResidentEffect::MailboxReceive { .. }
+                                    | ResidentEffect::ChannelSend { .. }
+                                    | ResidentEffect::ChannelReceive { .. }
                             )
                         ))
                     || (continuation.completed && continuation.waiter_order != 0)
@@ -1236,6 +1458,12 @@ impl KernelResidentSyncPlan {
                     crate::executives::resident_sync::ResidentOutcome::Full
                 }
                 ResidentEffect::MailboxReceive { .. } => {
+                    crate::executives::resident_sync::ResidentOutcome::Empty
+                }
+                ResidentEffect::ChannelSend { .. } => {
+                    crate::executives::resident_sync::ResidentOutcome::Full
+                }
+                ResidentEffect::ChannelReceive { .. } => {
                     crate::executives::resident_sync::ResidentOutcome::Empty
                 }
                 _ => return Err(KernelResidentSyncError::InvalidDeviceResult),
@@ -1419,6 +1647,16 @@ impl KernelResidentSyncPlan {
                                     == crate::scheduler::device_ops::OP_RECEIVE_MESSAGE
                                     && target == wake.target
                             }
+                            ResidentEffect::ChannelSend { target, .. } => {
+                                wake.cause_opcode
+                                    == crate::scheduler::device_ops::OP_CHANNEL_SEND
+                                    && target == wake.target
+                            }
+                            ResidentEffect::ChannelReceive { target } => {
+                                wake.cause_opcode
+                                    == crate::scheduler::device_ops::OP_CHANNEL_RECEIVE
+                                    && target == wake.target
+                            }
                             _ => false,
                         }
                 })
@@ -1538,6 +1776,20 @@ impl KernelResidentSyncPlan {
                     0,
                     0,
                 ),
+                ResidentEffect::ChannelSend { target, value } => (
+                    RESOURCE_CHANNEL,
+                    target,
+                    crate::scheduler::device_ops::OP_CHANNEL_SEND,
+                    value,
+                    0,
+                ),
+                ResidentEffect::ChannelReceive { target } => (
+                    RESOURCE_CHANNEL,
+                    target,
+                    crate::scheduler::device_ops::OP_CHANNEL_RECEIVE,
+                    0,
+                    0,
+                ),
             };
             let (expected_code, expected_ref) = match effect.outcome {
                 crate::executives::resident_sync::ResidentOutcome::ObjectRead(read) => (2, read),
@@ -1606,6 +1858,7 @@ impl KernelResidentSyncPlan {
                     RESOURCE_OBJECT => self.objects.get(a.resource as usize),
                     RESOURCE_FUTURE => self.futures.get(a.resource as usize),
                     RESOURCE_MAILBOX => self.mailboxes.get(a.resource as usize),
+                    RESOURCE_CHANNEL => self.channels.get(a.resource as usize),
                     _ => None,
                 }
                 .ok_or(KernelResidentSyncError::InvalidDeviceResult)?
@@ -1646,6 +1899,10 @@ impl KernelResidentSyncPlan {
                     | crate::scheduler::device_ops::OP_RECEIVE_MESSAGE => {
                         self.mailboxes.get(op.target as usize)
                     }
+                    crate::scheduler::device_ops::OP_CHANNEL_SEND
+                    | crate::scheduler::device_ops::OP_CHANNEL_RECEIVE => {
+                        self.channels.get(op.target as usize)
+                    }
                     _ => None,
                 }
                 .ok_or(KernelResidentSyncError::InvalidDeviceResult)?;
@@ -1674,11 +1931,17 @@ impl KernelResidentSyncPlan {
         r: &ResidentSyncResult,
     ) -> Result<(), KernelResidentSyncError> {
         let base_epoch = self.initial_epoch;
+        // Wakes the lanes produce are boundary effects: the woken continuation
+        // runs in a later epoch, so its `ContinuationReady` is traced in that
+        // epoch's host phase rather than in the acting lane (see
+        // `Kernel::flush_deferred_wake_traces`).
+        k.defer_wake_traces = true;
         for epoch_record in &r.epoch_records {
             k.epoch = base_epoch.wrapping_add(epoch_record.epoch);
             if epoch_record.epoch != 0 {
                 k.open_epoch_positions();
             }
+            k.flush_deferred_wake_traces();
             let mut invocations: Vec<_> = r
                 .invocations
                 .iter()
@@ -1931,6 +2194,38 @@ impl KernelResidentSyncPlan {
                                 _ => return Err(KernelResidentSyncError::InvalidDeviceResult),
                             }
                         }
+                        ResidentEffect::ChannelSend { value, .. } => {
+                            let applied = k.send_channel(actor, target, Ref64::from_u64(value), cont);
+                            match (applied, effect.outcome) {
+                                (
+                                    Ok(()),
+                                    crate::executives::resident_sync::ResidentOutcome::Sent,
+                                ) => {}
+                                (
+                                    Err(crate::kernel::RuntimeError::MailboxFull),
+                                    crate::executives::resident_sync::ResidentOutcome::Full,
+                                ) => parked = Some(target),
+                                _ => return Err(KernelResidentSyncError::InvalidDeviceResult),
+                            }
+                        }
+                        ResidentEffect::ChannelReceive { .. } => {
+                            let applied = k.receive_channel(actor, target, cont);
+                            match (applied, effect.outcome) {
+                                (
+                                    Ok(None),
+                                    crate::executives::resident_sync::ResidentOutcome::Empty,
+                                ) => parked = Some(target),
+                                (
+                                    Ok(Some(message)),
+                                    crate::executives::resident_sync::ResidentOutcome::Received {
+                                        value,
+                                        sender,
+                                    },
+                                ) if message.payload.to_u64() == value
+                                    && message.sender.to_u64() == sender => {}
+                                _ => return Err(KernelResidentSyncError::InvalidDeviceResult),
+                            }
+                        }
                     }
                 }
                 let step = if let Some(target) = parked {
@@ -1969,8 +2264,10 @@ impl KernelResidentSyncPlan {
             k.accounting.epochs += 1;
             k.accounting.steps += u64::from(epoch_record.invocations);
         }
+        k.defer_wake_traces = false;
         k.epoch = base_epoch.wrapping_add(r.epochs);
         k.open_epoch_positions();
+        k.flush_deferred_wake_traces();
         for (&id, frame) in &r.frames {
             let cont = self.continuations_by_id[&id];
             let frame_ref = k
@@ -2018,9 +2315,40 @@ impl KernelResidentSyncPlan {
                 return Err(KernelResidentSyncError::InvalidDeviceResult);
             }
         }
-        let mut expected_future_waiters: BTreeMap<u64, Vec<(u32, Ref64)>> = BTreeMap::new();
-        let mut expected_full_waiters: BTreeMap<u64, Vec<(u32, Ref64)>> = BTreeMap::new();
-        let mut expected_recv_waiters: BTreeMap<u64, Vec<(u32, Ref64)>> = BTreeMap::new();
+        for (index, channel) in self.channels.iter().enumerate() {
+            let actual = k
+                .channel_queues
+                .get(&channel.key())
+                .ok_or(KernelResidentSyncError::InvalidDeviceResult)?
+                .entries
+                .iter()
+                .map(|entry| (entry.descriptor.sender.to_u64(), entry.descriptor.payload.to_u64()))
+                .collect::<Vec<_>>();
+            let expected = &r.channels[index];
+            if actual != *expected {
+                return Err(KernelResidentSyncError::InvalidDeviceResult);
+            }
+        }
+        fn seed_waiters(initial: &BTreeMap<u64, Vec<Ref64>>) -> BTreeMap<u64, Vec<(u32, Ref64)>> {
+            initial
+                .iter()
+                .map(|(target, waiters)| {
+                    (
+                        *target,
+                        waiters
+                            .iter()
+                            .enumerate()
+                            .map(|(order, continuation)| (order as u32, *continuation))
+                            .collect(),
+                    )
+                })
+                .collect()
+        }
+        let mut expected_future_waiters = seed_waiters(&self.initial_future_waiters);
+        let mut expected_full_waiters = seed_waiters(&self.initial_full_waiters);
+        let mut expected_recv_waiters = seed_waiters(&self.initial_recv_waiters);
+        let mut expected_channel_send_waiters = seed_waiters(&self.initial_send_waiters);
+        let mut expected_channel_recv_waiters = seed_waiters(&self.initial_recv_channel_waiters);
         for final_c in &r.final_continuations {
             let continuation = self.continuations_by_id[&final_c.id];
             let descriptor = k
@@ -2066,6 +2394,22 @@ impl KernelResidentSyncPlan {
                         .copied()
                         .ok_or(KernelResidentSyncError::InvalidDeviceResult)?;
                     (mailbox, Ref64::NULL, &mut expected_recv_waiters)
+                }
+                ResidentEffect::ChannelSend { target, .. } => {
+                    let channel = self
+                        .channels
+                        .get(target as usize)
+                        .copied()
+                        .ok_or(KernelResidentSyncError::InvalidDeviceResult)?;
+                    (channel, Ref64::NULL, &mut expected_channel_send_waiters)
+                }
+                ResidentEffect::ChannelReceive { target } => {
+                    let channel = self
+                        .channels
+                        .get(target as usize)
+                        .copied()
+                        .ok_or(KernelResidentSyncError::InvalidDeviceResult)?;
+                    (channel, Ref64::NULL, &mut expected_channel_recv_waiters)
                 }
                 _ => return Err(KernelResidentSyncError::InvalidDeviceResult),
             };
@@ -2116,9 +2460,23 @@ impl KernelResidentSyncPlan {
             .filter(|(_, mailbox)| !mailbox.recv_waiters.is_empty())
             .map(|(mailbox, state)| (*mailbox, state.recv_waiters.iter().copied().collect()))
             .collect();
+        let actual_channel_send_waiters: BTreeMap<u64, Vec<Ref64>> = k
+            .channel_queues
+            .iter()
+            .filter(|(_, queue)| !queue.send_waiters.is_empty())
+            .map(|(channel, queue)| (*channel, queue.send_waiters.iter().copied().collect()))
+            .collect();
+        let actual_channel_recv_waiters: BTreeMap<u64, Vec<Ref64>> = k
+            .channel_queues
+            .iter()
+            .filter(|(_, queue)| !queue.receive_waiters.is_empty())
+            .map(|(channel, queue)| (*channel, queue.receive_waiters.iter().copied().collect()))
+            .collect();
         if actual_future_waiters != ordered_waiters(expected_future_waiters)
             || actual_full_waiters != ordered_waiters(expected_full_waiters)
             || actual_recv_waiters != ordered_waiters(expected_recv_waiters)
+            || actual_channel_send_waiters != ordered_waiters(expected_channel_send_waiters)
+            || actual_channel_recv_waiters != ordered_waiters(expected_channel_recv_waiters)
         {
             return Err(KernelResidentSyncError::InvalidDeviceResult);
         }
@@ -2641,6 +2999,101 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    fn disjoint_waiter_setup(width: u32) -> (Kernel, KernelResidentSyncPlan, Ref64, Ref64, Ref64) {
+        let mut kernel = Kernel::new();
+        let waiting_process = kernel.create_process(Ref64::NULL, ProcessMode::Pure);
+        let future = kernel.create_future(waiting_process);
+        let waiter = kernel
+            .create_continuation(
+                waiting_process,
+                waiting_process,
+                ContinuationSpec::new(StateAccess::ReadOnly, 1810, 0, vec![0; 8], 2),
+            )
+            .unwrap();
+        kernel
+            .await_future(waiting_process, waiter, future, 1810)
+            .unwrap();
+        kernel.scheduler.remove(waiter);
+
+        let resident_process = kernel.create_process(Ref64::NULL, ProcessMode::Pure);
+        kernel
+            .install_resident_sync_program(KernelResidentProgram {
+                run_class: 1811,
+                instructions: vec![KernelResidentInstruction::plain(HANDLER_COMPLETE, 0, 0)],
+            })
+            .unwrap();
+        let resident = kernel
+            .create_continuation(
+                resident_process,
+                resident_process,
+                ContinuationSpec::new(StateAccess::ReadOnly, 1811, 0, vec![0; 8], 2),
+            )
+            .unwrap();
+        let plan = kernel.plan_resident_sync(1, 1, 8, width).unwrap();
+        (kernel, plan, future, waiter, resident)
+    }
+
+    #[test]
+    fn touched_preexisting_waiter_queue_refuses_plan_atomically() {
+        let (mut kernel, _, future, _, _) = disjoint_waiter_setup(1);
+        kernel
+            .install_resident_sync_program(KernelResidentProgram {
+                run_class: 1811,
+                instructions: vec![
+                    KernelResidentInstruction::effect(
+                        HANDLER_EFFECT_FUTURE_AWAIT,
+                        future,
+                        Ref64::NULL,
+                    ),
+                    KernelResidentInstruction::plain(HANDLER_COMPLETE, 0, 0),
+                ],
+            })
+            .unwrap();
+        let before = KernelResidentSyncPlan::fingerprint(&kernel);
+        assert!(matches!(
+            kernel.plan_resident_sync(1, 1, 8, 1),
+            Err(KernelResidentSyncError::UnsupportedShape)
+        ));
+        assert_eq!(KernelResidentSyncPlan::fingerprint(&kernel), before);
+    }
+
+    #[test]
+    fn disjoint_preexisting_future_waiter_survives_cpu_resident_run() {
+        for width in [1, 32] {
+            let (mut kernel, plan, future, waiter, resident) = disjoint_waiter_setup(width);
+            assert_eq!(kernel.run_resident_sync_cpu_reference(plan), Ok(1));
+            assert_eq!(
+                kernel.continuation_state(waiter),
+                Ok(ContinuationState::Waiting)
+            );
+            assert_eq!(kernel.future_waiters[&future.key()], vec![waiter]);
+            assert_eq!(
+                kernel.continuation_state(resident),
+                Ok(ContinuationState::Completed)
+            );
+            assert!(crate::semantics::invariants::check(&kernel).is_empty());
+        }
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn disjoint_preexisting_future_waiter_survives_actual_metal_width_1_32() {
+        for width in [1, 32] {
+            let (mut kernel, plan, future, waiter, resident) = disjoint_waiter_setup(width);
+            assert_eq!(kernel.run_resident_sync_metal(plan), Ok(1));
+            assert_eq!(
+                kernel.continuation_state(waiter),
+                Ok(ContinuationState::Waiting)
+            );
+            assert_eq!(kernel.future_waiters[&future.key()], vec![waiter]);
+            assert_eq!(
+                kernel.continuation_state(resident),
+                Ok(ContinuationState::Completed)
+            );
+            assert!(crate::semantics::invariants::check(&kernel).is_empty());
+        }
     }
 
     #[test]
@@ -4016,5 +4469,516 @@ mod tests {
             Err(KernelResidentSyncError::InvalidDeviceResult)
         );
         assert_eq!(k.object_payloads[&object.key()].as_slice(), before);
+    }
+
+    /// Channel slice setup. The resident lane order follows `(run_class, id)`,
+    /// so `receiver_first` controls which party runs on lane zero rather than
+    /// which continuation was minted first. With `receiver_first` the receiver
+    /// parks on an empty channel and a resident send wakes it for a cross-epoch
+    /// retry; otherwise the sender parks on a full (prefilled) channel and a
+    /// resident receive wakes it. Cross-lane delivery within one epoch is the
+    /// workload I25 reports, so every delivery here crosses an epoch boundary.
+    /// `prefill` seeds the channel with one ordinary escrowed message so a
+    /// sender-first run parks full. `drain_receiver` swaps the skip-guarded
+    /// retry receiver for a plain `[receive, complete]` drain: it pops the
+    /// prefill (or the sender's message) and completes on the same run, leaving
+    /// the resident sender to deliver across the epoch boundary alone.
+    #[allow(clippy::too_many_arguments)]
+    fn channel_setup(
+        width: u32,
+        capacity: u32,
+        prefill: bool,
+        receiver_first: bool,
+        drain_receiver: bool,
+    ) -> (Kernel, KernelResidentSyncPlan, Ref64, Ref64, Ref64, Ref64, Ref64) {
+        let mut k = Kernel::new();
+        let creator = k.create_process(Ref64::NULL, ProcessMode::Pure);
+        let sender = k.create_process(Ref64::NULL, ProcessMode::Pure);
+        let receiver = k.create_process(Ref64::NULL, ProcessMode::Pure);
+        let channel = k.create_channel(creator, capacity);
+        let payload = k.create_object(sender, ObjectKind::MessagePayload, vec![9, 8, 7, 6]);
+        let pre_payload = k.create_object(sender, ObjectKind::MessagePayload, vec![1, 2, 3, 4]);
+        k.grant_capability(creator, sender, channel, Rights::SEND, 0, 0)
+            .unwrap();
+        k.grant_capability(creator, receiver, channel, Rights::RECEIVE, 0, 0)
+            .unwrap();
+        if prefill {
+            k.send_channel(sender, channel, pre_payload, Ref64::NULL)
+                .unwrap();
+        }
+        let (send_rc, recv_rc) = if receiver_first {
+            (1201, 1200)
+        } else {
+            (1200, 1201)
+        };
+        k.install_resident_sync_program(KernelResidentProgram {
+            run_class: send_rc,
+            instructions: vec![
+                KernelResidentInstruction::effect(HANDLER_EFFECT_CHANNEL_SEND, channel, payload),
+                KernelResidentInstruction::plain(HANDLER_COMPLETE, 0, 0),
+            ],
+        })
+        .unwrap();
+        let receiver_instructions = if drain_receiver {
+            // Plain drain: pop one message and complete on the same run.
+            vec![
+                KernelResidentInstruction::effect(
+                    HANDLER_EFFECT_CHANNEL_RECEIVE,
+                    channel,
+                    Ref64::NULL,
+                ),
+                KernelResidentInstruction::plain(HANDLER_COMPLETE, 0, 0),
+            ]
+        } else {
+            // The skip-guarded complete makes the receive terminate only after a
+            // successful retry consumed the exact payload: the first run parks
+            // (previous is empty, so COMPLETE is skipped), the retry receives
+            // and yields, and the following program run completes on the match.
+            vec![
+                KernelResidentInstruction::plain(
+                    HANDLER_IF_PREVIOUS_VALUE_NE_SKIP,
+                    1,
+                    payload.to_u64(),
+                ),
+                KernelResidentInstruction::plain(HANDLER_COMPLETE, 0, 0),
+                KernelResidentInstruction::effect(
+                    HANDLER_EFFECT_CHANNEL_RECEIVE,
+                    channel,
+                    Ref64::NULL,
+                ),
+                KernelResidentInstruction::plain(HANDLER_YIELD, recv_rc, 0),
+            ]
+        };
+        k.install_resident_sync_program(KernelResidentProgram {
+            run_class: recv_rc,
+            instructions: receiver_instructions,
+        })
+        .unwrap();
+        let mk = |rc| ContinuationSpec::new(StateAccess::ReadOnly, rc, 0, vec![0; 8], 16);
+        let recv_cont = k.create_continuation(receiver, receiver, mk(recv_rc)).unwrap();
+        let send_cont = k.create_continuation(sender, sender, mk(send_rc)).unwrap();
+        // `receiver_first` controls which run class is lower, and therefore which
+        // party runs on lane zero; the returned handles always name their roles.
+        let plan = k.plan_resident_sync(8, 1, 8, width).unwrap();
+        (k, plan, send_cont, recv_cont, channel, payload, pre_payload)
+    }
+
+    /// Sender-only channel setup: a full (prefilled) channel and a single
+    /// resident sender that parks on it. The receiver exists only as a process
+    /// with RECEIVE authority so an ordinary governed receive can wake the
+    /// parked sender later.
+    #[allow(clippy::too_many_arguments)]
+    fn channel_sender_park_setup(
+        width: u32,
+        capacity: u32,
+    ) -> (Kernel, KernelResidentSyncPlan, Ref64, Ref64, Ref64, Ref64, Ref64) {
+        let mut k = Kernel::new();
+        let creator = k.create_process(Ref64::NULL, ProcessMode::Pure);
+        let sender = k.create_process(Ref64::NULL, ProcessMode::Pure);
+        let receiver = k.create_process(Ref64::NULL, ProcessMode::Pure);
+        let channel = k.create_channel(creator, capacity);
+        let payload = k.create_object(sender, ObjectKind::MessagePayload, vec![9, 8, 7, 6]);
+        let pre_payload = k.create_object(sender, ObjectKind::MessagePayload, vec![1, 2, 3, 4]);
+        k.grant_capability(creator, sender, channel, Rights::SEND, 0, 0)
+            .unwrap();
+        k.grant_capability(creator, receiver, channel, Rights::RECEIVE, 0, 0)
+            .unwrap();
+        k.send_channel(sender, channel, pre_payload, Ref64::NULL)
+            .unwrap();
+        let send_rc = 1200;
+        k.install_resident_sync_program(KernelResidentProgram {
+            run_class: send_rc,
+            instructions: vec![
+                KernelResidentInstruction::effect(HANDLER_EFFECT_CHANNEL_SEND, channel, payload),
+                KernelResidentInstruction::plain(HANDLER_COMPLETE, 0, 0),
+            ],
+        })
+        .unwrap();
+        let send_cont = k
+            .create_continuation(
+                sender,
+                sender,
+                ContinuationSpec::new(StateAccess::ReadOnly, send_rc, 0, vec![0; 8], 16),
+            )
+            .unwrap();
+        let plan = k.plan_resident_sync(8, 1, 8, width).unwrap();
+        (k, plan, send_cont, channel, payload, pre_payload, receiver)
+    }
+
+    fn channel_queue_entries(k: &Kernel, channel: Ref64) -> Vec<(u64, u64)> {
+        k.channel_queues
+            .get(&channel.key())
+            .unwrap()
+            .entries
+            .iter()
+            .map(|entry| (entry.descriptor.sender.to_u64(), entry.descriptor.payload.to_u64()))
+            .collect()
+    }
+
+    fn assert_channel_trace_parity(cpu: &Kernel, metal: &Kernel) {
+        let project = |k: &Kernel| -> Vec<(u64, u32, u32, EventKind, Ref64, Ref64, u32)> {
+            k.trace_events()
+                .iter()
+                .map(|e| {
+                    (
+                        e.logical_time,
+                        e.epoch,
+                        e.lane,
+                        e.event_kind,
+                        e.process,
+                        e.continuation,
+                        e.auxiliary,
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(project(metal), project(cpu));
+        assert_eq!(metal.epoch_runnable, cpu.epoch_runnable);
+        assert_eq!(metal.accounting.epochs, cpu.accounting.epochs);
+        assert_eq!(metal.accounting.steps, cpu.accounting.steps);
+        assert!(crate::semantics::order::conforms(cpu, metal).is_empty());
+    }
+
+    #[test]
+    fn channel_send_then_receive_delivers_exact_payload_width_1_32() {
+        // Receiver first: it parks on the empty channel, the resident send
+        // wakes it, and the retry receives in a later epoch. The delivery
+        // edge crosses an epoch, so I25 has nothing to report.
+        let (mut cpu, cpu_plan, send_cont, recv_cont, channel, payload, _) =
+            channel_setup(1, 4, false, true, false);
+        cpu.run_resident_sync_cpu_reference(cpu_plan).unwrap();
+        assert_eq!(
+            cpu.continuation_state(send_cont).unwrap(),
+            ContinuationState::Completed
+        );
+        assert_eq!(
+            cpu.continuation_state(recv_cont).unwrap(),
+            ContinuationState::Completed
+        );
+        assert!(channel_queue_entries(&cpu, channel).is_empty());
+        assert!(cpu
+            .trace_events()
+            .iter()
+            .any(|e| e.event_kind == EventKind::ChannelSent));
+        assert!(cpu
+            .trace_events()
+            .iter()
+            .any(|e| e.event_kind == EventKind::ChannelReceived));
+
+        let mut metal_runs = Vec::new();
+        for width in [1, 32] {
+            let (mut metal, plan, s, r, ch, pl, _) = channel_setup(width, 4, false, true, false);
+            metal.run_resident_sync_metal(plan).unwrap();
+            assert_eq!(
+                metal.continuation_state(s).unwrap(),
+                ContinuationState::Completed
+            );
+            assert_eq!(
+                metal.continuation_state(r).unwrap(),
+                ContinuationState::Completed
+            );
+            assert_eq!(channel_queue_entries(&metal, ch), channel_queue_entries(&cpu, channel));
+            assert!(metal
+                .trace_events()
+                .iter()
+                .any(|e| e.event_kind == EventKind::ChannelSent));
+            assert!(metal
+                .trace_events()
+                .iter()
+                .any(|e| e.event_kind == EventKind::ChannelReceived));
+            assert!(crate::semantics::invariants::check(&metal).is_empty());
+            metal_runs.push((metal, pl));
+        }
+        assert_channel_trace_parity(&cpu, &metal_runs[0].0);
+        assert_channel_trace_parity(&cpu, &metal_runs[1].0);
+        assert_eq!(metal_runs[0].1, payload);
+    }
+
+    #[test]
+    fn channel_receiver_first_prefill_delivery_width_1_32() {
+        // Receiver-first on a prefilled channel. Epoch 0: the receiver pops the
+        // ordinary prefill escrow and yields; the sender's send succeeds and
+        // completes. Epoch 1: the receiver's retry consumes the exact payload
+        // and yields. Epoch 2: the skip guard sees the payload and completes.
+        // The payload delivery crosses an epoch boundary; nobody parks, so no
+        // wake edges exist.
+        let mut runs = Vec::new();
+        for width in [1, 32] {
+            let (mut k, plan, send_cont, recv_cont, channel, payload, pre_payload) =
+                channel_setup(width, 1, true, true, false);
+            assert_eq!(k.run_resident_sync_cpu_reference(plan).unwrap(), 3);
+            assert_eq!(
+                k.continuation_state(send_cont).unwrap(),
+                ContinuationState::Completed
+            );
+            assert_eq!(
+                k.continuation_state(recv_cont).unwrap(),
+                ContinuationState::Completed
+            );
+            assert_ne!(pre_payload, payload);
+            assert!(channel_queue_entries(&k, channel).is_empty());
+            assert!(k
+                .channel_queues
+                .get(&channel.key())
+                .unwrap()
+                .send_waiters
+                .is_empty());
+            assert!(k
+                .channel_queues
+                .get(&channel.key())
+                .unwrap()
+                .receive_waiters
+                .is_empty());
+            assert!(k
+                .trace_events()
+                .iter()
+                .any(|e| e.event_kind == EventKind::ChannelSent));
+            assert!(k
+                .trace_events()
+                .iter()
+                .any(|e| e.event_kind == EventKind::ChannelReceived));
+            assert!(crate::semantics::invariants::check(&k).is_empty());
+            runs.push(k);
+        }
+        assert_channel_trace_parity(&runs[0], &runs[1]);
+    }
+
+    #[test]
+    fn channel_sender_full_park_wakes_and_delivers_across_epoch() {
+        // Sender-first on a full channel. Epoch 0: the sender parks as a
+        // send_waiter; the drain receiver pops the prefill, wakes the parked
+        // sender, and completes. Epoch 1: the sender's retry re-executes the
+        // send into the drained channel and yields. Epoch 2: its full re-run
+        // finds the channel full of its own delivery and parks again. The
+        // delivery crosses an epoch boundary; the sender legitimately re-parks
+        // because `Sent` is not value-bearing, so it cannot observe its own
+        // success.
+        let mut runs = Vec::new();
+        for width in [1, 32] {
+            let (mut k, plan, send_cont, recv_cont, channel, payload, _) =
+                channel_setup(width, 1, true, false, true);
+            assert_eq!(k.run_resident_sync_cpu_reference(plan).unwrap(), 3);
+            assert_eq!(
+                k.continuation_state(send_cont).unwrap(),
+                ContinuationState::Waiting
+            );
+            assert_eq!(
+                k.continuation_state(recv_cont).unwrap(),
+                ContinuationState::Completed
+            );
+            assert_eq!(
+                k.channel_queues.get(&channel.key()).unwrap().send_waiters,
+                vec![send_cont]
+            );
+            assert_eq!(
+                channel_queue_entries(&k, channel),
+                vec![(
+                    k.continuations.get(send_cont).unwrap().process.to_u64(),
+                    payload.to_u64()
+                )]
+            );
+            assert!(k
+                .trace_events()
+                .iter()
+                .any(|e| e.event_kind == EventKind::ChannelSent));
+            assert!(k
+                .trace_events()
+                .iter()
+                .any(|e| e.event_kind == EventKind::ChannelReceived));
+            assert!(crate::semantics::invariants::check(&k).is_empty());
+            runs.push(k);
+        }
+        assert_channel_trace_parity(&runs[0], &runs[1]);
+    }
+
+    #[test]
+    fn channel_waiter_equivalence_with_ordinary_kernel_wake() {
+        // An ordinary governed receive drains a resident-parks-full sender
+        // exactly like the canonical resident receive: the parked continuation
+        // is live canonical state, ordinary Phase G wakes it, and a re-plan
+        // completes the send into the drained channel without re-importing the
+        // parked send.
+        let (mut k, plan, send_cont, channel, payload, pre_payload, receiver_actor) =
+            channel_sender_park_setup(1, 1);
+        let wake_count = k.run_resident_sync_cpu_reference(plan).unwrap();
+        assert_eq!(wake_count, 1);
+        assert_eq!(
+            k.continuation_state(send_cont).unwrap(),
+            ContinuationState::Waiting
+        );
+        assert_eq!(
+            k.channel_queues.get(&channel.key()).unwrap().send_waiters,
+            vec![send_cont]
+        );
+        assert_eq!(
+            channel_queue_entries(&k, channel),
+            vec![(k.continuations.get(send_cont).unwrap().process.to_u64(), pre_payload.to_u64())]
+        );
+        // Ordinary receive transfers the prefill escrow and wakes the parked
+        // resident sender, exactly as the canonical resident receive does.
+        let received = k
+            .receive_channel(receiver_actor, channel, Ref64::NULL)
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.payload, pre_payload);
+        assert_ne!(received.payload, payload);
+        assert!(k
+            .channel_queues
+            .get(&channel.key())
+            .unwrap()
+            .send_waiters
+            .is_empty());
+        k.apply_epoch_effects();
+        assert!(k
+            .scheduler
+            .pending_entries()
+            .iter()
+            .any(|(_, queued)| *queued == send_cont));
+        // Re-plan: the sender re-runs and delivers into the drained channel.
+        let resume_plan = k.plan_resident_sync(8, 1, 8, 1).unwrap();
+        assert_eq!(k.run_resident_sync_cpu_reference(resume_plan), Ok(1));
+        assert_eq!(
+            k.continuation_state(send_cont).unwrap(),
+            ContinuationState::Completed
+        );
+        assert!(k
+            .channel_queues
+            .get(&channel.key())
+            .unwrap()
+            .send_waiters
+            .is_empty());
+        assert_eq!(
+            channel_queue_entries(&k, channel),
+            vec![(k.continuations.get(send_cont).unwrap().process.to_u64(), payload.to_u64())]
+        );
+        assert!(crate::semantics::invariants::check(&k).is_empty());
+    }
+
+    #[test]
+    fn channel_metal_full_park_and_empty_receive_park_match_cpu() {
+        // The two clean park directions, on Metal vs CPU, width 1 and 32:
+        // receiver-empty-park (receiver-first, no prefill) and sender-full-park
+        // (sender-first, prefilled, drain receiver). Both deliveries cross an
+        // epoch boundary, so I25 has nothing to report.
+        for (capacity, prefill, receiver_first, drain_receiver) in
+            [(1, false, true, false), (1, true, false, true)]
+        {
+            let (mut cpu, plan, s, r, ch, _, _) =
+                channel_setup(1, capacity, prefill, receiver_first, drain_receiver);
+            cpu.run_resident_sync_cpu_reference(plan).unwrap();
+            assert!(crate::semantics::invariants::check(&cpu).is_empty());
+            for width in [1, 32] {
+                let (mut metal, plan, sm, rm, chm, _, _) =
+                    channel_setup(width, capacity, prefill, receiver_first, drain_receiver);
+                metal.run_resident_sync_metal(plan).unwrap();
+                assert_eq!(
+                    metal.continuation_state(sm).unwrap(),
+                    cpu.continuation_state(s).unwrap()
+                );
+                assert_eq!(
+                    metal.continuation_state(rm).unwrap(),
+                    cpu.continuation_state(r).unwrap()
+                );
+                assert_eq!(
+                    channel_queue_entries(&metal, chm),
+                    channel_queue_entries(&cpu, ch)
+                );
+                assert!(crate::semantics::invariants::check(&metal).is_empty());
+                assert_channel_trace_parity(&cpu, &metal);
+            }
+        }
+    }
+
+    #[test]
+    fn channel_tamper_and_admission_refusals_are_atomic() {
+        // Closed channels refuse before submit.
+        let mut k = Kernel::new();
+        let creator = k.create_process(Ref64::NULL, ProcessMode::Pure);
+        let sender = k.create_process(Ref64::NULL, ProcessMode::Pure);
+        let channel = k.create_channel(creator, 1);
+        k.close_channel(creator, channel).unwrap();
+        let payload = k.create_object(sender, ObjectKind::MessagePayload, vec![1, 2, 3, 4]);
+        k.install_resident_sync_program(KernelResidentProgram {
+            run_class: 1200,
+            instructions: vec![
+                KernelResidentInstruction::effect(HANDLER_EFFECT_CHANNEL_SEND, channel, payload),
+                KernelResidentInstruction::plain(HANDLER_COMPLETE, 0, 0),
+            ],
+        })
+        .unwrap();
+        k.create_continuation(
+            sender,
+            sender,
+            ContinuationSpec::new(StateAccess::ReadOnly, 1200, 0, vec![0; 8], 8),
+        )
+        .unwrap();
+        assert!(matches!(
+            k.plan_resident_sync(4, 1, 8, 1),
+            Err(KernelResidentSyncError::UnsupportedShape)
+        ));
+
+        // An unauthorized channel receive (no RECEIVE right) refuses.
+        let mut k = Kernel::new();
+        let creator = k.create_process(Ref64::NULL, ProcessMode::Pure);
+        let receiver = k.create_process(Ref64::NULL, ProcessMode::Pure);
+        let channel = k.create_channel(creator, 1);
+        k.install_resident_sync_program(KernelResidentProgram {
+            run_class: 1200,
+            instructions: vec![
+                KernelResidentInstruction::effect(
+                    HANDLER_EFFECT_CHANNEL_RECEIVE,
+                    channel,
+                    Ref64::NULL,
+                ),
+                KernelResidentInstruction::plain(HANDLER_COMPLETE, 0, 0),
+            ],
+        })
+        .unwrap();
+        k.create_continuation(
+            receiver,
+            receiver,
+            ContinuationSpec::new(StateAccess::ReadOnly, 1200, 0, vec![0; 8], 8),
+        )
+        .unwrap();
+        assert!(matches!(
+            k.plan_resident_sync(4, 1, 8, 1),
+            Err(KernelResidentSyncError::UnsupportedShape)
+        ));
+
+        // A channel send whose payload lacks a stable transfer right refuses.
+        let mut k = Kernel::new();
+        let creator = k.create_process(Ref64::NULL, ProcessMode::Pure);
+        let sender = k.create_process(Ref64::NULL, ProcessMode::Pure);
+        let channel = k.create_channel(creator, 1);
+        k.grant_capability(creator, sender, channel, Rights::SEND, 0, 0)
+            .unwrap();
+        let payload = k.create_object(sender, ObjectKind::MessagePayload, vec![1, 2, 3, 4]);
+        // Expire the payload transfer capability before the plan horizon so the
+        // resident send has no stable transfer authority to escrow.
+        let cap = k.find_capability(sender, payload, Rights::TRANSFER).unwrap();
+        k.capability_spaces
+            .get_mut(&sender.key())
+            .unwrap()
+            .get_mut(cap)
+            .unwrap()
+            .valid_until_epoch = 0;
+        k.install_resident_sync_program(KernelResidentProgram {
+            run_class: 1200,
+            instructions: vec![
+                KernelResidentInstruction::effect(HANDLER_EFFECT_CHANNEL_SEND, channel, payload),
+                KernelResidentInstruction::plain(HANDLER_COMPLETE, 0, 0),
+            ],
+        })
+        .unwrap();
+        k.create_continuation(
+            sender,
+            sender,
+            ContinuationSpec::new(StateAccess::ReadOnly, 1200, 0, vec![0; 8], 8),
+        )
+        .unwrap();
+        assert!(matches!(
+            k.plan_resident_sync(4, 1, 8, 1),
+            Err(KernelResidentSyncError::UnsupportedShape)
+        ));
     }
 }

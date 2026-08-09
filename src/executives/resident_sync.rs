@@ -10,14 +10,16 @@
 
 use crate::scheduler::device::{DeviceLaneAccess, DEVICE_ACCESS_WRITE};
 use crate::scheduler::device_ops::{
-    DeviceLaneOperation, DeviceOperationJournal, OP_AWAIT_FUTURE, OP_ENQUEUE_MESSAGE,
-    OP_READ_OBJECT, OP_RECEIVE_MESSAGE, OP_RESOLVE_FUTURE, OP_WRITE_OBJECT,
+    DeviceLaneOperation, DeviceOperationJournal, OP_AWAIT_FUTURE, OP_CHANNEL_RECEIVE,
+    OP_CHANNEL_SEND, OP_ENQUEUE_MESSAGE, OP_READ_OBJECT, OP_RECEIVE_MESSAGE, OP_RESOLVE_FUTURE,
+    OP_WRITE_OBJECT,
 };
 use std::collections::{BTreeMap, VecDeque};
 
 pub const RESOURCE_OBJECT: u32 = 1;
 pub const RESOURCE_FUTURE: u32 = 2;
 pub const RESOURCE_MAILBOX: u32 = 3;
+pub const RESOURCE_CHANNEL: u32 = 4;
 pub const RIGHT_READ: u32 = 1;
 pub const RIGHT_WRITE: u32 = 2;
 /// Hard device-plan bounds, checked before CPU cloning or Metal arena allocation.
@@ -54,6 +56,15 @@ pub enum ResidentEffect {
         value: u64,
     },
     MailboxReceive {
+        target: u32,
+    },
+    /// Exact bounded channel send with capacity backpressure. `value` is the
+    /// little-endian payload reference carried by the escrowed message.
+    ChannelSend {
+        target: u32,
+        value: u64,
+    },
+    ChannelReceive {
         target: u32,
     },
 }
@@ -124,6 +135,11 @@ pub const HANDLER_YIELD_FRAME_U32: u32 = 15;
 pub const HANDLER_ADD_FRAME_U64: u32 = 16;
 /// Yield by a frame-zero predicate; `value` packs zero/nonzero run classes.
 pub const HANDLER_YIELD_IF_FRAME_ZERO_U64: u32 = 17;
+/// Exact bounded channel send; `target` is the dense channel index and `value`
+/// the little-endian payload reference carried by the message.
+pub const HANDLER_EFFECT_CHANNEL_SEND: u32 = 18;
+/// Exact bounded channel receive; `target` is the dense channel index.
+pub const HANDLER_EFFECT_CHANNEL_RECEIVE: u32 = 19;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResidentHandlerProgram {
@@ -164,6 +180,8 @@ pub(crate) fn validate_handler_program(
                 HANDLER_EFFECT_FUTURE_AWAIT
                     | HANDLER_EFFECT_MAILBOX_SEND
                     | HANDLER_EFFECT_MAILBOX_RECEIVE
+                    | HANDLER_EFFECT_CHANNEL_SEND
+                    | HANDLER_EFFECT_CHANNEL_RECEIVE
             )
         })
         .count();
@@ -187,7 +205,9 @@ pub(crate) fn validate_handler_program(
             | HANDLER_EFFECT_FUTURE_AWAIT
             | HANDLER_EFFECT_FUTURE_RESOLVE
             | HANDLER_EFFECT_MAILBOX_SEND
-            | HANDLER_EFFECT_MAILBOX_RECEIVE => {
+            | HANDLER_EFFECT_MAILBOX_RECEIVE
+            | HANDLER_EFFECT_CHANNEL_SEND
+            | HANDLER_EFFECT_CHANNEL_RECEIVE => {
                 let next_effects = effects.saturating_add(1);
                 if next_effects > max_effects {
                     return false;
@@ -296,6 +316,13 @@ fn execute_program(
                 value: instruction.value,
             }),
             HANDLER_EFFECT_MAILBOX_RECEIVE => effects.push(ResidentEffect::MailboxReceive {
+                target: instruction.argument,
+            }),
+            HANDLER_EFFECT_CHANNEL_SEND => effects.push(ResidentEffect::ChannelSend {
+                target: instruction.argument,
+                value: instruction.value,
+            }),
+            HANDLER_EFFECT_CHANNEL_RECEIVE => effects.push(ResidentEffect::ChannelReceive {
                 target: instruction.argument,
             }),
             HANDLER_STORE_IMMEDIATE_U64 | HANDLER_STORE_PREVIOUS_VALUE_U64 => {
@@ -449,6 +476,12 @@ pub struct ResidentSyncConfig {
     /// Canonical FIFO `(sender, value)` entries present at the resident boundary.
     /// The outer vector is exactly parallel to `mailbox_capacities`.
     pub mailbox_messages: Vec<Vec<(u64, u64)>>,
+    /// Fixed channel capacities. A channel is an open bounded FIFO queue with
+    /// capacity backpressure and separate send/receive waiter queues.
+    pub channel_capacities: Vec<u32>,
+    /// Canonical FIFO `(sender, value)` entries present at the resident boundary.
+    /// The outer vector is exactly parallel to `channel_capacities`.
+    pub channel_messages: Vec<Vec<(u64, u64)>>,
     pub capabilities: Vec<ResidentCapability>,
 }
 
@@ -545,6 +578,7 @@ pub struct ResidentSyncResult {
     pub object_values: Vec<Vec<u8>>,
     pub future_values: Vec<Option<u64>>,
     pub mailboxes: Vec<Vec<(u64, u64)>>,
+    pub channels: Vec<Vec<(u64, u64)>>,
     pub final_continuations: Vec<ResidentFinalContinuation>,
     pub invocations: Vec<ResidentInvocationRecord>,
     pub wakes: Vec<ResidentWakeRecord>,
@@ -570,6 +604,12 @@ struct Mail {
     receivers: Vec<u64>,
     senders: Vec<u64>,
 }
+struct Chan {
+    capacity: usize,
+    queue: VecDeque<(u64, u64)>,
+    receivers: Vec<u64>,
+    senders: Vec<u64>,
+}
 
 fn opcode(e: ResidentEffect) -> u32 {
     match e {
@@ -580,6 +620,8 @@ fn opcode(e: ResidentEffect) -> u32 {
         ResidentEffect::FutureResolve { .. } => OP_RESOLVE_FUTURE,
         ResidentEffect::MailboxSend { .. } => OP_ENQUEUE_MESSAGE,
         ResidentEffect::MailboxReceive { .. } => OP_RECEIVE_MESSAGE,
+        ResidentEffect::ChannelSend { .. } => crate::scheduler::device_ops::OP_CHANNEL_SEND,
+        ResidentEffect::ChannelReceive { .. } => crate::scheduler::device_ops::OP_CHANNEL_RECEIVE,
     }
 }
 fn target(e: ResidentEffect) -> u32 {
@@ -590,7 +632,9 @@ fn target(e: ResidentEffect) -> u32 {
         | ResidentEffect::FutureAwait { target }
         | ResidentEffect::FutureResolve { target, .. }
         | ResidentEffect::MailboxSend { target, .. }
-        | ResidentEffect::MailboxReceive { target } => target,
+        | ResidentEffect::MailboxReceive { target }
+        | ResidentEffect::ChannelSend { target, .. }
+        | ResidentEffect::ChannelReceive { target } => target,
     }
 }
 fn resource(e: ResidentEffect) -> u32 {
@@ -599,7 +643,12 @@ fn resource(e: ResidentEffect) -> u32 {
         ResidentEffect::FutureObserve { .. }
         | ResidentEffect::FutureAwait { .. }
         | ResidentEffect::FutureResolve { .. } => RESOURCE_FUTURE,
-        _ => RESOURCE_MAILBOX,
+        ResidentEffect::MailboxSend { .. } | ResidentEffect::MailboxReceive { .. } => {
+            RESOURCE_MAILBOX
+        }
+        ResidentEffect::ChannelSend { .. } | ResidentEffect::ChannelReceive { .. } => {
+            RESOURCE_CHANNEL
+        }
     }
 }
 fn required_right(e: ResidentEffect) -> u32 {
@@ -608,7 +657,8 @@ fn required_right(e: ResidentEffect) -> u32 {
         ResidentEffect::ObjectWrite { .. } => RIGHT_WRITE,
         ResidentEffect::FutureObserve { .. }
         | ResidentEffect::FutureAwait { .. }
-        | ResidentEffect::MailboxReceive { .. } => RIGHT_READ,
+        | ResidentEffect::MailboxReceive { .. }
+        | ResidentEffect::ChannelReceive { .. } => RIGHT_READ,
         _ => RIGHT_WRITE,
     }
 }
@@ -676,6 +726,12 @@ pub fn run_resident_sync(
             .iter()
             .zip(&config.mailbox_capacities)
             .any(|(messages, capacity)| messages.len() > *capacity as usize)
+        || config.channel_messages.len() != config.channel_capacities.len()
+        || config
+            .channel_messages
+            .iter()
+            .zip(&config.channel_capacities)
+            .any(|(messages, capacity)| messages.len() > *capacity as usize)
         || continuations.len() > config.max_continuations as usize
         || continuations.iter().any(|continuation| {
             continuation.frame.len() > config.max_frame_bytes as usize
@@ -725,6 +781,17 @@ pub fn run_resident_sync(
         .iter()
         .zip(&config.mailbox_messages)
         .map(|(capacity, messages)| Mail {
+            capacity: *capacity as usize,
+            queue: messages.iter().copied().collect(),
+            receivers: vec![],
+            senders: vec![],
+        })
+        .collect();
+    let mut chs: Vec<Chan> = config
+        .channel_capacities
+        .iter()
+        .zip(&config.channel_messages)
+        .map(|(capacity, messages)| Chan {
             capacity: *capacity as usize,
             queue: messages.iter().copied().collect(),
             receivers: vec![],
@@ -1018,6 +1085,79 @@ pub fn run_resident_sync(
                                 }
                             }
                         }
+                        ResidentEffect::ChannelSend { target, value } => {
+                            match chs.get_mut(target as usize) {
+                                None => ResidentOutcome::InvalidTarget,
+                                Some(ch) => {
+                                    if ch.queue.len() >= ch.capacity {
+                                        if !ch.senders.contains(&id) {
+                                            ch.senders.push(id)
+                                        }
+                                        cs.get_mut(&id).unwrap().pending = Some(e);
+                                        parked = true;
+                                        waiter_order = waiter_order.saturating_add(1);
+                                        cs.get_mut(&id).unwrap().waiter_order = waiter_order;
+                                        ResidentOutcome::Full
+                                    } else {
+                                        ch.queue.push_back((actor, value));
+                                        if let Some(w) = ch.receivers.first().copied() {
+                                            ch.receivers.remove(0);
+                                            let c = cs.get_mut(&w).unwrap();
+                                            result.wakes.push(ResidentWakeRecord {
+                                                epoch,
+                                                lane,
+                                                cause_opcode: OP_CHANNEL_SEND,
+                                                target,
+                                                continuation: w,
+                                                run_class: c.spec.run_class,
+                                                ticket: c.waiter_order,
+                                                ordinal: ord as u32,
+                                                cause_continuation: id,
+                                                reserved: 0,
+                                            });
+                                            c.runnable = true;
+                                        }
+                                        ResidentOutcome::Sent
+                                    }
+                                }
+                            }
+                        }
+                        ResidentEffect::ChannelReceive { target } => {
+                            match chs.get_mut(target as usize) {
+                                None => ResidentOutcome::InvalidTarget,
+                                Some(ch) => {
+                                    if let Some((sender, value)) = ch.queue.pop_front() {
+                                        if let Some(w) = ch.senders.first().copied() {
+                                            ch.senders.remove(0);
+                                            let c = cs.get_mut(&w).unwrap();
+                                            result.wakes.push(ResidentWakeRecord {
+                                                epoch,
+                                                lane,
+                                                cause_opcode: OP_CHANNEL_RECEIVE,
+                                                target,
+                                                continuation: w,
+                                                run_class: c.spec.run_class,
+                                                ticket: c.waiter_order,
+                                                ordinal: ord as u32,
+                                                cause_continuation: id,
+                                                reserved: 0,
+                                            });
+                                            c.runnable = true;
+                                        }
+                                        ResidentOutcome::Received { value, sender }
+                                    } else {
+                                        if !ch.receivers.contains(&id) {
+                                            ch.receivers.push(id)
+                                        }
+                                        cs.get_mut(&id).unwrap().pending = Some(e);
+                                        parked = true;
+                                        waiter_order = waiter_order.saturating_add(1);
+                                        cs.get_mut(&id).unwrap().waiter_order = waiter_order;
+                                        ResidentOutcome::Empty
+                                    }
+                                }
+                            }
+                        }
                     }
                 };
                 result.accesses.push(DeviceLaneAccess::new(
@@ -1038,7 +1178,8 @@ pub fn run_resident_sync(
                     ResidentEffect::ObjectWrite { offset, value, .. } => (value, u64::from(offset)),
                     ResidentEffect::ObjectRead { offset, .. } => (0, u64::from(offset)),
                     ResidentEffect::FutureResolve { value, .. }
-                    | ResidentEffect::MailboxSend { value, .. } => (value, 0),
+                    | ResidentEffect::MailboxSend { value, .. }
+                    | ResidentEffect::ChannelSend { value, .. } => (value, 0),
                     _ => (0, 0),
                 };
                 let payload = match outcome {
@@ -1140,6 +1281,10 @@ pub fn run_resident_sync(
         .into_iter()
         .map(|m| m.queue.into_iter().collect())
         .collect();
+    result.channels = chs
+        .into_iter()
+        .map(|ch| ch.queue.into_iter().collect())
+        .collect();
     Some(result)
 }
 
@@ -1202,6 +1347,8 @@ mod tests {
             futures: vec![InitialFuture::Pending],
             mailbox_capacities: vec![],
             mailbox_messages: vec![],
+            channel_capacities: vec![],
+            channel_messages: vec![],
             capabilities: vec![
                 cap(10, RESOURCE_FUTURE, 0, RIGHT_READ),
                 cap(20, RESOURCE_FUTURE, 0, RIGHT_WRITE),
@@ -1323,6 +1470,8 @@ mod tests {
             futures: vec![],
             mailbox_capacities: vec![1],
             mailbox_messages: vec![vec![]],
+            channel_capacities: vec![],
+            channel_messages: vec![],
             capabilities: vec![
                 cap(10, RESOURCE_MAILBOX, 0, RIGHT_READ),
                 cap(20, RESOURCE_MAILBOX, 0, RIGHT_WRITE),
@@ -1451,6 +1600,8 @@ mod tests {
             futures: vec![InitialFuture::Pending],
             mailbox_capacities: vec![],
             mailbox_messages: vec![],
+            channel_capacities: vec![],
+            channel_messages: vec![],
             capabilities: vec![cap(7, RESOURCE_FUTURE, 0, RIGHT_WRITE)],
         };
         let mut programs = BTreeMap::new();
@@ -1600,6 +1751,8 @@ mod tests {
             futures: vec![InitialFuture::Pending, InitialFuture::Resolved(44)],
             mailbox_capacities: vec![],
             mailbox_messages: vec![],
+            channel_capacities: vec![],
+            channel_messages: vec![],
             capabilities: vec![
                 cap(7, RESOURCE_FUTURE, 0, RIGHT_READ),
                 cap(7, RESOURCE_FUTURE, 1, RIGHT_READ),
@@ -1753,6 +1906,8 @@ mod tests {
             futures: vec![InitialFuture::Resolved(1)],
             mailbox_capacities: vec![0],
             mailbox_messages: vec![vec![]],
+            channel_capacities: vec![],
+            channel_messages: vec![],
             capabilities: vec![
                 cap(7, RESOURCE_FUTURE, 0, RIGHT_WRITE),
                 cap(7, RESOURCE_FUTURE, 9, RIGHT_WRITE),

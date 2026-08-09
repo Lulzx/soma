@@ -53,18 +53,30 @@ receives may publish exact canonical pending/disposition/ticket state and exact
 ordinary-Kernel waiter queues. Ordinary resolution, receive, or enqueue wakes
 the imported waiter in FIFO order; CPU and actual Metal widths 1/32 agree, and
 metadata tampering refuses atomically. This is still a bounded canonical commit
-slice: only local unsupervised programs with pre-existing stable authority and
-initially empty waiter queues are admitted. Existing mailbox entries are
+slice: only local unsupervised programs with pre-existing stable authority are
+admitted, and any pre-existing waiter queue must be disjoint from resources the
+resident bytecode can touch. Existing mailbox entries are
 snapshotted exactly on CPU and Metal, allowing an ordinary enqueue wake followed
 by resident receive retry and completion. Multiple mutable contenders now use
 bounded actor groups, deterministic longest-waiting/identity admission, and
 exact ordinary-Kernel deferral replay on CPU and Metal. Wrapping frame-word
 immediate/frame-word addition, frame-equality completion, and direct or
 zero-conditional frame-selected next classes now support bounded multi-handler,
-multi-epoch private arithmetic on both backends. Pre-existing waiter queues,
-allocation/resizing, channels, supervision, device capability creation, general
-loop/gather handlers, broader effects, and the general canonical bridge remain
-to be integrated.
+multi-epoch private arithmetic on both backends. Disjoint ordinary waiter queues
+also coexist unchanged across CPU and actual-Metal resident runs; touched queues
+and device re-entry of their parked continuations remain unsupported. Channel
+send/receive is now a canonical resident effect through the same bridge: the
+device journal carries channel opcodes, the Metal shader applies channel
+send/receive and wakes exactly the parked send or receive waiter, and the Kernel
+primitives park a sender on a full channel or a receiver on an empty one with
+exact FIFO waiter queues, deferred wake across the epoch boundary, retry of the
+single pending effect with `Yield` disposition, and `Sent` kept non-value-bearing
+so a sender can never observe its own send. Receiver-empty-park, prefill
+delivery, and sender-full-park-with-across-epoch-retry flows all match the
+reference Kernel on CPU and actual-Metal widths 1/32; tamper and admission
+refusals stay atomic. Allocation/resizing, supervision, device capability
+creation, general loop/gather handlers, broader effects, and the general
+canonical bridge remain to be integrated.
 
 ## G3 — Distributed ownership [in progress]
 
